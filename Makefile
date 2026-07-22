@@ -1,5 +1,6 @@
 CC ?= cc
 CXX ?= c++
+GLSLC ?= ./glslc
 .DEFAULT_GOAL := all
 UNAME_S := $(shell uname -s)
 
@@ -92,55 +93,55 @@ VULKAN_SHADERS := \
 	vulkan/ffn_tail.spv
 
 vulkan/moe_matvec_fast.spv: vulkan/moe_matvec_fast.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b.spv: vulkan/matmul_q8_0_f32b.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/shared_gate_up_decode.spv: vulkan/shared_gate_up_decode.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/shared_down_tail_decode.spv: vulkan/shared_down_tail_decode.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_mm.spv: vulkan/matmul_q8_0_mm.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_mm_f16.spv: vulkan/matmul_q8_0_mm_f16.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_gate_up_f32b.spv: vulkan/moe_gate_up_f32b.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_down_q2k_f32b.spv: vulkan/moe_down_q2k_f32b.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_down_q2k_sum_decode.spv: vulkan/moe_down_q2k_sum_decode.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_gate_up_gemm.spv: vulkan/moe_gate_up_gemm.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_down_gemm.spv: vulkan/moe_down_gemm.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/delta_net_cols.spv: vulkan/delta_net_cols.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/attn_decode_fused.spv: vulkan/attn_decode_fused.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/attn_decode_split.spv: vulkan/attn_decode_split.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/attn_prefill_qtile.spv: vulkan/attn_prefill_qtile.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 # Vulkan is the default backend. CORE_OBJS holds the GPU engine; CPU_CORE_OBJS
 # is the -DQ36_NO_GPU reference build selected by `make cpu`.
@@ -247,22 +248,22 @@ rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ rax.c
 
 vulkan/%.spv: vulkan/%.comp
-	glslc -O -o $@ $<
+	$(GLSLC) -O -o $@ $<
 
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q5k_mmq_fast.spv: vulkan/matmul_q5k_mmq_fast.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q6k_mmq_fast.spv: vulkan/matmul_q6k_mmq_fast.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q5k_mmq.spv: vulkan/matmul_q5k_mmq.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q6k_mmq.spv: vulkan/matmul_q6k_mmq.comp
-	glslc -O --target-env=vulkan1.1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 # --- CPU-only objects (-DQ36_NO_GPU) ---
 q36_cpu.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_streaming_hotlist.inc
