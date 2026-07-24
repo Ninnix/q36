@@ -338,6 +338,23 @@ int q36_gpu_rms_norm_rope_qwen_kv_store_tensor(
         uint32_t              cap,
         float                 eps);
 
+int q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(
+        q36_gpu_tensor       *k_cache,
+        q36_gpu_tensor       *v_cache,
+        const q36_gpu_tensor *k,
+        const q36_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              src_stride,
+        uint32_t              n_head,
+        uint32_t              pos0,
+        uint32_t              n_tok,
+        uint32_t              cap,
+        float                 eps,
+        uint32_t              k_row_bytes,
+        uint32_t              v_row_bytes);
+
 int q36_gpu_shared_ffn_decode_tensor(
         q36_gpu_tensor       *out,
         q36_gpu_tensor       *mid,

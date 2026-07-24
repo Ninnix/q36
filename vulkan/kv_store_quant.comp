@@ -1,0 +1,119 @@
+#version 460
+
+/* Quantized KV store: one workgroup (256 threads) per token.
+ * Blocks processed sequentially. Staging buffer with atomicOr writes,
+ * then copy to cache as aligned uints. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Cache {
+    uint cache[];
+};
+
+layout(set = 0, binding = 1) readonly buffer Src {
+    float src[];
+};
+
+layout(push_constant) uniform Push {
+    uint row_elems;
+    uint cache_row_bytes;
+    uint pos0;
+    uint n_tok;
+    uint qtype;   /* 1 = Q8_0, 2 = Q4_0 */
+} pc;
+
+const uint QK = 32u;
+
+/* All shared vars at global scope */
+shared float sh_blk[32];   /* one block of source values */
+shared float sh_extreme;   /* reduction result for current block */
+shared uint  sh_row[144];  /* staging: up to 576 bytes */
+
+int nearest_int(float f) {
+    return int(floatBitsToUint(f + 12582912.0) & 0x007fffffu) - 0x00400000;
+}
+
+void main(void) {
+    uint lid  = gl_LocalInvocationID.x;
+    uint tok  = gl_WorkGroupID.y;
+    uint pos  = pc.pos0 + tok;
+    uint src_base = tok * pc.row_elems;
+    uint n_blocks = pc.row_elems / QK;
+    uint blk_bytes = (pc.qtype == 1u) ? 34u : 18u;
+    uint n_stage = (n_blocks * blk_bytes + 3u) / 4u;
+
+    /* Zero staging buffer */
+    for (uint i = lid; i < n_stage; i += 256u) sh_row[i] = 0u;
+    barrier();
+
+    for (uint blk = 0u; blk < n_blocks; blk++) {
+        /* Load block values into shared */
+        if (lid < QK) sh_blk[lid] = src[src_base + blk * QK + lid];
+        barrier();
+
+        /* Lane 0: sequential reduction */
+        if (lid == 0u) {
+            float ext = 0.0;
+            if (pc.qtype == 1u) {
+                for (uint i = 0u; i < QK; i++) ext = max(ext, abs(sh_blk[i]));
+            } else {
+                float amax = 0.0;
+                for (uint i = 0u; i < QK; i++) {
+                    float a = abs(sh_blk[i]);
+                    if (a > amax) { amax = a; ext = sh_blk[i]; }
+                }
+            }
+            sh_extreme = ext;
+        }
+        barrier();
+
+        float extreme = sh_extreme;
+        float d = (pc.qtype == 1u) ? extreme * (1.0 / 127.0) : extreme / (-8.0);
+        float id = d != 0.0 ? 1.0 / d : 0.0;
+
+        uint blk_off = blk * blk_bytes;
+        uint scale_u = packHalf2x16(vec2(d, 0.0));
+
+        /* Write scale (2 bytes) via atomicOr into staging */
+        if (lid == 0u) {
+            uint w0 = blk_off / 4u;
+            uint s0 = (blk_off & 3u) * 8u;
+            atomicOr(sh_row[w0], (scale_u & 0xFFFFu) << s0);
+            if (s0 > 0u)
+                atomicOr(sh_row[w0 + 1u], (scale_u & 0xFFFFu) >> (32u - s0));
+        }
+
+        /* Write quantized values */
+        if (pc.qtype == 1u) {
+            /* Q8_0: 32 int8 values */
+            if (lid < QK) {
+                float v = sh_blk[lid];
+                int q = id != 0.0 ? nearest_int(v * id) : 0;
+                q = clamp(q, -128, 127);
+                uint byte_off = blk_off + 2u + lid;
+                uint w = byte_off / 4u;
+                uint s = (byte_off & 3u) * 8u;
+                atomicOr(sh_row[w], (uint(q) & 0xFFu) << s);
+            }
+        } else {
+            /* Q4_0: 16 packed nibble pairs */
+            if (lid < 16u) {
+                float v0 = sh_blk[lid];
+                float v1 = sh_blk[lid + 16u];
+                int q0 = id != 0.0 ? clamp(int(v0 * id + 8.5), 0, 15) : 0;
+                int q1 = id != 0.0 ? clamp(int(v1 * id + 8.5), 0, 15) : 0;
+                uint packed = (uint(q0) & 0xFu) | ((uint(q1) & 0xFu) << 4u);
+                uint byte_off = blk_off + 2u + lid;
+                uint w = byte_off / 4u;
+                uint s = (byte_off & 3u) * 8u;
+                atomicOr(sh_row[w], packed << s);
+            }
+        }
+        barrier();
+    }
+
+    /* Copy staging to cache */
+    uint cache_base = (pos * pc.cache_row_bytes) / 4u;
+    for (uint i = lid; i < n_stage; i += 256u)
+        cache[cache_base + i] = sh_row[i];
+}
