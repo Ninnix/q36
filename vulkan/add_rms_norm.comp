@@ -1,64 +1,44 @@
 #version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
-/* Fused residual add + weighted RMS norm.  One workgroup per row.
- *
- * sum[i]  = a[i] + b[i]                (written back, becomes the residual)
- * norm[i] = rmsnorm(sum)[i] * w[i]
- *
- * The add is the same f32 add and the reduction the same fp64
- * strided-then-shared order as add.comp followed by rms_norm.comp, so the
- * fused path is bit-identical to the unfused one.  sum may alias a or b:
- * each index is owned by one thread and never re-read from memory. */
+/* Fused residual add + weighted RMS norm, fast path: fp32 accumulation
+ * with subgroup reduction. Only used when !quality. */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer A {
-    float a[];
-};
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) readonly buffer Weight { float w[]; };
+layout(set = 0, binding = 3) writeonly buffer Sum { float s[]; };
+layout(set = 0, binding = 4) writeonly buffer Norm { float y[]; };
 
-layout(set = 0, binding = 1) readonly buffer B {
-    float b[];
-};
+layout(push_constant) uniform Push { uint n; float eps; } pc;
 
-layout(set = 0, binding = 2) readonly buffer Weight {
-    float w[];
-};
-
-layout(set = 0, binding = 3) writeonly buffer Sum {
-    float s[];
-};
-
-layout(set = 0, binding = 4) writeonly buffer Norm {
-    float y[];
-};
-
-layout(push_constant) uniform Push {
-    uint n;   /* row width, <= 16*256 */
-    float eps;
-} pc;
-
-shared double sh_sum[256];
+shared float sh_sg[8];
 
 void main(void) {
     uint row = gl_WorkGroupID.x;
     uint lid = gl_LocalInvocationID.x;
     uint base = row * pc.n;
     float v[16];
-    double ss = 0.0;
+    float ss = 0.0;
     uint c = 0u;
     for (uint i = lid; i < pc.n; i += 256u) {
         float x = a[base + i] + b[base + i];
         s[base + i] = x;
         v[c++] = x;
-        ss += double(x) * double(x);
+        ss += x * x;
     }
-    sh_sum[lid] = ss;
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) sh_sg[gl_SubgroupID] = ss;
     barrier();
-    for (uint sh = 128u; sh > 0u; sh >>= 1u) {
-        if (lid < sh) sh_sum[lid] += sh_sum[lid + sh];
-        barrier();
+    if (lid == 0u) {
+        float total = sh_sg[0];
+        for (uint i = 1u; i < gl_NumSubgroups; i++) total += sh_sg[i];
+        sh_sg[0] = inversesqrt(total / float(pc.n) + pc.eps);
     }
-    float scale = inversesqrt(float(sh_sum[0] / double(pc.n)) + pc.eps);
+    barrier();
+    float scale = sh_sg[0];
     c = 0u;
     for (uint i = lid; i < pc.n; i += 256u) {
         y[base + i] = (v[c++] * scale) * w[i];

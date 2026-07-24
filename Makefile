@@ -254,6 +254,12 @@ vulkan/%.spv: vulkan/%.comp
 vulkan/rms_norm_rope_kv_qwen_quant.spv: vulkan/rms_norm_rope_kv_qwen_quant.comp
 	glslc -O --target-env=vulkan1.3 -o $@ $<
 
+vulkan/rms_norm.spv: vulkan/rms_norm.comp
+	glslc -O --target-env=vulkan1.3 -o $@ $<
+
+vulkan/add_rms_norm.spv: vulkan/add_rms_norm.comp
+	glslc -O --target-env=vulkan1.3 -o $@ $<
+
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
 	glslc -O --target-env=vulkan1.1 -o $@ $<
 

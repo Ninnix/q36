@@ -1,42 +1,39 @@
 #version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* RMS norm, fast path: fp32 accumulation with subgroup reduction.
+ * Only used when !quality (quality path falls back to host fp64).
+ * Reduces barriers from 8 (fp64 tree) to 2 (subgroup + broadcast). */
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer Input {
-    float x[];
-};
+layout(set = 0, binding = 0) readonly buffer Input { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 
-layout(set = 0, binding = 1) readonly buffer Weight {
-    float w[];
-};
+layout(push_constant) uniform Push { uint n; uint has_weight; float eps; } pc;
 
-layout(set = 0, binding = 2) writeonly buffer Output {
-    float y[];
-};
-
-layout(push_constant) uniform Push {
-    uint n;
-    uint has_weight;
-    float eps;
-} pc;
-
-shared double sh_sum[256];
+shared float sh_sg[8];
 
 void main(void) {
     uint row = gl_WorkGroupID.x;
     uint lid = gl_LocalInvocationID.x;
     uint base = row * pc.n;
-    double ss = 0.0;
+    float ss = 0.0;
     for (uint i = lid; i < pc.n; i += 256u) {
         float v = x[base + i];
-        ss += double(v) * double(v);
+        ss += v * v;
     }
-    sh_sum[lid] = ss;
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) sh_sg[gl_SubgroupID] = ss;
     barrier();
-    for (uint s = 128u; s > 0u; s >>= 1u) {
-        if (lid < s) sh_sum[lid] += sh_sum[lid + s];
-        barrier();
+    if (lid == 0u) {
+        float total = sh_sg[0];
+        for (uint i = 1u; i < gl_NumSubgroups; i++) total += sh_sg[i];
+        sh_sg[0] = inversesqrt(total / float(pc.n) + pc.eps);
     }
-    float scale = inversesqrt(float(sh_sum[0] / double(pc.n)) + pc.eps);
+    barrier();
+    float scale = sh_sg[0];
     for (uint i = lid; i < pc.n; i += 256u) {
         float v = x[base + i] * scale;
         y[base + i] = pc.has_weight != 0u ? v * w[i] : v;
