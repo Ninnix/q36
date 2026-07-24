@@ -1,0 +1,161 @@
+#version 460
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Fused RMS norm + Qwen RoPE + quantized KV store (Q8_0 K / Q4_0 V).
+ * Same dataflow as rms_norm_rope_kv_qwen.comp but writes quantized blocks
+ * instead of f16.  One workgroup (256 threads) per (head, token). */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer K { float k[]; };
+layout(set = 0, binding = 1) readonly buffer Weight { float w[]; };
+layout(set = 0, binding = 2) buffer KCache { uint kc[]; };
+layout(set = 0, binding = 3) readonly buffer V { float v[]; };
+layout(set = 0, binding = 4) buffer VCache { uint vc[]; };
+
+layout(push_constant) uniform Push {
+    uint src_stride; uint n_head; uint pos0; uint n_tok; uint cap;
+    float eps; uint k_row_bytes; uint v_row_bytes;
+} pc;
+
+shared float sh_sg[8];
+shared float sh_k[256];
+shared float sh_v[256];
+shared float sh_red[256];
+shared uint  sh_scale_k[8];
+shared uint  sh_scale_v[8];
+shared int   sh_qk[256];
+shared int   sh_qv[256];
+
+int nearest_int(float f) {
+    return int(floatBitsToUint(f + 12582912.0) & 0x007fffffu) - 0x00400000;
+}
+
+void main(void) {
+    uint lid  = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+    uint tok  = gl_WorkGroupID.y;
+    uint row  = tok * pc.n_head + head;
+    uint pos  = pc.pos0 + tok;
+
+    /* Phase 1: RMS norm + weight */
+    float input_value = k[row * pc.src_stride + lid];
+    float ss = input_value * input_value;
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) sh_sg[gl_SubgroupID] = ss;
+    barrier();
+    float nscale;
+    if (lid == 0u) {
+        float total = sh_sg[0];
+        for (uint i = 1u; i < gl_NumSubgroups; i++) total += sh_sg[i];
+        sh_sg[0] = inversesqrt(total / 256.0 + pc.eps);
+    }
+    barrier();
+    nscale = sh_sg[0];
+    sh_k[lid] = input_value * nscale * w[lid];
+    barrier();
+
+    /* Phase 2: Qwen RoPE */
+    if (lid < 32u) {
+        float theta_scale = pow(10000000.0f, -2.0f / 64.0f);
+        float theta[4] = { float(pos), float(pos), float(pos), 0.0f };
+        for (uint i = 0u; i < lid; i++) {
+            theta[0] *= theta_scale; theta[1] *= theta_scale; theta[2] *= theta_scale;
+        }
+        uint axis = (lid < 11u) ? 0u : (lid < 22u) ? 1u : 2u;
+        float c = cos(theta[axis]);
+        float s = sin(theta[axis]);
+        float x0 = sh_k[lid];
+        float x1 = sh_k[lid + 32u];
+        sh_k[lid] = x0 * c - x1 * s;
+        sh_k[lid + 32u] = x0 * s + x1 * c;
+    }
+    barrier();
+
+    /* Phase 3: Load V */
+    sh_v[lid] = v[row * 256u + lid];
+    barrier();
+
+    /* Phase 4: Quantize K to Q8_0 and write.
+     * 8 blocks of 32, threads [b*32..b*32+31] handle block b. */
+    {
+        uint blk = lid >> 5u;
+        uint lane = lid & 31u;
+        float kval = sh_k[lid];
+        sh_red[lid] = abs(kval);
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (lane < s) sh_red[lid] = max(sh_red[lid], sh_red[lid + s]);
+            barrier();
+        }
+        float amax = sh_red[blk * 32u];
+        barrier();
+        float d  = amax * (1.0 / 127.0);
+        float id = d != 0.0 ? 1.0 / d : 0.0;
+        sh_qk[lid] = clamp(id != 0.0 ? nearest_int(kval * id) : 0, -128, 127);
+        if (lane == 0u) sh_scale_k[blk] = packHalf2x16(vec2(d, 0.0));
+        barrier();
+        /* Pack 272 bytes = 68 uints per head */
+        uint head_bytes = (256u / 32u) * 34u;
+        uint base_u = (pos * pc.k_row_bytes + head * head_bytes) / 4u;
+        if (lid < 68u) {
+            uint result = 0u;
+            for (uint bi = 0u; bi < 4u; bi++) {
+                uint bp = lid * 4u + bi;
+                uint b = bp / 34u;
+                uint off = bp - b * 34u;
+                uint bv = (off < 2u)
+                    ? (sh_scale_k[b] >> (off * 8u)) & 0xFFu
+                    : uint(sh_qk[b * 32u + off - 2u]) & 0xFFu;
+                result |= bv << (bi * 8u);
+            }
+            kc[base_u + lid] = result;
+        }
+    }
+    barrier();
+
+    /* Phase 5: Quantize V to Q4_0 and write */
+    {
+        uint blk = lid >> 5u;
+        uint lane = lid & 31u;
+        float vval = sh_v[lid];
+        sh_red[lid] = vval;
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                float a = sh_red[lid];
+                float b = sh_red[lid + s];
+                sh_red[lid] = abs(b) > abs(a) ? b : a;
+            }
+            barrier();
+        }
+        float extreme = sh_red[blk * 32u];
+        barrier();
+        float d  = extreme / (-8.0);
+        float id = d != 0.0 ? 1.0 / d : 0.0;
+        sh_qv[lid] = clamp(id != 0.0 ? int(vval * id + 8.5) : 0, 0, 15);
+        if (lane == 0u) sh_scale_v[blk] = packHalf2x16(vec2(d, 0.0));
+        barrier();
+        /* Pack 144 bytes = 36 uints per head */
+        uint head_bytes = (256u / 32u) * 18u;
+        uint base_u = (pos * pc.v_row_bytes + head * head_bytes) / 4u;
+        if (lid < 36u) {
+            uint result = 0u;
+            for (uint bi = 0u; bi < 4u; bi++) {
+                uint bp = lid * 4u + bi;
+                uint b = bp / 18u;
+                uint off = bp - b * 18u;
+                uint bv;
+                if (off < 2u) {
+                    bv = (sh_scale_v[b] >> (off * 8u)) & 0xFFu;
+                } else {
+                    uint pi = off - 2u;
+                    bv = (uint(sh_qv[b * 32u + pi]) & 0xFu)
+                       | ((uint(sh_qv[b * 32u + pi + 16u]) & 0xFu) << 4u);
+                }
+                result |= bv << (bi * 8u);
+            }
+            vc[base_u + lid] = result;
+        }
+    }
+}

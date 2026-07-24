@@ -169,6 +169,8 @@ typedef struct {
     q36_vk_kernel router_topk;
     q36_vk_kernel moe_tiles;
     q36_vk_kernel kv_store;
+    q36_vk_kernel kv_store_quant;
+    q36_vk_kernel rms_norm_rope_kv_quant;
     q36_vk_kernel moe_gate_up_f32b;
     q36_vk_kernel moe_down_q2k_f32b;
     q36_vk_kernel moe_down_q2k_sum_decode;
@@ -2456,6 +2458,8 @@ int q36_gpu_init(void) {
     q36_vk.router_topk = Q36_VK_KERNEL("vulkan/router_topk.spv", 3, 16, (1u << 1) | (1u << 2));
     q36_vk.moe_tiles = Q36_VK_KERNEL("vulkan/moe_tiles.spv", 3, 16, 1u << 1);
     q36_vk.kv_store = Q36_VK_KERNEL("vulkan/kv_store.spv", 4, 16, (1u << 0) | (1u << 1));
+    q36_vk.kv_store_quant = Q36_VK_KERNEL("vulkan/kv_store_quant.spv", 2, 20, 1u << 0);
+    q36_vk.rms_norm_rope_kv_quant = Q36_VK_KERNEL("vulkan/rms_norm_rope_kv_qwen_quant.spv", 5, 32, (1u << 2) | (1u << 4));
     q36_vk.moe_gate_up_f32b = Q36_VK_KERNEL("vulkan/moe_gate_up_f32b.spv", 8, 24, 1u << 6);
     q36_vk.moe_down_q2k_f32b = Q36_VK_KERNEL("vulkan/moe_down_q2k_f32b.spv", 5, 24, 1u << 4);
     q36_vk.moe_down_q2k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q2k_sum_decode.spv", 6, 24, 1u << 5);
@@ -2686,6 +2690,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.router_topk);
     q36_vk_kernel_destroy(&q36_vk.moe_tiles);
     q36_vk_kernel_destroy(&q36_vk.kv_store);
+    q36_vk_kernel_destroy(&q36_vk.kv_store_quant);
+    q36_vk_kernel_destroy(&q36_vk.rms_norm_rope_kv_quant);
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_sum_decode);
@@ -4773,7 +4779,57 @@ int q36_gpu_rms_norm_rope_qwen_kv_store_tensor(q36_gpu_tensor *k_cache,
     return ok;
 }
 
-/* Short causal conv1d + SiLU on the host: fp64 tap accumulation like
+/* Fused RMS norm + Qwen RoPE + quantized KV store (Q8_0 K / Q4_0 V).
+ * Same semantics as q36_gpu_rms_norm_rope_qwen_kv_store_tensor but writes
+ * quantized blocks directly on the GPU, eliminating the host round-trip. */
+int q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(q36_gpu_tensor *k_cache,
+                                                q36_gpu_tensor *v_cache,
+                                                const q36_gpu_tensor *k,
+                                                const q36_gpu_tensor *v,
+                                                const void *model_map,
+                                                uint64_t model_size,
+                                                uint64_t weight_offset,
+                                                uint32_t src_stride,
+                                                uint32_t n_head,
+                                                uint32_t pos0,
+                                                uint32_t n_tok,
+                                                uint32_t cap,
+                                                float eps,
+                                                uint32_t k_row_bytes,
+                                                uint32_t v_row_bytes) {
+    const uint32_t head_dim = Q36_VK_N_HEAD_DIM;
+    uint64_t rows = (uint64_t)n_head * n_tok;
+    if (src_stride < head_dim || rows == 0 || cap == 0 ||
+        pos0 >= cap || n_tok > cap - pos0) return 0;
+    const float *weight = (const float *)q36_gpu_weight_bytes(model_map, model_size,
+                                                              weight_offset,
+                                                              head_dim * sizeof(float));
+    if (!weight) return 0;
+    struct {
+        uint32_t src_stride;
+        uint32_t n_head;
+        uint32_t pos0;
+        uint32_t n_tok;
+        uint32_t cap;
+        float eps;
+        uint32_t k_row_bytes;
+        uint32_t v_row_bytes;
+    } push = { src_stride, n_head, pos0, n_tok, cap, eps, k_row_bytes, v_row_bytes };
+    pthread_mutex_lock(&q36_vk_mu);
+    q36_gpu_tensor *wt = q36_vk_weight_get_unlocked(weight, head_dim * sizeof(float));
+    int ok = wt != NULL;
+    if (ok) {
+        const q36_gpu_tensor *bindings[5] = { k, wt, k_cache, v, v_cache };
+        ok = q36_vk_run_unlocked("norm_rope_kv_quant", &q36_vk.rms_norm_rope_kv_quant,
+                                 bindings, &push, sizeof(push),
+                                 n_head, n_tok, 1);
+    }
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+
+/* Short causal conv1d + SiLU on the host:
+ * fp64 tap accumulation like
  * q36_ssm_conv_apply() and q36_siluf()'s exact formula with libm expf.
  * Batched over n_tok windows of n_taps rows each. */
 typedef struct {
@@ -5215,6 +5271,31 @@ int q36_gpu_attn_kv_store_tensor(q36_gpu_tensor *k_cache,
         pthread_mutex_lock(&q36_vk_mu);
         ok = q36_vk_run_unlocked("attn_kv_store", &q36_vk.kv_store, bindings, &push, sizeof(push),
                                  (row_max / 2u + 255u) / 256u, n_tok, 1);
+        pthread_mutex_unlock(&q36_vk_mu);
+        if (ok) return 1;
+        ok = 0;
+    }
+
+    /* GPU quantized KV store: writes Q8_0/Q4_0 blocks directly on the GPU,
+     * avoiding the host round-trip that costs ~200 pipeline flushes per run. */
+    if (!q36_gpu_quality && n_tok > 1u &&
+        (k_row % 32u) == 0u && (v_row % 32u) == 0u &&
+        k_cache_type >= 1u && k_cache_type <= 2u &&
+        v_cache_type >= 1u && v_cache_type <= 2u &&
+        q36_vk_env_default_on("Q36_VK_GPU_KV_STORE")) {
+        struct { uint32_t row_elems; uint32_t cache_row_bytes; uint32_t pos0; uint32_t n_tok; uint32_t qtype; } kpush =
+            { k_row, k_cache_row_bytes, pos0, n_tok, k_cache_type };
+        struct { uint32_t row_elems; uint32_t cache_row_bytes; uint32_t pos0; uint32_t n_tok; uint32_t qtype; } vpush =
+            { v_row, v_cache_row_bytes, pos0, n_tok, v_cache_type };
+        const q36_gpu_tensor *kbind[2] = { k_cache, k };
+        const q36_gpu_tensor *vbind[2] = { v_cache, v };
+        pthread_mutex_lock(&q36_vk_mu);
+        ok = q36_vk_run_unlocked("kv_store_quant_k", &q36_vk.kv_store_quant,
+                                 kbind, &kpush, sizeof(kpush), 1, n_tok, 1);
+        if (ok) {
+            ok = q36_vk_run_unlocked("kv_store_quant_v", &q36_vk.kv_store_quant,
+                                     vbind, &vpush, sizeof(vpush), 1, n_tok, 1);
+        }
         pthread_mutex_unlock(&q36_vk_mu);
         if (ok) return 1;
         ok = 0;

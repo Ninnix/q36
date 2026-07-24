@@ -5799,6 +5799,18 @@ static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
                     pos0, n_tok, cache->cap, Q36_RMS_EPS)) {
                 return false;
             }
+        } else if (!quality && (!env || !env[0] || env[0] != '0') &&
+                   cache->type_k >= 1u && cache->type_k <= 2u &&
+                   cache->type_v >= 1u && cache->type_v <= 2u &&
+                   (Q36_N_HEAD_DIM % 32u) == 0u &&
+                   (Q36_N_VALUE_DIM % 32u) == 0u &&
+                   q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(
+                       cache->k, cache->v, rt->attn_k, rt->attn_v,
+                       m->map, m->size, l->attn_k_norm->abs_offset,
+                       Q36_N_HEAD_DIM, Q36_N_HEAD_KV,
+                       pos0, n_tok, cache->cap, Q36_RMS_EPS,
+                       cache->k_row_bytes, cache->v_row_bytes)) {
+            /* Fused quantized KV store succeeded */
         } else {
             if (!q36_vulkan_prepare_attn_heads(rt->attn_k, rt->attn_k, m, l->attn_k_norm,
                                                Q36_N_HEAD_DIM, Q36_N_HEAD_KV,

@@ -81,6 +81,8 @@ VULKAN_SHADERS := \
 	vulkan/router_topk.spv \
 	vulkan/moe_tiles.spv \
 	vulkan/kv_store.spv \
+	vulkan/kv_store_quant.spv \
+	vulkan/rms_norm_rope_kv_qwen_quant.spv \
 	vulkan/moe_gate_up_f32b.spv \
 	vulkan/moe_down_q2k_f32b.spv \
 	vulkan/moe_down_q2k_sum_decode.spv \
@@ -248,6 +250,9 @@ rax.o: rax.c rax.h rax_malloc.h
 
 vulkan/%.spv: vulkan/%.comp
 	glslc -O -o $@ $<
+
+vulkan/rms_norm_rope_kv_qwen_quant.spv: vulkan/rms_norm_rope_kv_qwen_quant.comp
+	glslc -O --target-env=vulkan1.3 -o $@ $<
 
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
 	glslc -O --target-env=vulkan1.1 -o $@ $<
