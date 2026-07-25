@@ -167,16 +167,9 @@ Then build:
 make
 ```
 
-The Vulkan build requires **glslc** (from the `shaderc` package) to compile
-GLSL compute shaders to SPIR-V:
-
-```sh
-sudo pacman -S shaderc   # Arch / CachyOS / Bazzite
-```
-
-The normal and CPU-only builds are self-contained beyond that. They do not
-require a llama.cpp checkout or GGML libraries; those are used only by explicit
-optional reference targets under `make test-llama` and `make test-vectors-local`.
+The normal and CPU-only builds are self-contained. They do not require a
+llama.cpp checkout or GGML libraries; those are used only by explicit optional
+reference targets under `make test-llama` and `make test-vectors-local`.
 
 `gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf` is
 the default model path used by all runtime binaries. Pass `-m` to select another
