@@ -1213,6 +1213,11 @@ uint16_t q36_quant_f32_to_f16(float f) {
     }
 }
 
+/* Compiled without fast-math: -ffast-math substitutes rcpss approximations
+ * for the scale divisions (off by 1 ulp on some inputs, varying across
+ * CPUs), which breaks bit-identity with the GPU quantization kernels. */
+#pragma GCC push_options
+#pragma GCC optimize ("no-fast-math")
 void q36_quant_q8_0(const float *x, void *out, int64_t n) {
     q36_block_q8_0 *y = out;
     int64_t blocks = n / Q36_QK8_0;
@@ -1223,8 +1228,13 @@ void q36_quant_q8_0(const float *x, void *out, int64_t n) {
             float a = fabsf(x[b * Q36_QK8_0 + j]);
             if (a > amax) amax = a;
         }
-        float d = amax / 127.0f;
-        float inv = d ? 1.0f / d : 0.0f;
+        /* Double-rounded divisions: -ffast-math -march=native substitutes
+         * rcpss approximations for f32 division, which is off by 1 ulp on
+         * some inputs and varies across CPUs. Going through double keeps
+         * the result correctly rounded, so the GPU twin can match bit for
+         * bit. */
+        float d = (float)((double)amax / 127.0);
+        float inv = d ? (float)(1.0 / (double)d) : 0.0f;
         y[b].d = q36_quant_f32_to_f16(d);
         for (int j = 0; j < (int)Q36_QK8_0; j++)
             y[b].qs[j] = (int8_t)nearbyintf(x[b * Q36_QK8_0 + j] * inv);
@@ -1247,7 +1257,7 @@ void q36_quant_q4_0(const float *x, void *out, int64_t n) {
             }
         }
         float d = max / -8.0f;
-        float inv = d ? 1.0f / d : 0.0f;
+        float inv = d ? (float)(1.0 / (double)d) : 0.0f;
         y[b].d = q36_quant_f32_to_f16(d);
         for (uint32_t i = 0; i < Q36_QK4_0 / 2u; i++) {
             int q0 = (int8_t)(row[i] * inv + 8.5f);
@@ -1258,6 +1268,7 @@ void q36_quant_q4_0(const float *x, void *out, int64_t n) {
         }
     }
 }
+#pragma GCC pop_options
 
 void q36_quant_q8_k(const float *x, void *out, int64_t n) {
     q36_block_q8_k *y = out;
@@ -5800,8 +5811,8 @@ static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
                 return false;
             }
         } else if (!quality && (!env || !env[0] || env[0] != '0') &&
-                   cache->type_k >= 1u && cache->type_k <= 2u &&
-                   cache->type_v >= 1u && cache->type_v <= 2u &&
+                   cache->type_k == Q36_KV_CACHE_Q8_0 &&
+                   cache->type_v == Q36_KV_CACHE_Q4_0 &&
                    (Q36_N_HEAD_DIM % 32u) == 0u &&
                    (Q36_N_VALUE_DIM % 32u) == 0u &&
                    q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(

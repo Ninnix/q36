@@ -30,7 +30,24 @@ shared float sh_extreme;   /* reduction result for current block */
 shared uint  sh_row[144];  /* staging: up to 576 bytes */
 
 int nearest_int(float f) {
-    return int(floatBitsToUint(f + 12582912.0) & 0x007fffffu) - 0x00400000;
+    precise float g = f + 12582912.0;  /* keep the fma contractor away */
+    return int(floatBitsToUint(g) & 0x007fffffu) - 0x00400000;
+}
+
+/* f32 -> f16 round-to-nearest-even, bit-matching q36_quant_f32_to_f16().
+ * packHalf2x16 rounds toward zero on AMD and cannot be used for scales. */
+uint f16_rte(float f) {
+    uint w = floatBitsToUint(f);
+    uint shl1 = w + w;
+    uint sign = w & 0x80000000u;
+    uint bias = shl1 & 0xff000000u;
+    if (bias < 0x71000000u) bias = 0x71000000u;
+    precise float base = abs(f) * uintBitsToFloat(0x77800000u);  /* 0x1.0p+112 */
+    base *= uintBitsToFloat(0x08800000u);                        /* 0x1.0p-110 */
+    base += uintBitsToFloat((bias >> 1) + 0x07800000u);
+    uint bits = floatBitsToUint(base);
+    uint nonsign = ((bits >> 13) & 0x7c00u) + (bits & 0xfffu);
+    return (sign >> 16) | (shl1 > 0xff000000u ? 0x7e00u : nonsign);
 }
 
 void main(void) {
@@ -68,11 +85,14 @@ void main(void) {
         barrier();
 
         float extreme = sh_extreme;
-        float d = (pc.qtype == 1u) ? extreme * (1.0 / 127.0) : extreme / (-8.0);
-        float id = d != 0.0 ? 1.0 / d : 0.0;
+        /* fp64 divide: f32 division is 2.5 ulp on RADV, the host is exact */
+        float d = (pc.qtype == 1u) ? float(double(extreme) / 127.0)
+                                   : extreme / (-8.0);
+        /* fp64 divide: f32 rcp is 2.5 ulp on RADV, the host divide is exact */
+        float id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
 
         uint blk_off = blk * blk_bytes;
-        uint scale_u = packHalf2x16(vec2(d, 0.0));
+        uint scale_u = f16_rte(d);
 
         /* Write scale (2 bytes) via atomicOr into staging */
         if (lid == 0u) {
@@ -87,8 +107,8 @@ void main(void) {
         if (pc.qtype == 1u) {
             /* Q8_0: 32 int8 values */
             if (lid < QK) {
-                float v = sh_blk[lid];
-                int q = id != 0.0 ? nearest_int(v * id) : 0;
+                precise float p = sh_blk[lid] * id;
+                int q = id != 0.0 ? nearest_int(p) : 0;
                 q = clamp(q, -128, 127);
                 uint byte_off = blk_off + 2u + lid;
                 uint w = byte_off / 4u;
@@ -98,10 +118,10 @@ void main(void) {
         } else {
             /* Q4_0: 16 packed nibble pairs */
             if (lid < 16u) {
-                float v0 = sh_blk[lid];
-                float v1 = sh_blk[lid + 16u];
-                int q0 = id != 0.0 ? clamp(int(v0 * id + 8.5), 0, 15) : 0;
-                int q1 = id != 0.0 ? clamp(int(v1 * id + 8.5), 0, 15) : 0;
+                precise float p0 = sh_blk[lid] * id + 8.5;
+                precise float p1 = sh_blk[lid + 16u] * id + 8.5;
+                int q0 = clamp(int(p0), 0, 15);
+                int q1 = clamp(int(p1), 0, 15);
                 uint packed = (uint(q0) & 0xFu) | ((uint(q1) & 0xFu) << 4u);
                 uint byte_off = blk_off + 2u + lid;
                 uint w = byte_off / 4u;

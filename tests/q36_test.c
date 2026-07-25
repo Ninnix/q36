@@ -2027,6 +2027,201 @@ done:
 #endif
 }
 
+/* GPU quantized KV store must be byte-identical to the host quantizers:
+ * same blocks, same f16 scales, same packing, at the same cache offsets. */
+static void test_kv_quant_diff(const char *label, const unsigned char *exp,
+                               const unsigned char *got, size_t n, uint32_t blk_bytes) {
+    for (size_t i = 0; i < n; i++) {
+        if (exp[i] == got[i]) continue;
+        size_t blk = i / blk_bytes, off = i - blk * blk_bytes;
+        fprintf(stderr,
+                "q36-test: kv-quant %s first diff at byte %zu (block %zu +%zu) "
+                "exp=%02x got=%02x scale exp=%02x%02x got=%02x%02x\n",
+                label, i, blk, off, exp[i], got[i],
+                exp[blk * blk_bytes + 1], exp[blk * blk_bytes],
+                got[blk * blk_bytes + 1], got[blk * blk_bytes]);
+        return;
+    }
+}
+static void test_vulkan_kv_store_quant_case(uint32_t type_k, uint32_t type_v) {
+#ifdef Q36_NO_GPU
+    (void)type_k; (void)type_v;
+#else
+    const uint32_t row = 512, n_tok = 5, cap = 8, pos0 = 2;
+    const uint32_t k_row_bytes = (row / 32u) * (type_k == Q36_KV_CACHE_Q8_0 ? 34u : 18u);
+    const uint32_t v_row_bytes = (row / 32u) * (type_v == Q36_KV_CACHE_Q8_0 ? 34u : 18u);
+    const uint64_t values = (uint64_t)n_tok * row;
+    float *k_host = malloc(values * sizeof(float));
+    float *v_host = malloc(values * sizeof(float));
+    unsigned char *k_exp = malloc((size_t)n_tok * k_row_bytes);
+    unsigned char *v_exp = malloc((size_t)n_tok * v_row_bytes);
+    unsigned char *k_got = malloc((size_t)n_tok * k_row_bytes);
+    unsigned char *v_got = malloc((size_t)n_tok * v_row_bytes);
+    q36_gpu_tensor *k = NULL, *v = NULL, *kc = NULL, *vc = NULL;
+
+    TEST_ASSERT(k_host && v_host && k_exp && v_exp && k_got && v_got);
+    if (!k_host || !v_host || !k_exp || !v_exp || !k_got || !v_got) goto done;
+    for (uint64_t i = 0; i < values; i++) {
+        k_host[i] = (float)((int)((i * 13u + 7u) % 97u) - 48) / 31.0f;
+        v_host[i] = (float)((int)((i * 19u + 3u) % 89u) - 44) / 29.0f;
+    }
+    /* All-zero blocks exercise the d == 0 path. */
+    for (uint32_t i = 0; i < 32; i++) {
+        k_host[512 + 96 + i] = 0.0f;
+        v_host[160 + i] = 0.0f;
+    }
+    for (uint32_t t = 0; t < n_tok; t++) {
+        if (type_k == Q36_KV_CACHE_Q8_0)
+            q36_quant_q8_0(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
+        else
+            q36_quant_q4_0(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
+        if (type_v == Q36_KV_CACHE_Q8_0)
+            q36_quant_q8_0(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
+        else
+            q36_quant_q4_0(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
+    }
+    k = q36_gpu_tensor_alloc(values * sizeof(float));
+    v = q36_gpu_tensor_alloc(values * sizeof(float));
+    kc = q36_gpu_tensor_alloc((uint64_t)cap * k_row_bytes);
+    vc = q36_gpu_tensor_alloc((uint64_t)cap * v_row_bytes);
+    TEST_ASSERT(k && v && kc && vc);
+    if (!k || !v || !kc || !vc) goto done;
+    TEST_ASSERT(q36_gpu_tensor_write(k, 0, k_host, values * sizeof(float)) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(v, 0, v_host, values * sizeof(float)) != 0);
+    TEST_ASSERT(q36_gpu_attn_kv_store_tensor(kc, vc, k, v, pos0, n_tok, cap,
+                                             row, row, type_k, type_v,
+                                             k_row_bytes, v_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(kc, (uint64_t)pos0 * k_row_bytes,
+                                    k_got, (uint64_t)n_tok * k_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(vc, (uint64_t)pos0 * v_row_bytes,
+                                    v_got, (uint64_t)n_tok * v_row_bytes) != 0);
+    test_kv_quant_diff("store-k", k_exp, k_got, (size_t)n_tok * k_row_bytes,
+                       type_k == Q36_KV_CACHE_Q8_0 ? 34u : 18u);
+    test_kv_quant_diff("store-v", v_exp, v_got, (size_t)n_tok * v_row_bytes,
+                       type_v == Q36_KV_CACHE_Q8_0 ? 34u : 18u);
+    TEST_ASSERT(memcmp(k_got, k_exp, (size_t)n_tok * k_row_bytes) == 0);
+    TEST_ASSERT(memcmp(v_got, v_exp, (size_t)n_tok * v_row_bytes) == 0);
+    /* Single-token append (decode path). */
+    TEST_ASSERT(q36_gpu_attn_kv_store_tensor(kc, vc, k, v, cap - 1u, 1, cap,
+                                             row, row, type_k, type_v,
+                                             k_row_bytes, v_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(kc, (uint64_t)(cap - 1u) * k_row_bytes,
+                                    k_got, k_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(vc, (uint64_t)(cap - 1u) * v_row_bytes,
+                                    v_got, v_row_bytes) != 0);
+    TEST_ASSERT(memcmp(k_got, k_exp, k_row_bytes) == 0);
+    TEST_ASSERT(memcmp(v_got, v_exp, v_row_bytes) == 0);
+
+done:
+    q36_gpu_tensor_free(k);
+    q36_gpu_tensor_free(v);
+    q36_gpu_tensor_free(kc);
+    q36_gpu_tensor_free(vc);
+    free(k_host);
+    free(v_host);
+    free(k_exp);
+    free(v_exp);
+    free(k_got);
+    free(v_got);
+#endif
+}
+
+static void test_vulkan_kv_store_quant(void) {
+#ifdef Q36_NO_GPU
+    test_skip("vulkan-kernels", "CPU-only build");
+#else
+    test_vulkan_kv_store_quant_case(Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0);
+    test_vulkan_kv_store_quant_case(Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q8_0);
+#endif
+}
+
+/* Fused norm+rope+quant kernel against the separate norm, rope and quant
+ * store kernels: caches must match byte for byte, like the f16 twin above. */
+static void test_vulkan_rms_norm_rope_kv_quant(void) {
+#ifdef Q36_NO_GPU
+    test_skip("vulkan-kernels", "CPU-only build");
+#else
+    const uint32_t n_head = 2, head_dim = 256, n_tok = 2, cap = 8, pos0 = 3;
+    const uint32_t row = n_head * head_dim;
+    const uint32_t k_row_bytes = n_head * (head_dim / 32u) * 34u;
+    const uint32_t v_row_bytes = n_head * (head_dim / 32u) * 18u;
+    const uint64_t values = (uint64_t)n_tok * row;
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t weight_alloc = test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    void *weights_raw = NULL;
+    float *k_host = NULL, *v_host = NULL;
+    unsigned char *a = NULL, *b = NULL;
+    q36_gpu_tensor *k = NULL, *v = NULL, *sep = NULL;
+    q36_gpu_tensor *ka = NULL, *va = NULL, *kb = NULL, *vb = NULL;
+
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(), (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+    memset(weights_raw, 0, (size_t)weight_alloc);
+    k_host = malloc(values * sizeof(float));
+    v_host = malloc(values * sizeof(float));
+    a = malloc((size_t)n_tok * k_row_bytes);
+    b = malloc((size_t)n_tok * k_row_bytes);
+    TEST_ASSERT(k_host && v_host && a && b);
+    if (!k_host || !v_host || !a || !b) goto done;
+    for (uint32_t i = 0; i < head_dim; i++)
+        ((float *)weights_raw)[i] = 0.75f + (float)(i % 17u) / 32.0f;
+    for (uint64_t i = 0; i < values; i++) {
+        k_host[i] = (float)((int)((i * 13u + 7u) % 97u) - 48) / 31.0f;
+        v_host[i] = (float)((int)((i * 19u + 3u) % 89u) - 44) / 29.0f;
+    }
+    /* All-zero V block exercises the Q4_0 d == 0 path. */
+    for (uint32_t i = 0; i < 32; i++) v_host[160 + i] = 0.0f;
+    k = q36_gpu_tensor_alloc(values * sizeof(float));
+    v = q36_gpu_tensor_alloc(values * sizeof(float));
+    sep = q36_gpu_tensor_alloc(values * sizeof(float));
+    ka = q36_gpu_tensor_alloc((uint64_t)cap * k_row_bytes);
+    va = q36_gpu_tensor_alloc((uint64_t)cap * v_row_bytes);
+    kb = q36_gpu_tensor_alloc((uint64_t)cap * k_row_bytes);
+    vb = q36_gpu_tensor_alloc((uint64_t)cap * v_row_bytes);
+    TEST_ASSERT(k && v && sep && ka && va && kb && vb);
+    if (!k || !v || !sep || !ka || !va || !kb || !vb) goto done;
+    TEST_ASSERT(q36_gpu_tensor_write(k, 0, k_host, values * sizeof(float)) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(v, 0, v_host, values * sizeof(float)) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(sep, 0, k_host, values * sizeof(float)) != 0);
+    TEST_ASSERT(q36_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+    TEST_ASSERT(q36_gpu_rms_norm_weight_rows_tensor(sep, sep, weights_raw, weight_alloc,
+                                                    0, head_dim, n_head * n_tok, 1.0e-6f) != 0);
+    TEST_ASSERT(q36_gpu_rope_qwen_rows_tensor(sep, n_head, pos0, n_tok) != 0);
+    TEST_ASSERT(q36_gpu_attn_kv_store_tensor(ka, va, sep, v, pos0, n_tok, cap,
+                                             row, row,
+                                             Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0,
+                                             k_row_bytes, v_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(
+                    kb, vb, k, v, weights_raw, weight_alloc, 0,
+                    head_dim, n_head, pos0, n_tok, cap, 1.0e-6f,
+                    k_row_bytes, v_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(ka, (uint64_t)pos0 * k_row_bytes,
+                                    a, (uint64_t)n_tok * k_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(kb, (uint64_t)pos0 * k_row_bytes,
+                                    b, (uint64_t)n_tok * k_row_bytes) != 0);
+    TEST_ASSERT(memcmp(a, b, (size_t)n_tok * k_row_bytes) == 0);
+    TEST_ASSERT(q36_gpu_tensor_read(va, (uint64_t)pos0 * v_row_bytes,
+                                    a, (uint64_t)n_tok * v_row_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(vb, (uint64_t)pos0 * v_row_bytes,
+                                    b, (uint64_t)n_tok * v_row_bytes) != 0);
+    TEST_ASSERT(memcmp(a, b, (size_t)n_tok * v_row_bytes) == 0);
+
+done:
+    q36_gpu_tensor_free(k);
+    q36_gpu_tensor_free(v);
+    q36_gpu_tensor_free(sep);
+    q36_gpu_tensor_free(ka);
+    q36_gpu_tensor_free(va);
+    q36_gpu_tensor_free(kb);
+    q36_gpu_tensor_free(vb);
+    free(k_host);
+    free(v_host);
+    free(a);
+    free(b);
+    free(weights_raw);
+#endif
+}
+
 static void test_vulkan_recurrent_conv_decode(void) {
 #ifdef Q36_NO_GPU
     test_skip("vulkan-kernels", "CPU-only build");
@@ -3443,6 +3638,8 @@ static void test_vulkan_kernels(void) {
     test_vulkan_rms_norm();
     test_vulkan_rms_norm_rope();
     test_vulkan_rms_norm_rope_kv();
+    test_vulkan_kv_store_quant();
+    test_vulkan_rms_norm_rope_kv_quant();
     test_vulkan_recurrent_conv_decode();
     test_vulkan_delta_qkv();
     test_vulkan_shared_ffn_decode();
@@ -5648,6 +5845,17 @@ static void test_backend_parity_replay_vulkan(q36_engine *engine,
     q36_session_free(session);
 }
 
+/* KV-type parity matrix support: Q36_TEST_PARITY_REF=vulkan swaps the
+ * reference engine to Vulkan; Q36_TEST_REF_CACHE_TYPE_{K,V} and
+ * Q36_TEST_VK_CACHE_TYPE_{K,V} pin the cache types of each engine through
+ * the Q36_TEST_CACHE_TYPE_* variables read at engine open. */
+static void test_parity_cache_env(const char *k, const char *v) {
+    if (k && k[0]) setenv("Q36_TEST_CACHE_TYPE_K", k, 1);
+    else unsetenv("Q36_TEST_CACHE_TYPE_K");
+    if (v && v[0]) setenv("Q36_TEST_CACHE_TYPE_V", v, 1);
+    else unsetenv("Q36_TEST_CACHE_TYPE_V");
+}
+
 static void test_vulkan_cpu_parity(void) {
     static const test_backend_parity_case cases[] = {
         {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
@@ -5667,10 +5875,16 @@ static void test_vulkan_cpu_parity(void) {
         test_skip("vulkan-cpu-parity", "model file not found");
         return;
     }
-    cpu_engine = test_open_backend_engine(test_model_path(), Q36_BACKEND_CPU,
-                                          test_reference_threads());
+    const char *ref_env = getenv("Q36_TEST_PARITY_REF");
+    bool ref_vulkan = ref_env && !strcmp(ref_env, "vulkan");
+    test_parity_cache_env(getenv("Q36_TEST_REF_CACHE_TYPE_K"),
+                          getenv("Q36_TEST_REF_CACHE_TYPE_V"));
+    cpu_engine = test_open_backend_engine(test_model_path(),
+                                          ref_vulkan ? Q36_BACKEND_VULKAN
+                                                     : Q36_BACKEND_CPU,
+                                          ref_vulkan ? 1 : test_reference_threads());
     if (!cpu_engine) {
-        test_skip("vulkan-cpu-parity", "CPU backend unavailable");
+        test_skip("vulkan-cpu-parity", "reference backend unavailable");
         return;
     }
     if (!test_require_session_backend("vulkan-cpu-parity", cpu_engine, 4096)) {
@@ -5685,6 +5899,8 @@ static void test_vulkan_cpu_parity(void) {
     }
     q36_engine_close(cpu_engine);
 
+    test_parity_cache_env(getenv("Q36_TEST_VK_CACHE_TYPE_K"),
+                          getenv("Q36_TEST_VK_CACHE_TYPE_V"));
     vk_engine = test_open_backend_engine(test_model_path(), Q36_BACKEND_VULKAN, 1);
     if (!vk_engine) {
         test_skip("vulkan-cpu-parity", "Vulkan backend unavailable");

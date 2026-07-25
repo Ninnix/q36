@@ -251,9 +251,6 @@ rax.o: rax.c rax.h rax_malloc.h
 vulkan/%.spv: vulkan/%.comp
 	glslc -O -o $@ $<
 
-vulkan/rms_norm_rope_kv_qwen_quant.spv: vulkan/rms_norm_rope_kv_qwen_quant.comp
-	glslc -O --target-env=vulkan1.3 -o $@ $<
-
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
 	glslc -O --target-env=vulkan1.1 -o $@ $<
 

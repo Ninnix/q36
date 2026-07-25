@@ -21,13 +21,31 @@ shared double sh_sum[256];
 shared float sh_k[256];
 shared float sh_v[256];
 shared float sh_red[256];
+shared uint  sh_ri[256];
 shared uint  sh_scale_k[8];
 shared uint  sh_scale_v[8];
 shared int   sh_qk[256];
 shared int   sh_qv[256];
 
 int nearest_int(float f) {
-    return int(floatBitsToUint(f + 12582912.0) & 0x007fffffu) - 0x00400000;
+    precise float g = f + 12582912.0;  /* keep the fma contractor away */
+    return int(floatBitsToUint(g) & 0x007fffffu) - 0x00400000;
+}
+
+/* f32 -> f16 round-to-nearest-even, bit-matching q36_quant_f32_to_f16().
+ * packHalf2x16 rounds toward zero on AMD and cannot be used for scales. */
+uint f16_rte(float f) {
+    uint w = floatBitsToUint(f);
+    uint shl1 = w + w;
+    uint sign = w & 0x80000000u;
+    uint bias = shl1 & 0xff000000u;
+    if (bias < 0x71000000u) bias = 0x71000000u;
+    precise float base = abs(f) * uintBitsToFloat(0x77800000u);  /* 0x1.0p+112 */
+    base *= uintBitsToFloat(0x08800000u);                        /* 0x1.0p-110 */
+    base += uintBitsToFloat((bias >> 1) + 0x07800000u);
+    uint bits = floatBitsToUint(base);
+    uint nonsign = ((bits >> 13) & 0x7c00u) + (bits & 0xfffu);
+    return (sign >> 16) | (shl1 > 0xff000000u ? 0x7e00u : nonsign);
 }
 
 void main(void) {
@@ -84,10 +102,13 @@ void main(void) {
         }
         float amax = sh_red[blk * 32u];
         barrier();
-        float d  = amax * (1.0 / 127.0);
-        float id = d != 0.0 ? 1.0 / d : 0.0;
-        sh_qk[lid] = clamp(id != 0.0 ? nearest_int(kval * id) : 0, -128, 127);
-        if (lane == 0u) sh_scale_k[blk] = packHalf2x16(vec2(d, 0.0));
+        /* fp64 divide: f32 division is 2.5 ulp on RADV, the host is exact */
+        float d  = float(double(amax) / 127.0);
+        /* fp64 divide: f32 rcp is 2.5 ulp on RADV, the host divide is exact */
+        float id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
+        precise float pk = kval * id;
+        sh_qk[lid] = clamp(id != 0.0 ? nearest_int(pk) : 0, -128, 127);
+        if (lane == 0u) sh_scale_k[blk] = f16_rte(d);
         barrier();
         /* Pack 272 bytes = 68 uints per head */
         uint head_bytes = (256u / 32u) * 34u;
@@ -114,21 +135,29 @@ void main(void) {
         uint lane = lid & 31u;
         float vval = sh_v[lid];
         sh_red[lid] = vval;
+        sh_ri[lid] = lane;
         barrier();
+        /* Ties on |x| keep the lowest index, like the host sequential scan:
+         * the winner's sign decides the sign of d. */
         for (uint s = 16u; s > 0u; s >>= 1u) {
             if (lane < s) {
                 float a = sh_red[lid];
                 float b = sh_red[lid + s];
-                sh_red[lid] = abs(b) > abs(a) ? b : a;
+                uint ia = sh_ri[lid];
+                uint ib = sh_ri[lid + s];
+                bool takeb = abs(b) > abs(a) || (abs(b) == abs(a) && ib < ia);
+                sh_red[lid] = takeb ? b : a;
+                sh_ri[lid] = takeb ? ib : ia;
             }
             barrier();
         }
         float extreme = sh_red[blk * 32u];
         barrier();
         float d  = extreme / (-8.0);
-        float id = d != 0.0 ? 1.0 / d : 0.0;
-        sh_qv[lid] = clamp(id != 0.0 ? int(vval * id + 8.5) : 0, 0, 15);
-        if (lane == 0u) sh_scale_v[blk] = packHalf2x16(vec2(d, 0.0));
+        float id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
+        precise float pv = vval * id + 8.5;
+        sh_qv[lid] = clamp(int(pv), 0, 15);
+        if (lane == 0u) sh_scale_v[blk] = f16_rte(d);
         barrier();
         /* Pack 144 bytes = 36 uints per head */
         uint head_bytes = (256u / 32u) * 18u;

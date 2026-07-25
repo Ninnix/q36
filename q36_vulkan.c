@@ -4799,8 +4799,20 @@ int q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(q36_gpu_tensor *k_cache,
                                                 uint32_t v_row_bytes) {
     const uint32_t head_dim = Q36_VK_N_HEAD_DIM;
     uint64_t rows = (uint64_t)n_head * n_tok;
+    uint64_t src_floats;
     if (src_stride < head_dim || rows == 0 || cap == 0 ||
         pos0 >= cap || n_tok > cap - pos0) return 0;
+    /* The kernel writes fixed Q8_0 K rows and Q4_0 V rows; reject any
+     * other cache layout. */
+    if (k_row_bytes != n_head * (head_dim / 32u) * 34u ||
+        v_row_bytes != n_head * (head_dim / 32u) * 18u) return 0;
+    src_floats = (rows - 1u) * src_stride + head_dim;
+    if (!q36_gpu_tensor_range_ok(k, 0, src_floats * sizeof(float)) ||
+        !q36_gpu_tensor_range_ok(v, 0, rows * head_dim * sizeof(float)) ||
+        !q36_gpu_tensor_range_ok(k_cache, 0, (uint64_t)cap * k_row_bytes) ||
+        !q36_gpu_tensor_range_ok(v_cache, 0, (uint64_t)cap * v_row_bytes)) {
+        return 0;
+    }
     const float *weight = (const float *)q36_gpu_weight_bytes(model_map, model_size,
                                                               weight_offset,
                                                               head_dim * sizeof(float));
@@ -4828,8 +4840,7 @@ int q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(q36_gpu_tensor *k_cache,
     return ok;
 }
 
-/* Short causal conv1d + SiLU on the host:
- * fp64 tap accumulation like
+/* Short causal conv1d + SiLU on the host: fp64 tap accumulation like
  * q36_ssm_conv_apply() and q36_siluf()'s exact formula with libm expf.
  * Batched over n_tok windows of n_taps rows each. */
 typedef struct {
@@ -5278,8 +5289,9 @@ int q36_gpu_attn_kv_store_tensor(q36_gpu_tensor *k_cache,
 
     /* GPU quantized KV store: writes Q8_0/Q4_0 blocks directly on the GPU,
      * avoiding the host round-trip that costs ~200 pipeline flushes per run. */
-    if (!q36_gpu_quality && n_tok > 1u &&
+    if (!q36_gpu_quality &&
         (k_row % 32u) == 0u && (v_row % 32u) == 0u &&
+        k_row <= 512u && v_row <= 512u && /* sh_row staging: 16 blocks max */
         k_cache_type >= 1u && k_cache_type <= 2u &&
         v_cache_type >= 1u && v_cache_type <= 2u &&
         q36_vk_env_default_on("Q36_VK_GPU_KV_STORE")) {
