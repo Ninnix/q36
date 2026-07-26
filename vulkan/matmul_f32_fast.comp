@@ -1,21 +1,25 @@
 #version 460
 
-/* Dense f32 matvec, f32 accumulation.  Same one-workgroup-per-row strided
- * partials + tree reduction as matmul_f32.comp, but f32 FMA instead of the
- * 1/16-rate fp64 path.  The arithmetic per (row, token) is fixed, so
- * results are n_tok-invariant; what changes vs fp64 is only the rounding.
- * The rows this feeds are control projections (router logits, delta
- * alpha/beta, gate scalars) where a near-tie could flip an expert pick, so
- * the fp64 kernel remains the --quality and Q36_VK_F32_FAST=0 path. */
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Dense f32 matvec, f32 accumulation.  One workgroup per (row, token),
+ * vec4 loads and a subgroup reduction: these control projections (router
+ * logits, delta alpha/beta, gate scalars) are few and small, so the
+ * scalar strided version was latency-bound, not bandwidth-bound.  The
+ * arithmetic per (row, token) is fixed, so results are n_tok-invariant.
+ * A near-tie could still flip an expert pick vs the CPU engine, so the
+ * fp64 kernel remains the --quality and Q36_VK_F32_FAST=0 path; the
+ * dispatcher also routes in_dim % 4 != 0 there. */
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Weights {
-    float w[];
+    vec4 w[];
 };
 
 layout(set = 0, binding = 1) readonly buffer Input {
-    float x[];
+    vec4 x[];
 };
 
 layout(set = 0, binding = 2) writeonly buffer Output {
@@ -29,7 +33,7 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
-shared float sh_sum[64];
+shared float sh_sum[2];
 
 void main(void) {
     uint out_row = gl_WorkGroupID.x;
@@ -37,17 +41,20 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     if (out_row >= pc.out_dim || tok >= pc.n_tok) return;
 
-    uint wbase = out_row * pc.in_dim;
-    uint xbase = tok * pc.in_dim;
+    uint n4 = pc.in_dim >> 2u;
+    uint wbase = out_row * n4;
+    uint xbase = tok * n4;
     float acc = 0.0;
-    for (uint i = lid; i < pc.in_dim; i += 64u) {
-        acc = fma(w[wbase + i], x[xbase + i], acc);
+    for (uint i = lid; i < n4; i += 64u) {
+        acc += dot(w[wbase + i], x[xbase + i]);
     }
-    sh_sum[lid] = acc;
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lid < s) sh_sum[lid] += sh_sum[lid + s];
+    acc = subgroupAdd(acc);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) sh_sum[gl_SubgroupID] = acc;
         barrier();
+        if (lid == 0u) {
+            for (uint i = 1u; i < gl_NumSubgroups; i++) acc += sh_sum[i];
+        }
     }
-    if (lid == 0u) y[tok * pc.out_dim + out_row] = sh_sum[0] * pc.scale;
+    if (lid == 0u) y[tok * pc.out_dim + out_row] = acc * pc.scale;
 }

@@ -87,6 +87,8 @@ VULKAN_SHADERS := \
 	vulkan/moe_gate_up_f32b.spv \
 	vulkan/moe_down_q2k_f32b.spv \
 	vulkan/moe_down_q2k_sum_decode.spv \
+	vulkan/moe_gate_up_q4k_f32b.spv \
+	vulkan/moe_down_q4k_sum_decode.spv \
 	vulkan/moe_gate_up_gemm.spv \
 	vulkan/moe_down_gemm.spv \
 	vulkan/moe_matvec.spv \
@@ -125,6 +127,12 @@ vulkan/moe_down_q2k_f32b.spv: vulkan/moe_down_q2k_f32b.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_down_q2k_sum_decode.spv: vulkan/moe_down_q2k_sum_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/moe_gate_up_q4k_f32b.spv: vulkan/moe_gate_up_q4k_f32b.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/moe_down_q4k_sum_decode.spv: vulkan/moe_down_q4k_sum_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_gate_up_gemm.spv: vulkan/moe_gate_up_gemm.comp
@@ -251,6 +259,9 @@ rax.o: rax.c rax.h rax_malloc.h
 
 vulkan/%.spv: vulkan/%.comp
 	$(GLSLC) -O -o $@ $<
+
+vulkan/matmul_f32_fast.spv: vulkan/matmul_f32_fast.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

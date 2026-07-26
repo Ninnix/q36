@@ -2,6 +2,7 @@
 
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 /* Query-tiled prefill attention: one workgroup per (head, QT-token tile,
  * SPAN-key span) serves QT queries at once, so each K row and V element is
@@ -128,6 +129,11 @@ float vc_at_f16(uint idx) {
     return (idx & 1u) == 0u ? pair.x : pair.y;
 }
 
+/* dot() is shadowed by the per-query accumulator array below. */
+float dot4(vec4 a, vec4 b) {
+    return dot(a, b);
+}
+
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint h = gl_WorkGroupID.x;
@@ -198,6 +204,43 @@ void main(void) {
                         for (uint j = 0u; j < QT; j++) {
                             dot[j] += sh_q[j * 256u + 2u * w] * kp.x + sh_q[j * 256u + 2u * w + 1u] * kp.y;
                         }
+                    }
+                } else if (pc.k_type == 1u && pc.v_type == 2u && (pc.head_dim & 63u) == 0u) {
+                    /* Mirror of the decode kernels' q8_0 stripe walk: same
+                     * pair partition, same s-chain word order, same
+                     * d0*s0 + d1*s1 combine, per query — bit-lockstep with
+                     * attn_decode_fused/split is the invariant. */
+                    uint pairs = pc.head_dim >> 6u;
+                    uint k_head_bytes = (pc.head_dim >> 5u) * 34u;
+                    uint kb = key * pc.k_row_bytes + kvh * k_head_bytes;
+                    for (uint p = quad; p < pairs; p += 4u) {
+                        uint wi = (kb + p * 68u) >> 2u;
+                        uint prev = kc[wi];
+                        float d0 = unpackHalf2x16(prev).x;
+                        float s0[QT];
+                        float s1[QT];
+                        for (uint j = 0u; j < QT; j++) { s0[j] = 0.0; s1[j] = 0.0; }
+                        for (uint k = 0u; k < 8u; k++) {
+                            uint next = kc[wi + 1u + k];
+                            uint sw = (prev >> 16u) | (next << 16u);
+                            prev = next;
+                            vec4 qv = vec4(unpack8(int(sw)));
+                            uint qi = p * 64u + 4u * k;
+                            for (uint j = 0u; j < QT; j++) {
+                                s0[j] += dot4(qv, vec4(sh_q[j * 256u + qi], sh_q[j * 256u + qi + 1u],
+                                                      sh_q[j * 256u + qi + 2u], sh_q[j * 256u + qi + 3u]));
+                            }
+                        }
+                        float d1 = unpackHalf2x16(prev).y;
+                        for (uint k = 0u; k < 8u; k++) {
+                            vec4 qv = vec4(unpack8(int(kc[wi + 9u + k])));
+                            uint qi = p * 64u + 32u + 4u * k;
+                            for (uint j = 0u; j < QT; j++) {
+                                s1[j] += dot4(qv, vec4(sh_q[j * 256u + qi], sh_q[j * 256u + qi + 1u],
+                                                      sh_q[j * 256u + qi + 2u], sh_q[j * 256u + qi + 3u]));
+                            }
+                        }
+                        for (uint j = 0u; j < QT; j++) dot[j] += d0 * s0[j] + d1 * s1[j];
                     }
                 } else {
                     for (uint w = quad; w < half_dim; w += 4u) {

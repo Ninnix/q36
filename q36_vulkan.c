@@ -174,6 +174,8 @@ typedef struct {
     q36_vk_kernel moe_gate_up_f32b;
     q36_vk_kernel moe_down_q2k_f32b;
     q36_vk_kernel moe_down_q2k_sum_decode;
+    q36_vk_kernel moe_gate_up_q4k_f32b;
+    q36_vk_kernel moe_down_q4k_sum_decode;
     q36_vk_kernel moe_gate_up_gemm;
     q36_vk_kernel moe_down_gemm;
     q36_vk_kernel moe_matvec;
@@ -1043,8 +1045,13 @@ static uint32_t q36_vk_kv_cache_row_bytes(uint32_t type, uint32_t n) {
     return 0;
 }
 
+/* Opt-in: the vec4 f32 kernel reorders partial sums, and a router
+ * near-tie flip against the CPU engine costs the parity gate.  The fp64
+ * kernel is exact on expert picks and measured wall-faster than the old
+ * strided-scalar f32 version, so exact is the default. */
 static bool q36_vk_use_f32_fast(void) {
-    return q36_vk_env_default_on("Q36_VK_F32_FAST");
+    const char *env = getenv("Q36_VK_F32_FAST");
+    return env && env[0] == '1';
 }
 
 static bool q36_vk_use_gpu_ffn_tail(void) {
@@ -2463,6 +2470,8 @@ int q36_gpu_init(void) {
     q36_vk.moe_gate_up_f32b = Q36_VK_KERNEL("vulkan/moe_gate_up_f32b.spv", 8, 24, 1u << 6);
     q36_vk.moe_down_q2k_f32b = Q36_VK_KERNEL("vulkan/moe_down_q2k_f32b.spv", 5, 24, 1u << 4);
     q36_vk.moe_down_q2k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q2k_sum_decode.spv", 6, 24, 1u << 5);
+    q36_vk.moe_gate_up_q4k_f32b = Q36_VK_KERNEL("vulkan/moe_gate_up_q4k_f32b.spv", 7, 24, 1u << 6);
+    q36_vk.moe_down_q4k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q4k_sum_decode.spv", 6, 24, 1u << 5);
     q36_vk.moe_gate_up_gemm = Q36_VK_KERNEL("vulkan/moe_gate_up_gemm.spv", 8, 24, 1u << 6);
     q36_vk.moe_down_gemm = Q36_VK_KERNEL("vulkan/moe_down_gemm.spv", 5, 24, 1u << 4);
     q36_vk.moe_matvec = Q36_VK_KERNEL("vulkan/moe_matvec.spv", 6, 36, 1u << 4);
@@ -2695,6 +2704,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_sum_decode);
+    q36_vk_kernel_destroy(&q36_vk.moe_gate_up_q4k_f32b);
+    q36_vk_kernel_destroy(&q36_vk.moe_down_q4k_sum_decode);
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_gemm);
     q36_vk_kernel_destroy(&q36_vk.moe_down_gemm);
     q36_vk_kernel_destroy(&q36_vk.attn_decode_fused);
@@ -3337,11 +3348,12 @@ int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out,
 
     /* Fast mode keeps these small control matvecs on GPU: a host fallback
      * here would force a flush now that nothing else reads activations back
-     * during decode.  Default is the f32-FMA kernel; Q36_VK_F32_FAST=0
-     * restores the fp64 shader whose 29 guard bits make a router near-tie
-     * flip impossible (--quality keeps the host-exact route). */
+     * during decode.  Default is the fp64 shader whose 29 guard bits make a
+     * router near-tie flip impossible; Q36_VK_F32_FAST=1 opts into the vec4
+     * f32 kernel (--quality keeps the host-exact route). */
     if (!q36_gpu_quality &&
-        q36_vk_matmul_dense(q36_vk_use_f32_fast() ? &q36_vk.matmul_f32_fast : &q36_vk.matmul_f32,
+        q36_vk_matmul_dense(q36_vk_use_f32_fast() && (in_dim & 3u) == 0u
+                                ? &q36_vk.matmul_f32_fast : &q36_vk.matmul_f32,
                             out, model_map, model_size, weight_offset,
                             elems * sizeof(float), in_dim, out_dim, x, n_tok, scale)) {
         return 1;
@@ -6546,8 +6558,10 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                                       uint32_t mid_dim,
                                       uint32_t out_dim,
                                       uint32_t n_expert) {
-    uint64_t gu_stride = (uint64_t)(in_dim / Q36_VK_QK_K) * 66u * mid_dim;
-    uint64_t down_stride = (uint64_t)(mid_dim / Q36_VK_QK_K) * 84u * out_dim;
+    bool q4k = gate->type == Q36_VK_TENSOR_Q4_K && up->type == Q36_VK_TENSOR_Q4_K &&
+               down->type == Q36_VK_TENSOR_Q4_K;
+    uint64_t gu_stride = (uint64_t)(in_dim / Q36_VK_QK_K) * (q4k ? 144u : 66u) * mid_dim;
+    uint64_t down_stride = (uint64_t)(mid_dim / Q36_VK_QK_K) * (q4k ? 144u : 84u) * out_dim;
     uint64_t scale_bytes = (uint64_t)n_expert * sizeof(float);
     uint64_t n_slot = (uint64_t)n_tok * n_used;
     q36_gpu_tensor *tiles = NULL;
@@ -6566,8 +6580,13 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
     if (q36_gpu_quality || n_tok == 0 || n_used == 0 || n_used > 8u || n_slot > 8192u) return 0;
     if (!q36_vk_env_default_on("Q36_VK_MOE_F32B")) return 0;
     if (!streamed && !q36_vk_moe_bank_cache) return 0;
-    if (gate->type != Q36_VK_TENSOR_IQ2_XXS || up->type != Q36_VK_TENSOR_IQ2_XXS ||
-        down->type != Q36_VK_TENSOR_Q2_K) return 0;
+    if (!q4k &&
+        (gate->type != Q36_VK_TENSOR_IQ2_XXS || up->type != Q36_VK_TENSOR_IQ2_XXS ||
+         down->type != Q36_VK_TENSOR_Q2_K)) return 0;
+    /* Q4_K rides the same identity-schedule decode kernels; batches and
+     * streaming keep the q8_K fallback. */
+    if (q4k && (streamed || n_tok != 1u || !q36_vk_use_moe_down_sum_decode() ||
+                !q36_vk_env_default_on("Q36_VK_MOE_Q4K_F32B"))) return 0;
     if (in_dim == 0 || (in_dim % Q36_VK_QK_K) != 0 || (in_dim % 4u) != 0 ||
         mid_dim == 0 || (mid_dim % Q36_VK_QK_K) != 0 || out_dim == 0) return 0;
     if (gu_stride * n_expert > UINT32_MAX || down_stride * n_expert > UINT32_MAX) return 0;
@@ -6739,10 +6758,21 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                 up_scales ? up_scales : up_bank,
                 mid8, tables,
             };
-            ok = gemm ? q36_vk_run_unlocked("moe_iq2_gate_up_gemm", &q36_vk.moe_gate_up_gemm, gb, &gpush, sizeof(gpush),
-                                            (mid_dim + 63u) / 64u, wave_tile_count, 1)
-                      : q36_vk_run_unlocked("moe_iq2_gate_up", &q36_vk.moe_gate_up_f32b, gb, &gpush, sizeof(gpush),
-                                            mid_dim, wave_tile_count, 1);
+            if (q4k) {
+                const q36_gpu_tensor *qgb[7] = {
+                    gate_bank, up_bank, x, sel_slots ? sel_slots : selected,
+                    gate_scales ? gate_scales : gate_bank,
+                    up_scales ? up_scales : up_bank,
+                    mid8,
+                };
+                ok = q36_vk_run_unlocked("moe_q4k_gate_up", &q36_vk.moe_gate_up_q4k_f32b, qgb, &gpush, sizeof(gpush),
+                                         mid_dim, wave_tile_count, 1);
+            } else {
+                ok = gemm ? q36_vk_run_unlocked("moe_iq2_gate_up_gemm", &q36_vk.moe_gate_up_gemm, gb, &gpush, sizeof(gpush),
+                                                (mid_dim + 63u) / 64u, wave_tile_count, 1)
+                          : q36_vk_run_unlocked("moe_iq2_gate_up", &q36_vk.moe_gate_up_f32b, gb, &gpush, sizeof(gpush),
+                                                mid_dim, wave_tile_count, 1);
+            }
         }
         if (ok) {
             struct {
@@ -6761,8 +6791,8 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                     down_scales ? down_scales : down_bank,
                     weights, out,
                 };
-                ok = q36_vk_run_unlocked("moe_q2k_down_sum_decode",
-                                         &q36_vk.moe_down_q2k_sum_decode,
+                ok = q36_vk_run_unlocked(q4k ? "moe_q4k_down_sum_decode" : "moe_q2k_down_sum_decode",
+                                         q4k ? &q36_vk.moe_down_q4k_sum_decode : &q36_vk.moe_down_q2k_sum_decode,
                                          db, &dpush, sizeof(dpush),
                                          out_dim, 1, 1);
             } else {

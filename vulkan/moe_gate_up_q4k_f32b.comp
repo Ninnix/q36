@@ -1,0 +1,138 @@
+#version 460
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Decode-only routed Q4_K gate/up/SwiGLU against raw f32 activations.
+ * The router selection binds directly as a one-slot-per-pair schedule
+ * (identity), so one workgroup owns one mid row of one slot's expert.
+ * No q8_K staging: nibbles dequant in registers, the dmin correction
+ * accumulates separately against the raw activation sums. */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateWeights { uint gw[]; };
+layout(set = 0, binding = 1) readonly buffer UpWeights { uint uw[]; };
+layout(set = 0, binding = 2) readonly buffer X { vec4 xv[]; };
+layout(set = 0, binding = 3) readonly buffer Selected { uint selected[]; };
+layout(set = 0, binding = 4) readonly buffer GateScales { float gate_scales[]; };
+layout(set = 0, binding = 5) readonly buffer UpScales { float up_scales[]; };
+layout(set = 0, binding = 6) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint mid_dim;
+    uint blocks;
+    uint n_used;
+    uint has_gate_scales;
+    uint has_up_scales;
+    uint identity;
+} pc;
+
+/* One Q4_K superblock is 144 bytes: [d f16][dmin f16][12 scale bytes]
+ * [128 qs bytes]. Offsets below are bytes into the uint views. */
+const uint Q4K_BYTES = 144u;
+
+uint g_u8(uint off) { return (gw[off >> 2] >> ((off & 3u) * 8u)) & 255u; }
+uint u_u8(uint off) { return (uw[off >> 2] >> ((off & 3u) * 8u)) & 255u; }
+
+void g_scale_min(uint base, uint j, out float sc, out float mn) {
+    uint s0 = g_u8(base + 4u + j);
+    if (j < 4u) {
+        sc = float(s0 & 63u);
+        mn = float(g_u8(base + 8u + j) & 63u);
+    } else {
+        uint sj4 = g_u8(base + 4u + j + 4u);
+        uint sjm4 = g_u8(base + 4u + j - 4u);
+        sc = float((sj4 & 15u) | ((sjm4 >> 6) << 4));
+        mn = float((sj4 >> 4) | ((s0 >> 6) << 4));
+    }
+}
+void u_scale_min(uint base, uint j, out float sc, out float mn) {
+    uint s0 = u_u8(base + 4u + j);
+    if (j < 4u) {
+        sc = float(s0 & 63u);
+        mn = float(u_u8(base + 8u + j) & 63u);
+    } else {
+        uint sj4 = u_u8(base + 4u + j + 4u);
+        uint sjm4 = u_u8(base + 4u + j - 4u);
+        sc = float((sj4 & 15u) | ((sjm4 >> 6) << 4));
+        mn = float((sj4 >> 4) | ((s0 >> 6) << 4));
+    }
+}
+
+shared float sh_red[2][4];
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y;
+    uint expert = selected[slot];
+    uint x4 = (slot / pc.n_used) * pc.blocks * 64u;
+    uint itid = tid & 15u;
+    uint ix = tid >> 4u;
+    /* Thread lane covers 16 consecutive weights: sub-block sb, nibble
+     * plane sb&1, byte half (itid&1)*16. */
+    uint sb = itid >> 1u;
+    uint qoff = 16u + (sb >> 1u) * 32u + 16u * (itid & 1u);
+    uint shift = (sb & 1u) * 4u;
+
+    uint row_bytes = pc.blocks * Q4K_BYTES;
+    uint base = (expert * pc.mid_dim + row) * row_bytes;
+
+    float lg = 0.0, lu = 0.0, mg = 0.0, mu = 0.0;
+
+    for (uint i = ix; i < pc.blocks; i += 4u) {
+        uint bb = base + i * Q4K_BYTES;
+        vec2 gdm = unpackHalf2x16(gw[bb >> 2]);
+        vec2 udm = unpackHalf2x16(uw[bb >> 2]);
+        float gsc, gmn, usc, umn;
+        g_scale_min(bb, sb, gsc, gmn);
+        u_scale_min(bb, sb, usc, umn);
+
+        uint qb = (bb + qoff) >> 2u;
+        uint xb = x4 + i * 64u + itid * 4u;
+        float gq = 0.0, uq = 0.0, xs = 0.0;
+        for (uint j = 0u; j < 4u; j++) {
+            vec4 b = xv[xb + j];
+            uint gwv = (gw[qb + j] >> shift) & 0x0F0F0F0Fu;
+            uint uwv = (uw[qb + j] >> shift) & 0x0F0F0F0Fu;
+            gq += dot(b, vec4(unpack8(gwv)));
+            uq += dot(b, vec4(unpack8(uwv)));
+            xs += b.x + b.y + b.z + b.w;
+        }
+        lg = fma(gdm.x * gsc, gq, lg);
+        mg = fma(gdm.y * gmn, xs, mg);
+        lu = fma(udm.x * usc, uq, lu);
+        mu = fma(udm.y * umn, xs, mu);
+    }
+
+    lg = subgroupAdd(lg);
+    lu = subgroupAdd(lu);
+    mg = subgroupAdd(mg);
+    mu = subgroupAdd(mu);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            sh_red[gl_SubgroupID][0] = lg;
+            sh_red[gl_SubgroupID][1] = lu;
+            sh_red[gl_SubgroupID][2] = mg;
+            sh_red[gl_SubgroupID][3] = mu;
+        }
+        barrier();
+        if (tid == 0u) {
+            for (uint i = 1u; i < gl_NumSubgroups; i++) {
+                lg += sh_red[i][0];
+                lu += sh_red[i][1];
+                mg += sh_red[i][2];
+                mu += sh_red[i][3];
+            }
+        }
+    }
+    if (tid == 0u) {
+        float gsc = pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0;
+        float usc = pc.has_up_scales != 0u ? up_scales[expert] : 1.0;
+        float g = (lg - mg) * gsc;
+        float v = (lu - mu) * usc;
+        y[slot * pc.mid_dim + row] = (g / (1.0f + exp(-g))) * v;
+    }
+}

@@ -70,6 +70,9 @@ void main(void) {
             x4[u] = (live[u] ? pair[u] / pc.n_used : 0u) * pc.blocks * 64u;
         }
     }
+    /* identity schedules carry exactly one live pair: shrinking the pair
+     * loops drops 14 of the 16 subgroup reductions per workgroup. */
+    uint nu = pc.identity != 0u ? 1u : PAIR_TILE;
     uint itid = tid & 15u;
     uint ix = tid >> 4u;
 
@@ -118,7 +121,7 @@ void main(void) {
             u0 = mix(u0, -u0, bvec4((usign & 1u) != 0u, (usign & 2u) != 0u, (usign & 4u) != 0u, (usign & 8u) != 0u));
             u1 = mix(u1, -u1, bvec4((usign & 16u) != 0u, (usign & 32u) != 0u, (usign & 64u) != 0u, (bitCount(usign) & 1) != 0));
 
-            for (uint u = 0u; u < PAIR_TILE; u++) {
+            for (uint u = 0u; u < nu; u++) {
                 if (!live[u]) continue;
                 vec4 b0 = xv[x4[u] + y4 + 2u * l];
                 vec4 b4 = xv[x4[u] + y4 + 2u * l + 1u];
@@ -128,13 +131,13 @@ void main(void) {
         }
     }
 
-    for (uint u = 0u; u < PAIR_TILE; u++) {
+    for (uint u = 0u; u < nu; u++) {
         gate_acc[u] = subgroupAdd(gate_acc[u]);
         up_acc[u] = subgroupAdd(up_acc[u]);
     }
     if (gl_NumSubgroups > 1u) {
         if (subgroupElect()) {
-            for (uint u = 0u; u < PAIR_TILE; u++) {
+            for (uint u = 0u; u < nu; u++) {
                 sh_gate[gl_SubgroupID][u] = gate_acc[u];
                 sh_up[gl_SubgroupID][u] = up_acc[u];
             }
@@ -142,7 +145,7 @@ void main(void) {
         barrier();
         if (tid == 0u) {
             for (uint i = 1u; i < gl_NumSubgroups; i++) {
-                for (uint u = 0u; u < PAIR_TILE; u++) {
+                for (uint u = 0u; u < nu; u++) {
                     gate_acc[u] += sh_gate[i][u];
                     up_acc[u] += sh_up[i][u];
                 }
@@ -152,7 +155,7 @@ void main(void) {
     if (tid == 0u) {
         float gsc = pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0;
         float usc = pc.has_up_scales != 0u ? up_scales[expert] : 1.0;
-        for (uint u = 0u; u < PAIR_TILE; u++) {
+        for (uint u = 0u; u < nu; u++) {
             if (!live[u]) continue;
             float g = gate_acc[u] * gsc;
             float v = up_acc[u] * usc;

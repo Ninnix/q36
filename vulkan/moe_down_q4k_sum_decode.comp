@@ -1,0 +1,106 @@
+#version 460
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_ARB_gpu_shader_int64 : require
+
+/* Decode-only Q4_K down projection and routing-weighted sum. One
+ * workgroup owns one output row and visits the eight experts in order. */
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint wb[]; };
+layout(set = 0, binding = 1) readonly buffer Mid { vec4 mid[]; };
+layout(set = 0, binding = 2) readonly buffer Selected { uint selected[]; };
+layout(set = 0, binding = 3) readonly buffer Scales { float scales[]; };
+layout(set = 0, binding = 4) readonly buffer RouteWeights { float route[]; };
+layout(set = 0, binding = 5) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint in_dim;
+    uint blocks;
+    uint n_used;
+    uint has_scales;
+    uint pad;
+} pc;
+
+const uint Q4K_BYTES = 144u;
+
+uint w_u8(uint off) { return (wb[off >> 2] >> ((off & 3u) * 8u)) & 255u; }
+
+void w_scale_min(uint base, uint j, out float sc, out float mn) {
+    uint s0 = w_u8(base + 4u + j);
+    if (j < 4u) {
+        sc = float(s0 & 63u);
+        mn = float(w_u8(base + 8u + j) & 63u);
+    } else {
+        uint sj4 = w_u8(base + 4u + j + 4u);
+        uint sjm4 = w_u8(base + 4u + j - 4u);
+        sc = float((sj4 & 15u) | ((sjm4 >> 6) << 4));
+        mn = float((sj4 >> 4) | ((s0 >> 6) << 4));
+    }
+}
+
+float fma32(float a, float b, float c) {
+    double p = double(a) * double(b);
+    double s = p + double(c);
+    double bv = s - p;
+    double e = (p - (s - bv)) + (double(c) - bv);
+    if (e != 0.0LF) {
+        uint64_t bits = doubleBitsToUint64(s);
+        if ((bits & 1UL) == 0UL) {
+            if (s > 0.0LF) bits += (e > 0.0LF) ? 1UL : -1UL;
+            else if (s < 0.0LF) bits += (e < 0.0LF) ? 1UL : -1UL;
+            s = uint64BitsToDouble(bits);
+        }
+    }
+    return float(s);
+}
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint itid = tid & 15u;
+    uint ix = tid >> 4u;
+    uint sb = itid >> 1u;
+    uint qoff = 16u + (sb >> 1u) * 32u + 16u * (itid & 1u);
+    uint shift = (sb & 1u) * 4u;
+    uint row_bytes = pc.blocks * Q4K_BYTES;
+    float sum = 0.0;
+
+    for (uint u = 0u; u < pc.n_used; u++) {
+        uint expert = selected[u];
+        uint base = (expert * pc.out_dim + row) * row_bytes;
+        uint m4 = u * pc.in_dim / 4u;
+        float acc = 0.0, macc = 0.0;
+
+        for (uint i = ix; i < pc.blocks; i += 2u) {
+            uint bb = base + i * Q4K_BYTES;
+            vec2 dm = unpackHalf2x16(wb[bb >> 2]);
+            float sc, mn;
+            w_scale_min(bb, sb, sc, mn);
+
+            uint qb = (bb + qoff) >> 2u;
+            uint xb = m4 + i * 64u + itid * 4u;
+            float qs = 0.0, xs = 0.0;
+            for (uint j = 0u; j < 4u; j++) {
+                vec4 b = mid[xb + j];
+                uint wv = (wb[qb + j] >> shift) & 0x0F0F0F0Fu;
+                qs += dot(b, vec4(unpack8(wv)));
+                xs += b.x + b.y + b.z + b.w;
+            }
+            acc = fma(dm.x * sc, qs, acc);
+            macc = fma(dm.y * mn, xs, macc);
+        }
+
+        acc = subgroupAdd(acc);
+        macc = subgroupAdd(macc);
+        if (tid == 0u) {
+            float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
+            sum = fma32((acc - macc) * sc, route[u], sum);
+        }
+    }
+    if (tid == 0u) y[row] = sum;
+}
