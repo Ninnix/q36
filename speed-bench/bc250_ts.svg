@@ -8,7 +8,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
 </style>
 <rect width="960" height="540" fill="#ffffff"/>
-<text class="title" x="480.0" y="34" text-anchor="middle">BC-250 t/s (q2, full RAM, K=q8 V=q4)</text>
+<text class="title" x="480.0" y="34" text-anchor="middle">BC-250 t/s</text>
 <line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="70" y="472.00" text-anchor="end">0</text>
 <line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
@@ -29,20 +29,20 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 <text class="tick" x="890" y="70.00" text-anchor="start">100</text>
 <line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
-<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="324.92" y="492" text-anchor="middle">10k</text>
-<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="567.84" y="492" text-anchor="middle">20k</text>
-<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="810.76" y="492" text-anchor="middle">30k</text>
+<line x1="341.11" y1="66" x2="341.11" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="341.11" y="492" text-anchor="middle">10k</text>
+<line x1="600.23" y1="66" x2="600.23" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="600.23" y="492" text-anchor="middle">20k</text>
+<line x1="859.34" y1="66" x2="859.34" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="859.34" y="492" text-anchor="middle">30k</text>
 <line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
 <line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
 <line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
 <text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
 <text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
 <text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="94.44,189.55 106.88,151.64 119.31,168.84 131.75,185.31 281.00,224.31 480.00,290.59 679.00,340.57 878.00,344.02"/>
-<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="94.44,249.51 106.88,246.30 119.31,253.05 131.75,256.19 281.00,311.10 480.00,349.89 679.00,381.65 878.00,385.59"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="135.07,135.00 188.13,194.15 241.20,237.49 294.27,276.13 347.33,308.78 400.40,330.90 453.47,346.71 506.53,358.55 559.60,367.28 612.67,375.64 665.73,385.86 718.80,390.80 771.87,396.56 824.93,401.23 878.00,404.81"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="135.07,200.99 188.13,210.32 241.20,215.46 294.27,230.78 347.33,243.16 400.40,252.69 453.47,261.01 506.53,266.92 559.60,276.29 612.67,281.23 665.73,288.27 718.80,294.34 771.87,298.88 824.93,304.51 878.00,307.84"/>
 <rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
 <rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
 <text class="legend" x="730" y="89">prefill</text>

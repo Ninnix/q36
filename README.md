@@ -194,13 +194,14 @@ Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor limited
 to 500-1500 MHz, 85 °C thermal ceiling — a hot summer in Italy). All runs
 use the Vulkan backend with greedy decoding, `--gen-tokens 128`, and the
 long context story prompt. Resident (full RAM) runs use Q8_0 K / Q4_0 V
-cache. SSD streaming runs use F16 KV cache.
+cache. SSD streaming runs use F16 KV cache. Table rows were measured in
+separate processes, with only one benchmark process running at a time.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
-| BC-250 (40 CU) | q2 | 2048 ctx | 351.60 t/s | 52.69 t/s |
-| BC-250 (40 CU) | q2 | 10240 ctx | 305.44 t/s | 39.99 t/s |
-| BC-250 (40 CU) | q2 | 32768 ctx | 154.20 t/s | 20.50 t/s |
+| BC-250 (40 CU) | q2 | 2048 ctx | 414.18 t/s | 66.42 t/s |
+| BC-250 (40 CU) | q2 | 10240 ctx | 305.44 t/s | 58.55 t/s |
+| BC-250 (40 CU) | q2 | 30720 ctx | 154.20 t/s | 40.01 t/s |
 | BC-250 (40 CU) | q2 SSD | 2048 ctx | 40.08 t/s | 14.91 t/s |
 | BC-250 (40 CU) | q2-q4 SSD | 2048 ctx | 35.55 t/s | 10.80 t/s |
 
