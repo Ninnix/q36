@@ -5465,11 +5465,12 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
      * chain below. */
     if (q36_gpu_attn_fused_enabled() &&
         head_dim <= 256 && (head_dim & 1u) == 0u) {
-        /* Query-tiled prefill: one workgroup reuses K/V across eight queries
-         * and folds eight adjacent spans before writing a partial. */
-        if (n_tok >= 2u && q36_vk_use_attn_qtile()) {
+        /* GQA-tiled prefill: one workgroup reuses K/V across the query heads
+         * sharing a KV head and folds sixteen spans into each partial. */
+        if (n_tok >= 2u && n_head / n_head_kv <= 8u &&
+            q36_vk_use_attn_qtile()) {
             uint32_t n_spans = (kv_max + 511u) / 512u;
-            uint32_t n_groups = (n_spans + 7u) / 8u;
+            uint32_t n_groups = (n_spans + 15u) / 16u;
             uint64_t part_bytes = (uint64_t)n_tok * n_head * n_groups *
                                   (head_dim + 2u) * sizeof(float);
             struct {
@@ -5495,7 +5496,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 uint32_t has_sinks;
                 uint32_t span_keys;
             } cpush = { pos0, n_head, head_dim, n_groups,
-                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 4096u };
+                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 8192u };
             pthread_mutex_lock(&q36_vk_mu);
             q36_gpu_tensor *part = q36_vk.attn_part;
             if (!part || q36_vk.attn_part_bytes < part_bytes) {
@@ -5512,7 +5513,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 const q36_gpu_tensor *qbind[5] = { q, k_cache, v_cache, sinks_t, part };
                 ok = q36_vk_run_unlocked("attn_prefill_qtile", &q36_vk.attn_prefill_qtile,
                                          qbind, &qpush, sizeof(qpush),
-                                         n_head, (n_tok + 7u) / 8u, n_groups);
+                                         n_head_kv, n_tok, n_groups);
             }
             if (ok) {
                 const q36_gpu_tensor *cbind[4] = { part, qg, sinks_t, out };

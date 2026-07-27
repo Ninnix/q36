@@ -1118,7 +1118,7 @@ static uint64_t q36_vulkan_scratch_bytes(uint32_t ctx, uint32_t cap) {
              sizeof(float);
     bytes += (uint64_t)Q36_N_VOCAB * sizeof(float);
     bytes += (uint64_t)cap * Q36_N_HEAD *
-             ((ctx + 4095u) / 4096u) *
+             ((ctx + 8191u) / 8192u) *
              (Q36_N_HEAD_DIM + 2u) * sizeof(float);
     return bytes;
 }
