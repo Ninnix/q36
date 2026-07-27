@@ -5466,11 +5466,10 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
     if (q36_gpu_attn_fused_enabled() &&
         head_dim <= 256 && (head_dim & 1u) == 0u) {
         /* Query-tiled prefill: one workgroup reuses K/V across eight queries
-         * and folds four adjacent spans before writing a partial. This keeps
-         * span parallelism while quartering partials RAM and combine traffic. */
+         * and folds eight adjacent spans before writing a partial. */
         if (n_tok >= 2u && q36_vk_use_attn_qtile()) {
             uint32_t n_spans = (kv_max + 511u) / 512u;
-            uint32_t n_groups = (n_spans + 3u) / 4u;
+            uint32_t n_groups = (n_spans + 7u) / 8u;
             uint64_t part_bytes = (uint64_t)n_tok * n_head * n_groups *
                                   (head_dim + 2u) * sizeof(float);
             struct {
@@ -5496,7 +5495,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 uint32_t has_sinks;
                 uint32_t span_keys;
             } cpush = { pos0, n_head, head_dim, n_groups,
-                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 2048u };
+                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 4096u };
             pthread_mutex_lock(&q36_vk_mu);
             q36_gpu_tensor *part = q36_vk.attn_part;
             if (!part || q36_vk.attn_part_bytes < part_bytes) {
