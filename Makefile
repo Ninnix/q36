@@ -14,6 +14,7 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 LLAMA_CPP_DIR ?= llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build
 REFERENCE_MODEL ?= gguf/Qwen3.6-35B-A3B-Q8_0.gguf
+SAMPLING_TEST := tests/test_sampling
 OPENROUTER_MODEL ?= qwen/qwen3.6-35b-a3b
 OPENROUTER_OUT ?= gguf-tools/quality-testing/local/openrouter
 OPENROUTER_COUNT ?= 100
@@ -312,15 +313,25 @@ q36_web_cpu.o: q36_web.c q36_web.h
 q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h rax.h
 	$(CC) $(CPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
+q36_sampling_test_core.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_streaming_hotlist.inc
+	$(CC) $(CPU_CFLAGS) -Wno-unused-function -DQ36_TEST_HOOKS -c -o $@ q36.c
+
+tests/test_sampling.o: tests/test_sampling.c q36.h
+	$(CC) $(CPU_CFLAGS) -DQ36_TEST_HOOKS -I. -c -o $@ $<
+
+$(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o
+	$(CC) $(CPU_CFLAGS) -o $@ $^ $(LDLIBS)
+
 linenoise_cpu.o: linenoise.c linenoise.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ linenoise.c
 
 rax_cpu.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ rax.c
 
-test: all q36_agent_test
+test: all q36_agent_test $(SAMPLING_TEST)
 	./q36-eval --self-test-extractors
 	./q36_agent_test
+	./tests/test_sampling
 	./q36_test --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
 
 test-quick: test
@@ -442,4 +453,4 @@ q36_agent_test: q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o li
 	$(CC) $(GPU_CFLAGS) -o $@ q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
 
 clean:
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test $(SAMPLING_TEST) tests/test_sampling.o gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)

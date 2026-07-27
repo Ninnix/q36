@@ -214,6 +214,12 @@ int q36_session_common_prefix(q36_session *s, const q36_tokens *prompt);
 int q36_session_argmax(q36_session *s);
 int q36_session_argmax_excluding(q36_session *s, int excluded_id);
 int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+#ifdef Q36_TEST_HOOKS
+int q36_test_sample_logits(const float *logits, uint32_t n_vocab,
+                           float temperature, int top_k,
+                           float top_p, float min_p, uint64_t *rng,
+                           float *prob_scratch);
+#endif
 bool q36_session_in_think(q36_session *s);
 int q36_session_eos_to_think_close(q36_session *s, int token);
 int q36_session_top_logprobs(q36_session *s, q36_token_score *out, int k);

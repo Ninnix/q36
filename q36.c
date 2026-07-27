@@ -15,6 +15,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
@@ -418,6 +419,7 @@ struct q36_session {
     q36_tokens checkpoint;
     bool checkpoint_valid;
     float *logits;
+    float *sample_probs;
     float *mtp_logits;
     void *runtime;
     q36_session_progress_fn progress;
@@ -7495,7 +7497,7 @@ static int q36_sample_candidate_cmp_desc(const void *a, const void *b) {
 
 static int q36_sample_full_vocab(const float *logits, uint32_t n_vocab,
                                  float temperature, float top_p, float min_p,
-                                 uint64_t *rng) {
+                                 uint64_t *rng, float *prob_scratch) {
     float max_logit = Q36_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
@@ -7513,41 +7515,90 @@ static int q36_sample_full_vocab(const float *logits, uint32_t n_vocab,
     if (top_p >= 1.0f) {
         float sum = 0.0f;
         const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            {
-                const float p = expf((v - max_logit) / temperature);
-                if (p < min_rel) continue;
-                sum += p;
-            }
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
-        {
-            float r = q36_sample_rng_f32(rng) * sum;
-            for (uint32_t i = 0; i < n_vocab; i++) {
-                const float v = logits[i];
-                if (!isfinite(v)) continue;
-                {
-                    const float p = expf((v - max_logit) / temperature);
-                    if (p < min_rel) continue;
-                    r -= p;
-                    if (r <= 0.0f) return (int)i;
+        if (min_rel > 1.0f) return best;
+
+        /* Reject only values proven to fail the ordinary expf comparison.
+         * The small retreat covers logf/expf boundary rounding. */
+        float reject_scaled = Q36_NEG_INF;
+        bool have_reject_scaled = false;
+        if (min_rel > 0.0f && isfinite(min_rel)) {
+            float cutoff = logf(min_rel);
+            for (int i = 0; i < 8 && isfinite(cutoff); i++) {
+                cutoff = nextafterf(cutoff, -FLT_MAX);
+                if (expf(cutoff) < min_rel) {
+                    reject_scaled = cutoff;
+                    have_reject_scaled = true;
+                    break;
                 }
             }
+        }
+
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            prob_scratch[i] = -1.0f;
+            if (!isfinite(v)) continue;
+            const float scaled = (v - max_logit) / temperature;
+            if (have_reject_scaled && scaled <= reject_scaled) continue;
+            const float p = expf(scaled);
+            if (p < min_rel) continue;
+            prob_scratch[i] = p;
+            sum += p;
+        }
+        if (sum <= 0.0f || !isfinite(sum)) return best;
+        float r = q36_sample_rng_f32(rng) * sum;
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float p = prob_scratch[i];
+            if (p < 0.0f) continue;
+            r -= p;
+            if (r <= 0.0f) return (int)i;
         }
         return best;
     }
 
     {
-        q36_sample_candidate *cand = xmalloc((size_t)finite * sizeof(cand[0]));
         uint32_t n = 0;
         float sum = 0.0f;
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            if (!isfinite(v)) continue;
-            cand[n++] = (q36_sample_candidate){.id = (int)i, .logit = v, .prob = expf((v - max_logit) / temperature)};
-            sum += cand[n - 1].prob;
+        q36_sample_candidate *cand = NULL;
+        if (min_p > 0.0f && min_p <= 1.0f) {
+            /* Normalization cancels in the min-p comparison. Keep the full
+             * softmax sum, but sort only candidates that can survive. */
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float v = logits[i];
+                prob_scratch[i] = -1.0f;
+                if (!isfinite(v)) continue;
+                const float p = expf((v - max_logit) / temperature);
+                prob_scratch[i] = p;
+                sum += p;
+            }
+            if (sum <= 0.0f || !isfinite(sum)) return best;
+
+            const float min_prob = (1.0f / sum) * min_p;
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float p = prob_scratch[i];
+                if (p < 0.0f || p / sum < min_prob) continue;
+                n++;
+            }
+            if (n == 0) return best;
+            cand = xmalloc((size_t)n * sizeof(cand[0]));
+            uint32_t out = 0;
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float p = prob_scratch[i];
+                if (p < 0.0f || p / sum < min_prob) continue;
+                cand[out++] = (q36_sample_candidate){
+                    .id = (int)i, .logit = logits[i], .prob = p
+                };
+            }
+        } else {
+            cand = xmalloc((size_t)finite * sizeof(cand[0]));
+            for (uint32_t i = 0; i < n_vocab; i++) {
+                const float v = logits[i];
+                if (!isfinite(v)) continue;
+                const float p = expf((v - max_logit) / temperature);
+                cand[n++] = (q36_sample_candidate){
+                    .id = (int)i, .logit = v, .prob = p
+                };
+                sum += p;
+            }
         }
         if (sum <= 0.0f || !isfinite(sum)) {
             free(cand);
@@ -7593,11 +7644,20 @@ static int q36_sample_full_vocab(const float *logits, uint32_t n_vocab,
 static int q36_sample_top_p_min_p(const float *logits, uint32_t n_vocab,
                                   float temperature, int top_k,
                                   float top_p, float min_p,
-                                  uint64_t *rng) {
+                                  uint64_t *rng, float *prob_scratch) {
     if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
     if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
     if (min_p < 0.0f) min_p = 0.0f;
-    if (top_k <= 0) return q36_sample_full_vocab(logits, n_vocab, temperature, top_p, min_p, rng);
+    if (top_k <= 0) {
+        const bool owned_scratch = prob_scratch == NULL;
+        if (owned_scratch) {
+            prob_scratch = xmalloc((size_t)n_vocab * sizeof(prob_scratch[0]));
+        }
+        const int token = q36_sample_full_vocab(logits, n_vocab, temperature,
+                                                top_p, min_p, rng, prob_scratch);
+        if (owned_scratch) free(prob_scratch);
+        return token;
+    }
     if (top_k > 1024) top_k = 1024;
     if ((uint32_t)top_k > n_vocab) top_k = (int)n_vocab;
 
@@ -7657,6 +7717,17 @@ static int q36_sample_top_p_min_p(const float *logits, uint32_t n_vocab,
         }
     }
 }
+
+#ifdef Q36_TEST_HOOKS
+int q36_test_sample_logits(const float *logits, uint32_t n_vocab,
+                           float temperature, int top_k,
+                           float top_p, float min_p, uint64_t *rng,
+                           float *prob_scratch) {
+    if (!logits || !rng || n_vocab == 0) return -1;
+    return q36_sample_top_p_min_p(logits, n_vocab, temperature, top_k,
+                                  top_p, min_p, rng, prob_scratch);
+}
+#endif
 
 static bool q36_load_directional_steering(q36_engine *e) {
     uint64_t count;
@@ -8128,6 +8199,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     s->logits = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->logits));
+    s->sample_probs = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->sample_probs));
     memset(s->logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->logits));
     if (q36_engine_uses_vulkan_runtime(e)) {
 #ifdef Q36_NO_GPU
@@ -8149,6 +8221,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     }
     if (!s->runtime) {
         free(s->logits);
+        free(s->sample_probs);
         free(s->mtp_logits);
         free(s);
         return 1;
@@ -8174,6 +8247,7 @@ void q36_session_free(q36_session *s) {
         q36_cpu_runtime_free((q36_cpu_runtime *)s->runtime);
     }
     free(s->logits);
+    free(s->sample_probs);
     free(s->mtp_logits);
     free(s);
 }
@@ -8344,7 +8418,8 @@ int q36_session_argmax_excluding(q36_session *s, int excluded_id) {
 int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->logits) return -1;
     if (!rng) return q36_session_argmax(s);
-    return q36_sample_top_p_min_p(s->logits, Q36_N_VOCAB, temperature, top_k, top_p, min_p, rng);
+    return q36_sample_top_p_min_p(s->logits, Q36_N_VOCAB, temperature,
+                                  top_k, top_p, min_p, rng, s->sample_probs);
 }
 
 bool q36_session_in_think(q36_session *s) {
