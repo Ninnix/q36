@@ -147,6 +147,12 @@ q36_context_memory q36_context_memory_estimate_with_prefill(
         q36_backend backend,
         int ctx_size,
         uint32_t prefill_chunk);
+q36_context_memory q36_context_memory_estimate_configured(
+        q36_backend backend,
+        int ctx_size,
+        uint32_t prefill_chunk,
+        q36_kv_cache_type cache_type_k,
+        q36_kv_cache_type cache_type_v);
 bool q36_log_is_tty(FILE *fp);
 void q36_log(FILE *fp, q36_log_type type, const char *fmt, ...);
 int q36_engine_generate_argmax(q36_engine *e, const q36_tokens *prompt,

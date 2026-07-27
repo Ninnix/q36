@@ -260,8 +260,11 @@ static q36_backend default_backend(void) {
 #endif
 }
 
-static void log_context_memory(q36_backend backend, int ctx_size) {
-    q36_context_memory m = q36_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(q36_backend backend, int ctx_size,
+                               q36_kv_cache_type cache_type_k,
+                               q36_kv_cache_type cache_type_v) {
+    q36_context_memory m = q36_context_memory_estimate_configured(
+            backend, ctx_size, 0, cache_type_k, cache_type_v);
     fprintf(stderr,
             "q36: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -1153,7 +1156,9 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "q36: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend, cfg->gen.ctx_size);
+                log_context_memory(cfg->engine.backend, cfg->gen.ctx_size,
+                                   cfg->engine.cache_type_k,
+                                   cfg->engine.cache_type_v);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
@@ -1458,7 +1463,9 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size,
+                           cfg.engine.cache_type_k,
+                           cfg.engine.cache_type_v);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
     }
     q36_engine *engine = NULL;

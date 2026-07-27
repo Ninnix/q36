@@ -371,13 +371,14 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(q36_backend backend, int ctx_size) {
-    q36_context_memory m = q36_context_memory_estimate(backend, ctx_size);
+static void log_context_memory(const bench_config *c) {
+    q36_context_memory m = q36_context_memory_estimate_configured(
+            c->backend, c->ctx_alloc, 0, c->cache_type_k, c->cache_type_v);
     fprintf(stderr,
             "q36-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
-            ctx_size,
-            q36_backend_name(backend),
+            c->ctx_alloc,
+            q36_backend_name(c->backend),
             m.prefill_cap,
             m.raw_cap,
             m.comp_cap);
@@ -385,7 +386,7 @@ static void log_context_memory(q36_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
+    log_context_memory(&cfg);
 
     q36_engine_options opt = {
         .model_path = cfg.model_path,
@@ -570,7 +571,8 @@ int main(int argc, char **argv) {
     q36_session_free(session);
     q36_tokens_free(&prompt);
 #ifndef Q36_NO_GPU
-    if (cfg.ssd_streaming) q36_gpu_print_memory_report("bench");
+    if (cfg.ssd_streaming || getenv("Q36_VK_MEMORY_REPORT"))
+        q36_gpu_print_memory_report("bench");
 #endif
     q36_engine_close(engine);
     return rc;

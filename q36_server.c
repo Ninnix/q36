@@ -8610,9 +8610,11 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 }
 
 static void log_context_memory(q36_backend backend, int ctx_size,
-                               uint32_t prefill_chunk, int session_count) {
-    q36_context_memory m = q36_context_memory_estimate_with_prefill(
-            backend, ctx_size, prefill_chunk);
+                               uint32_t prefill_chunk, int session_count,
+                               q36_kv_cache_type cache_type_k,
+                               q36_kv_cache_type cache_type_v) {
+    q36_context_memory m = q36_context_memory_estimate_configured(
+            backend, ctx_size, prefill_chunk, cache_type_k, cache_type_v);
     server_log(Q36_LOG_DEFAULT,
                "q36-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
@@ -8960,7 +8962,8 @@ int main(int argc, char **argv) {
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     log_context_memory(cfg.engine.backend, cfg.ctx_size,
-                       cfg.engine.prefill_chunk, slot_count);
+                       cfg.engine.prefill_chunk, slot_count,
+                       cfg.engine.cache_type_k, cfg.engine.cache_type_v);
 
     server s;
     memset(&s, 0, sizeof(s));

@@ -1045,13 +1045,8 @@ static uint32_t q36_vk_kv_cache_row_bytes(uint32_t type, uint32_t n) {
     return 0;
 }
 
-/* Opt-in: the vec4 f32 kernel reorders partial sums, and a router
- * near-tie flip against the CPU engine costs the parity gate.  The fp64
- * kernel is exact on expert picks and measured wall-faster than the old
- * strided-scalar f32 version, so exact is the default. */
 static bool q36_vk_use_f32_fast(void) {
-    const char *env = getenv("Q36_VK_F32_FAST");
-    return env && env[0] == '1';
+    return q36_vk_env_default_on("Q36_VK_F32_FAST");
 }
 
 static bool q36_vk_use_gpu_ffn_tail(void) {
@@ -3348,9 +3343,8 @@ int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out,
 
     /* Fast mode keeps these small control matvecs on GPU: a host fallback
      * here would force a flush now that nothing else reads activations back
-     * during decode.  Default is the fp64 shader whose 29 guard bits make a
-     * router near-tie flip impossible; Q36_VK_F32_FAST=1 opts into the vec4
-     * f32 kernel (--quality keeps the host-exact route). */
+     * during decode. The vec4 f32 kernel is the normal path; --quality or
+     * Q36_VK_F32_FAST=0 retains the fp64 accumulation for exact routing. */
     if (!q36_gpu_quality &&
         q36_vk_matmul_dense(q36_vk_use_f32_fast() && (in_dim & 3u) == 0u
                                 ? &q36_vk.matmul_f32_fast : &q36_vk.matmul_f32,
