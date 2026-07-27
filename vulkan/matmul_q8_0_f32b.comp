@@ -11,7 +11,7 @@
  * Weights stay in the mmap'd 34-byte Q8_0 blocks; the 16-bit typed view
  * keeps every load aligned (block byte offset is always even). */
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Weights {
     uint16_t wb16[];

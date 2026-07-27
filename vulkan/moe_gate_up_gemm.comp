@@ -5,9 +5,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 /* Routed IQ2_XXS gate/up/SwiGLU GEMM for prefill batches: one workgroup
- * owns a 64-mid-row x 16-slot tile of one expert's token group. The
+ * owns a 64-mid-row x 32-slot tile of one expert's token group. The
  * expert row block dequantizes into shared memory once per k-block and
- * is applied to all 16 slots through packed f16 FMAs, so the dequant
+ * is applied to all 32 slots through packed f16 FMAs, so the dequant
  * and weight traffic amortize over the tile instead of per 8 routed
  * pairs, and no subgroup reduction runs at all.
  *
@@ -41,7 +41,7 @@ layout(push_constant) uniform Push {
 
 /* One IQ2_XXS superblock is 33 uint16 words: [d_f16][32 x qs words]. */
 const uint IQ2_U16 = 33u;
-const uint SLOT_TILE = 16u;
+const uint SLOT_TILE = 32u;
 const uint TILE_WORDS = 1u + SLOT_TILE;
 const uint INVALID = 0xffffffffu;
 const uint BM = 64u;
@@ -76,14 +76,14 @@ void main(void) {
     uint sub = tid & 3u;      /* 8-element group within the 32-block */
     uint row = row0 + ar;
     uint base_u16 = (expert * pc.mid_dim + (row < pc.mid_dim ? row : 0u)) * row_u16;
-    uint bc = tid >> 3u;      /* staged slot 0..31 -> first 16 live */
+    uint bc = tid >> 3u;      /* staged slot 0..31 */
     uint bkk = tid & 7u;
-    uint tx = tid & 15u;      /* output slot lane */
-    uint ty = tid >> 4u;      /* output row lane: rows ty + 16*i */
+    uint tx = tid & 31u;      /* output slot lane */
+    uint ty = tid >> 5u;      /* output row lane: rows ty + 8*i */
 
-    float accg[4];
-    float accu[4];
-    for (uint i = 0u; i < 4u; i++) {
+    float accg[8];
+    float accu[8];
+    for (uint i = 0u; i < 8u; i++) {
         accg[i] = 0.0;
         accu[i] = 0.0;
     }
@@ -127,31 +127,31 @@ void main(void) {
                 Du[ar] = ud * 0.25 * (0.5 + float(uss >> 28u)) * 64.0;
             }
         }
-        /* Stage B: 16 slots x 32 elements, rounded once to f16. */
+        /* Stage B: 32 slots x 32 elements, rounded once to f16. */
         if (bc < SLOT_TILE) {
             bool live = sh_slot[bc] != INVALID;
             Bs[bc][bkk] = live ? f16vec4(xv[sh_x4[bc] + kb * 8u + bkk]) : f16vec4(0.0hf);
         }
         barrier();
 
-        f16vec2 pkg[4];
-        f16vec2 pku[4];
-        for (uint i = 0u; i < 4u; i++) {
+        f16vec2 pkg[8];
+        f16vec2 pku[8];
+        for (uint i = 0u; i < 8u; i++) {
             pkg[i] = f16vec2(0.0hf);
             pku[i] = f16vec2(0.0hf);
         }
         for (uint kk = 0u; kk < KK; kk++) {
             f16vec4 b = Bs[tx][kk];
-            for (uint i = 0u; i < 4u; i++) {
-                f16vec4 ag = Ag[ty + 16u * i][kk];
-                f16vec4 au = Au[ty + 16u * i][kk];
+            for (uint i = 0u; i < 8u; i++) {
+                f16vec4 ag = Ag[ty + 8u * i][kk];
+                f16vec4 au = Au[ty + 8u * i][kk];
                 pkg[i] = fma(ag.zw, b.zw, fma(ag.xy, b.xy, pkg[i]));
                 pku[i] = fma(au.zw, b.zw, fma(au.xy, b.xy, pku[i]));
             }
         }
-        for (uint i = 0u; i < 4u; i++) {
-            accg[i] = fma(Dg[ty + 16u * i], float(pkg[i].x) + float(pkg[i].y), accg[i]);
-            accu[i] = fma(Du[ty + 16u * i], float(pku[i].x) + float(pku[i].y), accu[i]);
+        for (uint i = 0u; i < 8u; i++) {
+            accg[i] = fma(Dg[ty + 8u * i], float(pkg[i].x) + float(pkg[i].y), accg[i]);
+            accu[i] = fma(Du[ty + 8u * i], float(pku[i].x) + float(pku[i].y), accu[i]);
         }
         barrier();
     }
@@ -160,8 +160,8 @@ void main(void) {
     if (slot == INVALID) return;
     float gsc = pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0;
     float usc = pc.has_up_scales != 0u ? up_scales[expert] : 1.0;
-    for (uint i = 0u; i < 4u; i++) {
-        uint r = row0 + ty + 16u * i;
+    for (uint i = 0u; i < 8u; i++) {
+        uint r = row0 + ty + 8u * i;
         if (r >= pc.mid_dim) continue;
         float g = accg[i] * gsc;
         float v = accu[i] * usc;

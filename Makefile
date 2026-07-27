@@ -53,6 +53,7 @@ VULKAN_SHADERS := \
 	vulkan/matmul_q8_0.spv \
 	vulkan/matmul_q8_0_q36.spv \
 	vulkan/matmul_q8_0_f32b.spv \
+	vulkan/matmul_q8_0_f32b_pair.spv \
 	vulkan/shared_gate_up_decode.spv \
 	vulkan/shared_down_tail_decode.spv \
 	vulkan/matmul_q8_0_mm.spv \
@@ -87,6 +88,7 @@ VULKAN_SHADERS := \
 	vulkan/kv_store_quant.spv \
 	vulkan/rms_norm_rope_kv_qwen_quant.spv \
 	vulkan/moe_gate_up_f32b.spv \
+	vulkan/moe_gate_up_decode.spv \
 	vulkan/moe_down_q2k_f32b.spv \
 	vulkan/moe_down_q2k_sum_decode.spv \
 	vulkan/moe_gate_up_q4k_f32b.spv \
@@ -102,6 +104,9 @@ vulkan/moe_matvec_fast.spv: vulkan/moe_matvec_fast.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b.spv: vulkan/matmul_q8_0_f32b.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_q8_0_f32b_pair.spv: vulkan/matmul_q8_0_f32b_pair.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/shared_gate_up_decode.spv: vulkan/shared_gate_up_decode.comp
@@ -123,6 +128,9 @@ vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_gate_up_f32b.spv: vulkan/moe_gate_up_f32b.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/moe_gate_up_decode.spv: vulkan/moe_gate_up_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_down_q2k_f32b.spv: vulkan/moe_down_q2k_f32b.comp

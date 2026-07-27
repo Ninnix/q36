@@ -15,10 +15,7 @@ layout(set = 0, binding = 0) readonly buffer Selected {
     uint selected[];
 };
 
-/* coherent: the build stages expert-grouped slot ids in the buffer tail
- * and re-reads them across invocations of this one workgroup; without it
- * the reads can hit a stale per-CU L0 line. */
-layout(set = 0, binding = 1) coherent buffer Tiles {
+layout(set = 0, binding = 1) buffer Tiles {
     uint tiles[];
 };
 
@@ -34,25 +31,23 @@ layout(push_constant) uniform Push {
     uint n_expert;
     uint streamed;
     uint pair_tile;
+    uint tile_bound;
 } pc;
 
 const uint INVALID = 0xffffffffu;
 
 shared uint counts[256];
 shared uint offsets[256];
+shared uint starts[256];
 shared uint tile_off[256];
 
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint tile_words = 1u + pc.pair_tile;
-    /* Expert-grouped slot ids stage in the tail of the tiles buffer (the
-     * host allocates n_slot extra words): this one-workgroup kernel had
-     * them in LDS, which capped n_slot at 4096 and with it the prefill
-     * chunk at 512 tokens. */
-    uint grouped = pc.n_slot * tile_words;
+    uint words = pc.tile_bound * tile_words;
 
     counts[tid] = 0u;
-    for (uint w = tid; w < pc.n_slot * tile_words; w += 256u) tiles[w] = INVALID;
+    for (uint w = tid; w < words; w += 256u) tiles[w] = INVALID;
     barrier();
 
     for (uint i = tid; i < pc.n_slot; i += 256u) {
@@ -65,6 +60,7 @@ void main(void) {
         uint toff = 0u;
         for (uint e = 0u; e < pc.n_expert; e++) {
             offsets[e] = off;
+            starts[e] = off;
             tile_off[e] = toff;
             off += counts[e];
             toff += (counts[e] + pc.pair_tile - 1u) / pc.pair_tile;
@@ -73,20 +69,11 @@ void main(void) {
     barrier();
 
     for (uint i = tid; i < pc.n_slot; i += 256u) {
-        tiles[grouped + atomicAdd(offsets[selected[i]], 1u)] = i;
-    }
-    memoryBarrierBuffer();
-    barrier();
-
-    if (tid < pc.n_expert && counts[tid] != 0u) {
-        uint e = tid;
-        uint pos = offsets[e] - counts[e];
-        for (uint c = 0u; c < counts[e]; c += pc.pair_tile) {
-            uint base = (tile_off[e] + c / pc.pair_tile) * tile_words;
+        uint e = selected[i];
+        uint rank = atomicAdd(offsets[e], 1u) - starts[e];
+        uint base = (tile_off[e] + rank / pc.pair_tile) * tile_words;
+        if (rank % pc.pair_tile == 0u)
             tiles[base] = pc.streamed != 0u ? slot_map[e] : e;
-            for (uint u = 0u; u < pc.pair_tile && c + u < counts[e]; u++) {
-                tiles[base + 1u + u] = tiles[grouped + pos + c + u];
-            }
-        }
+        tiles[base + 1u + rank % pc.pair_tile] = i;
     }
 }

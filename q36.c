@@ -5977,19 +5977,31 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         !q36_gpu_quantize_q8_k_tensor(rt->inp_q8, inp, Q36_N_EMBD, n_tok)) {
         return false;
     }
-    if (!q36_gpu_tensor_matmul_q8_or_float_scaled(&e->model, l->attn_qkv, inp, rt->inp_q8, rt->recur_qkv,
-                                                  Q36_N_EMBD, Q36_N_SSM_CONV_DIM, n_tok,
-                                                  q36_tensor_scalar_or(&e->model, l->attn_qkv_scale, 1.0f))) {
-        fprintf(stderr, "q36: recurrent attn_qkv failed at layer=%u\n", il);
-        return false;
-    }
-    /* The z gate dispatch records before the host conv step so the flush
-     * the conv's qkv read triggers completes both projections. */
-    if (!q36_gpu_tensor_matmul_q8_or_float_scaled(&e->model, l->attn_gate, inp, rt->inp_q8, rt->recur_z,
-                                                  Q36_N_EMBD, Q36_N_SSM_INNER, n_tok,
-                                                  q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f))) {
-        fprintf(stderr, "q36: recurrent attn_gate failed at layer=%u\n", il);
-        return false;
+    bool pair_projected = n_tok == 1u &&
+                          l->attn_qkv->type == Q36_TENSOR_Q8_0 &&
+                          l->attn_gate->type == Q36_TENSOR_Q8_0 &&
+                          q36_gpu_matmul_q8_0_pair_scaled_tensor(
+                              rt->recur_qkv, rt->recur_z,
+                              e->model.map, e->model.size,
+                              l->attn_qkv->abs_offset, l->attn_gate->abs_offset,
+                              Q36_N_EMBD, Q36_N_SSM_CONV_DIM, Q36_N_SSM_INNER, inp,
+                              q36_tensor_scalar_or(&e->model, l->attn_qkv_scale, 1.0f),
+                              q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f));
+    if (!pair_projected) {
+        if (!q36_gpu_tensor_matmul_q8_or_float_scaled(&e->model, l->attn_qkv, inp, rt->inp_q8, rt->recur_qkv,
+                                                      Q36_N_EMBD, Q36_N_SSM_CONV_DIM, n_tok,
+                                                      q36_tensor_scalar_or(&e->model, l->attn_qkv_scale, 1.0f))) {
+            fprintf(stderr, "q36: recurrent attn_qkv failed at layer=%u\n", il);
+            return false;
+        }
+        /* The z gate dispatch records before the host conv step so the flush
+         * the conv's qkv read triggers completes both projections. */
+        if (!q36_gpu_tensor_matmul_q8_or_float_scaled(&e->model, l->attn_gate, inp, rt->inp_q8, rt->recur_z,
+                                                      Q36_N_EMBD, Q36_N_SSM_INNER, n_tok,
+                                                      q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f))) {
+            fprintf(stderr, "q36: recurrent attn_gate failed at layer=%u\n", il);
+            return false;
+        }
     }
     {
         if (!rt->recur_conv_fused) {
@@ -6014,17 +6026,29 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         fprintf(stderr, "q36: recurrent conv non-finite at layer=%u\n", il);
         return false;
     }
-    if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_beta, inp, rt->recur_beta,
-                                      Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
-                                      q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f))) {
-        fprintf(stderr, "q36: recurrent ssm_beta failed at layer=%u\n", il);
-        return false;
-    }
-    if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_alpha, inp, rt->recur_alpha,
-                                      Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
-                                      q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
-        fprintf(stderr, "q36: recurrent ssm_alpha failed at layer=%u\n", il);
-        return false;
+    pair_projected = n_tok == 1u &&
+                     l->ssm_beta->type == Q36_TENSOR_Q8_0 &&
+                     l->ssm_alpha->type == Q36_TENSOR_Q8_0 &&
+                     q36_gpu_matmul_q8_0_pair_scaled_tensor(
+                         rt->recur_beta, rt->recur_alpha,
+                         e->model.map, e->model.size,
+                         l->ssm_beta->abs_offset, l->ssm_alpha->abs_offset,
+                         Q36_N_EMBD, Q36_N_SSM_DT_RANK, Q36_N_SSM_DT_RANK, inp,
+                         q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f),
+                         q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f));
+    if (!pair_projected) {
+        if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_beta, inp, rt->recur_beta,
+                                          Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
+                                          q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f))) {
+            fprintf(stderr, "q36: recurrent ssm_beta failed at layer=%u\n", il);
+            return false;
+        }
+        if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_alpha, inp, rt->recur_alpha,
+                                          Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
+                                          q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
+            fprintf(stderr, "q36: recurrent ssm_alpha failed at layer=%u\n", il);
+            return false;
+        }
     }
     {
         const char *env = getenv("Q36_VK_DELTA_QKV");

@@ -1,0 +1,84 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Decode pair projection. Both matrices consume the same F32 row while
+ * retaining the standalone Q8_0 dot order for each output. */
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer WeightsA { uint16_t wa[]; };
+layout(set = 0, binding = 1) readonly buffer WeightsB { uint16_t wb[]; };
+layout(set = 0, binding = 2) readonly buffer X { vec4 xv[]; };
+layout(set = 0, binding = 3) writeonly buffer OutputA { float ya[]; };
+layout(set = 0, binding = 4) writeonly buffer OutputB { float yb[]; };
+
+layout(push_constant) uniform Push {
+    uint out_a;
+    uint out_b;
+    uint blocks;
+    float scale_a;
+    float scale_b;
+} pc;
+
+const uint Q8_0_U16 = 17u;
+shared float sh_a[4];
+shared float sh_b[4];
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.out_a) return;
+    bool live_b = row < pc.out_b;
+    uint row_base = row * pc.blocks * Q8_0_U16;
+    uint bstep = gl_WorkGroupSize.x >> 2u;
+    uint boff = tid >> 2u;
+    uint eoff = (tid & 3u) * 8u;
+    float aa = 0.0;
+    float ab = 0.0;
+
+    for (uint b = boff; b < pc.blocks; b += bstep) {
+        uint base = row_base + b * Q8_0_U16;
+        uint q = base + 1u + (eoff >> 1u);
+        uint a0 = uint(wa[q]) | (uint(wa[q + 1u]) << 16u);
+        uint a1 = uint(wa[q + 2u]) | (uint(wa[q + 3u]) << 16u);
+        uint xi = (b * 32u + eoff) >> 2u;
+        vec4 x0 = xv[xi];
+        vec4 x1 = xv[xi + 1u];
+        float da = unpackHalf2x16(uint(wa[base])).x;
+        aa += da * (dot(vec4(unpack8(int(a0))), x0) +
+                    dot(vec4(unpack8(int(a1))), x1));
+        if (live_b) {
+            uint b0 = uint(wb[q]) | (uint(wb[q + 1u]) << 16u);
+            uint b1 = uint(wb[q + 2u]) | (uint(wb[q + 3u]) << 16u);
+            float db = unpackHalf2x16(uint(wb[base])).x;
+            ab += db * (dot(vec4(unpack8(int(b0))), x0) +
+                        dot(vec4(unpack8(int(b1))), x1));
+        }
+    }
+
+    aa = subgroupAdd(aa);
+    ab = subgroupAdd(ab);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            sh_a[gl_SubgroupID] = aa;
+            sh_b[gl_SubgroupID] = ab;
+        }
+        barrier();
+        if (tid == 0u) {
+            aa = sh_a[0];
+            ab = sh_b[0];
+            for (uint i = 1u; i < gl_NumSubgroups; i++) {
+                aa += sh_a[i];
+                ab += sh_b[i];
+            }
+        }
+    }
+    if (tid == 0u) {
+        ya[row] = aa * pc.scale_a;
+        if (live_b) yb[row] = ab * pc.scale_b;
+    }
+}

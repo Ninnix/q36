@@ -41,11 +41,12 @@ layout(push_constant) uniform Push {
     uint v_type;
     uint k_row_bytes;
     uint v_row_bytes;
+    uint tok_base;
 } pc;
 
 #define TILE 64u
 #define SPAN 512u
-#define SPAN_GROUP 16u
+#define SPAN_GROUP 8u
 #define HQ 8u
 #define QT 2u
 #define HD 256u
@@ -80,8 +81,9 @@ void main(void) {
     uint lane = tid & 63u;
     uint r0 = rg * ROWS;
     uint kvh = gl_WorkGroupID.x;
-    uint tok0 = gl_WorkGroupID.y * QT;
-    uint tn = min(QT, pc.n_tok - tok0);
+    uint local0 = gl_WorkGroupID.y * QT;
+    uint tok0 = pc.tok_base + local0;
+    uint tn = min(QT, pc.n_tok - local0);
     uint max_n_kv = pc.pos0 + tok0 + tn;
     uint group = gl_WorkGroupID.z;
     uint span_first = group * SPAN_GROUP;
@@ -268,7 +270,7 @@ void main(void) {
         uint n_kv = pc.pos0 + tok + 1u;
         uint row_spans = (n_kv + SPAN - 1u) / SPAN;
         if (ti >= tn || span_first >= row_spans) continue;
-        uint pbase = ((tok * pc.n_head + h0 + j) *
+        uint pbase = (((local0 + ti) * pc.n_head + h0 + j) *
                       pc.n_spans + group) * (HD + 2u);
         for (uint v = 0u; v < VD; v++)
             part[pbase + lane + v * 64u] = gacc[rr][v];

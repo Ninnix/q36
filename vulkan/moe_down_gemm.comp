@@ -5,9 +5,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 /* Routed Q2_K down projection GEMM for prefill batches: one workgroup
- * owns a 64-out-row x 16-slot tile of one expert's token group. Weights
+ * owns a 64-out-row x 32-slot tile of one expert's token group. Weights
  * dequantize fully (d*sc*q - dmin*m) into shared f16 once per 32-element
- * k-block and apply to all 16 slots' SwiGLU mid rows through packed f16
+ * k-block and apply to all 32 slots' SwiGLU mid rows through packed f16
  * FMAs; partial sums flush to f32 accumulators per k-block. Same
  * numerics posture as the gate/up GEMM: fixed per-output k order for
  * any n_tok, ~1e-3 from the decode matvec, covered by the relaxed
@@ -33,7 +33,7 @@ layout(push_constant) uniform Push {
 /* One Q2_K superblock is 42 uint16 words:
  * [8 x scales][32 x qs][dm.x f16][dm.y f16]. */
 const uint Q2K_U16 = 42u;
-const uint SLOT_TILE = 16u;
+const uint SLOT_TILE = 32u;
 const uint TILE_WORDS = 1u + SLOT_TILE;
 const uint INVALID = 0xffffffffu;
 const uint BM = 64u;
@@ -59,12 +59,12 @@ void main(void) {
     uint base_u16 = (expert * pc.out_dim + (row < pc.out_dim ? row : 0u)) * row_u16;
     uint bc = tid >> 3u;
     uint bkk = tid & 7u;
-    uint tx = tid & 15u;
-    uint ty = tid >> 4u;
+    uint tx = tid & 31u;
+    uint ty = tid >> 5u;
     uint mid4 = pc.in_dim / 4u;
 
-    float acc[4];
-    for (uint i = 0u; i < 4u; i++) acc[i] = 0.0;
+    float acc[8];
+    for (uint i = 0u; i < 8u; i++) acc[i] = 0.0;
     barrier();
 
     uint n_kb = pc.blocks * 8u;
@@ -89,7 +89,7 @@ void main(void) {
             As[ar][sub * 2u] = f16vec4(q0 * sc1 - sc2);
             As[ar][sub * 2u + 1u] = f16vec4(q1 * sc1 - sc2);
         }
-        /* Stage B: 16 slots x 32 mid elements, rounded once to f16. */
+        /* Stage B: 32 slots x 32 mid elements, rounded once to f16. */
         if (bc < SLOT_TILE) {
             uint slot = sh_slot[bc];
             Bs[bc][bkk] = slot != INVALID ? f16vec4(mid[slot * mid4 + kb * 8u + bkk])
@@ -97,24 +97,24 @@ void main(void) {
         }
         barrier();
 
-        f16vec2 pk[4];
-        for (uint i = 0u; i < 4u; i++) pk[i] = f16vec2(0.0hf);
+        f16vec2 pk[8];
+        for (uint i = 0u; i < 8u; i++) pk[i] = f16vec2(0.0hf);
         for (uint kk = 0u; kk < KK; kk++) {
             f16vec4 b = Bs[tx][kk];
-            for (uint i = 0u; i < 4u; i++) {
-                f16vec4 a = As[ty + 16u * i][kk];
+            for (uint i = 0u; i < 8u; i++) {
+                f16vec4 a = As[ty + 8u * i][kk];
                 pk[i] = fma(a.zw, b.zw, fma(a.xy, b.xy, pk[i]));
             }
         }
-        for (uint i = 0u; i < 4u; i++) acc[i] += float(pk[i].x) + float(pk[i].y);
+        for (uint i = 0u; i < 8u; i++) acc[i] += float(pk[i].x) + float(pk[i].y);
         barrier();
     }
 
     uint slot = sh_slot[tx];
     if (slot == INVALID) return;
     float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
-    for (uint i = 0u; i < 4u; i++) {
-        uint r = row0 + ty + 16u * i;
+    for (uint i = 0u; i < 8u; i++) {
+        uint r = row0 + ty + 8u * i;
         if (r < pc.out_dim) y[slot * pc.out_dim + r] = acc[i] * sc;
     }
 }

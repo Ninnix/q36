@@ -1,0 +1,116 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+/* Decode IQ2_XXS gate/up/SwiGLU. Identity scheduling gives each workgroup
+ * exactly one routed pair, so no general pair tile lives in registers. */
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer GateWeights { uint16_t gw[]; };
+layout(set = 0, binding = 1) readonly buffer UpWeights { uint16_t uw[]; };
+layout(set = 0, binding = 2) readonly buffer X { vec4 xv[]; };
+layout(set = 0, binding = 3) readonly buffer Selected { uint selected[]; };
+layout(set = 0, binding = 4) readonly buffer GateScales { float gate_scales[]; };
+layout(set = 0, binding = 5) readonly buffer UpScales { float up_scales[]; };
+layout(set = 0, binding = 6) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 7) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint mid_dim;
+    uint blocks;
+    uint n_used;
+    uint has_gate_scales;
+    uint has_up_scales;
+    uint pad;
+} pc;
+
+const uint IQ2_U16 = 33u;
+
+shared uint sh_grid[512];
+shared float sh_gate[2];
+shared float sh_up[2];
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint pair = gl_WorkGroupID.y;
+    uint expert = selected[pair];
+    uint x4 = (pair / pc.n_used) * pc.blocks * 64u;
+    uint itid = tid & 15u;
+    uint ix = tid >> 4u;
+
+    for (uint w = tid; w < 512u; w += 64u) sh_grid[w] = tables[w];
+    barrier();
+
+    uint row_u16 = pc.blocks * IQ2_U16;
+    uint base_u16 = (expert * pc.mid_dim + row) * row_u16;
+    uint ib32 = itid >> 1u;
+    uint qpair = itid & 1u;
+    float gate_acc = 0.0;
+    float up_acc = 0.0;
+
+    for (uint i = ix; i < pc.blocks; i += 4u) {
+        uint gb = base_u16 + i * IQ2_U16;
+        float gd = unpackHalf2x16(uint(gw[gb])).x;
+        float ud = unpackHalf2x16(uint(uw[gb])).x;
+        uint gq = gb + 1u + 4u * ib32;
+        uint gss = uint(gw[gq + 2u]) | (uint(gw[gq + 3u]) << 16u);
+        uint uss = uint(uw[gq + 2u]) | (uint(uw[gq + 3u]) << 16u);
+        float gdb = gd * 0.25 * (0.5 + float(gss >> 28u));
+        float udb = ud * 0.25 * (0.5 + float(uss >> 28u));
+        uint gidx_w = uint(gw[gq + qpair]);
+        uint uidx_w = uint(uw[gq + qpair]);
+        uint y4 = (i * 256u + 16u * itid) >> 2u;
+
+        for (uint l = 0u; l < 2u; l++) {
+            uint sbit = 7u * (2u * qpair + l);
+            uint gqs = (gidx_w >> (8u * l)) & 255u;
+            uint gsign = bitfieldExtract(gss, int(sbit), 7);
+            vec4 g0 = vec4(unpack8(sh_grid[gqs * 2u]));
+            vec4 g1 = vec4(unpack8(sh_grid[gqs * 2u + 1u]));
+            g0 = mix(g0, -g0, bvec4((gsign & 1u) != 0u, (gsign & 2u) != 0u,
+                                     (gsign & 4u) != 0u, (gsign & 8u) != 0u));
+            g1 = mix(g1, -g1, bvec4((gsign & 16u) != 0u, (gsign & 32u) != 0u,
+                                     (gsign & 64u) != 0u, (bitCount(gsign) & 1) != 0));
+
+            uint uqs = (uidx_w >> (8u * l)) & 255u;
+            uint usign = bitfieldExtract(uss, int(sbit), 7);
+            vec4 u0 = vec4(unpack8(sh_grid[uqs * 2u]));
+            vec4 u1 = vec4(unpack8(sh_grid[uqs * 2u + 1u]));
+            u0 = mix(u0, -u0, bvec4((usign & 1u) != 0u, (usign & 2u) != 0u,
+                                     (usign & 4u) != 0u, (usign & 8u) != 0u));
+            u1 = mix(u1, -u1, bvec4((usign & 16u) != 0u, (usign & 32u) != 0u,
+                                     (usign & 64u) != 0u, (bitCount(usign) & 1) != 0));
+
+            vec4 b0 = xv[x4 + y4 + 2u * l];
+            vec4 b4 = xv[x4 + y4 + 2u * l + 1u];
+            gate_acc = fma(gdb, dot(b0, g0) + dot(b4, g1), gate_acc);
+            up_acc = fma(udb, dot(b0, u0) + dot(b4, u1), up_acc);
+        }
+    }
+
+    gate_acc = subgroupAdd(gate_acc);
+    up_acc = subgroupAdd(up_acc);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            sh_gate[gl_SubgroupID] = gate_acc;
+            sh_up[gl_SubgroupID] = up_acc;
+        }
+        barrier();
+        if (tid == 0u) {
+            gate_acc += sh_gate[1];
+            up_acc += sh_up[1];
+        }
+    }
+    if (tid == 0u) {
+        float g = gate_acc *
+                  (pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0);
+        float v = up_acc *
+                  (pc.has_up_scales != 0u ? up_scales[expert] : 1.0);
+        y[pair * pc.mid_dim + row] = (g / (1.0f + exp(-g))) * v;
+    }
+}

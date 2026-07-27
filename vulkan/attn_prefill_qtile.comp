@@ -5,7 +5,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 /* GQA-tiled prefill attention: one workgroup serves the query heads sharing
- * a KV head across sixteen adjacent SPAN-key spans. Each K/V value is fetched
+ * a KV head across eight adjacent SPAN-key spans. Each K/V value is fetched
  * once per GQA group; span partials are folded in order before one compact
  * group partial is written for attn_combine.
  *
@@ -47,11 +47,12 @@ layout(push_constant) uniform Push {
     uint v_type;
     uint k_row_bytes;
     uint v_row_bytes;
+    uint tok0;
 } pc;
 
 #define TILE 64u
 #define SPAN 512u
-#define SPAN_GROUP 16u
+#define SPAN_GROUP 8u
 #define HQ 8u
 
 shared float sh_q[HQ * 256u];
@@ -132,10 +133,11 @@ void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint kvh = gl_WorkGroupID.x;
     uint tok = gl_WorkGroupID.y;
+    uint qtok = pc.tok0 + tok;
     uint heads_per_kv = pc.n_head / pc.n_head_kv;
     uint h0 = kvh * heads_per_kv;
     uint hn = min(HQ, heads_per_kv);
-    uint n_kv = pc.pos0 + tok + 1u;
+    uint n_kv = pc.pos0 + qtok + 1u;
     uint spans = (n_kv + SPAN - 1u) / SPAN;
     uint group = gl_WorkGroupID.z;
     uint span_first = group * SPAN_GROUP;
@@ -149,7 +151,7 @@ void main(void) {
         uint j = e >> 8u;
         uint d = e & 255u;
         sh_q[e] = j < hn && d < pc.head_dim ?
-            q[(tok * pc.n_head + h0 + j) * pc.head_dim + d] : 0.0;
+            q[(qtok * pc.n_head + h0 + j) * pc.head_dim + d] : 0.0;
     }
     barrier();
 

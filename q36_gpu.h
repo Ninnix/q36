@@ -161,6 +161,20 @@ int q36_gpu_matmul_q8_0_scaled_tensor(
         uint64_t                n_tok,
         float                   scale);
 
+int q36_gpu_matmul_q8_0_pair_scaled_tensor(
+        q36_gpu_tensor       *out_a,
+        q36_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_a_dim,
+        uint64_t                out_b_dim,
+        const q36_gpu_tensor *x,
+        float                   scale_a,
+        float                   scale_b);
+
 int q36_gpu_matmul_k_quant_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,
