@@ -191,19 +191,22 @@ meaningful generation-speed win.
 ## Speed
 
 Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor limited
-to 500-1500 MHz, 85 °C thermal ceiling — a hot summer in Italy). All runs
-use the Vulkan backend with greedy decoding, `--gen-tokens 128`, and the
-long context story prompt. Resident (full RAM) runs use Q8_0 K / Q4_0 V
-cache. SSD streaming runs use F16 KV cache. Table rows were measured in
-separate processes, with only one benchmark process running at a time.
+to 500-1500 MHz, 85 °C thermal ceiling — a hot summer in Italy). These are
+full-model resident Vulkan runs with greedy decoding, `--gen-tokens 128`,
+and the extended long-context story prompt. All runs use Q8_0 K / Q4_0 V
+cache. Each row was measured in a separate process, with only one benchmark
+process running at a time.
 
 | Machine | Quant | Prompt | Prefill | Generation |
 | --- | ---: | ---: | ---: | ---: |
-| BC-250 (40 CU) | q2 | 2048 ctx | 414.18 t/s | 66.42 t/s |
-| BC-250 (40 CU) | q2 | 10240 ctx | 305.44 t/s | 58.55 t/s |
-| BC-250 (40 CU) | q2 | 30720 ctx | 154.20 t/s | 40.01 t/s |
-| BC-250 (40 CU) | q2 SSD | 2048 ctx | 40.08 t/s | 14.91 t/s |
-| BC-250 (40 CU) | q2-q4 SSD | 2048 ctx | 35.55 t/s | 10.80 t/s |
+| BC-250 (40 CU) | q2 | 2048 ctx | 451.34 t/s | 69.21 t/s |
+| BC-250 (40 CU) | q2 | 8192 ctx | 290.07 t/s | 56.54 t/s |
+| BC-250 (40 CU) | q2 | 16384 ctx | 217.04 t/s | 47.85 t/s |
+| BC-250 (40 CU) | q2 | 24576 ctx | 165.75 t/s | 41.89 t/s |
+| BC-250 (40 CU) | q2 | 32768 ctx | 134.17 t/s | 38.41 t/s |
+| BC-250 (40 CU) | q2 | 40960 ctx | 115.09 t/s | 34.14 t/s |
+| BC-250 (40 CU) | q2 | 49152 ctx | 100.01 t/s | 31.10 t/s |
+| BC-250 (40 CU) | q2 | 57344 ctx | 88.75 t/s | 28.12 t/s |
 
 ![BC-250 t/s](speed-bench/bc250_ts.svg)
 
