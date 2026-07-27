@@ -4,10 +4,10 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-/* Four 64-lane row groups serve two tokens and eight GQA heads. Each group
- * owns four query rows; each lane owns four output dimensions. */
+/* Two 64-lane row groups serve two tokens and eight GQA heads. Each group
+ * owns one token; each lane owns four output dimensions. */
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Qbuf {
     float q[];
@@ -49,7 +49,7 @@ layout(push_constant) uniform Push {
 #define HQ 8u
 #define QT 2u
 #define HD 256u
-#define ROWS 4u
+#define ROWS 8u
 #define VD 4u
 #define K_HEAD_BYTES 272u
 #define V_HEAD_BYTES 144u
@@ -92,7 +92,7 @@ void main(void) {
     uint h0 = kvh * HQ;
     float scale = 1.0 / sqrt(float(HD));
 
-    for (uint e = tid; e < QT * HQ * HD; e += 256u) {
+    for (uint e = tid; e < QT * HQ * HD; e += 128u) {
         uint r = e / HD;
         uint ti = r / HQ;
         uint j = r & (HQ - 1u);
