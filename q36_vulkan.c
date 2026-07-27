@@ -2455,7 +2455,7 @@ int q36_gpu_init(void) {
     q36_vk.attn_decode_fused = Q36_VK_KERNEL("vulkan/attn_decode_fused.spv", 6, 40, 1u << 5);
     q36_vk.attn_decode_split = Q36_VK_KERNEL("vulkan/attn_decode_split.spv", 5, 40, 1u << 4);
     q36_vk.attn_prefill_qtile = Q36_VK_KERNEL("vulkan/attn_prefill_qtile.spv", 5, 44, 1u << 4);
-    q36_vk.attn_combine = Q36_VK_KERNEL("vulkan/attn_combine.spv", 4, 24, 1u << 3);
+    q36_vk.attn_combine = Q36_VK_KERNEL("vulkan/attn_combine.spv", 4, 28, 1u << 3);
     q36_vk.moe_gate_up = Q36_VK_KERNEL("vulkan/moe_gate_up.spv", 8, 28, 1u << 6);
     q36_vk.router_topk = Q36_VK_KERNEL("vulkan/router_topk.spv", 3, 16, (1u << 1) | (1u << 2));
     q36_vk.moe_tiles = Q36_VK_KERNEL("vulkan/moe_tiles.spv", 3, 16, 1u << 1);
@@ -5465,15 +5465,14 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
      * chain below. */
     if (q36_gpu_attn_fused_enabled() &&
         head_dim <= 256 && (head_dim & 1u) == 0u) {
-        /* Query-tiled prefill: one workgroup per (head, 8-token tile, span)
-         * reuses each K/V fetch across the tile's queries instead of
-         * streaming the cache once per token.  It always goes through the
-         * split partials + ordered combine; single-span partials are
-         * bit-identical to the fused kernel, so decode (n_tok == 1) staying
-         * on fused/split cannot diverge from prefill. */
+        /* Query-tiled prefill: one workgroup reuses K/V across eight queries
+         * and folds four adjacent spans before writing a partial. This keeps
+         * span parallelism while quartering partials RAM and combine traffic. */
         if (n_tok >= 2u && q36_vk_use_attn_qtile()) {
             uint32_t n_spans = (kv_max + 511u) / 512u;
-            uint64_t part_bytes = (uint64_t)n_tok * n_head * n_spans * (head_dim + 2u) * sizeof(float);
+            uint32_t n_groups = (n_spans + 3u) / 4u;
+            uint64_t part_bytes = (uint64_t)n_tok * n_head * n_groups *
+                                  (head_dim + 2u) * sizeof(float);
             struct {
                 uint32_t pos0;
                 uint32_t n_head;
@@ -5486,7 +5485,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 uint32_t v_type;
                 uint32_t k_row_bytes;
                 uint32_t v_row_bytes;
-            } qpush = { pos0, n_head, n_head_kv, head_dim, n_spans, n_tok, has_sinks ? 1u : 0u,
+            } qpush = { pos0, n_head, n_head_kv, head_dim, n_groups, n_tok, has_sinks ? 1u : 0u,
                         k_cache_type, v_cache_type, k_cache_row_bytes, v_cache_row_bytes };
             struct {
                 uint32_t pos0;
@@ -5495,7 +5494,9 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 uint32_t n_spans;
                 uint32_t qg_stride;
                 uint32_t has_sinks;
-            } cpush = { pos0, n_head, head_dim, n_spans, (uint32_t)qg_stride, has_sinks ? 1u : 0u };
+                uint32_t span_keys;
+            } cpush = { pos0, n_head, head_dim, n_groups,
+                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 2048u };
             pthread_mutex_lock(&q36_vk_mu);
             q36_gpu_tensor *part = q36_vk.attn_part;
             if (!part || q36_vk.attn_part_bytes < part_bytes) {
@@ -5512,7 +5513,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 const q36_gpu_tensor *qbind[5] = { q, k_cache, v_cache, sinks_t, part };
                 ok = q36_vk_run_unlocked("attn_prefill_qtile", &q36_vk.attn_prefill_qtile,
                                          qbind, &qpush, sizeof(qpush),
-                                         n_head, (n_tok + 7u) / 8u, n_spans);
+                                         n_head, (n_tok + 7u) / 8u, n_groups);
             }
             if (ok) {
                 const q36_gpu_tensor *cbind[4] = { part, qg, sinks_t, out };
@@ -5552,7 +5553,9 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 uint32_t n_spans;
                 uint32_t qg_stride;
                 uint32_t has_sinks;
-            } cpush = { pos0, n_head, head_dim, n_spans, (uint32_t)qg_stride, has_sinks ? 1u : 0u };
+                uint32_t span_keys;
+            } cpush = { pos0, n_head, head_dim, n_spans,
+                        (uint32_t)qg_stride, has_sinks ? 1u : 0u, 512u };
             pthread_mutex_lock(&q36_vk_mu);
             /* The partials scratch lives on the runtime and only grows: an
              * alloc/free per attention call showed up as ~0.2ms of host

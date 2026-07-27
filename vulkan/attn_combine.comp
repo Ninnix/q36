@@ -30,16 +30,15 @@ layout(push_constant) uniform Push {
     uint n_spans;
     uint qg_stride;
     uint has_sinks;
+    uint span_keys;
 } pc;
-
-#define SPAN 512u
 
 void main(void) {
     uint j = gl_LocalInvocationID.x;
     uint h = gl_WorkGroupID.x;
     uint tok = gl_WorkGroupID.y;
     uint n_kv = pc.pos0 + tok + 1u;
-    uint spans = (n_kv + SPAN - 1u) / SPAN;
+    uint spans = (n_kv + pc.span_keys - 1u) / pc.span_keys;
     uint pstride = pc.head_dim + 2u;
     uint pbase = (tok * pc.n_head + h) * pc.n_spans * pstride;
     if (j >= pc.head_dim) return;

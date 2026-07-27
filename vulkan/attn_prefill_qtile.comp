@@ -4,19 +4,14 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-/* Query-tiled prefill attention: one workgroup per (head, QT-token tile,
- * SPAN-key span) serves QT queries at once, so each K row and V element is
- * fetched once per tile instead of once per token — the fused/split kernels
- * stream the whole causal K/V range per token with zero reuse across a
- * chunk's queries, which made attention the growing prefill cost.
+/* Query-tiled prefill attention: one workgroup serves QT queries across four
+ * adjacent SPAN-key spans. Each K/V value is fetched once per query tile;
+ * span partials are folded in order before one compact group partial is
+ * written for attn_combine.
  *
- * Numerics are the invariance-critical part: every query keeps the exact
- * per-token arithmetic of attn_decode_split — same 64-key tile walk, same
- * quad-strided f32 dot + clustered add, same redundant online-softmax
- * bookkeeping, same t-ordered l/acc adds — only the scheduling changes.
- * A token therefore produces bit-identical partials whether it arrives
- * here, in the split kernel, or (single span) in attn_decode_fused, and
- * attn_combine folds them identically (warm==cold holds).
+ * Inside each span every query keeps the arithmetic of attn_decode_split:
+ * the same 64-key walk, quad-strided dot, online softmax and t-ordered sums.
+ * Groups retain span order; only the association between groups changes.
  *
  * Per-query causal ends differ inside a tile: the key loop runs to the
  * tile's last valid query's span end and earlier queries gate themselves
@@ -61,10 +56,14 @@ layout(push_constant) uniform Push {
 
 #define TILE 64u
 #define SPAN 512u
+#define SPAN_GROUP 4u
 #define QT 8u
 
 shared float sh_q[QT * 256u];
 shared float sh_w[QT * TILE];
+shared float sh_gacc[QT * 256u];
+shared float sh_gm[QT];
+shared float sh_gl[QT];
 
 uint load_k_u8(uint off) {
     uint word = kc[off >> 2u];
@@ -138,14 +137,13 @@ void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint h = gl_WorkGroupID.x;
     uint tok0 = gl_WorkGroupID.y * QT;
-    uint span = gl_WorkGroupID.z;
     uint jn = min(QT, pc.n_tok - tok0);
-    uint span0 = span * SPAN;
-    /* The tile's key walk is bounded by its LAST query's causal end; the
-     * earlier queries clamp themselves per tile below. */
     uint n_kv_max = pc.pos0 + tok0 + jn;
-    if (span0 >= n_kv_max) return;
-    uint span_end_max = min(span0 + SPAN, n_kv_max);
+    uint spans = (n_kv_max + SPAN - 1u) / SPAN;
+    uint group = gl_WorkGroupID.z;
+    uint span_first = group * SPAN_GROUP;
+    uint span_limit = min(span_first + SPAN_GROUP, spans);
+    if (span_first >= spans) return;
 
     uint kvh = h / (pc.n_head / pc.n_head_kv);
     uint half_dim = pc.head_dim >> 1;
@@ -160,17 +158,29 @@ void main(void) {
     }
     barrier();
 
-    float m[QT];
-    float l[QT];
-    float acc[QT];
-    float nm[QT];
     for (uint j = 0u; j < QT; j++) {
-        m[j] = span == 0u && pc.has_sinks != 0u ? sinks[h] : -3.402823466e38;
-        l[j] = 0.0;
-        acc[j] = 0.0;
+        sh_gacc[j * 256u + tid] = 0.0;
+        if (tid == 0u) {
+            sh_gm[j] = -3.402823466e38;
+            sh_gl[j] = 0.0;
+        }
     }
+    barrier();
 
-    for (uint base = span0; base < span_end_max; base += TILE) {
+    for (uint span = span_first; span < span_limit; span++) {
+        uint span0 = span * SPAN;
+        uint span_end_max = min(span0 + SPAN, n_kv_max);
+        float m[QT];
+        float l[QT];
+        float acc[QT];
+        float nm[QT];
+        for (uint j = 0u; j < QT; j++) {
+            m[j] = span == 0u && pc.has_sinks != 0u ? sinks[h] : -3.402823466e38;
+            l[j] = 0.0;
+            acc[j] = 0.0;
+        }
+
+        for (uint base = span0; base < span_end_max; base += TILE) {
         uint tile_n = min(TILE, span_end_max - base);
 
         /* Per-query tile bound, hoisted once: queries whose causal range
@@ -301,17 +311,43 @@ void main(void) {
             }
         }
         for (uint j = 0u; j < QT; j++) m[j] = nm[j];
+            barrier();
+        }
+
+        for (uint j = 0u; j < jn; j++) {
+            uint n_kv_j = pc.pos0 + tok0 + j + 1u;
+            if (span0 >= n_kv_j) continue;
+            if (span == span_first) {
+                sh_gacc[j * 256u + tid] = acc[j];
+                if (tid == 0u) {
+                    sh_gm[j] = m[j];
+                    sh_gl[j] = l[j];
+                }
+            } else {
+                float n = max(sh_gm[j], m[j]);
+                float r = exp(sh_gm[j] - n);
+                float rs = exp(m[j] - n);
+                sh_gacc[j * 256u + tid] =
+                    sh_gacc[j * 256u + tid] * r + acc[j] * rs;
+                if (tid == 0u) {
+                    sh_gl[j] = sh_gl[j] * r + l[j] * rs;
+                    sh_gm[j] = n;
+                }
+            }
+        }
         barrier();
     }
 
     for (uint j = 0u; j < jn; j++) {
         uint n_kv_j = pc.pos0 + tok0 + j + 1u;
-        if (span0 >= n_kv_j) continue;
-        uint pbase = (((tok0 + j) * pc.n_head + h) * pc.n_spans + span) * (pc.head_dim + 2u);
-        if (tid < pc.head_dim) part[pbase + tid] = acc[j];
+        if (span_first * SPAN >= n_kv_j) continue;
+        uint pbase = (((tok0 + j) * pc.n_head + h) *
+                      pc.n_spans + group) * (pc.head_dim + 2u);
+        if (tid < pc.head_dim)
+            part[pbase + tid] = sh_gacc[j * 256u + tid];
         if (tid == 0u) {
-            part[pbase + pc.head_dim] = m[j];
-            part[pbase + pc.head_dim + 1u] = l[j];
+            part[pbase + pc.head_dim] = sh_gm[j];
+            part[pbase + pc.head_dim + 1u] = sh_gl[j];
         }
     }
 }
