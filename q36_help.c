@@ -195,6 +195,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     title(fp, c, "Prompt And Sampling");
     opt(fp, c, "-n, --tokens N", "Maximum generated tokens.");
     opt(fp, c, "--temp F", "Sampling temperature. 0 is greedy/deterministic.");
+    opt(fp, c, "--top-k N", "Keep only the top N logits. 0 disables the cap.");
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");

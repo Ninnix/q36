@@ -1202,6 +1202,7 @@ typedef struct {
     int max_tokens;
     int question_limit;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     uint64_t seed;
@@ -1507,6 +1508,7 @@ static eval_config parse_options(int argc, char **argv) {
         .backend = default_backend(),
         .max_tokens = 16000,
         .temperature = Q36_DEFAULT_TEMPERATURE,
+        .top_k = 0,
         .top_p = Q36_DEFAULT_TOP_P,
         .min_p = Q36_DEFAULT_MIN_P,
         .pause_ms = 350,
@@ -1552,6 +1554,8 @@ static eval_config parse_options(int argc, char **argv) {
             c.case_sequence = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--temp")) {
             c.temperature = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+        } else if (!strcmp(arg, "--top-k")) {
+            c.top_k = parse_nonnegative_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--top-p")) {
             c.top_p = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--min-p")) {
@@ -2550,6 +2554,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             "max_prompt_tokens: %d\n"
             "questions: %d\n"
             "temperature: %.6g\n"
+            "top_k: %d\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
             "seed: %llu\n"
@@ -2567,6 +2572,7 @@ static void trace_write_header(FILE *trace, const eval_config *cfg,
             max_prompt_tokens,
             ncases,
             cfg->temperature,
+            cfg->top_k,
             cfg->top_p,
             cfg->min_p,
             (unsigned long long)cfg->seed,
@@ -2609,6 +2615,7 @@ static void trace_write_case(FILE *trace,
             "generated_tokens: %d\n"
             "elapsed_sec: %.3f\n"
             "temperature: %.6g\n"
+            "top_k: %d\n"
             "top_p: %.6g\n"
             "min_p: %.6g\n"
             "think_mode_effective: %s\n",
@@ -2625,6 +2632,7 @@ static void trace_write_case(FILE *trace,
             generated_tokens,
             elapsed_sec,
             cfg->temperature,
+            cfg->top_k,
             cfg->top_p,
             cfg->min_p,
             q36_think_mode_name(effective_think_mode));
@@ -3853,7 +3861,7 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
             }
         }
         if (token < 0)
-            token = q36_session_sample(session, cfg->temperature, 0,
+            token = q36_session_sample(session, cfg->temperature, cfg->top_k,
                                        cfg->top_p, cfg->min_p, rng);
         if (token == eos && generation_in_think) {
             token = q36_session_eos_to_think_close(session, token);
