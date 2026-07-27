@@ -72,7 +72,7 @@ enum {
     Q36_N_EMBD = 2048,
     Q36_N_VOCAB = 248320,
     Q36_TENSOR_COUNT = 733,
-    Q36_CONTEXT_TRAIN = 262144,
+    Q36_CONTEXT_TRAIN = Q36_CONTEXT_MAX,
     Q36_N_HEAD = 16,
     Q36_N_HEAD_KV = 2,
     Q36_N_HEAD_DIM = 256,
@@ -8119,7 +8119,10 @@ int q36_engine_generate_argmax(q36_engine *e, const q36_tokens *prompt,
     t_prefill1 = q36_now_sec();
     eos = q36_token_eos(e);
     t_decode0 = q36_now_sec();
-    for (int i = 0; i < n_predict; i++) {
+    int room = q36_session_ctx(s) - q36_session_pos(s);
+    int max_tokens = room <= 1 ? 0 : n_predict;
+    if (max_tokens > room - 1) max_tokens = room - 1;
+    for (int i = 0; i < max_tokens; i++) {
         int token = q36_session_argmax(s);
         if (token < 0) goto done;
         token = q36_session_eos_to_think_close(s, token);
@@ -8218,7 +8221,7 @@ int q36_engine_debug_tensor_row_packed(q36_engine *e, const char *tensor_name, u
 
 int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     q36_session *s;
-    if (!out || !e || ctx_size <= 0) return 1;
+    if (!out || !e || ctx_size <= 0 || ctx_size > Q36_CONTEXT_ALLOC_MAX) return 1;
     s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;

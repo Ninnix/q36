@@ -10,6 +10,8 @@
 
 #define Q36_DEFAULT_MODEL_FILE "Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 #define Q36_DEFAULT_MODEL_PATH "gguf/" Q36_DEFAULT_MODEL_FILE
+#define Q36_CONTEXT_MAX 262144
+#define Q36_CONTEXT_ALLOC_MAX (Q36_CONTEXT_MAX + 1)
 
 typedef enum {
     Q36_BACKEND_VULKAN,

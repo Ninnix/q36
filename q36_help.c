@@ -152,7 +152,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--backend NAME", "Backend name: vulkan or cpu.");
     if (tool != Q36_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", tool == Q36_HELP_AGENT ?
-            "Allocated context tokens. Default: 32768 resident, 100000 with --ssd-streaming." :
+            "Allocated context tokens. Default: 100000." :
             "Allocated context tokens.");
     }
     opt(fp, c, "-ctk, --cache-type-k TYPE",

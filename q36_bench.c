@@ -342,9 +342,19 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr, "q36-bench: requested context is too large\n");
         exit(2);
     }
+    if (c.ctx_max + c.gen_tokens > Q36_CONTEXT_MAX) {
+        fprintf(stderr, "q36-bench: ctx-max + gen-tokens must not exceed %d\n",
+                Q36_CONTEXT_MAX);
+        exit(2);
+    }
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "q36-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+        exit(2);
+    }
+    if (c.ctx_alloc > Q36_CONTEXT_ALLOC_MAX) {
+        fprintf(stderr, "q36-bench: --ctx-alloc must not exceed %d\n",
+                Q36_CONTEXT_ALLOC_MAX);
         exit(2);
     }
     if (c.mtp_path && c.mtp_draft_tokens <= 1)

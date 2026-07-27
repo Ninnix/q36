@@ -266,9 +266,9 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-The resident Vulkan preset uses a 32768-token context and Q8_0 keys with Q4_0
-values. CPU uses F16 KV. For a 100000-token agent with SSD-streamed model
-weights and F16 KV, use:
+The resident Vulkan preset uses a 100000-token context and Q8_0 keys with Q4_0
+values. CPU uses F16 KV. SSD-streamed model weights also default to a
+100000-token context, with F16 KV:
 
 ```sh
 ./q36-agent --ssd-streaming
@@ -522,9 +522,9 @@ still fit in available memory. Disk KV checkpoints avoid repeated prefill and
 preserve sessions across restarts; they do not enlarge the active context
 window.
 
-The `384000` output limit in the configs below avoids token caps since the
-model is able to generate very long replies. The server still stops when
-the configured context window is full.
+The `262144` output limit in the configs below matches the model's native
+context ceiling. The server stops earlier when its configured context window
+is full.
 
 For **opencode**, add a provider and agent entry to
 `~/.config/opencode/opencode.json`:
@@ -545,7 +545,7 @@ For **opencode**, add a provider and agent entry to
           "name": "Qwen 3.6 MoE (q36.c local)",
           "limit": {
             "context": 32768,
-            "output": 384000
+            "output": 262144
           }
         }
       }
@@ -596,7 +596,7 @@ For **Pi**, add a provider to `~/.pi/agent/models.json`:
           },
           "input": ["text"],
           "contextWindow": 32768,
-          "maxTokens": 384000,
+          "maxTokens": 262144,
           "cost": {
             "input": 0,
             "output": 0,

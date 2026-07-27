@@ -3267,6 +3267,45 @@ static bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+static const char *context_length_error_param(const request *r) {
+    if (!r) return "prompt";
+    if (r->api == API_RESPONSES) return "input";
+    return r->kind == REQ_COMPLETION ? "prompt" : "messages";
+}
+
+static bool request_exceeds_context(const request *r, int ctx_size) {
+    /* Session sync needs one free slot for generation. */
+    return r && r->prompt.len >= ctx_size;
+}
+
+static bool http_error_context_length_exceeded(int fd, const request *r,
+                                               int n_prompt_tokens,
+                                               int ctx_size) {
+    buf b = {0};
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "Prompt has %d tokens, but the configured context size is %d tokens",
+             n_prompt_tokens, ctx_size);
+
+    if (r && r->api == API_ANTHROPIC) {
+        buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
+        json_escape(&b, msg);
+        buf_printf(&b, ",\"n_prompt_tokens\":%d,\"n_ctx\":%d}}\n",
+                   n_prompt_tokens, ctx_size);
+    } else {
+        buf_puts(&b, "{\"error\":{\"message\":");
+        json_escape(&b, msg);
+        buf_puts(&b, ",\"type\":\"invalid_request_error\",\"param\":");
+        json_escape(&b, context_length_error_param(r));
+        buf_printf(&b,
+                   ",\"code\":\"context_length_exceeded\",\"n_prompt_tokens\":%d,\"n_ctx\":%d}}\n",
+                   n_prompt_tokens, ctx_size);
+    }
+    bool ok = http_response(fd, 400, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 /* Streaming is a translation state machine over the raw Q36 text.  The model
  * may produce <think> and QWEN_TOOL tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
@@ -8481,6 +8520,11 @@ static void *client_main(void *arg) {
         http_error(fd, 400, err);
         goto done;
     }
+    if (request_exceeds_context(&req, ctx_size)) {
+        http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
+        request_free(&req);
+        goto done;
+    }
 
     set_client_socket_nonblocking(fd);
     job j;
@@ -8793,7 +8837,7 @@ static server_config parse_options(int argc, char **argv) {
         .host = "127.0.0.1",
         .port = 8000,
         .ctx_size = 32768,
-        .default_tokens = 262144,
+        .default_tokens = Q36_CONTEXT_MAX,
         .tool_memory_max_ids = Q36_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -8931,6 +8975,11 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.ctx_size > Q36_CONTEXT_MAX) {
+        server_log(Q36_LOG_DEFAULT,
+                   "q36-server: --ctx must not exceed %d", Q36_CONTEXT_MAX);
+        exit(2);
     }
     if (!cache_type_k_set)
         c.engine.cache_type_k = q36_default_kv_cache_type_k(c.engine.backend, c.engine.ssd_streaming);
@@ -9222,6 +9271,52 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_context_length_error_uses_protocol_standard_shape(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.prompt.len = 16;
+    TEST_ASSERT(request_exceeds_context(&r, 16));
+    TEST_ASSERT(!request_exceeds_context(&r, 17));
+
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &r, 16, 16));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 400") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"code\":\"context_length_exceeded\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"param\":\"messages\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":16") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_ctx\":16") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&r);
+
+    request a;
+    request_init(&a, REQ_CHAT, 128);
+    a.api = API_ANTHROPIC;
+
+    sv[0] = sv[1] = -1;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(http_error_context_length_exceeded(sv[0], &a, 20, 20));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "{\"type\":\"error\",\"error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"type\":\"invalid_request_error\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":20") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    request_free(&a);
 }
 
 static void test_anthropic_live_stream_sends_incremental_blocks(void) {
@@ -11517,6 +11612,7 @@ static void q36_server_unit_tests_run(void) {
     test_responses_input_parses_qwen_tool_continuation();
     test_responses_output_is_protocol_native();
     test_responses_stream_uses_responses_events();
+    test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_server_streaming_options();
     test_tool_prompt_args_preserve_call_order();

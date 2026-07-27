@@ -33,7 +33,7 @@
  * after Enter is pressed while the model is still busy. */
 int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
-#define AGENT_RESIDENT_CTX 32768
+#define AGENT_RESIDENT_CTX 100000
 #define AGENT_STREAMING_CTX 100000
 
 static int set_nonblock(int fd, bool on, int *old_flags);
@@ -678,6 +678,10 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
     if (c.engine.ssd_streaming && !ctx_set) c.gen.ctx_size = AGENT_STREAMING_CTX;
+    if (c.gen.ctx_size > Q36_CONTEXT_MAX) {
+        fprintf(stderr, "q36-agent: --ctx must not exceed %d\n", Q36_CONTEXT_MAX);
+        exit(2);
+    }
     if (!cache_type_k_set)
         c.engine.cache_type_k = q36_default_kv_cache_type_k(c.engine.backend, c.engine.ssd_streaming);
     if (!cache_type_v_set)

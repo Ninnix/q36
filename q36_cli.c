@@ -1155,19 +1155,24 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             if (!arg[0]) {
                 fprintf(stderr, "q36: /ctx needs a positive integer\n");
             } else {
-                cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend, cfg->gen.ctx_size,
-                                   cfg->engine.cache_type_k,
-                                   cfg->engine.cache_type_v);
-                rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
-                if (rc != 0) {
-                    linenoiseFree(line);
-                    break;
+                int ctx_size = parse_int(arg, "/ctx");
+                if (ctx_size > Q36_CONTEXT_MAX) {
+                    fprintf(stderr, "q36: /ctx must not exceed %d\n", Q36_CONTEXT_MAX);
+                } else {
+                    cfg->gen.ctx_size = ctx_size;
+                    log_context_memory(cfg->engine.backend, cfg->gen.ctx_size,
+                                       cfg->engine.cache_type_k,
+                                       cfg->engine.cache_type_v);
+                    rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
+                    if (rc != 0) {
+                        linenoiseFree(line);
+                        break;
+                    }
+                    bool active = q36_think_mode_for_context(cfg->gen.think_mode,
+                                                             chat.ctx_size) == Q36_THINK_MAX;
+                    repl_chat_apply_max_prefix(engine, &chat, active);
+                    cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
                 }
-                bool active = q36_think_mode_for_context(cfg->gen.think_mode,
-                                                         chat.ctx_size) == Q36_THINK_MAX;
-                repl_chat_apply_max_prefix(engine, &chat, active);
-                cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
             }
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
@@ -1439,6 +1444,10 @@ static cli_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.gen.ctx_size > Q36_CONTEXT_MAX) {
+        fprintf(stderr, "q36: --ctx must not exceed %d\n", Q36_CONTEXT_MAX);
+        exit(2);
     }
     if (!cache_type_k_set)
         c.engine.cache_type_k = q36_default_kv_cache_type_k(c.engine.backend, c.engine.ssd_streaming);
