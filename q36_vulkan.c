@@ -164,6 +164,7 @@ typedef struct {
     q36_vk_kernel attn_decode_fused;
     q36_vk_kernel attn_decode_split;
     q36_vk_kernel attn_prefill_qtile;
+    q36_vk_kernel attn_prefill_qtile2;
     q36_vk_kernel attn_combine;
     q36_vk_kernel moe_gate_up;
     q36_vk_kernel router_topk;
@@ -998,6 +999,10 @@ static bool q36_vk_use_attn_qtile(void) {
     static int cached = -1;
     if (cached < 0) cached = q36_vk_env_default_on("Q36_VK_ATTN_QTILE") ? 1 : 0;
     return cached != 0;
+}
+
+static bool q36_vk_use_attn_qtile2(void) {
+    return q36_vk_env_default_on("Q36_VK_ATTN_QTILE2");
 }
 
 static bool q36_vk_use_attn_fused(void) {
@@ -2455,6 +2460,7 @@ int q36_gpu_init(void) {
     q36_vk.attn_decode_fused = Q36_VK_KERNEL("vulkan/attn_decode_fused.spv", 6, 40, 1u << 5);
     q36_vk.attn_decode_split = Q36_VK_KERNEL("vulkan/attn_decode_split.spv", 5, 40, 1u << 4);
     q36_vk.attn_prefill_qtile = Q36_VK_KERNEL("vulkan/attn_prefill_qtile.spv", 5, 44, 1u << 4);
+    q36_vk.attn_prefill_qtile2 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile2.spv", 5, 44, 1u << 4);
     q36_vk.attn_combine = Q36_VK_KERNEL("vulkan/attn_combine.spv", 4, 28, 1u << 3);
     q36_vk.moe_gate_up = Q36_VK_KERNEL("vulkan/moe_gate_up.spv", 8, 28, 1u << 6);
     q36_vk.router_topk = Q36_VK_KERNEL("vulkan/router_topk.spv", 3, 16, (1u << 1) | (1u << 2));
@@ -2706,6 +2712,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.attn_decode_fused);
     q36_vk_kernel_destroy(&q36_vk.attn_decode_split);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile);
+    q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile2);
     q36_vk_kernel_destroy(&q36_vk.attn_combine);
     q36_vk_kernel_destroy(&q36_vk.attn_reduce);
     q36_vk_kernel_destroy(&q36_vk.attn_post);
@@ -5511,9 +5518,13 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
             ok = part != NULL && sinks_t != NULL;
             if (ok) {
                 const q36_gpu_tensor *qbind[5] = { q, k_cache, v_cache, sinks_t, part };
-                ok = q36_vk_run_unlocked("attn_prefill_qtile", &q36_vk.attn_prefill_qtile,
+                bool qt2 = q36_vk_use_attn_qtile2() &&
+                           head_dim == 256u && n_head / n_head_kv == 8u &&
+                           k_cache_type == 1u && v_cache_type == 2u;
+                ok = q36_vk_run_unlocked(qt2 ? "attn_prefill_qtile2" : "attn_prefill_qtile",
+                                         qt2 ? &q36_vk.attn_prefill_qtile2 : &q36_vk.attn_prefill_qtile,
                                          qbind, &qpush, sizeof(qpush),
-                                         n_head_kv, n_tok, n_groups);
+                                         n_head_kv, qt2 ? (n_tok + 1u) / 2u : n_tok, n_groups);
             }
             if (ok) {
                 const q36_gpu_tensor *cbind[4] = { part, qg, sinks_t, out };

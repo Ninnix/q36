@@ -78,6 +78,7 @@ VULKAN_SHADERS := \
 	vulkan/attn_decode_fused.spv \
 	vulkan/attn_decode_split.spv \
 	vulkan/attn_prefill_qtile.spv \
+	vulkan/attn_prefill_qtile2.spv \
 	vulkan/attn_combine.spv \
 	vulkan/moe_gate_up.spv \
 	vulkan/router_topk.spv \
@@ -152,6 +153,9 @@ vulkan/attn_decode_split.spv: vulkan/attn_decode_split.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/attn_prefill_qtile.spv: vulkan/attn_prefill_qtile.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/attn_prefill_qtile2.spv: vulkan/attn_prefill_qtile2.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 # Vulkan is the default backend. CORE_OBJS holds the GPU engine; CPU_CORE_OBJS
