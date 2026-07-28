@@ -98,6 +98,7 @@ int q36_gpu_stream_expert_cache_load_layer(const q36_gpu_stream_expert_table *ta
 int q36_gpu_stream_expert_cache_seed_from_layer_selected(const q36_gpu_stream_expert_table *table, const q36_gpu_tensor *selected, uint32_t n_tokens, uint32_t n_seed_tokens, uint32_t n_selected);
 int q36_gpu_stream_expert_cache_release_layer_cache(void);
 int q36_gpu_stream_expert_cache_seed_experts(const q36_gpu_stream_expert_table *table, const int32_t *expert_ids, const uint32_t *expert_priorities, uint32_t n_experts);
+int q36_gpu_stream_expert_cache_bias_experts(const q36_gpu_stream_expert_table *table, const int32_t *expert_ids, const uint32_t *expert_priorities, uint32_t n_experts);
 void q36_gpu_print_memory_report(const char *label);
 void q36_gpu_prof_reset(void);
 void q36_gpu_prof_report(const char *label);

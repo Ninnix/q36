@@ -76,9 +76,9 @@ not evidence of parity.
   released GGUF. Aggregate quality must remain in the same band.
 - Benchmark resident, warm streaming, and cold streaming one process at a time.
   Record prefill and decode speed separately.
-- Verify warm startup reports a bounded preload when a hotlist is available.
-  With no hotlist, warm and `--ssd-streaming-cold` must both avoid blind
-  startup reads.
+- Verify automatic hotlist startup reports an eviction bias and reads no
+  expert weights. With no hotlist, warm and `--ssd-streaming-cold` must both
+  avoid blind startup reads. An explicit preload count must still preload.
 - Test an explicit expert count and an `NGB` budget. The resolved budget must
   fit the reported working set and must never become zero silently.
 - Run a cache-pressure prompt long enough to evict expert slots. It must finish

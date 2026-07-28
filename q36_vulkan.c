@@ -326,6 +326,7 @@ typedef struct {
     q36_vk_stream_entry *entry;
     uint32_t slot_of[Q36_VK_STREAM_MAX_LAYERS][Q36_VK_STREAM_MAX_EXPERTS];
     uint32_t route_hotness[Q36_VK_STREAM_MAX_LAYERS][Q36_VK_STREAM_MAX_EXPERTS];
+    uint32_t route_bias[Q36_VK_STREAM_MAX_LAYERS][Q36_VK_STREAM_MAX_EXPERTS];
     uint64_t route_tokens;
     uint64_t hotness_decay_token;
 } q36_vk_stream_cache;
@@ -1979,7 +1980,9 @@ static void q36_vk_stream_cache_unmap_slot_unlocked(uint32_t slot) {
 
 static uint32_t q36_vk_stream_route_hotness_unlocked(uint32_t layer, uint32_t expert) {
     if (layer >= Q36_VK_STREAM_MAX_LAYERS || expert >= Q36_VK_STREAM_MAX_EXPERTS) return 0;
-    return q36_vk_stream.route_hotness[layer][expert];
+    uint32_t hotness = q36_vk_stream.route_hotness[layer][expert];
+    uint32_t bias = q36_vk_stream.route_bias[layer][expert];
+    return hotness > UINT32_MAX - bias ? UINT32_MAX : hotness + bias;
 }
 
 static void q36_vk_stream_note_hotness_unlocked(uint32_t layer, uint32_t expert,
@@ -3189,6 +3192,24 @@ int q36_gpu_stream_expert_cache_release_layer_cache(void) {
 
 int q36_gpu_stream_expert_cache_seed_experts(const q36_gpu_stream_expert_table *table, const int32_t *expert_ids, const uint32_t *expert_priorities, uint32_t n_experts) {
     return q36_vk_stream_cache_prepare_i32(table, expert_ids, expert_priorities, n_experts, NULL) ? 1 : 0;
+}
+
+int q36_gpu_stream_expert_cache_bias_experts(const q36_gpu_stream_expert_table *table, const int32_t *expert_ids, const uint32_t *expert_priorities, uint32_t n_experts) {
+    if (!table || !expert_ids || table->layer >= Q36_VK_STREAM_MAX_LAYERS) return 0;
+    pthread_mutex_lock(&q36_vk_mu);
+    for (uint32_t i = 0; i < n_experts; i++) {
+        int32_t expert = expert_ids[i];
+        if (expert < 0 || (uint32_t)expert >= table->n_total_expert ||
+            (uint32_t)expert >= Q36_VK_STREAM_MAX_EXPERTS) {
+            pthread_mutex_unlock(&q36_vk_mu);
+            return 0;
+        }
+        uint32_t priority = expert_priorities ? expert_priorities[i] : 1u;
+        uint32_t *bias = &q36_vk_stream.route_bias[table->layer][expert];
+        if (priority > *bias) *bias = priority;
+    }
+    pthread_mutex_unlock(&q36_vk_mu);
+    return 1;
 }
 
 void q36_gpu_print_memory_report(const char *label) {

@@ -228,11 +228,12 @@ the Vulkan recommended working set, subtracts non-routed weights, and targets
 ./q36 --ssd-streaming --ssd-streaming-cache-experts 6GB -p "Hello"
 ```
 
-Warm streaming preloads a bounded popularity hotlist when a built-in or
-`Q36_VK_STREAMING_EXPERT_HOTLIST` profile is available. It does not fill the
-cache with arbitrary experts when no profile exists. Use `--ssd-streaming-cold`
-for an empty cache, or `--ssd-streaming-preload-experts N` to request an
-explicit preload count.
+A built-in or `Q36_VK_STREAMING_EXPERT_HOTLIST` profile biases eviction
+without reading expert weights at startup. It does not fill the cache with
+arbitrary experts when no profile exists. Use `--ssd-streaming-cold` for an
+empty cache, or `--ssd-streaming-preload-experts N` to request an explicit
+weight preload. Mixed expert-size models keep their unbiased policy because
+one profile cannot rank the incompatible cache paths consistently.
 
 As in DS4, an explicit routed prefix can stay fully resident:
 

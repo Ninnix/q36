@@ -3821,7 +3821,7 @@ static bool q36_streaming_hotlist_load_default(uint32_t max_entries,
     for (uint32_t i = 0; i < q36_default_streaming_hotlist_count && loaded < max_entries; i++) {
         if (!q36_streaming_hotlist_add(q36_default_streaming_hotlist[i][0],
                                        q36_default_streaming_hotlist[i][1],
-                                       max_entries - loaded,
+                                       q36_default_streaming_hotlist[i][2],
                                        experts,
                                        priorities,
                                        counts,
@@ -3865,11 +3865,13 @@ static bool q36_engine_seed_streaming_expert_cache_blind(q36_engine *e,
 
 #ifndef Q36_NO_GPU
 static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
-    if (!e || !e->ssd_streaming || e->ssd_streaming_cold) return true;
+    if (!e || !e->ssd_streaming) return true;
     uint32_t budget = q36_gpu_stream_expert_cache_configured_count();
     uint32_t preload = e->ssd_streaming_preload_experts;
     const bool automatic = preload == 0;
+    const bool bias_only = automatic || e->ssd_streaming_cold;
     uint32_t seeded = 0;
+    uint32_t biased = 0;
     uint32_t loaded = 0;
     int32_t experts[Q36_N_LAYER][Q36_N_EXPERT];
     uint32_t priorities[Q36_N_LAYER][Q36_N_EXPERT];
@@ -3903,9 +3905,22 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
     }
 
     if (loaded == 0) {
-        if (automatic) return true;
+        if (automatic || e->ssd_streaming_cold) return true;
         if (!q36_engine_seed_streaming_expert_cache_blind(e, preload, &seeded)) return false;
     } else {
+        if (bias_only) {
+            for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+                const q36_layer_weights *layer = &e->weights.layer[il];
+                if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
+                    !layer->ffn_down_exps) continue;
+                if (!q36_weights_streaming_layer_experts_uniform(
+                        &e->weights, il)) {
+                    fprintf(stderr,
+                            "q36: SSD streaming hotlist bias disabled for mixed expert sizes\n");
+                    return true;
+                }
+            }
+        }
         for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
             uint32_t n = counts[il];
             if (n == 0) continue;
@@ -3913,12 +3928,23 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
             if (!q36_weights_streaming_layer_experts_uniform(&e->weights, il)) continue;
             q36_gpu_stream_expert_table table = q36_stream_expert_table_make(&e->model, layer, il);
             if (!table.model_map) continue;
-            if (!q36_gpu_stream_expert_cache_seed_experts(&table, experts[il], priorities[il], n)) {
-                fprintf(stderr, "q36: SSD streaming failed to preload hotlist experts for layer %u\n", il);
+            int ok = bias_only ?
+                q36_gpu_stream_expert_cache_bias_experts(
+                    &table, experts[il], priorities[il], n) :
+                q36_gpu_stream_expert_cache_seed_experts(
+                    &table, experts[il], priorities[il], n);
+            if (!ok) {
+                fprintf(stderr, "q36: SSD streaming failed to apply hotlist experts for layer %u\n", il);
                 return false;
             }
-            seeded += n;
+            if (bias_only) biased += n;
+            else seeded += n;
         }
+    }
+    if (biased != 0) {
+        fprintf(stderr,
+                "q36: SSD streaming biased eviction with %u hotlist experts without preload\n",
+                biased);
     }
     if (seeded != 0) {
         fprintf(stderr,

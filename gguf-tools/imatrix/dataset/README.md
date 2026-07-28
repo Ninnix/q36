@@ -63,6 +63,16 @@ python3 gguf-tools/imatrix/dataset/render_q36_prompts.py \
 
 This samples each category and thinking mode, then interleaves the groups.
 
+After collecting `Q36_VK_STREAMING_EXPERT_HOTLIST_OUT`, regenerate the
+built-in eviction profile with:
+
+```sh
+python3 gguf-tools/imatrix/dataset/profile_to_q36_hotlist.py \
+  /tmp/q36-balanced-hotlist.txt \
+  --out q36_streaming_hotlist.inc \
+  --limit 4096
+```
+
 ## 3. Run `llama-imatrix`
 
 Use the local Q8 GGUF and keep mmap enabled:
