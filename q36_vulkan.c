@@ -4,6 +4,7 @@
 #include "q36_ssd.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <math.h>
 #include <pthread.h>
@@ -2994,6 +2995,12 @@ int q36_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 
 int q36_gpu_set_model_fd(int fd) {
     q36_gpu_model_fd = fd;
+#if defined(POSIX_FADV_RANDOM)
+    if (fd >= 0 && q36_vk_stream.enabled &&
+        getenv("Q36_VK_STREAM_READAHEAD") == NULL) {
+        (void)posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    }
+#endif
     return fd >= 0;
 }
 
@@ -6155,8 +6162,7 @@ static q36_gpu_tensor *q36_vk_moe_build_tiles(const uint32_t *selected_host,
  * The whole expert bank and its .scale tensor are cached on device through
  * the weight cache and the router's expert ids index them directly, so a
  * decode step moves no expert bytes at all.  If the bank does not fit the
- * heaps the runtime falls back to packing one expert copy per tile; both
- * paths feed the shader the same expert-major tile schedule. */
+ * heaps the runtime falls back to packing one copy per selected expert. */
 static int q36_vk_moe_matvec(q36_gpu_tensor *out,
                               const void *model_map,
                               uint64_t model_size,
@@ -6190,6 +6196,9 @@ static int q36_vk_moe_matvec(q36_gpu_tensor *out,
     q36_gpu_tensor *packed_scales = NULL;
     const uint32_t *tiles_host;
     uint32_t tile_count = 0;
+    uint32_t packed_count = 0;
+    uint32_t packed_expert[256];
+    uint32_t packed_slot[256];
     unsigned char *packed_weight_host;
     float *packed_scales_host = NULL;
 
@@ -6309,13 +6318,24 @@ static int q36_vk_moe_matvec(q36_gpu_tensor *out,
         q36_gpu_tensor_free(tiles);
         return 0;
     }
-    if (!q36_u64_mul_ok(tile_count, expert_stride, &packed_weight_bytes)) {
+    memset(packed_slot, 0xff, sizeof(packed_slot));
+    for (uint64_t slot = 0; slot < n_slot; slot++) {
+        uint32_t expert = selected_host[slot];
+        if (packed_slot[expert] != UINT32_MAX) continue;
+        packed_slot[expert] = packed_count;
+        packed_expert[packed_count++] = expert;
+    }
+    q36_gpu_tensor_free(tiles);
+    tiles = q36_vk_moe_build_tiles(selected_host, n_slot, n_expert,
+                                   packed_slot, &tile_count);
+    if (!tiles || tile_count == 0 ||
+        !q36_u64_mul_ok(packed_count, expert_stride, &packed_weight_bytes)) {
         q36_gpu_tensor_free(tiles);
         return 0;
     }
     packed_weights = q36_gpu_tensor_alloc(packed_weight_bytes);
     if (w->has_scales) {
-        packed_scale_bytes = (uint64_t)tile_count * sizeof(float);
+        packed_scale_bytes = (uint64_t)packed_count * sizeof(float);
         packed_scales = q36_gpu_tensor_alloc(packed_scale_bytes);
     }
     packed_weight_host = packed_weights ? q36_vk_tensor_contents_labeled(packed_weights, "submit_wait_moe_pack_weights") : NULL;
@@ -6327,14 +6347,14 @@ static int q36_vk_moe_matvec(q36_gpu_tensor *out,
         q36_gpu_tensor_free(tiles);
         return 0;
     }
-    for (uint32_t tile = 0; tile < tile_count; tile++) {
-        const uint32_t expert = tiles_host[(uint64_t)tile * Q36_VK_MOE_TILE_WORDS];
-        memcpy(packed_weight_host + (uint64_t)tile * expert_stride,
+    for (uint32_t slot = 0; slot < packed_count; slot++) {
+        const uint32_t expert = packed_expert[slot];
+        memcpy(packed_weight_host + (uint64_t)slot * expert_stride,
                source + (uint64_t)expert * expert_stride,
                (size_t)expert_stride);
-        if (packed_scales_host) packed_scales_host[tile] = ((const float *)scales_source)[expert];
+        if (packed_scales_host) packed_scales_host[slot] = ((const float *)scales_source)[expert];
     }
-    push.packed_weights = 1u;
+    push.packed_weights = 0u;
 
     pthread_mutex_lock(&q36_vk_mu);
     q36_gpu_tensor *tables = q36_vk_iq_tables_unlocked();

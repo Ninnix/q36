@@ -3868,9 +3868,7 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
     if (!e || !e->ssd_streaming || e->ssd_streaming_cold) return true;
     uint32_t budget = q36_gpu_stream_expert_cache_configured_count();
     uint32_t preload = e->ssd_streaming_preload_experts;
-    if (preload == 0) preload = budget < 4096u ? budget : 4096u;
-    if (preload == 0) return true;
-    if (budget != 0 && preload > budget) preload = budget;
+    const bool automatic = preload == 0;
     uint32_t seeded = 0;
     uint32_t loaded = 0;
     int32_t experts[Q36_N_LAYER][Q36_N_EXPERT];
@@ -3880,6 +3878,14 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
     const char *path = getenv("Q36_VK_STREAMING_EXPERT_HOTLIST");
     const bool disable_default = getenv("Q36_VK_DISABLE_STREAMING_EXPERT_HOTLIST") != NULL;
     double t0 = q36_now_sec();
+
+    if (automatic && (!path || !path[0]) &&
+        (disable_default || q36_default_streaming_hotlist_count == 0)) {
+        return true;
+    }
+    if (automatic) preload = budget < 4096u ? budget : 4096u;
+    if (preload == 0) return true;
+    if (budget != 0 && preload > budget) preload = budget;
 
     memset(experts, 0, sizeof(experts));
     memset(priorities, 0, sizeof(priorities));
@@ -3897,6 +3903,7 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
     }
 
     if (loaded == 0) {
+        if (automatic) return true;
         if (!q36_engine_seed_streaming_expert_cache_blind(e, preload, &seeded)) return false;
     } else {
         for (uint32_t il = 0; il < Q36_N_LAYER; il++) {

@@ -53,6 +53,16 @@ For normal imatrix collection use `rendered_prompts.txt`. The split files are
 kept for ablations and debugging. If the model metadata chat template changes,
 update the renderer first and regenerate all three rendered files.
 
+For a balanced streaming-router profile without processing the full corpus:
+
+```sh
+python3 gguf-tools/imatrix/dataset/render_q36_prompts.py \
+  --sample-per-category-mode 2 \
+  --out /tmp/q36-streaming-prompts.txt
+```
+
+This samples each category and thinking mode, then interleaves the groups.
+
 ## 3. Run `llama-imatrix`
 
 Use the local Q8 GGUF and keep mmap enabled:

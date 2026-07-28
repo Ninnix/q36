@@ -228,9 +228,11 @@ the Vulkan recommended working set, subtracts non-routed weights, and targets
 ./q36 --ssd-streaming --ssd-streaming-cache-experts 6GB -p "Hello"
 ```
 
-Warm streaming preloads a bounded popularity hotlist. Use
-`--ssd-streaming-cold` for an empty cache, or
-`--ssd-streaming-preload-experts N` to override the preload count.
+Warm streaming preloads a bounded popularity hotlist when a built-in or
+`Q36_VK_STREAMING_EXPERT_HOTLIST` profile is available. It does not fill the
+cache with arbitrary experts when no profile exists. Use `--ssd-streaming-cold`
+for an empty cache, or `--ssd-streaming-preload-experts N` to request an
+explicit preload count.
 
 As in DS4, an explicit routed prefix can stay fully resident:
 

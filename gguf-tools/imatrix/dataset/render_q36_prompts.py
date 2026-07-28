@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 from pathlib import Path
 
@@ -171,6 +172,19 @@ def load_records(path: Path) -> list[dict]:
     return records
 
 
+def sample_records(records: list[dict], per_group: int) -> list[dict]:
+    groups = defaultdict(list)
+    for record in records:
+        groups[(record.get("category"), record.get("mode"))].append(record)
+
+    out = []
+    for i in range(per_group):
+        for key in sorted(groups):
+            if i < len(groups[key]):
+                out.append(groups[key][i])
+    return out
+
+
 def write_mode(path: Path, records: list[dict], mode: str) -> None:
     records = [r for r in records if r.get("mode") == mode]
     with path.open("w", encoding="utf-8") as f:
@@ -198,9 +212,15 @@ def main() -> None:
     ap.add_argument("--in", dest="inp", type=Path, default=Path(__file__).resolve().parent / "prompts.jsonl")
     ap.add_argument("--out-dir", type=Path, default=Path(__file__).resolve().parent)
     ap.add_argument("--out", type=Path, help="write only the combined file to this path")
+    ap.add_argument("--sample-per-category-mode", type=int, default=0,
+                    help="select N records from every category/mode pair")
     args = ap.parse_args()
 
     records = load_records(args.inp)
+    if args.sample_per_category_mode < 0:
+        ap.error("--sample-per-category-mode must be non-negative")
+    if args.sample_per_category_mode:
+        records = sample_records(records, args.sample_per_category_mode)
     if args.out:
         write_all(args.out, records)
         print(f"rendered {len(records)} prompts to {args.out}")
