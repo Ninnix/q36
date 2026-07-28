@@ -4971,8 +4971,7 @@ static void test_llama_parity_seq(void) {
     llama_backend_init();
     mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
-    mp.use_mmap = true;
-    mp.use_mlock = false;
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     llama_model = llama_model_load_from_file(test_model_path(), mp);
     TEST_ASSERT(llama_model != NULL);
     if (!llama_model) goto done;
@@ -5011,8 +5010,7 @@ static void test_llama_parity_seq_long(void) {
     llama_backend_init();
     mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
-    mp.use_mmap = true;
-    mp.use_mlock = false;
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     llama_model = llama_model_load_from_file(test_model_path(), mp);
     TEST_ASSERT(llama_model != NULL);
     if (!llama_model) goto done;
@@ -5052,8 +5050,7 @@ static void test_llama_parity_batch_loose(void) {
     llama_backend_init();
     mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
-    mp.use_mmap = true;
-    mp.use_mlock = false;
+    mp.load_mode = LLAMA_LOAD_MODE_MMAP;
     llama_model = llama_model_load_from_file(test_model_path(), mp);
     TEST_ASSERT(llama_model != NULL);
     if (!llama_model) goto done;

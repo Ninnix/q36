@@ -303,21 +303,13 @@ typedef struct {
     bool has_route_bias;
     uint64_t configured_expert_bytes;
     uint32_t cap;
+    uint32_t phase;
     uint64_t clock;
     uint64_t hits;
     uint64_t misses;
     uint64_t loads;
     uint64_t evictions;
     uint64_t lookup_steps;
-    uint64_t read_bytes;
-    uint64_t read_ns;
-    uint64_t phase_hits[2];
-    uint64_t phase_misses[2];
-    uint64_t phase_read_bytes[2];
-    uint64_t layer_hits[Q36_VK_STREAM_MAX_LAYERS];
-    uint64_t layer_misses[Q36_VK_STREAM_MAX_LAYERS];
-    uint64_t layer_read_bytes[Q36_VK_STREAM_MAX_LAYERS];
-    uint32_t phase;
     uint64_t gate_expert_bytes;
     uint64_t up_expert_bytes;
     uint64_t down_expert_bytes;
@@ -2152,15 +2144,9 @@ static bool q36_vk_stream_cache_prepare_one_unlocked(const q36_gpu_stream_expert
     int slot = q36_vk_stream_cache_find_unlocked(t, expert);
     if (slot >= 0) {
         q36_vk_stream.hits++;
-        q36_vk_stream.phase_hits[q36_vk_stream.phase]++;
-        if (t->layer < Q36_VK_STREAM_MAX_LAYERS)
-            q36_vk_stream.layer_hits[t->layer]++;
     } else {
         if (*n_miss >= 256u) return false;
         q36_vk_stream.misses++;
-        q36_vk_stream.phase_misses[q36_vk_stream.phase]++;
-        if (t->layer < Q36_VK_STREAM_MAX_LAYERS)
-            q36_vk_stream.layer_misses[t->layer]++;
         uint32_t pick = q36_vk_stream_cache_pick_slot_unlocked(t->layer, protect);
         if (pick == UINT32_MAX) return false;
         q36_vk_stream_entry *entry = &q36_vk_stream.entry[pick];
@@ -2198,46 +2184,20 @@ static bool q36_vk_stream_cache_finish_unlocked(const q36_gpu_stream_expert_tabl
     bool ok = prepared;
     if (n_miss == 0) return ok;
     if (ok && need_flush && !q36_vk_flush_reason_unlocked("submit_wait_stream_cache_evict")) ok = false;
-    uint64_t read_t0 = q36_vk_now_ns();
     if (ok) {
         q36_vk_stream_fetch_ctx ctx = { t, miss };
         q36_gpu_parallel_for_rows(n_miss, 2, q36_vk_stream_fetch_rows, &ctx);
     }
-    uint64_t read_ns = q36_vk_now_ns() - read_t0;
-    uint64_t expert_bytes = q36_vk_stream_table_expert_bytes(t);
-    uint64_t read_bytes = 0;
     for (uint32_t i = 0; i < n_miss; i++) {
         q36_vk_stream_entry *entry = &q36_vk_stream.entry[miss[i].slot];
         entry->loading = false;
         if (ok && miss[i].ok) {
             q36_vk_stream.loads++;
-            if (read_bytes <= UINT64_MAX - expert_bytes)
-                read_bytes += expert_bytes;
-            else
-                read_bytes = UINT64_MAX;
         } else {
             q36_vk_stream_cache_unmap_slot_unlocked(miss[i].slot);
             entry->valid = false;
             ok = false;
         }
-    }
-    if (q36_vk_stream.read_bytes <= UINT64_MAX - read_bytes)
-        q36_vk_stream.read_bytes += read_bytes;
-    else
-        q36_vk_stream.read_bytes = UINT64_MAX;
-    if (q36_vk_stream.read_ns <= UINT64_MAX - read_ns)
-        q36_vk_stream.read_ns += read_ns;
-    else
-        q36_vk_stream.read_ns = UINT64_MAX;
-    if (q36_vk_stream.phase_read_bytes[q36_vk_stream.phase] <= UINT64_MAX - read_bytes)
-        q36_vk_stream.phase_read_bytes[q36_vk_stream.phase] += read_bytes;
-    else
-        q36_vk_stream.phase_read_bytes[q36_vk_stream.phase] = UINT64_MAX;
-    if (t->layer < Q36_VK_STREAM_MAX_LAYERS) {
-        if (q36_vk_stream.layer_read_bytes[t->layer] <= UINT64_MAX - read_bytes)
-            q36_vk_stream.layer_read_bytes[t->layer] += read_bytes;
-        else
-            q36_vk_stream.layer_read_bytes[t->layer] = UINT64_MAX;
     }
     return ok;
 }
@@ -3303,7 +3263,7 @@ int q36_gpu_stream_expert_cache_bias_experts(const q36_gpu_stream_expert_table *
 
 void q36_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
-            "q36: Vulkan memory%s%s live=%" PRIu64 " peak=%" PRIu64 " fd=%d quality=%s ssd_streaming=%s cache=%u/%u requested=%u allocation_failures=%u lookup=%s lookup_steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " read=%.2fGiB read_ms=%.2f device=%s api=%u.%u.%u\n",
+            "q36: Vulkan memory%s%s live=%" PRIu64 " peak=%" PRIu64 " fd=%d quality=%s ssd_streaming=%s cache=%u/%u requested=%u allocation_failures=%u lookup=%s lookup_steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " device=%s api=%u.%u.%u\n",
             label ? " " : "",
             label ? label : "",
             q36_gpu_live_bytes,
@@ -3321,29 +3281,10 @@ void q36_gpu_print_memory_report(const char *label) {
             q36_vk_stream.misses,
             q36_vk_stream.loads,
             q36_vk_stream.evictions,
-            (double)q36_vk_stream.read_bytes / 1073741824.0,
-            (double)q36_vk_stream.read_ns / 1000000.0,
             q36_vk.props.deviceName[0] ? q36_vk.props.deviceName : "uninitialized",
             VK_VERSION_MAJOR(q36_vk.api_version),
             VK_VERSION_MINOR(q36_vk.api_version),
             VK_VERSION_PATCH(q36_vk.api_version));
-    if (q36_vk_stream.enabled && getenv("Q36_VK_STREAM_STATS")) {
-        fprintf(stderr,
-                "q36: Vulkan streaming phase prefill hits=%" PRIu64 " misses=%" PRIu64 " read=%.2fGiB decode hits=%" PRIu64 " misses=%" PRIu64 " read=%.2fGiB\n",
-                q36_vk_stream.phase_hits[0], q36_vk_stream.phase_misses[0],
-                (double)q36_vk_stream.phase_read_bytes[0] / 1073741824.0,
-                q36_vk_stream.phase_hits[1], q36_vk_stream.phase_misses[1],
-                (double)q36_vk_stream.phase_read_bytes[1] / 1073741824.0);
-        for (uint32_t layer = 0; layer < Q36_VK_STREAM_MAX_LAYERS; layer++) {
-            if (q36_vk_stream.layer_hits[layer] == 0 &&
-                q36_vk_stream.layer_misses[layer] == 0) continue;
-            fprintf(stderr,
-                    "q36: Vulkan streaming layer=%u hits=%" PRIu64 " misses=%" PRIu64 " read=%.2fGiB\n",
-                    layer, q36_vk_stream.layer_hits[layer],
-                    q36_vk_stream.layer_misses[layer],
-                    (double)q36_vk_stream.layer_read_bytes[layer] / 1073741824.0);
-        }
-    }
 }
 
 void q36_gpu_prof_reset(void) {
