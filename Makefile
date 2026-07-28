@@ -443,10 +443,10 @@ test-server: q36_test
 test-long: q36_test
 	./q36_test --long-context
 
-.opencode-tmp/llama_qwen_logprobs_capture: tests/test-vectors/llama_qwen_logprobs_capture.cpp
+.opencode-tmp/llama_qwen_logprobs_capture: tests/test-vectors/llama_qwen_logprobs_capture.c
 	@mkdir -p .opencode-tmp
-	$(CXX) -std=c++17 $(LLAMA_INCLUDE) \
-		-o $@ tests/test-vectors/llama_qwen_logprobs_capture.cpp \
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) $(LLAMA_INCLUDE) \
+		-o $@ tests/test-vectors/llama_qwen_logprobs_capture.c \
 		$(LLAMA_LIBS) $(LDLIBS) $(LLAMA_LDLIBS)
 
 q36_llama_test.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h

@@ -29,6 +29,7 @@ tests/__pycache__/
 /.opencode-tmp
 /tests/q36_layer_probe
 /tests/q36_parity_report
+/tests/test_sampling
 /tests/test-vectors/local/
 /gguf-tools/quality-testing/local/
 q36_agent_test
