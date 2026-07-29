@@ -183,6 +183,7 @@ static id<MTLComputeCommandEncoder> q36_encoder(NSString *kernel) {
     id<MTLComputePipelineState> p = q36_pipeline(kernel);
     if (!p) return nil;
     id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = kernel;
     [enc setComputePipelineState:p];
     return enc;
 }
@@ -272,6 +273,7 @@ static int q36_q8_prefill_mm(
         (int32_t)out_dim, (int32_t)tokens, 1, 1
     };
     id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mm_q8_0_f32";
     [enc setComputePipelineState:p];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
@@ -328,6 +330,8 @@ static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
         in_dim * sizeof(float), (int32_t)out_dim, 1, nr0, 1, 1
     };
     id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = nr0 == 4 ? @"kernel_mul_mv_q8_0_f32_r4"
+                         : @"kernel_mul_mv_q8_0_f32";
     [enc setComputePipelineState:p];
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
@@ -1522,6 +1526,7 @@ int q36_gpu_matmul_q8_0_pair_scaled_tensor(
     q36_q8_mv_args args_b = Q36_Q8_PAIR_ARGS(out_b_dim);
 #undef Q36_Q8_PAIR_ARGS
     id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mv_q8_0_f32_pair";
     [enc setComputePipelineState:p];
     [enc setBytes:&args_a length:sizeof(args_a) atIndex:0];
     [enc setBytes:&args_b length:sizeof(args_b) atIndex:1];
@@ -1987,6 +1992,7 @@ static int q36_moe_iq2_q2_gpu(
         id<MTLComputeCommandEncoder> menc =
             mp ? [q36_batch computeCommandEncoder] : nil;
         if (!menc) return 0;
+        menc.label = @"kernel_mul_mm_id_map0_ne20_8";
         [menc setComputePipelineState:mp];
         [menc setBytes:&ma length:sizeof(ma) atIndex:0];
         [menc setBuffer:selected->buffer offset:selected->offset atIndex:1];
@@ -2014,6 +2020,8 @@ static int q36_moe_iq2_q2_gpu(
         : q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
     id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
+    enc.label = use_mm ? @"moe.gate.kernel_mul_mm_id_iq2_xxs_f32"
+                       : @"moe.gate_up.kernel_mul_mv_id_iq2_xxs_pair_f32";
     [enc setComputePipelineState:gp];
     if (use_mm) {
         [enc setBytes:&gate_mm length:sizeof(gate_mm) atIndex:0];
@@ -2029,6 +2037,7 @@ static int q36_moe_iq2_q2_gpu(
         [enc endEncoding];
 
         enc = [q36_batch computeCommandEncoder];
+        enc.label = @"moe.up.kernel_mul_mm_id_iq2_xxs_f32";
         [enc setComputePipelineState:gp];
         [enc setBytes:&gate_mm length:sizeof(gate_mm) atIndex:0];
         [enc setBuffer:ub offset:(NSUInteger)uo atIndex:1];
@@ -2087,6 +2096,10 @@ static int q36_moe_iq2_q2_gpu(
                      : @"kernel_mul_mv_id_q2_K_f32", 2);
     enc = dp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
+    enc.label = use_mm ? @"moe.down.kernel_mul_mm_id_q2_K_f32"
+                       : (down_sum
+                          ? @"moe.down.kernel_mul_mv_id_q2_K_sum6_f32"
+                          : @"moe.down.kernel_mul_mv_id_q2_K_f32");
     [enc setComputePipelineState:dp];
     if (use_mm) {
         [enc setBytes:&down_mm length:sizeof(down_mm) atIndex:0];
