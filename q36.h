@@ -15,6 +15,7 @@
 
 typedef enum {
     Q36_BACKEND_VULKAN,
+    Q36_BACKEND_METAL,
     Q36_BACKEND_CPU,
 } q36_backend;
 

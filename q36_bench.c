@@ -79,8 +79,8 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
-        "  --vulkan | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Vulkan unless built CPU-only.\n"
+        "  --metal | --vulkan | --cpu | --backend NAME\n"
+        "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  -ctk, --cache-type-k TYPE\n"
@@ -157,16 +157,19 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 }
 
 static q36_backend parse_backend(const char *s, const char *opt) {
+    if (!strcmp(s, "metal")) return Q36_BACKEND_METAL;
     if (!strcmp(s, "vulkan")) return Q36_BACKEND_VULKAN;
     if (!strcmp(s, "cpu")) return Q36_BACKEND_CPU;
     fprintf(stderr, "q36-bench: invalid value for %s: %s\n", opt, s);
-    fprintf(stderr, "q36-bench: valid backends are: vulkan, cpu\n");
+    fprintf(stderr, "q36-bench: valid backends are: metal, vulkan, cpu\n");
     exit(2);
 }
 
 static q36_backend default_backend(void) {
 #ifdef Q36_NO_GPU
     return Q36_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return Q36_BACKEND_METAL;
 #else
     return Q36_BACKEND_VULKAN;
 #endif
@@ -260,10 +263,12 @@ static bench_config parse_options(int argc, char **argv) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--vulkan")) {
             c.backend = Q36_BACKEND_VULKAN;
+        } else if (!strcmp(arg, "--metal")) {
+            c.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = Q36_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--cuda")) {
-            fprintf(stderr, "q36-bench: %s is not supported; use --vulkan or --cpu\n", arg);
+        } else if (!strcmp(arg, "--cuda")) {
+            fprintf(stderr, "q36-bench: %s is not supported; use --metal, --vulkan, or --cpu\n", arg);
             exit(2);
         } else if (!strcmp(arg, "--quality")) {
             c.quality = true;

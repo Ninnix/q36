@@ -29,6 +29,7 @@ CPU_CFLAGS := $(filter-out -ffast-math,$(CFLAGS)) -D_GNU_SOURCE -fno-finite-math
 GPU_CFLAGS := $(CFLAGS) -D_GNU_SOURCE -fno-finite-math-only
 LDLIBS ?= -lm -pthread
 GPU_LDLIBS := $(LDLIBS) -ldl -lvulkan
+METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 VULKAN_SHADERS := \
 	vulkan/matmul_f16.spv \
 	vulkan/matmul_f32.spv \
@@ -169,15 +170,17 @@ vulkan/attn_prefill_qtile2.spv: vulkan/attn_prefill_qtile2.comp
 # Vulkan is the default backend. CORE_OBJS holds the GPU engine; CPU_CORE_OBJS
 # is the -DQ36_NO_GPU reference build selected by `make cpu`.
 CORE_OBJS := q36_gpu_core.o q36_vulkan.o
+METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu q36-quality-score test test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-batching test-release release-build-check benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu metal metal-shaders-check q36-quality-score test test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-batching test-release release-build-check benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
 help:
 	@echo "Q36 build targets:"
 	@echo "  make              Build Vulkan ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test (default)"
+	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
 	@echo "  make cpu          Build CPU-only ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test"
 	@echo "  make q36-quality-score  Build the OpenRouter/Q36 local scorer"
 	@echo "  make test         Build and run tests"
@@ -191,6 +194,18 @@ help:
 	@echo "  make clean        Remove build outputs"
 
 gpu: all
+
+metal: metal-shaders-check q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
+	$(CC) $(GPU_CFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(GPU_CFLAGS) -o q36-server q36_server.o rax.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(GPU_CFLAGS) -o q36-bench q36_bench.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(GPU_CFLAGS) -o q36-agent q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(GPU_CFLAGS) -o q36-eval q36_eval.o q36_help.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(GPU_CFLAGS) -o q36_test q36_test.o rax.o q36_ssd.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
+
+metal-shaders-check:
+	sh metal/compile-metal.sh /tmp/q36-metal-check.air
+	rm -f /tmp/q36-metal-check.air
 
 q36: q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
@@ -228,8 +243,20 @@ cpu: q36_cli_cpu.o linenoise_cpu.o q36_server_cpu.o rax_cpu.o q36_bench_cpu.o q3
 q36_gpu_core.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36.c
 
+q36_gpu_core_metal.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_streaming_hotlist.inc
+	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36.c
+
+q36_gpu_core_metal_test.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_streaming_hotlist.inc
+	$(CC) $(GPU_CFLAGS) -DQ36_METAL -DQ36_METAL_TEST_COMPAT -c -o $@ q36.c
+
+q36_cli_metal.o: q36_cli.c q36.h q36_ssd.h linenoise.h
+	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36_cli.c
+
 q36_vulkan.o: q36_vulkan.c q36_gpu.h q36_quant.h q36_iq2_tables_vulkan.inc q36_iq_tables.h $(VULKAN_SHADERS)
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_vulkan.c
+
+q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h $(wildcard metal/*.metal)
+	$(CC) $(GPU_CFLAGS) -fobjc-arc -c -o $@ q36_metal.m
 
 q36_cli.o: q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_cli.c

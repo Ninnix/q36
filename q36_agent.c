@@ -483,16 +483,19 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 }
 
 static q36_backend parse_backend(const char *s) {
+    if (!strcmp(s, "metal")) return Q36_BACKEND_METAL;
     if (!strcmp(s, "vulkan")) return Q36_BACKEND_VULKAN;
     if (!strcmp(s, "cpu")) return Q36_BACKEND_CPU;
     fprintf(stderr, "q36-agent: invalid backend: %s\n", s);
-    fprintf(stderr, "q36-agent: valid backends are: vulkan, cpu\n");
+    fprintf(stderr, "q36-agent: valid backends are: metal, vulkan, cpu\n");
     exit(2);
 }
 
 static q36_backend default_backend(void) {
 #ifdef Q36_NO_GPU
     return Q36_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return Q36_BACKEND_METAL;
 #else
     return Q36_BACKEND_VULKAN;
 #endif
@@ -598,9 +601,11 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--vulkan")) {
             c.engine.backend = Q36_BACKEND_VULKAN;
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = Q36_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--cuda") ||
+        } else if (!strcmp(arg, "--cuda") ||
                    !strcmp(arg, "--role") || !strcmp(arg, "--layers") ||
                    !strcmp(arg, "--listen") || !strcmp(arg, "--coordinator")) {
             fprintf(stderr, "q36-agent: %s is not supported in this q36 port\n", arg);

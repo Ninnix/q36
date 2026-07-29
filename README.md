@@ -4,7 +4,7 @@
 
 **QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B**. 
 It is self-contained and deliberately narrow, not a general GGUF runner. 
-The main path is a Qwen3.6-35B-A3B-specific Vulkan graph executor with 
+The main paths are Qwen3.6-35B-A3B-specific Vulkan and Metal graph executors with
 Q36-specific loading, prompt rendering, tool calls, KV state, HTTP server,
 and coding agent. The repository also includes tools and data for GGUF,
 imatrix, quality, and speed.
@@ -25,7 +25,7 @@ run it at a decent speed.
 
 ## Requirements
 
-QuarkStar for now targets one specific hardware configuration:
+QuarkStar has two native GPU targets:
 
 * **AMD BC-250** (Cyan Skillfish, RDNA 2, 24 CUs / 1536 shaders, 16 GB
   unified GDDR6) — the ex-PS5 mining board.
@@ -41,9 +41,15 @@ QuarkStar for now targets one specific hardware configuration:
 * **Kernel boot parameters**: add `ttm.pages_limit=3959290
   ttm.page_pool_size=3959290` to your bootloader, otherwise `amdgpu` caps
   GPU-accessible memory below 8 GB and the model will fail to load.
+* **Apple Silicon M1 or newer** with macOS and the Command Line Tools. Install
+  the optional shader compiler once with
+  `xcodebuild -downloadComponent MetalToolchain`, then build with `make metal`
+  and run with `./q36 --metal`.
 
 There is no support for discrete GPUs, integrated Intel/NVIDIA GPUs, or
-Windows (Windows has no driver support for the BC-250 APU at all).
+Windows (Windows has no driver support for the BC-250 APU at all). The Metal
+backend uses unified-memory, mmap-backed model buffers and is independent of
+the Vulkan/BC-250 build.
 
 ## Motivations
 
@@ -72,10 +78,10 @@ opens up some very interesting possibilities in the future.
 ### To antirez and ds4
 
 QuarkStar is essentially a port of [DwarfStar](https://github.com/antirez/ds4),
-redesigned for the Vulkan runtime and retargeted at Qwen3.6-35B-A3B. Where DwarfStar
-went deep on Metal, we go deep on Vulkan; everything else is the same idea
-adapted to a different model. I literally used DwarfStar as a bible for ideas,
-porting Salvatore's ideas to QuarkStar with the help of AI.
+redesigned for the Vulkan runtime and retargeted at Qwen3.6-35B-A3B. The Vulkan
+engine adapts DwarfStar's ideas to a different model and device. The Apple
+runtime also retains and specializes DwarfStar's mature Metal kernel library
+for Qwen3.6, including the routed IQ2_XXS/Q2_K expert path.
 
 **Special thanks to Salvatore**, he is a continuous source of inspiration for
 me, and his content on YouTube has greatly improved me as a software engineer

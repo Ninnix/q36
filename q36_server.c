@@ -8747,8 +8747,8 @@ static void usage(FILE *fp) {
         "      Override the number of dynamic expert slots preloaded at startup.\n"
         "  --simulate-used-memory NGB\n"
         "      Reserve memory before auto-sizing the streaming cache.\n"
-        "  --vulkan | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Vulkan on Linux and cpu on CPU-only builds.\n"
+        "  --metal | --vulkan | --cpu | --backend NAME\n"
+        "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -8811,16 +8811,19 @@ static void usage(FILE *fp) {
 }
 
 static q36_backend parse_backend_arg(const char *s, const char *arg) {
+    if (!strcmp(s, "metal")) return Q36_BACKEND_METAL;
     if (!strcmp(s, "vulkan")) return Q36_BACKEND_VULKAN;
     if (!strcmp(s, "cpu")) return Q36_BACKEND_CPU;
     server_log(Q36_LOG_DEFAULT, "q36-server: invalid %s value: %s", arg, s);
-    server_log(Q36_LOG_DEFAULT, "q36-server: valid server backends are: vulkan, cpu");
+    server_log(Q36_LOG_DEFAULT, "q36-server: valid server backends are: metal, vulkan, cpu");
     exit(2);
 }
 
 static q36_backend default_server_backend(void) {
 #ifdef Q36_NO_GPU
     return Q36_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return Q36_BACKEND_METAL;
 #else
     return Q36_BACKEND_VULKAN;
 #endif
@@ -8953,12 +8956,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--vulkan")) {
             c.engine.backend = Q36_BACKEND_VULKAN;
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = Q36_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--cuda")) {
-            server_log(Q36_LOG_DEFAULT, "q36-server: %s is not supported; use --vulkan or --cpu", arg);
+        } else if (!strcmp(arg, "--cuda")) {
+            server_log(Q36_LOG_DEFAULT, "q36-server: %s is not supported; use --metal, --vulkan, or --cpu", arg);
             exit(2);
         } else {
             server_log(Q36_LOG_DEFAULT, "q36-server: unknown option: %s", arg);

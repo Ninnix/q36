@@ -91,15 +91,15 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  -ctk, --cache-type-k TYPE\n"
-        "      KV cache K type: f16, q8_0, or q4_0. Default: Vulkan resident q8_0, otherwise f16\n"
+        "      KV cache K type: f16, q8_0, or q4_0. Default: Vulkan q8_0, Metal/CPU f16\n"
         "  -ctv, --cache-type-v TYPE\n"
-        "      KV cache V type: f16, q8_0, or q4_0. Default: Vulkan resident q4_0, otherwise f16\n"
-        "  --vulkan\n"
-        "      Use the Vulkan graph backend. This is the normal fast path on Linux/BC-250.\n"
+        "      KV cache V type: f16, q8_0, or q4_0. Default: Vulkan q4_0, Metal/CPU f16\n"
+        "  --metal | --vulkan\n"
+        "      Use Metal on Apple Silicon or Vulkan on Linux/BC-250.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: vulkan or cpu.\n"
+        "      Select backend explicitly: metal, vulkan, or cpu.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -182,11 +182,23 @@ static void usage(FILE *fp) {
         "      Run the output HC/logits head after the CPU slice.\n"
         "  --first-token-test\n"
         "      Run an exact CPU whole-model pass for the first prompt token.\n"
+#ifdef Q36_METAL
+        "  --metal-graph-test\n"
+#else
         "  --vulkan-graph-test\n"
+#endif
         "      Compare first GPU-resident graph stages with CPU.\n"
+#ifdef Q36_METAL
+        "  --metal-graph-full-test\n"
+#else
         "  --vulkan-graph-full-test\n"
+#endif
         "      Run the GPU-resident self-token graph across all layers.\n"
+#ifdef Q36_METAL
+        "  --metal-graph-prompt-test\n"
+#else
         "  --vulkan-graph-prompt-test\n"
+#endif
         "      Compare CPU and GPU graph logits for the full prompt.\n"
         "\n"
         "Normal CLI commands:\n"
@@ -245,16 +257,19 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 }
 
 static q36_backend parse_backend(const char *s) {
+    if (!strcmp(s, "metal")) return Q36_BACKEND_METAL;
     if (!strcmp(s, "vulkan")) return Q36_BACKEND_VULKAN;
     if (!strcmp(s, "cpu")) return Q36_BACKEND_CPU;
     fprintf(stderr, "q36: invalid backend: %s\n", s);
-    fprintf(stderr, "q36: valid backends are: vulkan, cpu\n");
+    fprintf(stderr, "q36: valid backends are: metal, vulkan, cpu\n");
     exit(2);
 }
 
 static q36_backend default_backend(void) {
 #ifdef Q36_NO_GPU
     return Q36_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return Q36_BACKEND_METAL;
 #else
     return Q36_BACKEND_VULKAN;
 #endif
@@ -1394,6 +1409,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = Q36_BACKEND_CPU;
         } else if (!strcmp(arg, "--vulkan")) {
             c.engine.backend = Q36_BACKEND_VULKAN;
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1410,21 +1427,41 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.head_test = true;
         } else if (!strcmp(arg, "--first-token-test")) {
             c.gen.first_token_test = true;
-        } else if (!strcmp(arg, "--vulkan-graph-test")) {
+        } else if (!strcmp(arg, "--vulkan-graph-test")
+#ifdef Q36_METAL
+                   || !strcmp(arg, "--metal-graph-test")
+#endif
+        ) {
             c.gen.vulkan_graph_test = true;
             c.engine.backend = Q36_BACKEND_VULKAN;
-        } else if (!strcmp(arg, "--vulkan-graph-full-test")) {
+        } else if (!strcmp(arg, "--vulkan-graph-full-test")
+#ifdef Q36_METAL
+                   || !strcmp(arg, "--metal-graph-full-test")
+#endif
+        ) {
             c.gen.vulkan_graph_full_test = true;
             c.engine.backend = Q36_BACKEND_VULKAN;
-        } else if (!strcmp(arg, "--vulkan-graph-prompt-test")) {
+        } else if (!strcmp(arg, "--vulkan-graph-prompt-test")
+#ifdef Q36_METAL
+                   || !strcmp(arg, "--metal-graph-prompt-test")
+#endif
+        ) {
             c.gen.vulkan_graph_prompt_test = true;
             c.engine.backend = Q36_BACKEND_VULKAN;
-        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--cuda")) {
+        } else if (
+                   !strcmp(arg, "--cuda")) {
+#ifdef Q36_METAL
+            fprintf(stderr, "q36: %s is not supported; use --metal or --cpu\n", arg);
+#else
             fprintf(stderr, "q36: %s is not supported; use --vulkan or --cpu\n", arg);
+#endif
             exit(2);
-        } else if (!strcmp(arg, "--metal-graph-test") ||
+        } else if (
+#ifndef Q36_METAL
+                   !strcmp(arg, "--metal-graph-test") ||
                    !strcmp(arg, "--metal-graph-full-test") ||
                    !strcmp(arg, "--metal-graph-prompt-test") ||
+#endif
                    !strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "q36: Metal graph flags were renamed to Vulkan graph flags\n");
             exit(2);

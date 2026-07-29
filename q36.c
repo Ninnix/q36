@@ -943,21 +943,21 @@ static void q36_parallel_for_rows(uint64_t n_rows,
 }
 
 static bool q36_backend_uses_graph(q36_backend backend) {
-    return backend == Q36_BACKEND_VULKAN;
+    return backend == Q36_BACKEND_VULKAN || backend == Q36_BACKEND_METAL;
 }
 
 static bool q36_backend_supports_ssd_streaming(q36_backend backend) {
-    return backend == Q36_BACKEND_VULKAN;
+    return q36_backend_uses_graph(backend);
 }
 
 #ifndef Q36_NO_GPU
 static bool q36_backend_supports_streaming_auto_cache(q36_backend backend) {
-    return backend == Q36_BACKEND_VULKAN;
+    return q36_backend_uses_graph(backend);
 }
 #endif
 
 static bool q36_engine_uses_vulkan_runtime(const q36_engine *e) {
-    return e && e->backend == Q36_BACKEND_VULKAN;
+    return e && q36_backend_uses_graph(e->backend);
 }
 
 static void q36_die(const char *msg) {
@@ -1063,6 +1063,7 @@ void q36_log(FILE *fp, q36_log_type type, const char *fmt, ...) {
 const char *q36_backend_name(q36_backend backend) {
     switch (backend) {
     case Q36_BACKEND_VULKAN: return "vulkan";
+    case Q36_BACKEND_METAL: return "metal";
     case Q36_BACKEND_CPU: return "cpu";
     default: return "unknown";
     }
@@ -1136,14 +1137,14 @@ q36_context_memory q36_context_memory_estimate_configured(
 #endif
     if (ctx_size <= 0) return m;
 #ifndef Q36_NO_GPU
-    m.prefill_cap = backend == Q36_BACKEND_VULKAN ? vk_prefill_cap : cpu_prefill_cap;
+    m.prefill_cap = q36_backend_uses_graph(backend) ? vk_prefill_cap : cpu_prefill_cap;
 #else
     m.prefill_cap = cpu_prefill_cap;
 #endif
     if (prefill_chunk != 0) m.prefill_cap = prefill_chunk;
-    m.raw_cap = backend == Q36_BACKEND_VULKAN ? (uint32_t)ctx_size : 0;
+    m.raw_cap = q36_backend_uses_graph(backend) ? (uint32_t)ctx_size : 0;
     m.comp_cap = 0;
-    if (backend == Q36_BACKEND_VULKAN) {
+    if (q36_backend_uses_graph(backend)) {
         uint64_t full_layers = Q36_N_LAYER / Q36_FULL_ATTENTION_INTERVAL;
         uint64_t recurrent_layers = Q36_N_LAYER - full_layers;
         uint64_t k_row = q36_kv_cache_row_bytes(cache_type_k,
@@ -7824,7 +7825,7 @@ static bool q36_load_directional_steering(q36_engine *e) {
         return false;
     }
 #ifndef Q36_NO_GPU
-    if (e->backend == Q36_BACKEND_VULKAN) {
+    if (q36_backend_uses_graph(e->backend)) {
         e->directional_steering_gpu = q36_gpu_tensor_alloc(bytes);
         if (!e->directional_steering_gpu ||
             !q36_gpu_tensor_write(e->directional_steering_gpu, 0,
@@ -7847,19 +7848,43 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     q36_engine *e;
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) return 1;
 #ifdef Q36_NO_GPU
-    if (opt->backend == Q36_BACKEND_VULKAN) return 1;
+    if (q36_backend_uses_graph(opt->backend)) return 1;
 #else
-    if (opt->backend == Q36_BACKEND_VULKAN && !q36_gpu_init()) return 1;
+#if defined(Q36_METAL) && !defined(Q36_METAL_TEST_COMPAT)
+    if (opt->backend == Q36_BACKEND_VULKAN) {
+        fprintf(stderr, "q36: Vulkan was requested from a Metal binary; use --metal or rebuild with 'make gpu'\n");
+        return 1;
+    }
+#elif !defined(Q36_METAL)
+    if (opt->backend == Q36_BACKEND_METAL) {
+        fprintf(stderr, "q36: Metal was requested from a Vulkan binary; use --vulkan or build with 'make metal'\n");
+        return 1;
+    }
+#endif
+    if (q36_backend_uses_graph(opt->backend) && !q36_gpu_init()) return 1;
 #endif
     e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+#if defined(Q36_METAL) && defined(Q36_METAL_TEST_COMPAT)
+    /* The GPU ABI is shared by both native runtimes.  Normalize legacy
+     * Vulkan-named test callers to the backend linked into this binary. */
+    e->backend = q36_backend_uses_graph(opt->backend)
+        ? Q36_BACKEND_METAL : opt->backend;
+#else
     e->backend = opt->backend;
+#endif
     e->n_threads = q36_resolve_thread_count(opt->n_threads);
     e->cpu_prefill_cap = opt->prefill_chunk ? opt->prefill_chunk : q36_default_cpu_prefill_cap();
     e->prefill_cap_override = opt->prefill_chunk;
     e->cache_type_k = opt->cache_type_k;
     e->cache_type_v = opt->cache_type_v;
+#if defined(Q36_METAL) && defined(Q36_METAL_TEST_COMPAT)
+    if (opt->backend == Q36_BACKEND_VULKAN && !opt->ssd_streaming) {
+        e->cache_type_k = Q36_KV_CACHE_F16;
+        e->cache_type_v = Q36_KV_CACHE_F16;
+    }
+#endif
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
@@ -7930,8 +7955,8 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     model_get_f32_compat(&e->model, "qwen35moe.expert_weights_scale", &e->expert_weights_scale);
     e->mtp_expert_weights_scale = e->expert_weights_scale;
     if (opt->mtp_path && opt->mtp_path[0]) {
-        if (opt->backend != Q36_BACKEND_VULKAN) {
-            fprintf(stderr, "q36: --mtp is currently supported only with --vulkan\n");
+        if (!q36_backend_uses_graph(opt->backend)) {
+            fprintf(stderr, "q36: --mtp requires a GPU graph backend\n");
             q36_engine_close(e);
             return 1;
         }
@@ -7950,7 +7975,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
 #endif
     }
 #ifndef Q36_NO_GPU
-    if (opt->backend == Q36_BACKEND_VULKAN) {
+    if (q36_backend_uses_graph(opt->backend)) {
         q36_gpu_set_quality(opt->quality);
         q36_gpu_set_ssd_streaming(e->ssd_streaming);
         if (!q36_engine_configure_streaming_auto_cache(e)) {
@@ -8050,7 +8075,7 @@ void q36_engine_close(q36_engine *e) {
 #ifndef Q36_NO_GPU
     q36_gpu_tensor_free(e->directional_steering_gpu);
     q36_gpu_tensor_free(e->session_batch_logits);
-    if (e->backend == Q36_BACKEND_VULKAN) q36_gpu_cleanup();
+    if (q36_backend_uses_graph(e->backend)) q36_gpu_cleanup();
 #endif
     free(e->directional_steering_dirs);
     vocab_free(&e->vocab);
@@ -8641,7 +8666,7 @@ static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
     const char *enabled = getenv("Q36_VK_SESSION_BATCH");
     if ((enabled && enabled[0] && !strcmp(enabled, "0")) ||
         !items || count < 2 || count > 8 || !e ||
-        e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming) {
+        !q36_backend_uses_graph(e->backend) || e->ssd_streaming) {
         return false;
     }
     for (int i = 0; i < count; i++) {
@@ -9000,7 +9025,7 @@ int q36_engine_routed_quant_bits(q36_engine *e) {
 }
 
 bool q36_engine_has_mtp(q36_engine *e) {
-    return e && e->backend == Q36_BACKEND_VULKAN && e->mtp_ready;
+    return e && q36_backend_uses_graph(e->backend) && e->mtp_ready;
 }
 
 int q36_engine_mtp_draft_tokens(q36_engine *e) {

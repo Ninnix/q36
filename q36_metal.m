@@ -1,0 +1,2182 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include "q36_gpu.h"
+#define Q36_QUANT_LINKAGE __attribute__((weak_import))
+#include "q36_quant.h"
+
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+
+/*
+ * Metal backend foundation.
+ *
+ * Apple Silicon buffers use shared storage: CPU reference probes and Metal
+ * kernels see the same allocation without staging copies.  Views retain their
+ * owner buffer and only adjust the byte range, matching q36_gpu.h's lifetime
+ * contract.  Operator kernels are added below this layer as they reach parity;
+ * keeping resource and command ownership here prevents each ported Vulkan op
+ * from inventing its own synchronization policy.
+ */
+
+struct q36_gpu_tensor {
+    id<MTLBuffer> buffer;
+    uint64_t offset;
+    uint64_t bytes;
+    bool owner;
+};
+
+static id<MTLDevice> q36_device;
+static id<MTLCommandQueue> q36_queue;
+static id<MTLLibrary> q36_library;
+static id<MTLCommandBuffer> q36_batch;
+static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *q36_pipelines;
+static NSMutableDictionary<NSString *, NSArray *> *q36_model_views;
+static pthread_mutex_t q36_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t q36_live_bytes;
+static uint64_t q36_peak_bytes;
+static const void *q36_model_map;
+static uint64_t q36_model_size;
+static int q36_model_fd = -1;
+static bool q36_quality;
+static bool q36_micro_batch;
+static bool q36_ssd_streaming;
+static uint32_t q36_streaming_full_layers;
+static uint32_t q36_streaming_expert_budget;
+static uint64_t q36_streaming_expert_bytes;
+static id<MTLBuffer> q36_moe_gate_scratch;
+static id<MTLBuffer> q36_moe_up_scratch;
+static id<MTLBuffer> q36_moe_mid_scratch;
+static id<MTLBuffer> q36_moe_down_scratch;
+static NSUInteger q36_moe_pair_scratch_bytes;
+static NSUInteger q36_moe_down_scratch_bytes;
+static id<MTLBuffer> q36_shared_gate_scratch;
+static id<MTLBuffer> q36_shared_up_scratch;
+static id<MTLBuffer> q36_shared_down_scratch;
+static NSUInteger q36_shared_mid_scratch_bytes;
+static NSUInteger q36_shared_down_scratch_bytes;
+
+static int q36_metal_wait(void) {
+    id<MTLCommandBuffer> cb = nil;
+    pthread_mutex_lock(&q36_mu);
+    cb = q36_batch;
+    q36_batch = nil;
+    pthread_mutex_unlock(&q36_mu);
+    if (!cb) return 1;
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "q36: Metal command buffer failed: %s\n",
+                cb.error.localizedDescription.UTF8String);
+        return 0;
+    }
+    return 1;
+}
+
+static NSString *q36_metal_source(void) {
+    NSArray<NSString *> *paths = @[
+        @"metal/q36_common.metal", @"metal/flash_attn.metal",
+        @"metal/dense.metal", @"metal/moe.metal", @"metal/dsv4_hc.metal",
+        @"metal/unary.metal", @"metal/dsv4_kv.metal", @"metal/dsv4_rope.metal",
+        @"metal/dsv4_misc.metal", @"metal/argsort.metal", @"metal/cpy.metal",
+        @"metal/concat.metal", @"metal/get_rows.metal", @"metal/sum_rows.metal",
+        @"metal/softmax.metal", @"metal/repeat.metal", @"metal/glu.metal",
+        @"metal/norm.metal", @"metal/bin.metal", @"metal/set_rows.metal",
+        @"metal/q36_ops.metal"
+    ];
+    NSMutableString *source = [NSMutableString string];
+    for (NSString *path in paths) {
+        NSError *error = nil;
+        NSString *part = [NSString stringWithContentsOfFile:path
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:&error];
+        if (!part) {
+            fprintf(stderr, "q36: cannot read Metal source %s: %s\n",
+                    path.UTF8String, error.localizedDescription.UTF8String);
+            return nil;
+        }
+        [source appendString:part];
+        [source appendString:@"\n"];
+    }
+    return source;
+}
+
+static id<MTLComputePipelineState> q36_pipeline(NSString *name) {
+    id<MTLComputePipelineState> p = q36_pipelines[name];
+    if (p) return p;
+    id<MTLFunction> fn = [q36_library newFunctionWithName:name];
+    if (!fn) {
+        fprintf(stderr, "q36: Metal function %s is missing\n", name.UTF8String);
+        return nil;
+    }
+    NSError *error = nil;
+    p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "q36: Metal pipeline %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    q36_pipelines[name] = p;
+    return p;
+}
+
+static id<MTLComputePipelineState> q36_pipeline_nsg(NSString *name, int16_t nsg) {
+    NSString *key = [NSString stringWithFormat:@"%@#%d", name, (int)nsg];
+    id<MTLComputePipelineState> p = q36_pipelines[key];
+    if (p) return p;
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    NSError *error = nil;
+    id<MTLFunction> fn = [q36_library newFunctionWithName:name
+                                          constantValues:constants error:&error];
+    if (!fn) {
+        fprintf(stderr, "q36: Metal function %s specialization failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "q36: Metal pipeline %s specialization failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    q36_pipelines[key] = p;
+    return p;
+}
+
+static id<MTLComputePipelineState> q36_pipeline_mm(
+        NSString *name, bool bc_inp, bool bc_out) {
+    NSString *key = [NSString stringWithFormat:@"%@#mm%d%d",
+                     name, bc_inp ? 1 : 0, bc_out ? 1 : 0];
+    id<MTLComputePipelineState> p = q36_pipelines[key];
+    if (p) return p;
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
+    [constants setConstantValue:&bc_out type:MTLDataTypeBool atIndex:701];
+    NSError *error = nil;
+    id<MTLFunction> fn = [q36_library newFunctionWithName:name
+                                          constantValues:constants error:&error];
+    if (!fn) {
+        fprintf(stderr, "q36: Metal MM function %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "q36: Metal MM pipeline %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    q36_pipelines[key] = p;
+    return p;
+}
+
+static id<MTLComputeCommandEncoder> q36_encoder(NSString *kernel) {
+    if (!q36_batch && !q36_gpu_begin_commands()) return nil;
+    id<MTLComputePipelineState> p = q36_pipeline(kernel);
+    if (!p) return nil;
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    return enc;
+}
+
+static id<MTLBuffer> q36_model_view(const void *map, uint64_t model_size,
+                                    uint64_t offset, uint64_t bytes,
+                                    uint64_t *inner) {
+    if (!map || !q36_device || offset > model_size ||
+        bytes > model_size - offset) return nil;
+    uint64_t page = (uint64_t)getpagesize();
+    uint64_t page_offset = offset & ~(page - 1u);
+    uint64_t leading = offset - page_offset;
+    if (bytes > UINT64_MAX - leading ||
+        leading + bytes > UINT64_MAX - (page - 1u)) return nil;
+    uint64_t view_bytes = (leading + bytes + page - 1u) & ~(page - 1u);
+    if (view_bytes > model_size - page_offset)
+        view_bytes = model_size - page_offset;
+    if (leading + bytes > view_bytes ||
+        view_bytes > (uint64_t)q36_device.maxBufferLength) return nil;
+    NSString *key = [NSString stringWithFormat:@"%016" PRIx64 ":%016" PRIx64,
+                                               offset, bytes];
+    if (map == q36_model_map && model_size == q36_model_size) {
+        NSArray *cached = q36_model_views[key];
+        if (cached) {
+            if (inner) *inner = [cached[1] unsignedLongLongValue];
+            return cached[0];
+        }
+    }
+    id<MTLBuffer> buffer =
+        [q36_device newBufferWithBytesNoCopy:(void *)((uintptr_t)map + page_offset)
+                                     length:(NSUInteger)view_bytes
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+    if (!buffer) return nil;
+    if (inner) *inner = leading;
+    if (map == q36_model_map && model_size == q36_model_size)
+        q36_model_views[key] = @[buffer, @(leading)];
+    return buffer;
+}
+
+typedef struct {
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t tokens;
+    float scale;
+} q36_dense_args;
+
+typedef struct {
+    int32_t ne00, ne01, ne02;
+    uint64_t nb00, nb01, nb02, nb03;
+    int32_t ne10, ne11, ne12;
+    uint64_t nb10, nb11, nb12, nb13;
+    int32_t ne0, ne1, nr0;
+    int16_t r2, r3;
+} q36_q8_mv_args;
+
+typedef struct {
+    int32_t ne00, ne02;
+    uint64_t nb01, nb02, nb03;
+    int32_t ne12;
+    uint64_t nb10, nb11, nb12, nb13;
+    int32_t ne0, ne1;
+    int16_t r2, r3;
+} q36_q8_mm_args;
+
+static int q36_q8_prefill_mm(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (!out || !x || !map || tokens < 2u || !in_dim || !out_dim ||
+        (in_dim & 31u) || in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        tokens > INT32_MAX) return 0;
+    uint64_t row_bytes = (in_dim / 32u) * 34u;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weights =
+        q36_model_view(map, size, offset, out_dim * row_bytes, &inner);
+    bool bc_inp = (in_dim % 32u) != 0;
+    bool bc_out = (out_dim % 64u) != 0 || (tokens % 32u) != 0;
+    id<MTLComputePipelineState> p =
+        q36_pipeline_mm(@"kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
+    if (!weights || !p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    q36_q8_mm_args args = {
+        (int32_t)in_dim, 1, row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, 1, sizeof(float), in_dim * sizeof(float),
+        in_dim * tokens * sizeof(float), in_dim * tokens * sizeof(float),
+        (int32_t)out_dim, (int32_t)tokens, 1, 1
+    };
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+    [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((tokens + 31u) / 32u,
+                                          (out_dim + 63u) / 64u, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    if (scale != 1.0f) {
+        uint64_t count64 = tokens * out_dim;
+        if (count64 > UINT32_MAX) return 0;
+        uint32_t count = (uint32_t)count64;
+        enc = q36_encoder(@"q36_scale_f32");
+        if (!enc) return 0;
+        [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+        [enc setBytes:&count length:sizeof(count) atIndex:1];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    return 1;
+}
+
+static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
+                         uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                         const q36_gpu_tensor *x, float scale) {
+    if (!out || !map || !x || !in_dim || !out_dim || (in_dim & 31u) ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX) return 0;
+    uint64_t row_bytes = (in_dim / 32u) * 34u;
+    if (out_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weights =
+        q36_model_view(map, size, offset, out_dim * row_bytes, &inner);
+    int16_t nsg = out_dim > 65536u ? 8 : 4;
+    id<MTLComputePipelineState> p =
+        q36_pipeline_nsg(@"kernel_mul_mv_q8_0_f32", nsg);
+    if (!weights || !p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    q36_q8_mv_args args = {
+        (int32_t)in_dim, (int32_t)out_dim, 1,
+        34u, row_bytes, row_bytes * out_dim, row_bytes * out_dim,
+        (int32_t)in_dim, 1, 1,
+        sizeof(float), in_dim * sizeof(float), in_dim * sizeof(float),
+        in_dim * sizeof(float), (int32_t)out_dim, 1, 2, 1, 1
+    };
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+    [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+    [enc endEncoding];
+    if (scale != 1.0f) {
+        uint32_t n = (uint32_t)out_dim;
+        enc = q36_encoder(@"q36_scale_f32");
+        if (!enc) return 0;
+        [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    return 1;
+}
+
+static int q36_dense(NSString *kernel, q36_gpu_tensor *out,
+                      const void *map, uint64_t model_size,
+                      uint64_t weight_offset, uint64_t weight_bytes,
+                      uint64_t in_dim, uint64_t out_dim,
+                      const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (!out || !x || !map || !in_dim || !out_dim || !tokens ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || tokens > UINT32_MAX ||
+        in_dim > UINT64_MAX / tokens / sizeof(float) ||
+        out_dim > UINT64_MAX / tokens / sizeof(float) ||
+        x->bytes < in_dim * tokens * sizeof(float) ||
+        out->bytes < out_dim * tokens * sizeof(float)) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weights =
+        q36_model_view(map, model_size, weight_offset, weight_bytes, &inner);
+    if (!weights) {
+        fprintf(stderr, "q36: Metal cannot wrap model projection at %.3f GiB\n",
+                (double)weight_offset / (1024.0 * 1024.0 * 1024.0));
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> enc = q36_encoder(kernel);
+    if (!enc) return 0;
+    q36_dense_args args = {
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)tokens, scale
+    };
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBytes:&args length:sizeof(args) atIndex:3];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)tokens, 1)
+   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+static void q36_dispatch_1d(id<MTLComputeCommandEncoder> enc, uint64_t n) {
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+}
+
+int q36_gpu_init(void) {
+    @autoreleasepool {
+        if (q36_device) return 1;
+        q36_device = MTLCreateSystemDefaultDevice();
+        if (!q36_device) {
+            fprintf(stderr, "q36: no Metal device is available\n");
+            return 0;
+        }
+        q36_queue = [q36_device newCommandQueue];
+        if (!q36_queue) {
+            q36_device = nil;
+            fprintf(stderr, "q36: failed to create Metal command queue\n");
+            return 0;
+        }
+        NSError *error = nil;
+        MTLCompileOptions *options = [MTLCompileOptions new];
+        if (@available(macOS 15.0, *)) {
+            options.mathMode = MTLMathModeFast;
+        } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            options.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+        }
+        q36_library = [q36_device newLibraryWithSource:q36_metal_source()
+                                               options:options error:&error];
+        if (!q36_library) {
+            fprintf(stderr, "q36: Metal library compilation failed: %s\n",
+                    error.localizedDescription.UTF8String);
+            q36_queue = nil;
+            q36_device = nil;
+            return 0;
+        }
+        q36_pipelines = [NSMutableDictionary dictionary];
+        q36_model_views = [NSMutableDictionary dictionary];
+        fprintf(stderr, "q36: Metal device: %s (unified memory: %s)\n",
+                q36_device.name.UTF8String,
+                q36_device.hasUnifiedMemory ? "yes" : "no");
+        return 1;
+    }
+}
+
+void q36_gpu_cleanup(void) {
+    @autoreleasepool {
+        (void)q36_metal_wait();
+        if (q36_live_bytes) {
+            fprintf(stderr, "q36: Metal cleanup with %.2f MiB of live tensors\n",
+                    (double)q36_live_bytes / (1024.0 * 1024.0));
+        }
+        q36_model_map = NULL;
+        q36_model_size = 0;
+        q36_model_fd = -1;
+        q36_queue = nil;
+        q36_moe_gate_scratch = nil;
+        q36_moe_up_scratch = nil;
+        q36_moe_mid_scratch = nil;
+        q36_moe_down_scratch = nil;
+        q36_moe_pair_scratch_bytes = 0;
+        q36_moe_down_scratch_bytes = 0;
+        q36_shared_gate_scratch = nil;
+        q36_shared_up_scratch = nil;
+        q36_shared_down_scratch = nil;
+        q36_shared_mid_scratch_bytes = 0;
+        q36_shared_down_scratch_bytes = 0;
+        q36_pipelines = nil;
+        q36_model_views = nil;
+        q36_library = nil;
+        q36_device = nil;
+    }
+}
+
+q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
+    if (!bytes || bytes > (uint64_t)NSUIntegerMax) return NULL;
+    if (!q36_device && !q36_gpu_init()) return NULL;
+    q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
+    if (!tensor) return NULL;
+    tensor->buffer = [q36_device newBufferWithLength:(NSUInteger)bytes
+                                             options:MTLResourceStorageModeShared];
+    if (!tensor->buffer) {
+        free(tensor);
+        return NULL;
+    }
+    tensor->bytes = bytes;
+    tensor->owner = true;
+    pthread_mutex_lock(&q36_mu);
+    q36_live_bytes += bytes;
+    if (q36_live_bytes > q36_peak_bytes) q36_peak_bytes = q36_live_bytes;
+    pthread_mutex_unlock(&q36_mu);
+    return tensor;
+}
+
+q36_gpu_tensor *q36_gpu_tensor_view(const q36_gpu_tensor *base,
+                                    uint64_t offset, uint64_t bytes) {
+    if (!base || offset > base->bytes || bytes > base->bytes - offset) return NULL;
+    q36_gpu_tensor *view = calloc(1, sizeof(*view));
+    if (!view) return NULL;
+    view->buffer = base->buffer;
+    view->offset = base->offset + offset;
+    view->bytes = bytes;
+    view->owner = false;
+    return view;
+}
+
+void q36_gpu_tensor_free(q36_gpu_tensor *tensor) {
+    if (!tensor) return;
+    if (tensor->owner) {
+        pthread_mutex_lock(&q36_mu);
+        q36_live_bytes -= tensor->bytes;
+        pthread_mutex_unlock(&q36_mu);
+    }
+    tensor->buffer = nil;
+    free(tensor);
+}
+
+uint64_t q36_gpu_tensor_bytes(const q36_gpu_tensor *tensor) {
+    return tensor ? tensor->bytes : 0;
+}
+
+void *q36_gpu_tensor_contents(q36_gpu_tensor *tensor) {
+    if (!tensor || !q36_metal_wait()) return NULL;
+    return (uint8_t *)tensor->buffer.contents + tensor->offset;
+}
+
+void *q36_gpu_tensor_contents_named(q36_gpu_tensor *tensor, const char *reason) {
+    (void)reason;
+    return q36_gpu_tensor_contents(tensor);
+}
+
+int q36_gpu_tensor_write(q36_gpu_tensor *tensor, uint64_t offset,
+                         const void *data, uint64_t bytes) {
+    if (!tensor || (!data && bytes) ||
+        offset > tensor->bytes || bytes > tensor->bytes - offset ||
+        !q36_metal_wait()) return 0;
+    if (bytes) memcpy((uint8_t *)tensor->buffer.contents + tensor->offset + offset,
+                      data, (size_t)bytes);
+    return 1;
+}
+
+int q36_gpu_tensor_read(const q36_gpu_tensor *tensor, uint64_t offset,
+                        void *data, uint64_t bytes) {
+    if (!tensor || (!data && bytes) ||
+        offset > tensor->bytes || bytes > tensor->bytes - offset ||
+        !q36_metal_wait()) return 0;
+    if (bytes) memcpy(data,
+                      (const uint8_t *)tensor->buffer.contents + tensor->offset + offset,
+                      (size_t)bytes);
+    return 1;
+}
+
+int q36_gpu_tensor_copy(q36_gpu_tensor *dst, uint64_t dst_offset,
+                        const q36_gpu_tensor *src, uint64_t src_offset,
+                        uint64_t bytes) {
+    if (!dst || !src || dst_offset > dst->bytes ||
+        bytes > dst->bytes - dst_offset || src_offset > src->bytes ||
+        bytes > src->bytes - src_offset) return 0;
+    if (!bytes) return 1;
+    if (!q36_batch && !q36_gpu_begin_commands()) return 0;
+    id<MTLBlitCommandEncoder> blit = [q36_batch blitCommandEncoder];
+    if (!blit) return 0;
+    [blit copyFromBuffer:src->buffer sourceOffset:(NSUInteger)(src->offset + src_offset)
+                toBuffer:dst->buffer destinationOffset:(NSUInteger)(dst->offset + dst_offset)
+                    size:(NSUInteger)bytes];
+    [blit endEncoding];
+    return 1;
+}
+
+int q36_gpu_begin_commands(void) {
+    if (!q36_device && !q36_gpu_init()) return 0;
+    pthread_mutex_lock(&q36_mu);
+    if (!q36_batch) q36_batch = [q36_queue commandBuffer];
+    int ok = q36_batch != nil;
+    pthread_mutex_unlock(&q36_mu);
+    return ok;
+}
+
+int q36_gpu_flush_commands(void) { return q36_metal_wait(); }
+int q36_gpu_end_commands(void) { return q36_metal_wait(); }
+int q36_gpu_synchronize(void) { return q36_metal_wait(); }
+
+int q36_gpu_set_model_map(const void *map, uint64_t size) {
+    if (!map || !size) return 0;
+    if (map != q36_model_map || size != q36_model_size)
+        [q36_model_views removeAllObjects];
+    q36_model_map = map;
+    q36_model_size = size;
+    return 1;
+}
+
+int q36_gpu_set_model_fd(int fd) {
+    q36_model_fd = fd;
+    return fd >= 0;
+}
+
+int q36_gpu_cache_model_range(const void *map, uint64_t size,
+                              uint64_t offset, uint64_t bytes,
+                              const char *label) {
+    (void)label;
+    if (!map || offset > size || bytes > size - offset) return 0;
+    /*
+     * Metal's no-copy mmap wrappers are created lazily by projection kernels.
+     * Touching/copying here would double the model's unified-memory footprint.
+     */
+    return 1;
+}
+
+int q36_gpu_cache_q8_f16_range(const void *map, uint64_t size,
+                               uint64_t offset, uint64_t bytes,
+                               uint64_t in_dim, uint64_t out_dim,
+                               const char *label) {
+    (void)in_dim; (void)out_dim;
+    return q36_gpu_cache_model_range(map, size, offset, bytes, label);
+}
+
+void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
+void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
+bool q36_gpu_attn_fused_enabled(void) { return false; }
+void q36_gpu_set_ssd_streaming(bool enabled) { q36_ssd_streaming = enabled; }
+void q36_gpu_set_streaming_full_layers(uint32_t layers) {
+    q36_streaming_full_layers = layers;
+}
+void q36_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
+    q36_streaming_expert_budget = experts;
+}
+void q36_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    q36_streaming_expert_bytes = bytes;
+}
+uint32_t q36_gpu_stream_expert_cache_configured_count(void) {
+    return q36_streaming_expert_budget;
+}
+uint32_t q36_gpu_stream_expert_cache_current_count(void) {
+    /*
+     * A no-copy Metal buffer wraps the file mapping itself.  Unlike the
+     * discrete Vulkan path there is no second device-local expert cache:
+     * macOS VM is the cache and faults routed pages into unified memory.
+     */
+    return q36_ssd_streaming ? q36_streaming_expert_budget : 0u;
+}
+void q36_gpu_stream_expert_cache_reset_route_hotness(void) {}
+void q36_gpu_stream_expert_cache_note_tokens(uint32_t tokens) { (void)tokens; }
+void q36_gpu_stream_expert_cache_release_resident(void) {}
+uint32_t q36_gpu_stream_expert_cache_budget_for_expert_size(
+        uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    uint64_t total = gate_bytes + up_bytes + down_bytes;
+    if (!total) return 0;
+    if (q36_streaming_expert_budget) return q36_streaming_expert_budget;
+    uint64_t working = q36_gpu_recommended_working_set_size();
+    uint64_t reserve = q36_model_size < working ? working - q36_model_size : 0;
+    uint64_t count = reserve / total;
+    return count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
+}
+
+int q36_gpu_stream_expert_cache_seed_selected(
+        const q36_gpu_stream_expert_table *table, const int32_t *ids,
+        uint32_t count) {
+    (void)table; (void)ids; (void)count;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_begin_selected_load(
+        const q36_gpu_stream_expert_table *table, const int32_t *ids,
+        uint32_t count) {
+    (void)table; (void)ids; (void)count;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_prepare_selected_batch(
+        const q36_gpu_stream_expert_table *table, const int32_t *ids,
+        uint32_t tokens, uint32_t selected) {
+    (void)table; (void)ids; (void)tokens; (void)selected;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_load_layer(
+        const q36_gpu_stream_expert_table *table) {
+    (void)table;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_seed_from_layer_selected(
+        const q36_gpu_stream_expert_table *table,
+        const q36_gpu_tensor *selected, uint32_t tokens,
+        uint32_t seed_tokens, uint32_t n_selected) {
+    (void)table; (void)selected; (void)tokens; (void)seed_tokens;
+    (void)n_selected;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_release_layer_cache(void) { return 1; }
+int q36_gpu_stream_expert_cache_seed_experts(
+        const q36_gpu_stream_expert_table *table, const int32_t *ids,
+        const uint32_t *priorities, uint32_t count) {
+    (void)table; (void)ids; (void)priorities; (void)count;
+    return 1;
+}
+int q36_gpu_stream_expert_cache_bias_experts(
+        const q36_gpu_stream_expert_table *table, const int32_t *ids,
+        const uint32_t *priorities, uint32_t count) {
+    (void)table; (void)ids; (void)priorities; (void)count;
+    return 1;
+}
+
+void q36_gpu_prof_reset(void) {}
+void q36_gpu_prof_report(const char *label) {
+    (void)label;
+    /* Metal counter sampling is wired when per-kernel dispatch is complete. */
+}
+
+int q36_gpu_set_model_map_range(const void *map, uint64_t size,
+                                uint64_t offset, uint64_t bytes) {
+    if (!map || offset > size || bytes > size - offset) return 0;
+    return q36_gpu_set_model_map(map, size);
+}
+
+int q36_gpu_set_model_map_spans(const void *map, uint64_t size,
+                                const uint64_t *offsets, const uint64_t *sizes,
+                                uint32_t count, uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (!map || (!offsets && count) || (!sizes && count)) return 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (offsets[i] > size || sizes[i] > size - offsets[i]) return 0;
+    return q36_gpu_set_model_map(map, size);
+}
+
+void q36_gpu_parallel_for_rows(uint64_t rows, uint64_t grain,
+                               q36_gpu_parallel_fn fn, void *ctx) {
+    (void)grain;
+    if (fn && rows) fn(ctx, 0, rows);
+}
+
+uint64_t q36_gpu_recommended_working_set_size(void) {
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return 0;
+    return bytes * 4u / 5u;
+}
+
+void q36_gpu_print_memory_report(const char *label) {
+    fprintf(stderr, "q36: Metal memory%s%s: live %.2f MiB, peak %.2f MiB\n",
+            label ? " " : "", label ? label : "",
+            (double)q36_live_bytes / (1024.0 * 1024.0),
+            (double)q36_peak_bytes / (1024.0 * 1024.0));
+}
+
+int q36_gpu_add_tensor(q36_gpu_tensor *out, const q36_gpu_tensor *a,
+                       const q36_gpu_tensor *b, uint32_t n) {
+    if (!out || !a || !b || out->bytes < (uint64_t)n * 4 ||
+        a->bytes < (uint64_t)n * 4 || b->bytes < (uint64_t)n * 4) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_add_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:a->buffer offset:a->offset atIndex:1];
+    [enc setBuffer:b->buffer offset:b->offset atIndex:2];
+    [enc setBytes:&n length:sizeof(n) atIndex:3];
+    q36_dispatch_1d(enc, n);
+    return 1;
+}
+
+int q36_gpu_copy_f32_tensor(q36_gpu_tensor *out, const q36_gpu_tensor *in,
+                            uint32_t n) {
+    if (!out || !in || out->bytes < (uint64_t)n * 4 ||
+        in->bytes < (uint64_t)n * 4) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_copy_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:in->buffer offset:in->offset atIndex:1];
+    [enc setBytes:&n length:sizeof(n) atIndex:2];
+    q36_dispatch_1d(enc, n);
+    return 1;
+}
+
+int q36_gpu_swiglu_tensor(q36_gpu_tensor *out, const q36_gpu_tensor *gate,
+                          const q36_gpu_tensor *up, uint32_t n,
+                          float limit, float weight) {
+    if (!out || !gate || !up || out->bytes < (uint64_t)n * 4 ||
+        gate->bytes < (uint64_t)n * 4 || up->bytes < (uint64_t)n * 4) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_swiglu_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:gate->buffer offset:gate->offset atIndex:1];
+    [enc setBuffer:up->buffer offset:up->offset atIndex:2];
+    [enc setBytes:&n length:sizeof(n) atIndex:3];
+    [enc setBytes:&limit length:sizeof(limit) atIndex:4];
+    [enc setBytes:&weight length:sizeof(weight) atIndex:5];
+    q36_dispatch_1d(enc, n);
+    return 1;
+}
+
+int q36_gpu_ffn_tail_tensor(q36_gpu_tensor *out,
+                            const q36_gpu_tensor *shared,
+                            const q36_gpu_tensor *scalar,
+                            uint32_t width, uint32_t rows) {
+    if (!out || !shared || !scalar) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_ffn_tail_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:shared->buffer offset:shared->offset atIndex:1];
+    [enc setBuffer:scalar->buffer offset:scalar->offset atIndex:2];
+    [enc setBytes:&width length:sizeof(width) atIndex:3];
+    [enc dispatchThreads:MTLSizeMake(width, rows, 1)
+   threadsPerThreadgroup:MTLSizeMake(MIN(width, 256u), 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+static int q36_norm(q36_gpu_tensor *out, const q36_gpu_tensor *in,
+                     const void *weight, uint32_t width, uint32_t rows,
+                     float eps) {
+    if (!out || !in || (uint64_t)width * rows * 4 > out->bytes ||
+        (uint64_t)width * rows * 4 > in->bytes) return 0;
+    id<MTLBuffer> wbuf = nil;
+    uint32_t has_weight = weight != NULL;
+    if (weight) {
+        wbuf = [q36_device newBufferWithBytes:weight
+                                       length:(NSUInteger)width * 4
+                                      options:MTLResourceStorageModeShared];
+        if (!wbuf) return 0;
+    } else {
+        wbuf = in->buffer;
+    }
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_rms_norm_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:in->buffer offset:in->offset atIndex:1];
+    [enc setBuffer:wbuf offset:weight ? 0 : in->offset atIndex:2];
+    [enc setBytes:&width length:sizeof(width) atIndex:3];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:4];
+    [enc setBytes:&has_weight length:sizeof(has_weight) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_rms_norm_plain_rows_tensor(q36_gpu_tensor *out,
+                                        const q36_gpu_tensor *in,
+                                        uint32_t width, uint32_t rows,
+                                        float eps) {
+    return q36_norm(out, in, NULL, width, rows, eps);
+}
+
+int q36_gpu_rms_norm_weight_rows_tensor(q36_gpu_tensor *out,
+                                         const q36_gpu_tensor *in,
+                                         const void *map, uint64_t size,
+                                         uint64_t offset, uint32_t width,
+                                         uint32_t rows, float eps) {
+    if (!map || offset > size || (uint64_t)width * 4 > size - offset) return 0;
+    return q36_norm(out, in, (const uint8_t *)map + offset, width, rows, eps);
+}
+
+int q36_gpu_l2_norm_rows_tensor(q36_gpu_tensor *x, uint32_t width,
+                                 uint32_t rows, float eps) {
+    if (!x || (uint64_t)width * rows * 4 > x->bytes) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_l2_norm_f32");
+    if (!enc) return 0;
+    [enc setBuffer:x->buffer offset:x->offset atIndex:0];
+    [enc setBytes:&width length:sizeof(width) atIndex:1];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_matmul_f16_tensor(q36_gpu_tensor *out, const void *map,
+                              uint64_t size, uint64_t offset,
+                              uint64_t in_dim, uint64_t out_dim,
+                              const q36_gpu_tensor *x, uint64_t tokens) {
+    if (!in_dim || !out_dim ||
+        in_dim > UINT64_MAX / out_dim / sizeof(uint16_t)) return 0;
+    return q36_dense(@"q36_matmul_f16", out, map, size, offset,
+                     in_dim * out_dim * sizeof(uint16_t),
+                     in_dim, out_dim, x, tokens, 1.0f);
+}
+
+int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out, const void *map,
+                                     uint64_t size, uint64_t offset,
+                                     uint64_t in_dim, uint64_t out_dim,
+                                     const q36_gpu_tensor *x, uint64_t tokens,
+                                     float scale) {
+    if (!in_dim || !out_dim ||
+        in_dim > UINT64_MAX / out_dim / sizeof(float)) return 0;
+    return q36_dense(@"q36_matmul_f32", out, map, size, offset,
+                     in_dim * out_dim * sizeof(float),
+                     in_dim, out_dim, x, tokens, scale);
+}
+
+int q36_gpu_matmul_f32_tensor(q36_gpu_tensor *out, const void *map,
+                              uint64_t size, uint64_t offset,
+                              uint64_t in_dim, uint64_t out_dim,
+                              const q36_gpu_tensor *x, uint64_t tokens) {
+    return q36_gpu_matmul_f32_scaled_tensor(out, map, size, offset,
+                                            in_dim, out_dim, x, tokens, 1.0f);
+}
+
+int q36_gpu_matmul_q8_0_scaled_tensor(q36_gpu_tensor *out, const void *map,
+                                      uint64_t size, uint64_t offset,
+                                      uint64_t in_dim, uint64_t out_dim,
+                                      const q36_gpu_tensor *x, uint64_t tokens,
+                                      float scale) {
+    if (!in_dim || !out_dim || (in_dim & 31u) ||
+        in_dim / 32u > UINT64_MAX / out_dim / 34u) return 0;
+    if (tokens == 1 &&
+        q36_q8_decode(out, map, size, offset, in_dim, out_dim, x, scale))
+        return 1;
+    if (tokens > 1 &&
+        q36_q8_prefill_mm(out, map, size, offset, in_dim, out_dim,
+                          x, tokens, scale))
+        return 1;
+    return q36_dense(@"q36_matmul_q8_0", out, map, size, offset,
+                     (in_dim / 32u) * out_dim * 34u,
+                     in_dim, out_dim, x, tokens, scale);
+}
+
+typedef struct {
+    uint32_t src_stride, dst_stride, src_offset, width, rows;
+} q36_copy_rows_args;
+
+static int q36_copy_rows(q36_gpu_tensor *dst, const q36_gpu_tensor *src,
+                          q36_copy_rows_args args) {
+    if (!dst || !src || !args.width || !args.rows) return 0;
+    uint64_t src_end = (uint64_t)(args.rows - 1u) * args.src_stride +
+                       args.src_offset + args.width;
+    uint64_t dst_end = (uint64_t)(args.rows - 1u) * args.dst_stride +
+                       args.width;
+    if (src_end > src->bytes / sizeof(float) ||
+        dst_end > dst->bytes / sizeof(float)) return 0;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_copy_rows_f32");
+    if (!enc) return 0;
+    [enc setBuffer:dst->buffer offset:dst->offset atIndex:0];
+    [enc setBuffer:src->buffer offset:src->offset atIndex:1];
+    [enc setBytes:&args length:sizeof(args) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(args.width, args.rows, 1)
+   threadsPerThreadgroup:MTLSizeMake(MIN(args.width, 256u), 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_extract_full_attn_q_tensor(q36_gpu_tensor *dst,
+                                        const q36_gpu_tensor *qg,
+                                        uint32_t tokens) {
+    return q36_copy_rows(dst, qg, (q36_copy_rows_args){
+        512u, 256u, 0u, 256u, tokens * 16u
+    });
+}
+
+int q36_gpu_extract_recurrent_v_tensor(q36_gpu_tensor *dst,
+                                        const q36_gpu_tensor *conv,
+                                        uint32_t tokens) {
+    return q36_copy_rows(dst, conv, (q36_copy_rows_args){
+        8192u, 4096u, 4096u, 4096u, tokens
+    });
+}
+
+int q36_gpu_recurrent_conv_step_tensor(q36_gpu_tensor *cache,
+                                        const q36_gpu_tensor *cur,
+                                        q36_gpu_tensor *window,
+                                        uint32_t tokens) {
+    const uint32_t conv_dim = 8192u, hist = 3u;
+    if (!cache || !cur || !window || !tokens ||
+        cache->bytes < (uint64_t)hist * conv_dim * 4u ||
+        cur->bytes < (uint64_t)tokens * conv_dim * 4u ||
+        window->bytes < (uint64_t)tokens * (hist + 1u) * conv_dim * 4u)
+        return 0;
+    struct { uint32_t conv_dim, hist, tokens; } args =
+        { conv_dim, hist, tokens };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_recurrent_window");
+    if (!enc) return 0;
+    [enc setBuffer:cache->buffer offset:cache->offset atIndex:0];
+    [enc setBuffer:cur->buffer offset:cur->offset atIndex:1];
+    [enc setBuffer:window->buffer offset:window->offset atIndex:2];
+    [enc setBytes:&args length:sizeof(args) atIndex:3];
+    q36_dispatch_1d(enc, conv_dim);
+    return 1;
+}
+
+static int q36_conv_dispatch(NSString *kernel, q36_gpu_tensor *out,
+                              q36_gpu_tensor *cache,
+                              const q36_gpu_tensor *input,
+                              const void *map, uint64_t size, uint64_t offset,
+                              uint32_t dim, uint32_t taps, uint32_t tokens) {
+    if (!out || !input || !map || !dim || !taps || !tokens ||
+        dim > UINT64_MAX / taps / sizeof(float)) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weights = q36_model_view(map, size, offset,
+        (uint64_t)dim * taps * sizeof(float), &inner);
+    if (!weights) return 0;
+    struct { uint32_t dim, taps, tokens; } args = { dim, taps, tokens };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(kernel);
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    NSUInteger index = 1;
+    if (cache) [enc setBuffer:cache->buffer offset:cache->offset atIndex:index++];
+    [enc setBuffer:input->buffer offset:input->offset atIndex:index++];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:index++];
+    [enc setBytes:&args length:sizeof(args) atIndex:index];
+    if (cache) q36_dispatch_1d(enc, dim);
+    else {
+        [enc dispatchThreads:MTLSizeMake(dim, tokens, 1)
+       threadsPerThreadgroup:MTLSizeMake(MIN(dim, 256u), 1, 1)];
+        [enc endEncoding];
+    }
+    return 1;
+}
+
+int q36_gpu_ssm_conv_silu_tensor(q36_gpu_tensor *out,
+                                  const q36_gpu_tensor *window,
+                                  const void *map, uint64_t size,
+                                  uint64_t offset, uint32_t dim,
+                                  uint32_t taps, uint32_t tokens) {
+    return q36_conv_dispatch(@"q36_conv_silu", out, NULL, window,
+                             map, size, offset, dim, taps, tokens);
+}
+
+int q36_gpu_recurrent_conv_silu_tensor(q36_gpu_tensor *cache,
+                                        const q36_gpu_tensor *cur,
+                                        q36_gpu_tensor *out,
+                                        const void *map, uint64_t size,
+                                        uint64_t offset, uint32_t dim,
+                                        uint32_t taps, uint32_t tokens) {
+    return q36_conv_dispatch(@"q36_recurrent_conv_silu", out, cache, cur,
+                             map, size, offset, dim, taps, tokens);
+}
+
+int q36_gpu_rope_qwen_rows_tensor(q36_gpu_tensor *x, uint32_t heads,
+                                   uint32_t pos0, uint32_t tokens) {
+    if (!x || !heads || !tokens ||
+        x->bytes < (uint64_t)heads * tokens * 256u * sizeof(float)) return 0;
+    struct { uint32_t heads, pos0, tokens; } args = { heads, pos0, tokens };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_rope_qwen");
+    if (!enc) return 0;
+    [enc setBuffer:x->buffer offset:x->offset atIndex:0];
+    [enc setBytes:&args length:sizeof(args) atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(heads * 32u, tokens, 1)
+   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_directional_steering_project_tensor(
+        q36_gpu_tensor *x, const q36_gpu_tensor *directions,
+        uint32_t layer, uint32_t width, uint32_t rows, float scale) {
+    if (!x || !directions || !width || !rows) return 0;
+    struct { uint32_t layer, width, rows; float scale; } args =
+        { layer, width, rows, scale };
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(@"q36_directional_steering");
+    if (!enc) return 0;
+    [enc setBuffer:x->buffer offset:x->offset atIndex:0];
+    [enc setBuffer:directions->buffer offset:directions->offset atIndex:1];
+    [enc setBytes:&args length:sizeof(args) atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
+                                 q36_gpu_tensor *out_sum,
+                                 const q36_gpu_tensor *a,
+                                 const q36_gpu_tensor *b,
+                                 const void *map, uint64_t size,
+                                 uint64_t weight_offset,
+                                 uint32_t width, uint32_t rows, float eps) {
+    return q36_gpu_add_tensor(out_sum, a, b, width * rows) &&
+           q36_gpu_rms_norm_weight_rows_tensor(
+               out_norm, out_sum, map, size, weight_offset, width, rows, eps);
+}
+
+static int q36_delta_qkv_dispatch(q36_gpu_tensor *q,
+                                   q36_gpu_tensor *k,
+                                   q36_gpu_tensor *v,
+                                   const q36_gpu_tensor *conv,
+                                   uint32_t heads, uint32_t groups,
+                                   uint32_t dim, uint32_t stride,
+                                   uint32_t tokens, float eps) {
+    if (!q || !k || !conv || !heads || !groups || !dim || !tokens ||
+        stride < 2u * groups * dim + (v ? heads * dim : 0u)) return 0;
+    struct {
+        uint32_t heads, groups, dim, stride, tokens;
+        float eps;
+    } args = { heads, groups, dim, stride, tokens, eps };
+    uint32_t write_v = v != NULL;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_delta_qkv");
+    if (!enc) return 0;
+    [enc setBuffer:q->buffer offset:q->offset atIndex:0];
+    [enc setBuffer:k->buffer offset:k->offset atIndex:1];
+    [enc setBuffer:(v ? v->buffer : q->buffer)
+            offset:(v ? v->offset : q->offset) atIndex:2];
+    [enc setBuffer:conv->buffer offset:conv->offset atIndex:3];
+    [enc setBytes:&args length:sizeof(args) atIndex:4];
+    [enc setBytes:&write_v length:sizeof(write_v) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_delta_qk_l2_norm_tensor(
+        q36_gpu_tensor *q, q36_gpu_tensor *k,
+        const q36_gpu_tensor *conv, uint32_t heads, uint32_t groups,
+        uint32_t dim, uint32_t stride, uint32_t tokens, float eps) {
+    return q36_delta_qkv_dispatch(q, k, NULL, conv, heads, groups, dim,
+                                  stride, tokens, eps);
+}
+
+int q36_gpu_delta_qkv_l2_norm_tensor(
+        q36_gpu_tensor *q, q36_gpu_tensor *k, q36_gpu_tensor *v,
+        const q36_gpu_tensor *conv, uint32_t heads, uint32_t groups,
+        uint32_t dim, uint32_t stride, uint32_t tokens, float eps) {
+    return q36_delta_qkv_dispatch(q, k, v, conv, heads, groups, dim,
+                                  stride, tokens, eps);
+}
+
+int q36_gpu_delta_net_gates_tensor(
+        q36_gpu_tensor *out, const q36_gpu_tensor *alpha,
+        const q36_gpu_tensor *beta, const void *map, uint64_t size,
+        uint64_t dt_offset, uint64_t a_offset,
+        uint32_t heads, uint32_t tokens) {
+    uint64_t bytes = (uint64_t)heads * sizeof(float);
+    uint64_t dt_inner = 0, a_inner = 0;
+    id<MTLBuffer> dt = q36_model_view(map, size, dt_offset, bytes, &dt_inner);
+    id<MTLBuffer> a = q36_model_view(map, size, a_offset, bytes, &a_inner);
+    if (!out || !alpha || !beta || !dt || !a || !heads || !tokens) return 0;
+    struct { uint32_t heads, tokens; } args = { heads, tokens };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_delta_gates");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:alpha->buffer offset:alpha->offset atIndex:1];
+    [enc setBuffer:beta->buffer offset:beta->offset atIndex:2];
+    [enc setBuffer:dt offset:(NSUInteger)dt_inner atIndex:3];
+    [enc setBuffer:a offset:(NSUInteger)a_inner atIndex:4];
+    [enc setBytes:&args length:sizeof(args) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(heads, tokens, 1)
+   threadsPerThreadgroup:MTLSizeMake(MIN(heads, 64u), 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_delta_net_decode_tensor(
+        q36_gpu_tensor *state, const q36_gpu_tensor *q,
+        const q36_gpu_tensor *k, const q36_gpu_tensor *v,
+        const q36_gpu_tensor *gb, q36_gpu_tensor *out,
+        uint32_t heads, uint32_t dim, uint32_t tokens) {
+    if (!state || !q || !k || !v || !gb || !out ||
+        !heads || !dim || !tokens || (dim & 31u)) return 0;
+    struct { uint32_t heads, dim, tokens; } args = { heads, dim, tokens };
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(@"q36_delta_net_decode");
+    if (!enc) return 0;
+    [enc setBuffer:state->buffer offset:state->offset atIndex:0];
+    [enc setBuffer:q->buffer offset:q->offset atIndex:1];
+    [enc setBuffer:k->buffer offset:k->offset atIndex:2];
+    [enc setBuffer:v->buffer offset:v->offset atIndex:3];
+    [enc setBuffer:gb->buffer offset:gb->offset atIndex:4];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:5];
+    [enc setBytes:&args length:sizeof(args) atIndex:6];
+    [enc dispatchThreadgroups:MTLSizeMake(heads, dim / 32u, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_attn_kv_store_tensor(
+        q36_gpu_tensor *kcache, q36_gpu_tensor *vcache,
+        const q36_gpu_tensor *k, const q36_gpu_tensor *v,
+        uint32_t pos0, uint32_t tokens, uint32_t cap,
+        uint32_t k_row, uint32_t v_row,
+        uint32_t k_type, uint32_t v_type,
+        uint32_t k_row_bytes, uint32_t v_row_bytes) {
+    if (!kcache || !vcache || !k || !v || !tokens ||
+        pos0 > cap || tokens > cap - pos0) return 0;
+    if (k_type != 0u || v_type != 0u) {
+        if ((k_type != 1u && k_type != 2u) ||
+            (v_type != 1u && v_type != 2u) ||
+            (k_row & 31u) || (v_row & 31u) ||
+            k_row_bytes != (k_row / 32u) * (k_type == 1u ? 34u : 18u) ||
+            v_row_bytes != (v_row / 32u) * (v_type == 1u ? 34u : 18u))
+            return 0;
+        const float *kp = q36_gpu_tensor_contents((q36_gpu_tensor *)k);
+        const float *vp = q36_gpu_tensor_contents((q36_gpu_tensor *)v);
+        uint8_t *kc = q36_gpu_tensor_contents(kcache);
+        uint8_t *vc = q36_gpu_tensor_contents(vcache);
+        if (!kp || !vp || !kc || !vc) return 0;
+        for (uint32_t tok = 0; tok < tokens; tok++) {
+            void *kd = kc + (uint64_t)(pos0 + tok) * k_row_bytes;
+            void *vd = vc + (uint64_t)(pos0 + tok) * v_row_bytes;
+            if (k_type == 1u) q36_quant_q8_0(kp + (uint64_t)tok * k_row, kd, k_row);
+            else q36_quant_q4_0(kp + (uint64_t)tok * k_row, kd, k_row);
+            if (v_type == 1u) q36_quant_q8_0(vp + (uint64_t)tok * v_row, vd, v_row);
+            else q36_quant_q4_0(vp + (uint64_t)tok * v_row, vd, v_row);
+        }
+        return 1;
+    }
+    if (k_row_bytes != k_row * sizeof(uint16_t) ||
+        v_row_bytes != v_row * sizeof(uint16_t)) return 0;
+    struct { uint32_t k_row, v_row, pos0, tokens; } args =
+        { k_row, v_row, pos0, tokens };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_kv_store_f16");
+    if (!enc) return 0;
+    [enc setBuffer:kcache->buffer offset:kcache->offset atIndex:0];
+    [enc setBuffer:vcache->buffer offset:vcache->offset atIndex:1];
+    [enc setBuffer:k->buffer offset:k->offset atIndex:2];
+    [enc setBuffer:v->buffer offset:v->offset atIndex:3];
+    [enc setBytes:&args length:sizeof(args) atIndex:4];
+    uint32_t width = k_row > v_row ? k_row : v_row;
+    [enc dispatchThreads:MTLSizeMake(width, tokens, 1)
+   threadsPerThreadgroup:MTLSizeMake(MIN(width, 256u), 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+int q36_gpu_router_topk_tensor(
+        q36_gpu_tensor *selected, q36_gpu_tensor *weights,
+        const q36_gpu_tensor *logits, uint32_t experts,
+        uint32_t used, uint32_t tokens, float scale) {
+    if (!selected || !weights || !logits || !experts || !used ||
+        used > 8u || !tokens) return 0;
+    struct { uint32_t experts, used, tokens; float scale; } args =
+        { experts, used, tokens, scale };
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_router_topk");
+    if (!enc) return 0;
+    [enc setBuffer:selected->buffer offset:selected->offset atIndex:0];
+    [enc setBuffer:weights->buffer offset:weights->offset atIndex:1];
+    [enc setBuffer:logits->buffer offset:logits->offset atIndex:2];
+    [enc setBytes:&args length:sizeof(args) atIndex:3];
+    q36_dispatch_1d(enc, tokens);
+    return 1;
+}
+
+typedef struct {
+    float d;
+    float dmin;
+    int8_t qs[256];
+    int16_t bsums[16];
+} q36_metal_q8_k;
+
+typedef struct {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+} q36_metal_q8_k_packed;
+
+typedef struct {
+    uint8_t scales[16], qs[64];
+    uint16_t d, dmin;
+} q36_metal_q2_k;
+typedef struct {
+    uint16_t d, dmin;
+    uint8_t scales[12], qs[128];
+} q36_metal_q4_k;
+typedef struct {
+    uint16_t d, dmin;
+    uint8_t scales[12], qh[32], qs[128];
+} q36_metal_q5_k;
+typedef struct {
+    uint8_t ql[128], qh[64];
+    int8_t scales[16];
+    uint16_t d;
+} q36_metal_q6_k;
+
+static void q36_k4_scale_min(const uint8_t *s, uint32_t j,
+                              uint32_t *scale, uint32_t *mn) {
+    if (j < 4u) {
+        *scale = s[j] & 63u;
+        *mn = s[4u + j] & 63u;
+    } else {
+        *scale = (s[j + 4u] & 15u) | ((s[j - 4u] >> 6) << 4);
+        *mn = (s[j + 4u] >> 4) | ((s[j] >> 6) << 4);
+    }
+}
+
+static int q36_q2_k_value(const q36_metal_q2_k *x, uint32_t idx) {
+    uint32_t in = idx & 127u;
+    uint32_t qoff = (idx >> 7u) * 32u + (in & 31u);
+    return (x->qs[qoff] >> ((in >> 5u) * 2u)) & 3u;
+}
+
+static int q36_q6_k_value(const q36_metal_q6_k *x, uint32_t idx) {
+    uint32_t half = idx >> 7u, in = idx & 127u;
+    uint32_t ql, qh, shift, low;
+    if (in < 32u) {
+        ql = half * 64u + in; qh = half * 32u + in; shift = 0u;
+        low = x->ql[ql] & 15u;
+    } else if (in < 64u) {
+        uint32_t i = in - 32u;
+        ql = half * 64u + 32u + i; qh = half * 32u + i; shift = 2u;
+        low = x->ql[ql] & 15u;
+    } else if (in < 96u) {
+        uint32_t i = in - 64u;
+        ql = half * 64u + i; qh = half * 32u + i; shift = 4u;
+        low = x->ql[ql] >> 4;
+    } else {
+        uint32_t i = in - 96u;
+        ql = half * 64u + 32u + i; qh = half * 32u + i; shift = 6u;
+        low = x->ql[ql] >> 4;
+    }
+    return (int)(low | (((x->qh[qh] >> shift) & 3u) << 4)) - 32;
+}
+
+static float q36_kquant_dot_block(uint32_t type, const void *vx,
+                                   const q36_metal_q8_k *y) {
+    if (type == 10u) {
+        const q36_metal_q2_k *x = vx;
+        float d = q36_quant_f16_to_f32(x->d) * y->d;
+        float dm = -q36_quant_f16_to_f32(x->dmin) * y->d;
+        float lane[8] = {0};
+        for (uint32_t k = 0; k < 8u; k++) {
+            int mp = (x->scales[2u*k] >> 4) * y->bsums[2u*k]
+                   + (x->scales[2u*k+1u] >> 4) * y->bsums[2u*k+1u];
+            int sum = 0;
+            lane[k] = fmaf(dm, (float)mp, lane[k]);
+            for (uint32_t h = 0; h < 2u; h++) for (uint32_t s = 0; s < 4u; s++) {
+                uint32_t g = h * 8u + 2u*s + (k >= 4u);
+                uint32_t e = h * 128u + s * 32u +
+                    (k < 4u ? 4u*k : 16u + 4u*(k-4u));
+                int v = 0;
+                for (uint32_t i = 0; i < 4u; i++)
+                    v += q36_q2_k_value(x, e+i) * y->qs[e+i];
+                sum += (x->scales[g] & 15u) * v;
+            }
+            lane[k] = fmaf(d, (float)sum, lane[k]);
+        }
+        return ((lane[0]+lane[4])+(lane[2]+lane[6])) +
+               ((lane[1]+lane[5])+(lane[3]+lane[7]));
+    }
+    if (type == 12u || type == 13u) {
+        const q36_metal_q4_k *x4 = vx;
+        const q36_metal_q5_k *x5 = vx;
+        const uint8_t *scales = type == 12u ? x4->scales : x5->scales;
+        const uint8_t *qs = type == 12u ? x4->qs : x5->qs;
+        uint16_t hd = type == 12u ? x4->d : x5->d;
+        uint16_t hm = type == 12u ? x4->dmin : x5->dmin;
+        int isum = 0, summs = 0;
+        for (uint32_t g = 0; g < 8u; g++) {
+            uint32_t sc, mn; int group = 0;
+            q36_k4_scale_min(scales, g, &sc, &mn);
+            const uint8_t *q = qs + (g >> 1u) * 32u;
+            for (uint32_t i = 0; i < 32u; i++) {
+                uint32_t v = (g & 1u) ? q[i] >> 4 : q[i] & 15u;
+                if (type == 13u) v |= ((x5->qh[i] >> g) & 1u) << 4;
+                group += (int)v * y->qs[g*32u+i];
+            }
+            isum += (int)sc * group;
+            summs += (int)mn * (y->bsums[2u*g] + y->bsums[2u*g+1u]);
+        }
+        return q36_quant_f16_to_f32(hd) * y->d * (float)isum -
+               q36_quant_f16_to_f32(hm) * y->d * (float)summs;
+    }
+    if (type == 14u) {
+        const q36_metal_q6_k *x = vx;
+        int isum = 0;
+        for (uint32_t g = 0; g < 16u; g++) {
+            int group = 0;
+            for (uint32_t i = 0; i < 16u; i++) {
+                uint32_t j = g*16u+i;
+                group += q36_q6_k_value(x, j) * y->qs[j];
+            }
+            isum += x->scales[g] * group;
+        }
+        return q36_quant_f16_to_f32(x->d) * y->d * (float)isum;
+    }
+    return 0.0f;
+}
+
+static uint64_t q36_kquant_row_bytes(uint32_t type, uint64_t in_dim) {
+    uint64_t block_bytes = 0;
+    switch (type) {
+    case 10: block_bytes = 84u; break;
+    case 12: block_bytes = 144u; break;
+    case 13: block_bytes = 176u; break;
+    case 14: block_bytes = 210u; break;
+    default: return 0;
+    }
+    return (in_dim / 256u) * block_bytes;
+}
+
+int q36_gpu_quantize_q8_k_tensor(q36_gpu_tensor *out,
+                                  const q36_gpu_tensor *x,
+                                  uint64_t in_dim, uint64_t tokens) {
+    if (!q36_quant_q8_k || !out || !x || !in_dim || (in_dim & 255u) ||
+        !tokens || out->bytes < tokens * (in_dim / 256u) * sizeof(q36_metal_q8_k) ||
+        x->bytes < tokens * in_dim * sizeof(float)) return 0;
+    const float *src = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
+    unsigned char *dst = q36_gpu_tensor_contents(out);
+    if (!src || !dst) return 0;
+    uint64_t blocks = in_dim / 256u;
+    q36_metal_q8_k_packed *tmp =
+        malloc((size_t)blocks * sizeof(q36_metal_q8_k_packed));
+    if (!tmp) return 0;
+    for (uint64_t tok = 0; tok < tokens; tok++) {
+        q36_quant_q8_k(src + tok * in_dim, tmp, (int64_t)in_dim);
+        q36_metal_q8_k *row = (q36_metal_q8_k *)dst + tok * blocks;
+        for (uint64_t b = 0; b < blocks; b++) {
+            row[b].d = tmp[b].d;
+            row[b].dmin = 0.0f;
+            memcpy(row[b].qs, tmp[b].qs, sizeof(row[b].qs));
+            memcpy(row[b].bsums, tmp[b].bsums, sizeof(row[b].bsums));
+        }
+    }
+    free(tmp);
+    return 1;
+}
+
+static int q36_kquant_q8_host(q36_gpu_tensor *out, const void *map,
+                              uint64_t size, uint64_t offset, uint32_t type,
+                              uint64_t in_dim, uint64_t out_dim,
+                              const q36_metal_q8_k *xq, uint64_t tokens,
+                              float scale) {
+    uint64_t row_bytes = q36_kquant_row_bytes(type, in_dim);
+    if (!q36_quant_f16_to_f32 || !out || !map || !row_bytes || !out_dim ||
+        offset > size || row_bytes > (size - offset) / out_dim) return 0;
+    float *dst = q36_gpu_tensor_contents(out);
+    if (!dst || !xq) return 0;
+    const unsigned char *weights = (const unsigned char *)map + offset;
+    uint64_t blocks = in_dim / 256u;
+    uint64_t block_bytes = row_bytes / blocks;
+    for (uint64_t r = 0; r < out_dim; r++) {
+        for (uint64_t tok = 0; tok < tokens; tok++) {
+            float sum = 0.0f;
+            for (uint64_t b = 0; b < blocks; b++)
+                sum += q36_kquant_dot_block(
+                    type, weights + r * row_bytes + b * block_bytes,
+                    xq + tok * blocks + b);
+            dst[tok * out_dim + r] = sum * scale;
+        }
+    }
+    return 1;
+}
+
+int q36_gpu_matmul_k_quant_scaled_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (!x || !in_dim || (in_dim & 255u) ||
+        x->bytes < tokens * in_dim * sizeof(float)) return 0;
+    const float *src = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
+    uint64_t blocks = in_dim / 256u;
+    q36_metal_q8_k *q8 = calloc((size_t)(tokens * blocks), sizeof(*q8));
+    q36_metal_q8_k_packed *tmp =
+        malloc((size_t)blocks * sizeof(q36_metal_q8_k_packed));
+    if (!src || !q8 || !tmp || !q36_quant_q8_k) {
+        free(tmp); free(q8); return 0;
+    }
+    for (uint64_t tok = 0; tok < tokens; tok++) {
+        q36_quant_q8_k(src + tok * in_dim, tmp, (int64_t)in_dim);
+        for (uint64_t b = 0; b < blocks; b++) {
+            q8[tok*blocks+b].d = tmp[b].d;
+            memcpy(q8[tok*blocks+b].qs, tmp[b].qs, 256u);
+            memcpy(q8[tok*blocks+b].bsums, tmp[b].bsums, 32u);
+        }
+    }
+    free(tmp);
+    int ok = q36_kquant_q8_host(out, map, size, offset, type,
+                                in_dim, out_dim, q8, tokens, scale);
+    free(q8);
+    return ok;
+}
+
+int q36_gpu_matmul_k_quant_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens) {
+    return q36_gpu_matmul_k_quant_scaled_tensor(
+        out, map, size, offset, type, in_dim, out_dim, x, tokens, 1.0f);
+}
+
+int q36_gpu_matmul_k_quant_q8_scaled_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *q8, uint64_t tokens, float scale) {
+    if (!q8 || !in_dim || (in_dim & 255u) ||
+        q8->bytes < tokens * (in_dim / 256u) * sizeof(q36_metal_q8_k))
+        return 0;
+    const q36_metal_q8_k *blocks =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)q8);
+    return blocks && q36_kquant_q8_host(out, map, size, offset, type,
+                                        in_dim, out_dim, blocks, tokens, scale);
+}
+
+int q36_gpu_matmul_q8_0_pair_scaled_tensor(
+        q36_gpu_tensor *out_a, q36_gpu_tensor *out_b,
+        const void *map, uint64_t size,
+        uint64_t offset_a, uint64_t offset_b,
+        uint64_t in_dim, uint64_t out_a_dim, uint64_t out_b_dim,
+        const q36_gpu_tensor *x, float scale_a, float scale_b) {
+    if (!out_a || !out_b || !x || !map || !in_dim || (in_dim & 31u) ||
+        !out_a_dim || !out_b_dim || in_dim > INT32_MAX ||
+        out_a_dim > INT32_MAX || out_b_dim > INT32_MAX ||
+        x->bytes < in_dim * sizeof(float) ||
+        out_a->bytes < out_a_dim * sizeof(float) ||
+        out_b->bytes < out_b_dim * sizeof(float)) return 0;
+    const uint64_t row_bytes = (in_dim / 32u) * 34u;
+    if (out_a_dim > UINT64_MAX / row_bytes ||
+        out_b_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner_a = 0, inner_b = 0;
+    id<MTLBuffer> wa = q36_model_view(
+        map, size, offset_a, out_a_dim * row_bytes, &inner_a);
+    id<MTLBuffer> wb = q36_model_view(
+        map, size, offset_b, out_b_dim * row_bytes, &inner_b);
+    int16_t nsg_a = out_a_dim > 65536u ? 8 : 4;
+    int16_t nsg_b = out_b_dim > 65536u ? 8 : 4;
+    if (!wa || !wb || nsg_a != nsg_b) return 0;
+    id<MTLComputePipelineState> p =
+        q36_pipeline_nsg(@"kernel_mul_mv_q8_0_f32_pair", nsg_a);
+    if (!p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+#define Q36_Q8_PAIR_ARGS(dim_) (q36_q8_mv_args) { \
+        (int32_t)in_dim, (int32_t)(dim_), 1, 34u, row_bytes, \
+        row_bytes * (dim_), row_bytes * (dim_), (int32_t)in_dim, 1, 1, \
+        sizeof(float), in_dim * sizeof(float), in_dim * sizeof(float), \
+        in_dim * sizeof(float), (int32_t)(dim_), 1, 2, 1, 1 }
+    q36_q8_mv_args args_a = Q36_Q8_PAIR_ARGS(out_a_dim);
+    q36_q8_mv_args args_b = Q36_Q8_PAIR_ARGS(out_b_dim);
+#undef Q36_Q8_PAIR_ARGS
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args_a length:sizeof(args_a) atIndex:0];
+    [enc setBytes:&args_b length:sizeof(args_b) atIndex:1];
+    [enc setBuffer:wa offset:(NSUInteger)inner_a atIndex:2];
+    [enc setBuffer:wb offset:(NSUInteger)inner_b atIndex:3];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:4];
+    [enc setBuffer:out_a->buffer offset:out_a->offset atIndex:5];
+    [enc setBuffer:out_b->buffer offset:out_b->offset atIndex:6];
+    [enc setThreadgroupMemoryLength:32u * 4u * sizeof(float) atIndex:0];
+    uint64_t max_dim = out_a_dim > out_b_dim ? out_a_dim : out_b_dim;
+    [enc dispatchThreadgroups:MTLSizeMake((max_dim + 1u) / 2u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg_a, 1)];
+    [enc endEncoding];
+    q36_gpu_tensor *outs[2] = {out_a, out_b};
+    float scales[2] = {scale_a, scale_b};
+    uint64_t dims[2] = {out_a_dim, out_b_dim};
+    for (uint32_t i = 0; i < 2; i++) {
+        if (scales[i] == 1.0f) continue;
+        uint32_t n = (uint32_t)dims[i];
+        enc = q36_encoder(@"q36_scale_f32");
+        if (!enc) return 0;
+        [enc setBuffer:outs[i]->buffer offset:outs[i]->offset atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBytes:&scales[i] length:sizeof(scales[i]) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    return 1;
+}
+
+int q36_gpu_shared_ffn_decode_tensor(
+        q36_gpu_tensor *out, q36_gpu_tensor *mid,
+        const q36_gpu_tensor *x, const q36_gpu_tensor *scalar,
+        const void *map, uint64_t size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        float gate_scale, float up_scale, float down_scale) {
+    const NSUInteger mid_bytes = (NSUInteger)mid_dim * sizeof(float);
+    const NSUInteger down_bytes = (NSUInteger)out_dim * sizeof(float);
+    if (q36_shared_mid_scratch_bytes < mid_bytes) {
+        q36_shared_gate_scratch =
+            [q36_device newBufferWithLength:mid_bytes options:MTLResourceStorageModePrivate];
+        q36_shared_up_scratch =
+            [q36_device newBufferWithLength:mid_bytes options:MTLResourceStorageModePrivate];
+        if (!q36_shared_gate_scratch || !q36_shared_up_scratch) return 0;
+        q36_shared_mid_scratch_bytes = mid_bytes;
+    }
+    if (q36_shared_down_scratch_bytes < down_bytes) {
+        q36_shared_down_scratch =
+            [q36_device newBufferWithLength:down_bytes options:MTLResourceStorageModePrivate];
+        if (!q36_shared_down_scratch) return 0;
+        q36_shared_down_scratch_bytes = down_bytes;
+    }
+    q36_gpu_tensor gate = {
+        .buffer = q36_shared_gate_scratch, .bytes = mid_bytes
+    };
+    q36_gpu_tensor up = {
+        .buffer = q36_shared_up_scratch, .bytes = mid_bytes
+    };
+    q36_gpu_tensor down = {
+        .buffer = q36_shared_down_scratch, .bytes = down_bytes
+    };
+    return q36_gpu_matmul_q8_0_pair_scaled_tensor(
+               &gate, &up, map, size, gate_offset, up_offset,
+               in_dim, mid_dim, mid_dim, x, gate_scale, up_scale) &&
+           q36_gpu_swiglu_tensor(mid, &gate, &up, mid_dim, 0.0f, 1.0f) &&
+           q36_gpu_matmul_q8_0_scaled_tensor(
+               &down, map, size, down_offset, mid_dim, out_dim,
+               mid, 1, down_scale) &&
+           q36_gpu_ffn_tail_tensor(out, &down, scalar, out_dim, 1);
+}
+
+int q36_gpu_rms_norm_rope_qwen_rows_tensor(
+        q36_gpu_tensor *dst, const q36_gpu_tensor *src,
+        const void *map, uint64_t size, uint64_t weight_offset,
+        uint32_t src_stride, uint32_t heads,
+        uint32_t pos0, uint32_t tokens, float eps) {
+    uint32_t rows = heads * tokens;
+    if (!rows || src_stride < 256u ||
+        !q36_copy_rows(dst, src, (q36_copy_rows_args){
+            src_stride, 256u, 0u, 256u, rows
+        })) return 0;
+    return q36_gpu_rms_norm_weight_rows_tensor(
+               dst, dst, map, size, weight_offset, 256u, rows, eps) &&
+           q36_gpu_rope_qwen_rows_tensor(dst, heads, pos0, tokens);
+}
+
+int q36_gpu_rms_norm_rope_qwen_kv_store_tensor(
+        q36_gpu_tensor *kcache, q36_gpu_tensor *vcache,
+        const q36_gpu_tensor *k, const q36_gpu_tensor *v,
+        const void *map, uint64_t size, uint64_t weight_offset,
+        uint32_t src_stride, uint32_t heads,
+        uint32_t pos0, uint32_t tokens, uint32_t cap, float eps) {
+    uint64_t row = (uint64_t)heads * 256u;
+    q36_gpu_tensor *kn = q36_gpu_tensor_alloc(row * tokens * sizeof(float));
+    int ok = kn &&
+        q36_gpu_rms_norm_rope_qwen_rows_tensor(
+            kn, k, map, size, weight_offset, src_stride,
+            heads, pos0, tokens, eps) &&
+        q36_gpu_attn_kv_store_tensor(
+            kcache, vcache, kn, v, pos0, tokens, cap,
+            (uint32_t)row, (uint32_t)row, 0u, 0u,
+            (uint32_t)row * 2u, (uint32_t)row * 2u);
+    q36_gpu_tensor_free(kn);
+    return ok;
+}
+
+int q36_gpu_rms_norm_rope_qwen_kv_store_quant_tensor(
+        q36_gpu_tensor *kcache, q36_gpu_tensor *vcache,
+        const q36_gpu_tensor *k, const q36_gpu_tensor *v,
+        const void *map, uint64_t size, uint64_t weight_offset,
+        uint32_t src_stride, uint32_t heads,
+        uint32_t pos0, uint32_t tokens, uint32_t cap, float eps,
+        uint32_t k_row_bytes, uint32_t v_row_bytes) {
+    if (!q36_quant_q8_0 || !q36_quant_q4_0 || !kcache || !vcache ||
+        !v || !heads || !tokens || pos0 > cap || tokens > cap - pos0)
+        return 0;
+    uint32_t row = heads * 256u;
+    if (k_row_bytes != (row / 32u) * 34u ||
+        v_row_bytes != (row / 32u) * 18u) return 0;
+    q36_gpu_tensor *kn =
+        q36_gpu_tensor_alloc((uint64_t)row * tokens * sizeof(float));
+    if (!kn || !q36_gpu_rms_norm_rope_qwen_rows_tensor(
+            kn, k, map, size, weight_offset, src_stride,
+            heads, pos0, tokens, eps)) {
+        q36_gpu_tensor_free(kn);
+        return 0;
+    }
+    const float *kp = q36_gpu_tensor_contents(kn);
+    const float *vp = q36_gpu_tensor_contents((q36_gpu_tensor *)v);
+    unsigned char *kc = q36_gpu_tensor_contents(kcache);
+    unsigned char *vc = q36_gpu_tensor_contents(vcache);
+    int ok = kp && vp && kc && vc;
+    for (uint32_t tok = 0; ok && tok < tokens; tok++) {
+        q36_quant_q8_0(kp + (uint64_t)tok * row,
+                       kc + (uint64_t)(pos0 + tok) * k_row_bytes, row);
+        q36_quant_q4_0(vp + (uint64_t)tok * row,
+                       vc + (uint64_t)(pos0 + tok) * v_row_bytes, row);
+    }
+    q36_gpu_tensor_free(kn);
+    return ok;
+}
+
+static float q36_kv_quant_value(const uint8_t *row, uint32_t type,
+                                uint32_t index) {
+    if (type == 0u) {
+        const uint8_t *p = row + (uint64_t)index * sizeof(uint16_t);
+        return q36_quant_f16_to_f32(
+            (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)));
+    }
+    const uint8_t *block = row + (uint64_t)(index / 32u) *
+        (type == 1u ? 34u : 18u);
+    float d = q36_quant_f16_to_f32(
+        (uint16_t)((uint16_t)block[0] | ((uint16_t)block[1] << 8)));
+    uint32_t i = index & 31u;
+    if (type == 1u) return d * (float)(int8_t)block[2u + i];
+    uint8_t packed = block[2u + (i & 15u)];
+    uint8_t q = i < 16u ? (packed & 15u) : (packed >> 4);
+    return d * (float)((int)q - 8);
+}
+
+static int q36_attention_quant_host(
+        q36_gpu_tensor *out, const q36_gpu_tensor *q,
+        const q36_gpu_tensor *qg, const q36_gpu_tensor *kcache,
+        const q36_gpu_tensor *vcache, q36_gpu_tensor *scores,
+        const void *map, uint64_t size, uint64_t sinks_offset,
+        bool has_sinks, uint32_t pos0, uint32_t tokens,
+        uint32_t heads, uint32_t kv_heads, uint32_t dim,
+        uint32_t k_type, uint32_t v_type,
+        uint32_t k_row_bytes, uint32_t v_row_bytes) {
+    if (!q36_quant_f16_to_f32 || !out || !q || !qg || !kcache || !vcache ||
+        !tokens || !heads || !kv_heads || heads % kv_heads ||
+        !dim || k_type > 2u || v_type > 2u || (dim & 31u) ||
+        k_row_bytes != (k_type == 0u
+            ? kv_heads * dim * sizeof(uint16_t)
+            : kv_heads * (dim / 32u) * (k_type == 1u ? 34u : 18u)) ||
+        v_row_bytes != (v_type == 0u
+            ? kv_heads * dim * sizeof(uint16_t)
+            : kv_heads * (dim / 32u) * (v_type == 1u ? 34u : 18u)))
+        return 0;
+    float *op = q36_gpu_tensor_contents(out);
+    const float *qp = q36_gpu_tensor_contents((q36_gpu_tensor *)q);
+    const float *qgp = q36_gpu_tensor_contents((q36_gpu_tensor *)qg);
+    const uint8_t *kc = q36_gpu_tensor_contents((q36_gpu_tensor *)kcache);
+    const uint8_t *vc = q36_gpu_tensor_contents((q36_gpu_tensor *)vcache);
+    float *sp = scores ? q36_gpu_tensor_contents(scores) : NULL;
+    const float *sinks = has_sinks && map && sinks_offset <= size &&
+                         (uint64_t)heads * sizeof(float) <= size - sinks_offset
+        ? (const float *)((const uint8_t *)map + sinks_offset) : NULL;
+    bool own_scores = false;
+    if (!sp) {
+        sp = calloc((size_t)tokens * heads * (pos0 + tokens), sizeof(float));
+        own_scores = true;
+    }
+    if (!op || !qp || !qgp || !kc || !vc || !sp || (has_sinks && !sinks)) {
+        if (own_scores) free(sp);
+        return 0;
+    }
+    const uint32_t score_stride = heads * (pos0 + tokens);
+    const uint32_t score_cap = pos0 + tokens;
+    const uint32_t group = heads / kv_heads;
+    const float attn_scale = 1.0f / sqrtf((float)dim);
+    for (uint32_t tok = 0; tok < tokens; tok++) {
+        uint32_t count = pos0 + tok + 1u;
+        for (uint32_t head = 0; head < heads; head++) {
+            uint32_t kvh = head / group;
+            const float *qh = qp + ((uint64_t)tok * heads + head) * dim;
+            float *sh = sp + (uint64_t)tok * score_stride +
+                        (uint64_t)head * score_cap;
+            float maxv = sinks ? sinks[head] : -INFINITY;
+            for (uint32_t pos = 0; pos < count; pos++) {
+                const uint8_t *kr = kc + (uint64_t)pos * k_row_bytes;
+                float dot = 0.0f;
+                for (uint32_t j = 0; j < dim; j++)
+                    dot = fmaf(qh[j],
+                               q36_kv_quant_value(kr, k_type, kvh * dim + j),
+                               dot);
+                sh[pos] = dot * attn_scale;
+                if (sh[pos] > maxv) maxv = sh[pos];
+            }
+            float denom = sinks ? expf(sinks[head] - maxv) : 0.0f;
+            for (uint32_t pos = 0; pos < count; pos++) {
+                sh[pos] = expf(sh[pos] - maxv);
+                denom += sh[pos];
+            }
+            float inv = denom > 0.0f ? 1.0f / denom : 1.0f;
+            const float *gate = qgp + (uint64_t)tok * heads * dim * 2u +
+                                (uint64_t)head * dim * 2u + dim;
+            float *oh = op + ((uint64_t)tok * heads + head) * dim;
+            for (uint32_t j = 0; j < dim; j++) {
+                float value = 0.0f;
+                for (uint32_t pos = 0; pos < count; pos++) {
+                    const uint8_t *vr = vc + (uint64_t)pos * v_row_bytes;
+                    value = fmaf(sh[pos] * inv,
+                                 q36_kv_quant_value(vr, v_type, kvh * dim + j),
+                                 value);
+                }
+                float g = gate[j];
+                float sig = g >= 0.0f ? 1.0f / (1.0f + expf(-g))
+                                      : expf(g) / (1.0f + expf(g));
+                oh[j] = value * sig;
+            }
+        }
+    }
+    if (own_scores) free(sp);
+    return 1;
+}
+
+int q36_gpu_attn_decode_tensor(
+        q36_gpu_tensor *out, const q36_gpu_tensor *q,
+        const q36_gpu_tensor *qg, const q36_gpu_tensor *kcache,
+        const q36_gpu_tensor *vcache, q36_gpu_tensor *scores,
+        const void *map, uint64_t size, uint64_t sinks_offset,
+        bool has_sinks, uint32_t pos0, uint32_t tokens,
+        uint32_t heads, uint32_t kv_heads, uint32_t dim,
+        uint32_t k_type, uint32_t v_type,
+        uint32_t k_row_bytes, uint32_t v_row_bytes) {
+    if (k_type != 0u || v_type != 0u || !scores)
+        return q36_attention_quant_host(
+            out, q, qg, kcache, vcache, scores, map, size, sinks_offset,
+            has_sinks, pos0, tokens, heads, kv_heads, dim,
+            k_type, v_type, k_row_bytes, v_row_bytes);
+    if (!out || !q || !qg || !kcache || !vcache || !scores ||
+        !tokens || !heads || !kv_heads || heads % kv_heads ||
+        !dim || k_type != 0u || v_type != 0u ||
+        k_row_bytes != kv_heads * dim * sizeof(uint16_t) ||
+        v_row_bytes != kv_heads * dim * sizeof(uint16_t)) return 0;
+    uint64_t sink_inner = 0;
+    id<MTLBuffer> sink_buffer = has_sinks
+        ? q36_model_view(map, size, sinks_offset,
+                         (uint64_t)heads * sizeof(float), &sink_inner)
+        : qg->buffer;
+    if (!sink_buffer) return 0;
+    struct {
+        uint32_t pos0, heads, kv_heads, dim;
+        uint32_t qg_stride, has_sinks, score_stride;
+    } args = {
+        pos0, heads, kv_heads, dim, heads * dim * 2u,
+        has_sinks ? 1u : 0u, heads * (pos0 + tokens)
+    };
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(@"q36_attention_f16_parallel");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:scores->buffer offset:scores->offset atIndex:1];
+    [enc setBuffer:q->buffer offset:q->offset atIndex:2];
+    [enc setBuffer:qg->buffer offset:qg->offset atIndex:3];
+    [enc setBuffer:kcache->buffer offset:kcache->offset atIndex:4];
+    [enc setBuffer:vcache->buffer offset:vcache->offset atIndex:5];
+    [enc setBuffer:sink_buffer
+            offset:(has_sinks ? (NSUInteger)sink_inner : qg->offset)
+           atIndex:6];
+    [enc setBytes:&args length:sizeof(args) atIndex:7];
+    [enc setThreadgroupMemoryLength:sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+static uint64_t q36_quant_row_bytes(uint32_t type, uint32_t width) {
+    uint32_t block = 0, bytes = 0;
+    switch (type) {
+    case 8:  block = 32u;  bytes = 34u;  break;
+    case 10: block = 256u; bytes = 84u;  break;
+    case 12: block = 256u; bytes = 144u; break;
+    case 13: block = 256u; bytes = 176u; break;
+    case 14: block = 256u; bytes = 210u; break;
+    case 16: block = 256u; bytes = 66u;  break;
+    case 21: block = 256u; bytes = 110u; break;
+    case 22: block = 256u; bytes = 82u;  break;
+    default: return 0;
+    }
+    return width % block ? 0 : (uint64_t)(width / block) * bytes;
+}
+
+typedef struct {
+    int32_t nei0, nei1; uint64_t nbi1;
+    int32_t ne00, ne01, ne02; uint64_t nb00, nb01, nb02;
+    int32_t ne10, ne11, ne12, ne13; uint64_t nb10, nb11, nb12;
+    int32_t ne0, ne1; uint64_t nb1; int32_t nr0;
+    int32_t tp_rank, tp_world, tp_addend, tp_expert_base;
+} q36_moe_mv_args;
+
+typedef struct { uint32_t width, used, tokens, has_down_scale; } q36_moe_reduce_args;
+typedef struct {
+    uint32_t width, used, tokens, has_gate_scale, has_up_scale;
+} q36_moe_activation_args;
+
+static q36_moe_mv_args q36_moe_make_args(
+        uint32_t cols, uint32_t rows, uint32_t experts,
+        uint64_t row_bytes, uint64_t expert_bytes,
+        uint32_t rhs_rows, uint32_t used, uint32_t tokens) {
+    return (q36_moe_mv_args) {
+        .nei0 = (int32_t)used, .nei1 = (int32_t)tokens,
+        .nbi1 = (uint64_t)used * sizeof(int32_t),
+        .ne00 = (int32_t)cols, .ne01 = (int32_t)rows, .ne02 = (int32_t)experts,
+        .nb00 = row_bytes / (cols / 256u), .nb01 = row_bytes, .nb02 = expert_bytes,
+        .ne10 = (int32_t)cols, .ne11 = (int32_t)rhs_rows,
+        .ne12 = (int32_t)tokens, .ne13 = 1, .nb10 = sizeof(float),
+        .nb11 = (uint64_t)cols * sizeof(float),
+        .nb12 = (uint64_t)rhs_rows * cols * sizeof(float),
+        .ne0 = (int32_t)rows, .ne1 = (int32_t)used,
+        .nb1 = (uint64_t)rows * sizeof(float), .nr0 = 4, .tp_world = 1,
+    };
+}
+
+static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
+    if (pair_bytes > NSUIntegerMax || down_bytes > NSUIntegerMax) return 0;
+    if (q36_moe_pair_scratch_bytes < pair_bytes) {
+        q36_moe_gate_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
+        q36_moe_up_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
+        q36_moe_mid_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
+        if (!q36_moe_gate_scratch || !q36_moe_up_scratch || !q36_moe_mid_scratch) return 0;
+        q36_moe_pair_scratch_bytes = (NSUInteger)pair_bytes;
+    }
+    if (q36_moe_down_scratch_bytes < down_bytes) {
+        q36_moe_down_scratch = [q36_device newBufferWithLength:(NSUInteger)down_bytes options:MTLResourceStorageModePrivate];
+        if (!q36_moe_down_scratch) return 0;
+        q36_moe_down_scratch_bytes = (NSUInteger)down_bytes;
+    }
+    return 1;
+}
+
+static int q36_moe_iq2_q2_gpu(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down, const q36_gpu_tensor *selected,
+        const q36_gpu_tensor *route_weights, uint32_t used,
+        const q36_gpu_tensor *x, uint32_t tokens, uint32_t in_dim,
+        uint32_t mid_dim, uint32_t out_dim, uint32_t experts) {
+    if (!out || !map || !gate || !up || !down || !selected || !route_weights || !x ||
+        !used || !tokens || gate->type != 16u || up->type != 16u ||
+        down->type != 10u || (in_dim & 255u) || (mid_dim & 255u)) return 0;
+    const uint64_t grb = q36_quant_row_bytes(16u, in_dim);
+    const uint64_t urb = q36_quant_row_bytes(16u, in_dim);
+    const uint64_t drb = q36_quant_row_bytes(10u, mid_dim);
+    const uint64_t geb = grb * mid_dim, ueb = urb * mid_dim, deb = drb * out_dim;
+    const uint64_t pairs = (uint64_t)tokens * used;
+    if (gate->offset > size || geb * experts > size - gate->offset ||
+        up->offset > size || ueb * experts > size - up->offset ||
+        down->offset > size || deb * experts > size - down->offset ||
+        selected->bytes < pairs * sizeof(int32_t) ||
+        route_weights->bytes < pairs * sizeof(float) ||
+        x->bytes < (uint64_t)tokens * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)tokens * out_dim * sizeof(float) ||
+        !q36_moe_ensure_scratch(pairs * mid_dim * sizeof(float),
+                                pairs * out_dim * sizeof(float))) return 0;
+
+    uint64_t go = 0, uo = 0, doff = 0, gso = 0, uso = 0, dso = 0;
+    id<MTLBuffer> gb = q36_model_view(map, size, gate->offset, geb * experts, &go);
+    id<MTLBuffer> ub = q36_model_view(map, size, up->offset, ueb * experts, &uo);
+    id<MTLBuffer> db = q36_model_view(map, size, down->offset, deb * experts, &doff);
+    id<MTLBuffer> gsb = route_weights->buffer, usb = route_weights->buffer, dsb = route_weights->buffer;
+    if (gate->has_scales) gsb = q36_model_view(map, size, gate->scales_offset, (uint64_t)experts * 4u, &gso);
+    if (up->has_scales) usb = q36_model_view(map, size, up->scales_offset, (uint64_t)experts * 4u, &uso);
+    if (down->has_scales) dsb = q36_model_view(map, size, down->scales_offset, (uint64_t)experts * 4u, &dso);
+    if (!gb || !ub || !db || !gsb || !usb || !dsb || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+
+    /* Every routed slot for a token consumes the same input row.  The id
+     * kernel's ne11/nb12 mapping must therefore expose one RHS row per token;
+     * using `used` here walks into following token rows (and out of bounds
+     * during decode). */
+    q36_moe_mv_args ga =
+        q36_moe_make_args(in_dim, mid_dim, experts, grb, geb, 1, used, tokens);
+    id<MTLComputePipelineState> gp =
+        q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
+    id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:gp]; [enc setBytes:&ga length:sizeof(ga) atIndex:0];
+    [enc setBuffer:gb offset:(NSUInteger)go atIndex:1]; [enc setBuffer:ub offset:(NSUInteger)uo atIndex:2];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:3];
+    [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:4];
+    [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
+    [enc setBuffer:selected->buffer offset:selected->offset atIndex:6];
+    [enc setThreadgroupMemoryLength:2176u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((mid_dim + 7u) / 8u, 1, (NSUInteger)pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, 2, 1)]; [enc endEncoding];
+
+    q36_moe_activation_args aa = {
+        mid_dim, used, tokens, gate->has_scales, up->has_scales
+    };
+    enc = q36_encoder(@"q36_moe_activation_f32");
+    if (!enc) return 0;
+    [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:0];
+    [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:1];
+    [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:2];
+    [enc setBuffer:selected->buffer offset:selected->offset atIndex:3];
+    [enc setBuffer:route_weights->buffer offset:route_weights->offset atIndex:4];
+    [enc setBuffer:gsb offset:(NSUInteger)gso atIndex:5];
+    [enc setBuffer:usb offset:(NSUInteger)uso atIndex:6];
+    [enc setBytes:&aa length:sizeof(aa) atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(mid_dim, (NSUInteger)pairs, 1)
+   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+
+    q36_moe_mv_args da = q36_moe_make_args(mid_dim, out_dim, experts, drb, deb, used, used, tokens);
+    id<MTLComputePipelineState> dp = q36_pipeline_nsg(@"kernel_mul_mv_id_q2_K_f32", 2);
+    enc = dp ? [q36_batch computeCommandEncoder] : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:dp]; [enc setBytes:&da length:sizeof(da) atIndex:0];
+    [enc setBuffer:db offset:(NSUInteger)doff atIndex:1]; [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:2];
+    [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:3];
+    [enc setBuffer:selected->buffer offset:selected->offset atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, 1, (NSUInteger)pairs)
+         threadsPerThreadgroup:MTLSizeMake(32, 2, 1)]; [enc endEncoding];
+
+    q36_moe_reduce_args ra = { out_dim, used, tokens, down->has_scales };
+    enc = q36_encoder(@"q36_moe_reduce_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:1];
+    [enc setBuffer:selected->buffer offset:selected->offset atIndex:2];
+    [enc setBuffer:dsb offset:(NSUInteger)dso atIndex:3]; [enc setBytes:&ra length:sizeof(ra) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(out_dim, tokens, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+static int q36_moe_host(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down,
+        const q36_gpu_tensor *selected, const q36_gpu_tensor *route_weights,
+        uint32_t used, const float *x, uint32_t tokens,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        uint32_t experts) {
+    if (!q36_quant_dequantize || !out || !map || !gate || !up || !down ||
+        !selected || !route_weights || !x || !used || !tokens ||
+        !in_dim || !mid_dim || !out_dim || !experts) return 0;
+    uint64_t grb = q36_quant_row_bytes(gate->type, in_dim);
+    uint64_t urb = q36_quant_row_bytes(up->type, in_dim);
+    uint64_t drb = q36_quant_row_bytes(down->type, mid_dim);
+    if (!grb || !urb || !drb ||
+        gate->offset > size || grb > (size - gate->offset) / mid_dim / experts ||
+        up->offset > size || urb > (size - up->offset) / mid_dim / experts ||
+        down->offset > size || drb > (size - down->offset) / out_dim / experts)
+        return 0;
+    const int32_t *ids =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)selected);
+    const float *rw =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)route_weights);
+    float *dst = q36_gpu_tensor_contents(out);
+    float *grow = malloc((size_t)in_dim * sizeof(float));
+    float *urow = malloc((size_t)in_dim * sizeof(float));
+    float *drow = malloc((size_t)mid_dim * sizeof(float));
+    float *mid = malloc((size_t)mid_dim * sizeof(float));
+    if (!ids || !rw || !dst || !grow || !urow || !drow || !mid) {
+        free(mid); free(drow); free(urow); free(grow);
+        return 0;
+    }
+    memset(dst, 0, (size_t)tokens * out_dim * sizeof(float));
+    const unsigned char *base = map;
+    const float *gsc = gate->has_scales
+        ? (const float *)(base + gate->scales_offset) : NULL;
+    const float *usc = up->has_scales
+        ? (const float *)(base + up->scales_offset) : NULL;
+    const float *dsc = down->has_scales
+        ? (const float *)(base + down->scales_offset) : NULL;
+    for (uint32_t tok = 0; tok < tokens; tok++) {
+        const float *xt = x + (uint64_t)tok * in_dim;
+        for (uint32_t slot = 0; slot < used; slot++) {
+            int32_t expert = ids[(uint64_t)tok * used + slot];
+            if (expert < 0 || (uint32_t)expert >= experts) continue;
+            float gs = gsc ? gsc[expert] : 1.0f;
+            float us = usc ? usc[expert] : 1.0f;
+            float ds = dsc ? dsc[expert] : 1.0f;
+            const unsigned char *gw = base + gate->offset +
+                (uint64_t)expert * mid_dim * grb;
+            const unsigned char *uw = base + up->offset +
+                (uint64_t)expert * mid_dim * urb;
+            for (uint32_t j = 0; j < mid_dim; j++) {
+                if (!q36_quant_dequantize(gate->type, gw + (uint64_t)j * grb,
+                                          grow, in_dim) ||
+                    !q36_quant_dequantize(up->type, uw + (uint64_t)j * urb,
+                                          urow, in_dim)) {
+                    free(mid); free(drow); free(urow); free(grow);
+                    return 0;
+                }
+                double ga = 0.0, ua = 0.0;
+                for (uint32_t i = 0; i < in_dim; i++) {
+                    ga += (double)grow[i] * xt[i];
+                    ua += (double)urow[i] * xt[i];
+                }
+                float g = (float)ga * gs;
+                mid[j] = (g / (1.0f + expf(-g))) * ((float)ua * us);
+            }
+            const unsigned char *dw = base + down->offset +
+                (uint64_t)expert * out_dim * drb;
+            float route = rw[(uint64_t)tok * used + slot];
+            for (uint32_t j = 0; j < out_dim; j++) {
+                if (!q36_quant_dequantize(down->type, dw + (uint64_t)j * drb,
+                                          drow, mid_dim)) {
+                    free(mid); free(drow); free(urow); free(grow);
+                    return 0;
+                }
+                double acc = 0.0;
+                for (uint32_t i = 0; i < mid_dim; i++)
+                    acc += (double)drow[i] * mid[i];
+                uint64_t at = (uint64_t)tok * out_dim + j;
+                dst[at] = fmaf((float)acc * ds, route, dst[at]);
+            }
+        }
+    }
+    free(mid); free(drow); free(urow); free(grow);
+    return 1;
+}
+
+int q36_gpu_moe_ffn_f32_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down,
+        const q36_gpu_tensor *selected, const q36_gpu_tensor *weights,
+        uint32_t layer, uint32_t used, const q36_gpu_tensor *x,
+        uint32_t tokens, uint32_t in_dim, uint32_t mid_dim,
+        uint32_t out_dim, uint32_t experts) {
+    (void)layer;
+    const char *gpu_moe = getenv("Q36_METAL_MOE_GPU");
+    const char *force_mv = getenv("Q36_VK_MOE_GEMM");
+    if ((!gpu_moe || gpu_moe[0] != '0') &&
+        (!force_mv || force_mv[0] != '0') &&
+        q36_moe_iq2_q2_gpu(out, map, size, gate, up, down, selected, weights,
+                            used, x, tokens, in_dim, mid_dim, out_dim, experts))
+        return 1;
+    const float *xp = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
+    return xp && q36_moe_host(out, map, size, gate, up, down,
+                              selected, weights, used, xp, tokens,
+                              in_dim, mid_dim, out_dim, experts);
+}
+
+int q36_gpu_moe_ffn_q8_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down,
+        const q36_gpu_tensor *selected, const q36_gpu_tensor *weights,
+        uint32_t layer, uint32_t used, const q36_gpu_tensor *q8,
+        uint32_t tokens, uint32_t in_dim, uint32_t mid_dim,
+        uint32_t out_dim, uint32_t experts) {
+    (void)layer;
+    if (!q8 || !in_dim || (in_dim & 255u)) return 0;
+    const q36_metal_q8_k *blocks =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)q8);
+    /*
+     * K-quant routed FFNs deliberately keep the Q8_K boundary between both
+     * matrix products.  Besides matching the Vulkan ABI, this avoids turning
+     * the integer dot into a subtly different dequantized-float operation.
+     */
+    if (blocks && gate && up && down && gate->type >= 10u && gate->type <= 14u &&
+        up->type >= 10u && up->type <= 14u &&
+        down->type >= 10u && down->type <= 14u &&
+        !(mid_dim & 255u) && q36_quant_q8_k) {
+        const int32_t *ids = q36_gpu_tensor_contents((q36_gpu_tensor *)selected);
+        const float *rw = q36_gpu_tensor_contents((q36_gpu_tensor *)weights);
+        float *dst = q36_gpu_tensor_contents(out);
+        uint64_t grb = q36_kquant_row_bytes(gate->type, in_dim);
+        uint64_t urb = q36_kquant_row_bytes(up->type, in_dim);
+        uint64_t drb = q36_kquant_row_bytes(down->type, mid_dim);
+        uint64_t in_blocks = in_dim / 256u, mid_blocks = mid_dim / 256u;
+        float *mid = malloc((size_t)mid_dim * sizeof(float));
+        q36_metal_q8_k *midq = calloc((size_t)mid_blocks, sizeof(*midq));
+        q36_metal_q8_k_packed *tmp =
+            malloc((size_t)mid_blocks * sizeof(*tmp));
+        if (!ids || !rw || !dst || !grb || !urb || !drb ||
+            !mid || !midq || !tmp) {
+            free(tmp); free(midq); free(mid); return 0;
+        }
+        memset(dst, 0, (size_t)tokens * out_dim * sizeof(float));
+        const uint8_t *base = map;
+        const float *gsc = gate->has_scales
+            ? (const float *)(base + gate->scales_offset) : NULL;
+        const float *usc = up->has_scales
+            ? (const float *)(base + up->scales_offset) : NULL;
+        const float *dsc = down->has_scales
+            ? (const float *)(base + down->scales_offset) : NULL;
+        for (uint32_t tok = 0; tok < tokens; tok++) {
+            const q36_metal_q8_k *xq = blocks + (uint64_t)tok * in_blocks;
+            for (uint32_t slot = 0; slot < used; slot++) {
+                int32_t e = ids[(uint64_t)tok * used + slot];
+                if (e < 0 || (uint32_t)e >= experts) continue;
+                const uint8_t *gw = base + gate->offset +
+                    (uint64_t)e * mid_dim * grb;
+                const uint8_t *uw = base + up->offset +
+                    (uint64_t)e * mid_dim * urb;
+                for (uint32_t j = 0; j < mid_dim; j++) {
+                    float ga = 0.0f, ua = 0.0f;
+                    for (uint64_t b = 0; b < in_blocks; b++) {
+                        ga += q36_kquant_dot_block(
+                            gate->type, gw + (uint64_t)j*grb +
+                            b*(grb/in_blocks), xq+b);
+                        ua += q36_kquant_dot_block(
+                            up->type, uw + (uint64_t)j*urb +
+                            b*(urb/in_blocks), xq+b);
+                    }
+                    ga *= gsc ? gsc[e] : 1.0f;
+                    ua *= usc ? usc[e] : 1.0f;
+                    mid[j] = (ga / (1.0f + expf(-ga))) * ua;
+                }
+                q36_quant_q8_k(mid, tmp, mid_dim);
+                for (uint64_t b = 0; b < mid_blocks; b++) {
+                    midq[b].d = tmp[b].d;
+                    memcpy(midq[b].qs, tmp[b].qs, 256u);
+                    memcpy(midq[b].bsums, tmp[b].bsums, 32u);
+                }
+                const uint8_t *dw = base + down->offset +
+                    (uint64_t)e * out_dim * drb;
+                float route = rw[(uint64_t)tok * used + slot];
+                float ds = dsc ? dsc[e] : 1.0f;
+                for (uint32_t j = 0; j < out_dim; j++) {
+                    float acc = 0.0f;
+                    for (uint64_t b = 0; b < mid_blocks; b++)
+                        acc += q36_kquant_dot_block(
+                            down->type, dw + (uint64_t)j*drb +
+                            b*(drb/mid_blocks), midq+b);
+                    uint64_t at = (uint64_t)tok*out_dim+j;
+                    dst[at] = fmaf(acc*ds, route, dst[at]);
+                }
+            }
+        }
+        free(tmp); free(midq); free(mid);
+        return 1;
+    }
+    float *x = malloc((size_t)tokens * in_dim * sizeof(float));
+    if (!blocks || !x) { free(x); return 0; }
+    uint32_t nb = in_dim / 256u;
+    for (uint32_t tok = 0; tok < tokens; tok++)
+        for (uint32_t b = 0; b < nb; b++)
+            for (uint32_t i = 0; i < 256u; i++)
+                x[(uint64_t)tok * in_dim + (uint64_t)b * 256u + i] =
+                    blocks[(uint64_t)tok * nb + b].d *
+                    blocks[(uint64_t)tok * nb + b].qs[i];
+    int ok = q36_moe_host(out, map, size, gate, up, down,
+                           selected, weights, used, x, tokens,
+                           in_dim, mid_dim, out_dim, experts);
+    free(x);
+    return ok;
+}
+
+int q36_gpu_moe_ffn_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down,
+        const q36_gpu_tensor *selected, const q36_gpu_tensor *weights,
+        uint32_t layer, uint32_t used, const q36_gpu_tensor *x,
+        uint32_t tokens, uint32_t in_dim, uint32_t mid_dim,
+        uint32_t out_dim, uint32_t experts) {
+    return q36_gpu_moe_ffn_f32_tensor(
+        out, map, size, gate, up, down, selected, weights,
+        layer, used, x, tokens, in_dim, mid_dim, out_dim, experts);
+}
