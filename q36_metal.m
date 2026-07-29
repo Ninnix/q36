@@ -306,16 +306,24 @@ static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
     uint64_t inner = 0;
     id<MTLBuffer> weights =
         q36_model_view(map, size, offset, out_dim * row_bytes, &inner);
-    int16_t nsg = out_dim > 65536u ? 8 : 4;
+    const char *rows_env = getenv("Q36_METAL_Q8_MV_ROWS");
+    const int32_t nr0 = rows_env && rows_env[0] == '2' ? 2 : 4;
+    int16_t nsg = 2;
+    const char *nsg_env = getenv("Q36_METAL_Q8_MV_NSG");
+    if (nsg_env && nsg_env[0] >= '1' && nsg_env[0] <= '8' &&
+        nsg_env[1] == '\0')
+        nsg = (int16_t)(nsg_env[0] - '0');
     id<MTLComputePipelineState> p =
-        q36_pipeline_nsg(@"kernel_mul_mv_q8_0_f32", nsg);
+        q36_pipeline_nsg(nr0 == 4
+            ? @"kernel_mul_mv_q8_0_f32_r4"
+            : @"kernel_mul_mv_q8_0_f32", nsg);
     if (!weights || !p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
     q36_q8_mv_args args = {
         (int32_t)in_dim, (int32_t)out_dim, 1,
         34u, row_bytes, row_bytes * out_dim, row_bytes * out_dim,
         (int32_t)in_dim, 1, 1,
         sizeof(float), in_dim * sizeof(float), in_dim * sizeof(float),
-        in_dim * sizeof(float), (int32_t)out_dim, 1, 2, 1, 1
+        in_dim * sizeof(float), (int32_t)out_dim, 1, nr0, 1, 1
     };
     id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
     [enc setComputePipelineState:p];
@@ -323,8 +331,9 @@ static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
     [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
     [enc setBuffer:x->buffer offset:x->offset atIndex:2];
     [enc setBuffer:out->buffer offset:out->offset atIndex:3];
-    [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, 1, 1)
+    [enc setThreadgroupMemoryLength:32u * (NSUInteger)nr0 * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(
+            (out_dim + (uint64_t)nr0 - 1u) / (uint64_t)nr0, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
     [enc endEncoding];
     if (scale != 1.0f) {
