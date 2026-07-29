@@ -65,6 +65,7 @@ struct q36_moe_activation_args {
     uint tokens;
     uint has_gate_scale;
     uint has_up_scale;
+    uint has_down_scale;
 };
 
 kernel void q36_moe_activation_f32(
@@ -76,6 +77,7 @@ kernel void q36_moe_activation_f32(
         device const float *gate_scales [[buffer(5)]],
         device const float *up_scales [[buffer(6)]],
         constant q36_moe_activation_args &args [[buffer(7)]],
+        device const float *down_scales [[buffer(8)]],
         uint2 gid [[thread_position_in_grid]]) {
     ulong pair = gid.y;
     if (gid.x >= args.width || pair >= (ulong)args.tokens * args.used) return;
@@ -84,8 +86,9 @@ kernel void q36_moe_activation_f32(
               (args.has_gate_scale ? gate_scales[expert] : 1.0f);
     float u = up[pair * args.width + gid.x] *
               (args.has_up_scale ? up_scales[expert] : 1.0f);
+    float d = args.has_down_scale ? down_scales[expert] : 1.0f;
     mid[pair * args.width + gid.x] =
-        (g / (1.0f + exp(-g))) * u * route_weights[pair];
+        (g / (1.0f + exp(-g))) * u * route_weights[pair] * d;
 }
 
 kernel void q36_moe_reduce_f32(
@@ -501,6 +504,79 @@ struct q36_attention_args {
     uint score_stride;
 };
 
+static inline float q36_kv_q8_value(device const uchar *row, uint index) {
+    device const uchar *block = row + (ulong)(index >> 5) * 34u;
+    float d = float(*reinterpret_cast<device const half *>(block));
+    return d * float(*reinterpret_cast<device const char *>(block + 2u + (index & 31u)));
+}
+
+static inline float q36_kv_q4_value(device const uchar *row, uint index) {
+    device const uchar *block = row + (ulong)(index >> 5) * 18u;
+    float d = float(*reinterpret_cast<device const half *>(block));
+    uint i = index & 31u;
+    uchar packed = block[2u + (i & 15u)];
+    uint q = i < 16u ? (packed & 15u) : (packed >> 4);
+    return d * float(int(q) - 8);
+}
+
+struct q36_kv_quant_args {
+    uint k_row;
+    uint v_row;
+    uint pos0;
+    uint tokens;
+    uint k_row_bytes;
+    uint v_row_bytes;
+};
+
+kernel void q36_kv_store_q8_q4(
+        device uchar *kcache [[buffer(0)]],
+        device uchar *vcache [[buffer(1)]],
+        device const float *k [[buffer(2)]],
+        device const float *v [[buffer(3)]],
+        constant q36_kv_quant_args &args [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint block = gid.x, tok = gid.y;
+    if (tok >= args.tokens) return;
+    uint kblocks = args.k_row >> 5;
+    uint vblocks = args.v_row >> 5;
+    if (block < kblocks) {
+        device const float *src = k + (ulong)tok * args.k_row + block * 32u;
+        float amax = 0.0f;
+        for (uint i = 0; i < 32u; i++) amax = max(amax, abs(src[i]));
+        float d = amax / 127.0f;
+        device uchar *dst = kcache + (ulong)(args.pos0 + tok) *
+            args.k_row_bytes + block * 34u;
+        *reinterpret_cast<device half *>(dst) = half(d);
+        float inv = d != 0.0f ? 1.0f / d : 0.0f;
+        for (uint i = 0; i < 32u; i++) {
+            int q = clamp(int(rint(src[i] * inv)), -127, 127);
+            *reinterpret_cast<device char *>(dst + 2u + i) = char(q);
+        }
+    }
+    if (block < vblocks) {
+        device const float *src = v + (ulong)tok * args.v_row + block * 32u;
+        float vmax = 0.0f;
+        float amax = 0.0f;
+        for (uint i = 0; i < 32u; i++) {
+            float a = abs(src[i]);
+            if (a > amax) {
+                amax = a;
+                vmax = src[i];
+            }
+        }
+        float d = vmax / -8.0f;
+        device uchar *dst = vcache + (ulong)(args.pos0 + tok) *
+            args.v_row_bytes + block * 18u;
+        *reinterpret_cast<device half *>(dst) = half(d);
+        float inv = d != 0.0f ? 1.0f / d : 0.0f;
+        for (uint i = 0; i < 16u; i++) {
+            uint q0 = uint(clamp(int(src[i] * inv + 8.5f), 0, 15));
+            uint q1 = uint(clamp(int(src[i + 16u] * inv + 8.5f), 0, 15));
+            dst[2u + i] = uchar(q0 | (q1 << 4));
+        }
+    }
+}
+
 kernel void q36_attention_f16(
         device float *out [[buffer(0)]],
         device float *scores [[buffer(1)]],
@@ -556,6 +632,73 @@ kernel void q36_attention_f16(
         float sigmoid = g >= 0.0f ? 1.0f / (1.0f + exp(-g))
                                   : exp(g) / (1.0f + exp(g));
         oh[j] = value * sigmoid;
+    }
+}
+
+kernel void q36_attention_q8_q4_parallel(
+        device float *out [[buffer(0)]],
+        device float *scores [[buffer(1)]],
+        device const float *q [[buffer(2)]],
+        device const float *qg [[buffer(3)]],
+        device const uchar *kcache [[buffer(4)]],
+        device const uchar *vcache [[buffer(5)]],
+        device const float *sinks [[buffer(6)]],
+        constant q36_attention_args &args [[buffer(7)]],
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2 group_id [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    uint head = group_id.x, tok = group_id.y;
+    if (head >= args.heads) return;
+    uint count = args.pos0 + tok + 1u;
+    uint kvh = head / (args.heads / args.kv_heads);
+    device const float *qh =
+        q + ((ulong)tok * args.heads + head) * args.dim;
+    uint score_capacity = args.score_stride / args.heads;
+    device float *sh = scores + (ulong)tok * args.score_stride +
+        (ulong)head * score_capacity;
+    uint k_row_bytes = args.kv_heads * (args.dim >> 5) * 34u;
+    uint v_row_bytes = args.kv_heads * (args.dim >> 5) * 18u;
+    float scale = rsqrt(float(args.dim));
+
+    for (uint pos = simdgroup; pos < count; pos += 8u) {
+        device const uchar *kr = kcache + (ulong)pos * k_row_bytes;
+        float dotv = 0.0f;
+        uint base = kvh * args.dim;
+        for (uint j = lane; j < args.dim; j += 32u)
+            dotv = fma(qh[j], q36_kv_q8_value(kr, base + j), dotv);
+        dotv = simd_sum(dotv) * scale;
+        if (lane == 0u) sh[pos] = dotv;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float maxv = args.has_sinks ? sinks[head] : -INFINITY;
+        for (uint pos = 0; pos < count; pos++) maxv = max(maxv, sh[pos]);
+        float denom = args.has_sinks ? exp(sinks[head] - maxv) : 0.0f;
+        for (uint pos = 0; pos < count; pos++) {
+            sh[pos] = exp(sh[pos] - maxv);
+            denom += sh[pos];
+        }
+        shared[0] = denom > 0.0f ? 1.0f / denom : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    if (tid < args.dim) {
+        float value = 0.0f;
+        uint base = kvh * args.dim + tid;
+        for (uint pos = 0; pos < count; pos++) {
+            device const uchar *vr = vcache + (ulong)pos * v_row_bytes;
+            value = fma(sh[pos], q36_kv_q4_value(vr, base), value);
+        }
+        device const float *gate = qg + (ulong)tok * args.qg_stride +
+            (ulong)head * args.dim * 2u + args.dim;
+        float g = gate[tid];
+        float sigmoid = g >= 0.0f ? 1.0f / (1.0f + exp(-g))
+                                  : exp(g) / (1.0f + exp(g));
+        device float *oh = out + ((ulong)tok * args.heads + head) * args.dim;
+        oh[tid] = value * shared[0] * sigmoid;
     }
 }
 

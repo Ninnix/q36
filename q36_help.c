@@ -156,9 +156,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             "Allocated context tokens.");
     }
     opt(fp, c, "-ctk, --cache-type-k TYPE",
-        "KV cache K type: f16, q8_0, or q4_0. Default: Vulkan resident q8_0, otherwise f16");
+        "KV cache K type: f16, q8_0, or q4_0. Default: Vulkan/Metal resident q8_0, otherwise f16");
     opt(fp, c, "-ctv, --cache-type-v TYPE",
-        "KV cache V type: f16, q8_0, or q4_0. Default: Vulkan resident q4_0, otherwise f16");
+        "KV cache V type: f16, q8_0, or q4_0. Default: Vulkan/Metal resident q4_0, otherwise f16");
     if (tool == Q36_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
         opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
