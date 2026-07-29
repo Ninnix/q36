@@ -1,4 +1,4 @@
-struct ds4_metal_args_norm {
+struct q36_metal_args_norm {
     int32_t  ne00;
     int32_t  ne00_t;
     uint64_t nb1;
@@ -14,11 +14,11 @@ struct ds4_metal_args_norm {
 };
 
 // RMSNorm over one activation row, optionally fusing the learned weight
-// multiply. DS4 calls this before attention, before the FFN, and for plain
+// multiply. Q36 calls this before attention, before the FFN, and for plain
 // diagnostics that need normalized but unweighted rows.
 template <typename T, short F>
 kernel void kernel_rms_norm_fuse_impl(
-        constant ds4_metal_args_norm & args,
+        constant q36_metal_args_norm & args,
         device const char * src0,
         device const char * src1_0,
         device const char * src1_1,
@@ -85,7 +85,7 @@ template [[host_name("kernel_rms_norm_f32_4")]]     kernel kernel_rms_norm_fuse_
 template [[host_name("kernel_rms_norm_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 
 kernel void kernel_add_rms_norm_mul_f32_4(
-        constant ds4_metal_args_norm & args,
+        constant q36_metal_args_norm & args,
         device const char * src0,
         device const char * src1,
         device const char * weight,
@@ -135,7 +135,7 @@ kernel void kernel_add_rms_norm_mul_f32_4(
 // RMSNorm reduction used when the following F16 matmul applies the row scale
 // while staging its RHS tile.
 kernel void kernel_rms_norm_scale_f32_4(
-        constant ds4_metal_args_norm & args,
+        constant q36_metal_args_norm & args,
         device const char * src0,
         device       float * dst_scale,
         threadgroup float * shmem_f32 [[threadgroup(0)]],
@@ -167,7 +167,7 @@ kernel void kernel_rms_norm_scale_f32_4(
     if (tpitg.x == 0) dst_scale[i01] = scale;
 }
 
-struct ds4_metal_args_qkv_rms_norm {
+struct q36_metal_args_qkv_rms_norm {
     int32_t  q_n;
     int32_t  q_n4;
     int32_t  kv_n;
@@ -177,13 +177,13 @@ struct ds4_metal_args_qkv_rms_norm {
     float    eps;
 };
 
-// Normalizes DS4's q-lora row and KV row in one dispatch.  The two reductions
+// Normalizes Q36's q-lora row and KV row in one dispatch.  The two reductions
 // deliberately mirror kernel_rms_norm_mul_f32_4: Q uses the full 256-thread
 // row shape for 1024 floats, while KV only has work in the first 128 lanes for
 // its 512 floats.  This keeps the q/kv normalization math aligned with the
 // standalone kernels while removing one tiny launch from the attention setup.
-kernel void kernel_dsv4_qkv_rms_norm_f32_4(
-        constant ds4_metal_args_qkv_rms_norm & args,
+kernel void kernel_q36_qkv_rms_norm_f32_4(
+        constant q36_metal_args_qkv_rms_norm & args,
         device const float4 * q_src,
         device const float4 * q_weight,
         device       float4 * q_dst,
@@ -228,7 +228,7 @@ kernel void kernel_dsv4_qkv_rms_norm_f32_4(
     sumf = shmem_f32[tiisg];
     sumf = simd_sum(sumf);
 
-#ifdef DS4_METAL_NORM_RSQRT_DISABLE
+#ifdef Q36_METAL_NORM_RSQRT_DISABLE
     // Match the formula used by kernel_rms_norm_fuse_impl above so both RMSNorm
     // entry points produce bit-identical scales. Hardware rsqrt() and 1.0f/sqrt()
     // can differ by ~1 ULP and that difference compounds across 43 layers.

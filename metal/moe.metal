@@ -1,4 +1,4 @@
-// DS4 Metal routed-MoE matvec kernels.
+// Q36 Metal routed-MoE matvec kernels.
 
 #ifndef QK_K
 #define QK_K 256
@@ -14,11 +14,11 @@
 #define N_R0_Q6_K 2
 #define N_R0_IQ2_XXS 4
 
-static constant uchar ds4_metal_kmask_iq2xs[8] = {
+static constant uchar q36_metal_kmask_iq2xs[8] = {
     1, 2, 4, 8, 16, 32, 64, 128
 };
 
-static constant uchar ds4_metal_ksigns_iq2xs[128] = {
+static constant uchar q36_metal_ksigns_iq2xs[128] = {
       0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
     144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
     160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
@@ -29,7 +29,7 @@ static constant uchar ds4_metal_ksigns_iq2xs[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-static constant ulong ds4_metal_iq2xxs_grid[256] = {
+static constant ulong q36_metal_iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
     0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
@@ -96,9 +96,9 @@ static constant ulong ds4_metal_iq2xxs_grid[256] = {
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 };
 
-#define kmask_iq2xs ds4_metal_kmask_iq2xs
-#define ksigns_iq2xs ds4_metal_ksigns_iq2xs
-#define iq2xxs_grid ds4_metal_iq2xxs_grid
+#define kmask_iq2xs q36_metal_kmask_iq2xs
+#define ksigns_iq2xs q36_metal_ksigns_iq2xs
+#define iq2xxs_grid q36_metal_iq2xxs_grid
 
 struct block_q2_K {
     uchar scales[QK_K/16];
@@ -134,7 +134,7 @@ struct block_iq2_xxs {
     ushort qs[QK_K/8];
 };
 
-struct ds4_metal_glm_routed_moe_args {
+struct q36_metal_glm_routed_moe_args {
     uint32_t in_dim;
     uint32_t mid_dim;
     uint32_t out_dim;
@@ -157,7 +157,7 @@ struct ds4_metal_glm_routed_moe_args {
 };
 
 
-static inline bool ds4_tp_owns_expert(int expert, int n_total,
+static inline bool q36_tp_owns_expert(int expert, int n_total,
                                       int tp_rank, int tp_world) {
     if (tp_world <= 1) return true;
     const int first = tp_rank * (n_total / tp_world);
@@ -165,7 +165,7 @@ static inline bool ds4_tp_owns_expert(int expert, int n_total,
     return expert >= first && expert < last;
 }
 
-struct ds4_metal_dsv4_moe_swiglu_weight_args {
+struct q36_metal_moe_swiglu_weight_args {
     uint32_t width;
     uint32_t rows;
     uint64_t gate_row_stride;
@@ -176,7 +176,7 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     float clamp_value;
 };
 
-struct ds4_metal_dsv4_moe_sum6_args {
+struct q36_metal_moe_sum6_args {
     uint32_t width;
     uint32_t tokens;
     uint64_t src_token_stride;
@@ -188,8 +188,8 @@ struct ds4_metal_dsv4_moe_sum6_args {
 // does not consume gate/up after this point, so the fast path avoids writing the
 // clamped intermediates back.  A diagnostic env switch can restore those writes
 // when comparing the old multi-kernel intermediate tensors.
-kernel void kernel_dsv4_moe_swiglu_weight(
-        constant ds4_metal_dsv4_moe_swiglu_weight_args &args,
+kernel void kernel_q36_moe_swiglu_weight(
+        constant q36_metal_moe_swiglu_weight_args &args,
         device char *gate,
         device char *up,
         device char *mid,
@@ -226,8 +226,8 @@ kernel void kernel_dsv4_moe_swiglu_weight(
 // half precision. The grouped matmul path converts F32 activations to half
 // before MMA anyway, so this cuts the large mid write/read traffic without
 // changing the effective matmul input precision.
-kernel void kernel_dsv4_moe_swiglu_weight_f16(
-        constant ds4_metal_dsv4_moe_swiglu_weight_args &args,
+kernel void kernel_q36_moe_swiglu_weight_f16(
+        constant q36_metal_moe_swiglu_weight_args &args,
         device char *gate,
         device char *up,
         device char *mid,
@@ -260,8 +260,8 @@ kernel void kernel_dsv4_moe_swiglu_weight_f16(
     }
 }
 
-kernel void kernel_dsv4_moe_sum6_f32(
-        constant ds4_metal_dsv4_moe_sum6_args &args,
+kernel void kernel_q36_moe_sum6_f32(
+        constant q36_metal_moe_sum6_args &args,
         device const char *src,
         device       char *dst,
         uint token[[threadgroup_position_in_grid]],
@@ -285,8 +285,8 @@ kernel void kernel_dsv4_moe_sum6_f32(
     }
 }
 
-kernel void kernel_dsv4_moe_sum8_f32(
-        constant ds4_metal_dsv4_moe_sum6_args &args,
+kernel void kernel_q36_moe_sum8_f32(
+        constant q36_metal_moe_sum6_args &args,
         device const char *src,
         device       char *dst,
         uint token[[threadgroup_position_in_grid]],
@@ -331,27 +331,13 @@ void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg
     }
 }
 
-static inline float ds4_glm_q2_K_value(device const block_q2_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q2_K *xb = blocks + block;
-    const uint group = idx / 16u;
-    const uint l = idx - group * 16u;
-    const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
-    const uint shift = ((group / 2u) & 3u) * 2u;
-    const uint q = ((uint)xb->qs[q_base + l] >> shift) & 0x03u;
-    const uint sc = (uint)xb->scales[group];
-    return (float)xb->d * (float)(sc & 0x0fu) * (float)q -
-           (float)xb->dmin * (float)(sc >> 4u);
-}
-
 static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
     return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
                           uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
-static inline float ds4_glm_q4_K_value(device const block_q4_K *blocks, uint k) {
+static inline float q36_glm_q4_K_value(device const block_q4_K *blocks, uint k) {
     const uint block = k / QK_K;
     const uint idx = k - block * QK_K;
     device const block_q4_K *xb = blocks + block;
@@ -365,54 +351,8 @@ static inline float ds4_glm_q4_K_value(device const block_q4_K *blocks, uint k) 
            (float)xb->dmin * (float)sm.y;
 }
 
-static inline float ds4_glm_q5_K_value(device const block_q5_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q5_K *xb = blocks + block;
-    const uint group = idx / 32u;
-    const uint l = idx - group * 32u;
-    const uchar2 sm = get_scale_min_k4_just2((int)group, 0, xb->scales);
-    const uint ql_base = (group >> 1u) * 32u + l;
-    const uint shift = (group & 1u) * 4u;
-    uint q = (xb->qs[ql_base] >> shift) & 0x0Fu;
-    q += (xb->qh[l] & (uchar)(1u << group)) ? 16u : 0u;
-    return (float)xb->d * (float)sm.x * (float)q -
-           (float)xb->dmin * (float)sm.y;
-}
-
-static inline float ds4_glm_q6_K_value(device const block_q6_K *blocks, uint k) {
-    const uint block = k / QK_K;
-    const uint idx = k - block * QK_K;
-    device const block_q6_K *xb = blocks + block;
-    const uint n128 = idx >> 7u;
-    const uint r = idx & 127u;
-    const uint l = r & 31u;
-    const uint quarter = r >> 5u;
-    const uint ql_base = n128 * 64u;
-    const uint qh_base = n128 * 32u;
-    const uint sc_base = n128 * 8u;
-    uint q;
-    int sc;
-
-    if (quarter == 0u) {
-        q = (xb->ql[ql_base + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 0u];
-    } else if (quarter == 1u) {
-        q = (xb->ql[ql_base + 32u + l] & 0x0Fu) | (((xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 2u];
-    } else if (quarter == 2u) {
-        q = (xb->ql[ql_base + l] >> 4u) | (((xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 4u];
-    } else {
-        q = (xb->ql[ql_base + 32u + l] >> 4u) | (((xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
-        sc = (int)xb->scales[sc_base + l / 16u + 6u];
-    }
-
-    return (float)xb->d * (float)sc * (float)((int)q - 32);
-}
-
 kernel void kernel_glm_q4_K_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -451,8 +391,8 @@ kernel void kernel_glm_q4_K_pair_swiglu_f32(
     device const float *token_x = x + (uint64_t)token * args.in_dim;
     for (uint k = tid; k < args.in_dim; k += ntg) {
         const float xv = token_x[k];
-        acc_gate += ds4_glm_q4_K_value(gate_row, k) * xv;
-        acc_up += ds4_glm_q4_K_value(up_row, k) * xv;
+        acc_gate += q36_glm_q4_K_value(gate_row, k) * xv;
+        acc_up += q36_glm_q4_K_value(up_row, k) * xv;
     }
 
     scratch[tid] = acc_gate;
@@ -476,7 +416,7 @@ kernel void kernel_glm_q4_K_pair_swiglu_f32(
 
 template <short N_R0>
 static inline void glm_q2_K_pair_swiglu_simd_f32_impl(
-        ds4_metal_glm_routed_moe_args args,
+        q36_metal_glm_routed_moe_args args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -616,7 +556,7 @@ static inline void glm_q2_K_pair_swiglu_simd_f32_impl(
 }
 
 kernel void kernel_glm_q2_K_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -632,7 +572,7 @@ kernel void kernel_glm_q2_K_pair_swiglu_f32(
     if (slot >= args.n_expert_used || token >= args.n_tokens) return;
     const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
     const int expert = selected[selected_off];
-    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+    if (!q36_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q2_K_pair_swiglu_simd_f32_impl<N_R0_Q2_K>(
         args, gate, up, x, weights, mid, scratch,
@@ -641,7 +581,7 @@ kernel void kernel_glm_q2_K_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const uint64_t *gate_addrs,
         device const uint64_t *up_addrs,
         device const float *x,
@@ -687,7 +627,7 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32(
         return;
     }
 
-    ds4_metal_glm_routed_moe_args local = args;
+    q36_metal_glm_routed_moe_args local = args;
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
@@ -700,7 +640,7 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32(
 }
 
 kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         constant uint32_t &active_mask,
         device const uint64_t *gate_addrs,
         device const uint64_t *up_addrs,
@@ -748,7 +688,7 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
         return;
     }
 
-    ds4_metal_glm_routed_moe_args local = args;
+    q36_metal_glm_routed_moe_args local = args;
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
@@ -762,7 +702,7 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
 
 template <short N_R0>
 static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
-        ds4_metal_glm_routed_moe_args args,
+        q36_metal_glm_routed_moe_args args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -920,7 +860,7 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
 }
 
 kernel void kernel_glm_q4_K_pair_swiglu2_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -942,7 +882,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
 }
 
 kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const uint64_t *gate_addrs,
         device const uint64_t *up_addrs,
         device const float *x,
@@ -988,7 +928,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
         return;
     }
 
-    ds4_metal_glm_routed_moe_args local = args;
+    q36_metal_glm_routed_moe_args local = args;
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
@@ -1001,7 +941,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         constant uint32_t &active_mask,
         device const uint64_t *gate_addrs,
         device const uint64_t *up_addrs,
@@ -1049,7 +989,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
         return;
     }
 
-    ds4_metal_glm_routed_moe_args local = args;
+    q36_metal_glm_routed_moe_args local = args;
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
@@ -1062,7 +1002,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
 }
 
 kernel void kernel_glm_q4_K_slots6_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1104,7 +1044,7 @@ kernel void kernel_glm_q4_K_slots6_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q4_K_slots8_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1152,7 +1092,7 @@ kernel void kernel_glm_q4_K_slots8_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q4_K_slots6_pair_swiglu4_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1194,7 +1134,7 @@ kernel void kernel_glm_q4_K_slots6_pair_swiglu4_f32(
 }
 
 kernel void kernel_glm_q4_K_slots8_pair_swiglu4_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1242,7 +1182,7 @@ kernel void kernel_glm_q4_K_slots8_pair_swiglu4_f32(
 }
 
 kernel void kernel_glm_q4_K_pair_swiglu4_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1264,7 +1204,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
 }
 
 kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1296,7 +1236,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
 }
 
 kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1323,7 +1263,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
 }
 
 static inline void glm_q5_K_pair_swiglu_f32_impl(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1500,7 +1440,7 @@ static inline void glm_q5_K_pair_swiglu_f32_impl(
 }
 
 kernel void kernel_glm_q5_K_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1522,7 +1462,7 @@ kernel void kernel_glm_q5_K_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q5_K_slots6_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1564,7 +1504,7 @@ kernel void kernel_glm_q5_K_slots6_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q5_K_slots8_pair_swiglu_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate0,
         device const char *gate1,
         device const char *gate2,
@@ -1612,7 +1552,7 @@ kernel void kernel_glm_q5_K_slots8_pair_swiglu_f32(
 }
 
 kernel void kernel_glm_q5_K_pair_swiglu_mapped_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1644,7 +1584,7 @@ kernel void kernel_glm_q5_K_pair_swiglu_mapped_f32(
 }
 
 kernel void kernel_glm_q5_K_pair_swiglu_mapped_row_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *gate,
         device const char *up,
         device const float *x,
@@ -1671,7 +1611,7 @@ kernel void kernel_glm_q5_K_pair_swiglu_mapped_row_f32(
 }
 
 kernel void kernel_glm_q5_K_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
@@ -1785,7 +1725,7 @@ kernel void kernel_glm_q5_K_down_f32(
 }
 
 kernel void kernel_glm_q2_K_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
@@ -1811,7 +1751,7 @@ kernel void kernel_glm_q2_K_down_f32(
     for (uint slot = 0; slot < args.n_expert_used; slot++) {
         const int expert = selected[selected_base + slot];
         if (expert < 0 || (uint)expert >= args.n_total_expert) continue;
-        if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+        if (!q36_tp_owns_expert(expert, args.n_total_expert,
                                 args.tp_rank, args.tp_world)) continue;
         device const block_q2_K *x =
             (device const block_q2_K *)(down +
@@ -1877,7 +1817,7 @@ kernel void kernel_glm_q2_K_down_f32(
 }
 
 kernel void kernel_glm_q2_K_addr_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const uint64_t *down_addrs,
         device const int32_t *selected,
         device const float *mid,
@@ -1968,7 +1908,7 @@ kernel void kernel_glm_q2_K_addr_down_f32(
 }
 
 kernel void kernel_glm_q4_K_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
@@ -1993,7 +1933,7 @@ kernel void kernel_glm_q4_K_down_f32(
                 (uint64_t)row * args.down_row_bytes);
         device const float *slot_mid = mid + mid_base + (uint64_t)slot * args.mid_dim;
         for (uint k = tid; k < args.mid_dim; k += ntg) {
-            acc += ds4_glm_q4_K_value(down_row, k) * slot_mid[k];
+            acc += q36_glm_q4_K_value(down_row, k) * slot_mid[k];
         }
     }
 
@@ -2009,7 +1949,7 @@ kernel void kernel_glm_q4_K_down_f32(
 }
 
 kernel void kernel_glm_q4_K_addr_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const uint64_t *down_addrs,
         device const int32_t *selected,
         device const float *mid,
@@ -2035,7 +1975,7 @@ kernel void kernel_glm_q4_K_addr_down_f32(
                 (uint64_t)row * args.down_row_bytes);
         device const float *slot_mid = mid + mid_base + (uint64_t)slot * args.mid_dim;
         for (uint k = tid; k < args.mid_dim; k += ntg) {
-            acc += ds4_glm_q4_K_value(down_row, k) * slot_mid[k];
+            acc += q36_glm_q4_K_value(down_row, k) * slot_mid[k];
         }
     }
 
@@ -2051,7 +1991,7 @@ kernel void kernel_glm_q4_K_addr_down_f32(
 }
 
 kernel void kernel_glm_q4_K_down_simd_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
@@ -2154,7 +2094,7 @@ kernel void kernel_glm_q4_K_down_simd_f32(
 }
 
 kernel void kernel_glm_q4_K_addr_down_simd_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const uint64_t *down_addrs,
         device const int32_t *selected,
         device const float *mid,
@@ -2258,7 +2198,7 @@ kernel void kernel_glm_q4_K_addr_down_simd_f32(
 }
 
 kernel void kernel_glm_q6_K_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
@@ -2351,7 +2291,7 @@ kernel void kernel_glm_q6_K_down_f32(
 }
 
 kernel void kernel_glm_q5_K_slots6_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down0,
         device const char *down1,
         device const char *down2,
@@ -2475,7 +2415,7 @@ kernel void kernel_glm_q5_K_slots6_down_f32(
 }
 
 kernel void kernel_glm_q5_K_slots8_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down0,
         device const char *down1,
         device const char *down2,
@@ -2603,7 +2543,7 @@ kernel void kernel_glm_q5_K_slots8_down_f32(
 }
 
 kernel void kernel_glm_q6_K_slots6_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down0,
         device const char *down1,
         device const char *down2,
@@ -2706,7 +2646,7 @@ kernel void kernel_glm_q6_K_slots6_down_f32(
 }
 
 kernel void kernel_glm_q6_K_slots8_down_f32(
-        constant ds4_metal_glm_routed_moe_args &args,
+        constant q36_metal_glm_routed_moe_args &args,
         device const char *down0,
         device const char *down1,
         device const char *down2,
@@ -2905,7 +2845,7 @@ void dequantize_iq2_xxs(device const block_iq2_xxs * xb, short il, thread type4x
     }
 }
 
-struct ds4_metal_args_mul_mv_id {
+struct q36_metal_args_mul_mv_id {
     int32_t  nei0;
     int32_t  nei1;
     uint64_t nbi1;
@@ -2940,38 +2880,38 @@ struct ds4_metal_args_mul_mv_id {
     int32_t  tp_expert_base;
 };
 
-struct ds4_metal_moe_expert_group_args {
+struct q36_metal_moe_expert_group_args {
     uint32_t expert_base;
     uint32_t expert_count;
     uint32_t accumulate;
     uint32_t pad0;
 };
 
-struct ds4_metal_q4_gather_slots6_args {
+struct q36_metal_q4_gather_slots6_args {
     uint64_t expert_bytes;
     uint32_t group_size;
     uint32_t n_slots;
 };
 
-struct ds4_metal_q4_expert_table {
+struct q36_metal_q4_expert_table {
     array<device const char *, 384> experts [[id(0)]];
 };
 
-struct ds4_metal_expert_address_table {
+struct q36_metal_expert_address_table {
     device const uint64_t *addrs;
 };
 
-struct ds4_metal_stream_expert_validate_args {
+struct q36_metal_stream_expert_validate_args {
     uint32_t n_total_expert;
     uint32_t n_expert;
 };
 
-struct ds4_metal_stream_expert_split_args {
+struct q36_metal_stream_expert_split_args {
     uint32_t active_mask;
     uint32_t accumulate;
 };
 
-struct ds4_metal_args_mul_mm_id_map0 {
+struct q36_metal_args_mul_mm_id_map0 {
     int32_t  ne02;
     int32_t  ne10;
     int32_t  ne11;
@@ -2982,7 +2922,7 @@ struct ds4_metal_args_mul_mm_id_map0 {
     uint64_t nb21;
 };
 
-struct ds4_metal_args_mul_mm_id {
+struct q36_metal_args_mul_mm_id {
     int32_t  ne00;
     int32_t  ne02;
     uint64_t nb01;
@@ -3319,10 +3259,10 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     {
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = q36_metal_iq2xxs_grid[pos + i];
         nval = 2;
         pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        for (int i = 0; i < nval; ++i) ssigns[pos+i] = q36_metal_ksigns_iq2xs[pos+i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3353,7 +3293,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
                 const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
                 const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
-                    sum += yl[8*l + j] * grid[j] * (signs & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sum += yl[8*l + j] * grid[j] * (signs & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
             sumf[row] += d * sum;
@@ -3377,7 +3317,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
 template<int nr0>
 void kernel_mul_mv_iq2_xxs_pair_f32_impl(
-        ds4_metal_args_mul_mv args,
+        q36_metal_args_mul_mv args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -3418,10 +3358,10 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     {
         int nval = 4;
         int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = q36_metal_iq2xxs_grid[pos + i];
         nval = 2;
         pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        for (int i = 0; i < nval; ++i) ssigns[pos+i] = q36_metal_ksigns_iq2xs[pos+i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3460,8 +3400,8 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
                 const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8*l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * gridg[j] * (signg & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * gridu[j] * (signu & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -3490,7 +3430,7 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
 }
 
 typedef void (kernel_mul_mv2_disp_t)(
-        ds4_metal_args_mul_mv args,
+        q36_metal_args_mul_mv args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -3501,7 +3441,7 @@ typedef void (kernel_mul_mv2_disp_t)(
 
 template<kernel_mul_mv2_disp_t disp_fn>
 void mmv_fn(
-        ds4_metal_args_mul_mv args,
+        q36_metal_args_mul_mv args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -3520,7 +3460,7 @@ typedef decltype(mmv_fn<kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K>>) mul_mv_id_disp_
 // IQ2_XXS weights without materializing per-expert dispatches on the CPU.
 template<mul_mv_id_disp_fn_t disp_fn>
 kernel void kernel_mul_mv_id(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -3547,7 +3487,7 @@ kernel void kernel_mul_mv_id(
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (!q36_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert under the TP split: zero this threadgroup's output
          * rows so the downstream expert-sum stages stay unchanged. */
         const short NSG = FC_mul_mv_nsg;
@@ -3563,7 +3503,7 @@ kernel void kernel_mul_mv_id(
         src0s + (int64_t)(i02 - args.tp_expert_base)*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         /*.ne00 =*/ args.ne00,
         /*.ne01 =*/ args.ne01,
         /*.ne02 =*/ 1,
@@ -3600,7 +3540,7 @@ kernel void kernel_mul_mv_id(
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K>>>) kernel_mul_mv_id_q_t;
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>>) kernel_mul_mv_id_q8_0_t;
 
-// Host-visible decode MoE matvec variants for the DS4 quant formats.
+// Host-visible decode MoE matvec variants for the Q36 quant formats.
 template [[host_name("kernel_mul_mv_id_q8_0_f32")]]    kernel kernel_mul_mv_id_q8_0_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0>>>;
 template [[host_name("kernel_mul_mv_id_q2_K_f32")]]    kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_impl<N_R0_Q2_K>>>;
 template [[host_name("kernel_mul_mv_id_q4_K_f32")]]    kernel kernel_mul_mv_id_q_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>>>;
@@ -3611,7 +3551,7 @@ template [[host_name("kernel_mul_mv_id_iq2_xxs_f32")]] kernel kernel_mul_mv_id_q
 // by the generic dense path tops out around 220 GB/s on M5 for the GLM
 // DenseQ4 decode shapes; this impl streams the same rows at 530-650 GB/s.
 kernel void kernel_mul_mv_q4_K_dense_f32(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -3622,7 +3562,7 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-// DS4 attention output low projection, specialized for the fixed block
+// Q36 attention output low projection, specialized for the fixed block
 // diagonal mapping used by the model:
 //
 //     low[token, group, rank] = heads[token, group, :] * Woa[group, rank, :]
@@ -3630,8 +3570,8 @@ kernel void kernel_mul_mv_q4_K_dense_f32(
 // The generic GGML-style id matvec supports arbitrary routed expert ids.  Here
 // the id is always equal to the group number, so this wrapper keeps the exact
 // Q8_0 dot kernel but removes the id-buffer load and the CPU-side id table.
-kernel void kernel_dsv4_attn_out_low_q8_0_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+kernel void kernel_q36_attn_out_low_q8_0_f32(
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -3652,7 +3592,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
     device       char * dst_cur  = dst   + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         /*.ne00 =*/ args.ne00,
         /*.ne01 =*/ args.ne01,
         /*.ne02 =*/ 1,
@@ -3674,7 +3614,7 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         /*.r3   =*/ 1,
     };
 
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, thread q36_metal_args_mul_mv &>(
         args0,
         src0_cur,
         src1_cur,
@@ -3685,8 +3625,8 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
-kernel void kernel_dsv4_attn_out_low_q4_K_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+kernel void kernel_q36_attn_out_low_q4_K_f32(
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -3709,7 +3649,7 @@ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
     device const char * src1_cur = src1  + i11 * args.nb11 + i12 * args.nb12;
     device       char * dst_cur  = dst   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         /*.ne00 =*/ args.ne00,
         /*.ne01 =*/ args.ne01,
         /*.ne02 =*/ 1,
@@ -3743,7 +3683,7 @@ kernel void kernel_dsv4_attn_out_low_q4_K_f32(
 }
 
 kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -3768,7 +3708,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
     device char * dst_gate_cur = dst_gate + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
     device char * dst_up_cur   = dst_up   + (idx*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (!q36_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert: zero this threadgroup's gate/up rows so the
          * separate swiglu-weight stage yields zero mid rows. */
         const short NSG_z = FC_mul_mv_nsg;
@@ -3788,7 +3728,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
     device const char * src0_up_cur   = src0_up   + (int64_t)(i02 - args.tp_expert_base)*args.nb02;
     device const char * src1_cur      = src1      + i11*args.nb11 + i12*args.nb12;
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -3810,7 +3750,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
         sgitg);
 }
 
-// Decode-only routed expert gate/up projection fused with the DS4 activation:
+// Decode-only routed expert gate/up projection fused with the Q36 activation:
 //
 //     mid = silu(clamp(gate)) * clamp(up) * route_weight
 //
@@ -3821,8 +3761,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_f32(
 // down projection.  The host uses this only for the normal release path where
 // diagnostics do not request clamped gate/up intermediates.
 kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -3843,7 +3783,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    if (!q36_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
     const int i02b = i02 - args.tp_expert_base;
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
@@ -3868,10 +3808,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     {
         int nval = 4;
         int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = q36_metal_iq2xxs_grid[pos + i];
         nval = 2;
         pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        for (int i = 0; i < nval; ++i) ssigns[pos + i] = q36_metal_ksigns_iq2xs[pos + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3910,8 +3850,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
                 const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
                 for (short j = 0; j < 8; ++j) {
                     const float v = yl[8 * l + j];
-                    sg += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
-                    su += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    sg += v * gridg[j] * (signg & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    su += v * gridu[j] * (signu & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                 }
             }
             sumg[row] += dg * sg;
@@ -3962,8 +3902,8 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
         device const char * src0_gate1,
         device const char * src0_gate2,
@@ -4010,7 +3950,7 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4058,8 +3998,8 @@ kernel void kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const uint64_t * gate_addrs,
         device const uint64_t * up_addrs,
         device const char * src1,
@@ -4100,7 +4040,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4148,7 +4088,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_addr_iq2_xxs_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const uint64_t * addrs,
         device const char * src1,
         device       char * dst,
@@ -4181,7 +4121,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
     device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
     device char *dst_cur = dst + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4201,9 +4141,9 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
 }
 
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
-        constant ds4_metal_stream_expert_split_args & split,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
+        constant q36_metal_stream_expert_split_args & split,
         device const uint64_t * gate_addrs,
         device const uint64_t * up_addrs,
         device const char * src1,
@@ -4247,7 +4187,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4295,7 +4235,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
 }
 
 kernel void kernel_stream_expert_cache_validate(
-        constant ds4_metal_stream_expert_validate_args & args,
+        constant q36_metal_stream_expert_validate_args & args,
         device const char * ids,
         device const uint64_t * gate_addrs,
         device const uint64_t * up_addrs,
@@ -4332,7 +4272,7 @@ kernel void kernel_stream_expert_cache_validate(
 }
 
 kernel void kernel_mul_mv_id_q4_K_pair_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -4356,7 +4296,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
+    if (!q36_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         const short NSG_z = FC_mul_mv_nsg;
         const int row0_z = (tgpig.x * NSG_z + sgitg) * args.nr0;
         device float *zg = (device float *)dst_gate_cur;
@@ -4374,7 +4314,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
     device const char *src0_up_cur   = src0_up   + (int64_t)(i02 - args.tp_expert_base) * args.nb02;
     device const char *src1_cur      = src1      + i11 * args.nb11 + i12 * args.nb12;
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4409,8 +4349,8 @@ kernel void kernel_mul_mv_id_q4_K_pair_f32(
 // SwiGLU input.  This keeps Q4 behavior aligned with the Q2 optimization while
 // preserving the old pair projection arithmetic.
 kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -4430,7 +4370,7 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
+    if (!q36_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) return;
     const int i02b = i02 - args.tp_expert_base;
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
@@ -4580,10 +4520,10 @@ kernel void kernel_mul_mv_id_q4_K_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
-        device const ds4_metal_q4_expert_table & gate_table,
-        device const ds4_metal_q4_expert_table & up_table,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
+        device const q36_metal_q4_expert_table & gate_table,
+        device const q36_metal_q4_expert_table & up_table,
         device const char * src1,
         device       char * dst_gate,
         device       char * dst_up,
@@ -4752,8 +4692,8 @@ kernel void kernel_mul_mv_table_q4_K_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const ulong * gate_addrs,
         device const ulong * up_addrs,
         device const char * src1,
@@ -4788,7 +4728,7 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4843,7 +4783,7 @@ kernel void kernel_mul_mv_addr_q4_K_pair_swiglu_f32(
 }
 
 kernel void kernel_q4_gather_slots6(
-        constant ds4_metal_q4_gather_slots6_args &args,
+        constant q36_metal_q4_gather_slots6_args &args,
         device const char *src_group0,
         device const char *src_group1,
         device const char *src_group2,
@@ -4887,8 +4827,8 @@ kernel void kernel_q4_gather_slots6(
 }
 
 kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
         device const char * src0_gate1,
         device const char * src0_gate2,
@@ -4935,7 +4875,7 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -4989,7 +4929,7 @@ kernel void kernel_mul_mv_slots6_q4_K_pair_swiglu_f32(
     (void)tiitg;
 }
 
-static inline device const char *ds4_q4_group24_select(
+static inline device const char *q36_q4_group24_select(
         uint32_t group_id,
         device const char *src00,
         device const char *src01,
@@ -5044,8 +4984,8 @@ static inline device const char *ds4_q4_group24_select(
 }
 
 kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
         device const char * src0_gate1,
         device const char * src0_gate2,
@@ -5107,7 +5047,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -5162,8 +5102,8 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate0,
         device const char * src0_gate1,
         device const char * src0_gate2,
@@ -5231,7 +5171,7 @@ kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -5286,7 +5226,7 @@ kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
 }
 
 kernel void kernel_mul_mv_group24_q4_K_id_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -5336,7 +5276,7 @@ kernel void kernel_mul_mv_group24_q4_K_id_f32(
     }
     const uint32_t expert_local = expert_u - group_id * expert_group_size;
 
-    device const char *src0_cur = ds4_q4_group24_select(group_id,
+    device const char *src0_cur = q36_q4_group24_select(group_id,
                                                         src00, src01, src02, src03,
                                                         src04, src05, src06, src07,
                                                         src08, src09, src10, src11,
@@ -5350,7 +5290,7 @@ kernel void kernel_mul_mv_group24_q4_K_id_f32(
     device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
     device char *dst_cur = dst + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -5372,9 +5312,9 @@ kernel void kernel_mul_mv_group24_q4_K_id_f32(
 }
 
 kernel void kernel_mul_mv_group_q4_K_pair_swiglu_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
-        constant ds4_metal_moe_expert_group_args & group,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
+        constant q36_metal_moe_expert_group_args & group,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -5414,7 +5354,7 @@ kernel void kernel_mul_mv_group_q4_K_pair_swiglu_f32(
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
+    q36_metal_args_mul_mv args0 = {
         args.ne00, args.ne01, 1,
         args.nb00, args.nb01, args.nb02, args.nb02,
         args.ne10, 1, 1,
@@ -5470,12 +5410,12 @@ kernel void kernel_mul_mv_group_q4_K_pair_swiglu_f32(
 
 
 /* IQ2_XXS down projection summed over the token's selected experts (the
- * GLM 5.2 routed blobs are IQ2_XXS end to end, unlike DS4 Flash's Q2_K
+ * GLM 5.2 routed blobs are IQ2_XXS end to end, unlike Q36 Flash's Q2_K
  * down).  Same contract as the q2_K sum kernel: mid rows already carry
  * silu(gate)*up*route_weight, expert ownership honors the TP split, and
  * add_in folds the shared-expert partial when tp_addend is set. */
 kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -5503,10 +5443,10 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
     {
         int nval = 4;
         int pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = q36_metal_iq2xxs_grid[pos + i];
         nval = 2;
         pos = (32 * sgitg + tiisg) * nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        for (int i = 0; i < nval; ++i) ssigns[pos + i] = q36_metal_ksigns_iq2xs[pos + i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -5514,7 +5454,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (!q36_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_iq2_xxs *x =
             (device const block_iq2_xxs *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
         device const float *y = (device const float *)(token_src1 + expert_slot*args.nb11);
@@ -5544,7 +5484,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
                         const uint8_t sign = ssigns[(aux32 >> 7 * l) & 127];
                         for (short j = 0; j < 8; ++j) {
                             s += yl[8 * l + j] * grid[j] *
-                                 (sign & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                                 (sign & q36_metal_kmask_iq2xs[j] ? -1.f : 1.f);
                         }
                     }
                     sumf[row] += d * s;
@@ -5575,7 +5515,7 @@ kernel void kernel_mul_mv_id_iq2_xxs_sum6_f32(
 }
 
 kernel void kernel_mul_mv_id_q2_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -5604,7 +5544,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (!q36_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q2_K * x = (device const block_q2_K *)(src0s + (int64_t)(expert - args.tp_expert_base)*args.nb02 + first_row*args.nb01);
         device const float * y = (device const float *)(token_src1 + expert_slot*args.nb11);
         device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
@@ -5674,7 +5614,7 @@ kernel void kernel_mul_mv_id_q2_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -5777,7 +5717,7 @@ kernel void kernel_mul_mv_slots6_q2_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const uint64_t * addrs,
         device const char * src1,
         device       char * dst,
@@ -5877,8 +5817,8 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_stream_expert_split_args & split,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_stream_expert_split_args & split,
         device const uint64_t * addrs,
         device const char * src1,
         device       char * dst,
@@ -5987,7 +5927,7 @@ kernel void kernel_mul_mv_addr_q2_K_sum6_masked_f32(
 }
 
 kernel void kernel_mul_mv_id_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -6021,7 +5961,7 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
 
     for (int expert_slot = 0; expert_slot < args.nei0; expert_slot++) {
         const int32_t expert = token_ids[expert_slot];
-        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        if (!q36_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
         device const block_q4_K *x =
             (device const block_q4_K *)(src0s + (int64_t)(expert - args.tp_expert_base) * args.nb02 + first_row * args.nb01);
         device const float *y = (device const float *)(token_src1 + expert_slot * args.nb11);
@@ -6101,8 +6041,8 @@ kernel void kernel_mul_mv_id_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_group_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        constant ds4_metal_moe_expert_group_args & group,
+        constant q36_metal_args_mul_mv_id & args,
+        constant q36_metal_moe_expert_group_args & group,
         device const char * src0s,
         device const char * src1,
         device       char * dst,
@@ -6224,8 +6164,8 @@ kernel void kernel_mul_mv_group_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_table_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
-        device const ds4_metal_q4_expert_table & table,
+        constant q36_metal_args_mul_mv_id & args,
+        device const q36_metal_q4_expert_table & table,
         device const char * src1,
         device       char * dst,
         device const char * ids,
@@ -6333,7 +6273,7 @@ kernel void kernel_mul_mv_table_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_addr_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const ulong * addrs,
         device const char * src1,
         device       char * dst,
@@ -6444,7 +6384,7 @@ kernel void kernel_mul_mv_addr_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -6561,7 +6501,7 @@ kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -6693,7 +6633,7 @@ kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_group8_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -6829,7 +6769,7 @@ kernel void kernel_mul_mv_group8_q4_K_sum6_f32(
 }
 
 kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
-        constant ds4_metal_args_mul_mv_id & args,
+        constant q36_metal_args_mul_mv_id & args,
         device const char * src00,
         device const char * src01,
         device const char * src02,
@@ -6896,7 +6836,7 @@ kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
         }
         const uint32_t expert_local = expert_u - group_id * expert_group_size;
 
-        device const char *src0_cur = ds4_q4_group24_select(group_id,
+        device const char *src0_cur = q36_q4_group24_select(group_id,
                                                             src00, src01, src02, src03,
                                                             src04, src05, src06, src07,
                                                             src08, src09, src10, src11,
@@ -6977,12 +6917,12 @@ kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
 
 #define QK_NL 16
 
-// Builds the compact per-expert work map used by batched MoE matmul. DS4 routes
+// Builds the compact per-expert work map used by batched MoE matmul. Q36 routes
 // each token to a small fixed top-k list, so this turns token-major ids into
 // expert-major slices that the tiled matmul can consume.
 template<short ne20>
 kernel void kernel_mul_mm_id_map0(
-        constant ds4_metal_args_mul_mm_id_map0 & args,
+        constant q36_metal_args_mul_mm_id_map0 & args,
         device  const char * src2,
         device        char * htpe,
         device        char * hids,
@@ -7036,7 +6976,7 @@ kernel void kernel_mul_mm_id_map0(
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
 
-// Host-visible map builders for the routed-expert counts used by DS4 graph
+// Host-visible map builders for the routed-expert counts used by Q36 graph
 // shapes. Some arities are generic leftovers retained for nearby batch sizes.
 template [[host_name("kernel_mul_mm_id_map0_ne20_1" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<1>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_2" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<2>;
@@ -7050,10 +6990,10 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_
 
 // Batched routed-expert matmul. It reads the expert-major map produced above,
 // loads selected expert weights, and writes results back to token-major slots
-// so the DS4 FFN can apply SwiGLU, weighting, and the down projection.
+// so the Q36 FFN can apply SwiGLU, weighting, and the down projection.
 template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id(
-        constant ds4_metal_args_mul_mm_id & args,
+        constant q36_metal_args_mul_mm_id & args,
         device const char * src0,
         device const char * src1,
         device const char * htpe,
@@ -7091,7 +7031,7 @@ kernel void kernel_mul_mm_id(
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
 
-    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+    if (!q36_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert under the TP split: zero this tile's output rows so
          * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
          * row belongs to exactly one expert, so nothing else writes them. */
@@ -7275,7 +7215,7 @@ kernel void kernel_mul_mm_id(
 // GPU-address table instead of a contiguous full-layer tensor.
 template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm_id_addr(
-        constant ds4_metal_args_mul_mm_id & args,
+        constant q36_metal_args_mul_mm_id & args,
         device const uint64_t * src0_addrs,
         device const char * src1,
         device const char * htpe,
@@ -7481,12 +7421,12 @@ kernel void kernel_mul_mm_id_addr(
 // Fused routed gate+up grouped matmul with the SwiGLU epilogue, generic over
 // the expert quant block.  Both A streams share one staged B tile per k-step;
 // each output keeps the exact MMA accumulation order of the separate GEMMs,
-// and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
+// and the epilogue matches kernel_q36_moe_swiglu_weight_f16, so the fused
 // result is bit-identical to the unfused path.
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
-        constant ds4_metal_args_mul_mm_id & args,
-        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        constant q36_metal_args_mul_mm_id & args,
+        constant q36_metal_moe_swiglu_weight_args & act,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -7678,7 +7618,7 @@ typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, deq
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>) mul_mm_id_pair_swiglu_f16_q4;
 typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q5_K, QK_NL, dequantize_q5_K>) mul_mm_id_pair_swiglu_f16_q5;
 
-// Host-visible fused routed pair matmuls for the DS4 expert quant formats.
+// Host-visible fused routed pair matmuls for the Q36 expert quant formats.
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
 template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_mul_mm_id_q5_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q5 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q5_K, QK_NL, dequantize_q5_K>;
@@ -7689,7 +7629,7 @@ typedef decltype(kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_addr;
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_addr_f16_rhs;
 
-// Host-visible batched MoE matmul variants for the DS4 quant formats.
+// Host-visible batched MoE matmul variants for the Q36 quant formats.
 template [[host_name("kernel_mul_mm_id_q8_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
@@ -7711,7 +7651,7 @@ template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_add
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_addr_f16_rhs kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, half, half4x4, half, half2x4>;
 
-#ifdef DS4_METAL_HAS_TENSOR
+#ifdef Q36_METAL_HAS_TENSOR
 // Attention-output low-rank projection retained for Metal4 prefill.  It uses
 // the same direct-RHS idea as dense matmul: dequantize the Q8_0 low projection
 // weights to a half tile, then let TensorOps read the dense head activations
@@ -7724,7 +7664,7 @@ template [[host_name("kernel_mul_mm_id_addr_q4_K_f16")]]    kernel mul_mm_id_add
 // threadgroup barrier per step instead of two.
 template<short NR1>
 kernel void kernel_attn_out_low_q8_0_mpp_direct_rhs(
-        constant ds4_metal_args_mul_mm_id & args,
+        constant q36_metal_args_mul_mm_id & args,
         device const char * srcA,
         device const char * srcB,
         device       char * dst,

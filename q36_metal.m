@@ -80,30 +80,91 @@ static int q36_metal_wait(void) {
     return 1;
 }
 
+static const char *q36_metal_base_source =
+"#include <metal_stdlib>\n"
+"#ifdef Q36_METAL_HAS_TENSOR\n"
+"#include <metal_tensor>\n"
+"#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+"#endif\n"
+"using namespace metal;\n"
+"#ifdef Q36_METAL_HAS_TENSOR\n"
+"using namespace mpp::tensor_ops;\n"
+"#endif\n"
+"\n"
+"#define MAX(x, y) ((x) > (y) ? (x) : (y))\n"
+"#define MIN(x, y) ((x) < (y) ? (x) : (y))\n"
+"#define SWAP(x, y) { auto tmp = (x); (x) = (y); (y) = tmp; }\n"
+"#define QK8_0 32\n"
+"#ifndef QK_K\n"
+"#define QK_K 256\n"
+"#endif\n"
+"#define N_SIMDWIDTH 32\n"
+"#define N_R0_Q8_0 2\n"
+"#define N_SG_Q8_0 4\n"
+"#define FC_MUL_MV 600\n"
+"#define FC_MUL_MM 700\n"
+"#define FC_BIN 1300\n"
+"#define FOR_UNROLL(x) _Pragma(\"clang loop unroll(full)\") for (x)\n"
+"#ifndef M_PI_F\n"
+"#define M_PI_F 3.14159265358979323846f\n"
+"#endif\n"
+"\n"
+"struct block_q8_0 {\n"
+"    half d;\n"
+"    int8_t qs[QK8_0];\n"
+"};\n"
+"\n"
+"struct block_q8_K {\n"
+"    float d;\n"
+"    int8_t qs[QK_K];\n"
+"    int16_t bsums[QK_K / 16];\n"
+"};\n";
+
 static NSString *q36_metal_source(void) {
-    NSArray<NSString *> *paths = @[
-        @"metal/q36_common.metal", @"metal/flash_attn.metal",
-        @"metal/dense.metal", @"metal/moe.metal", @"metal/dsv4_hc.metal",
-        @"metal/unary.metal", @"metal/dsv4_kv.metal", @"metal/dsv4_rope.metal",
-        @"metal/dsv4_misc.metal", @"metal/argsort.metal", @"metal/cpy.metal",
-        @"metal/concat.metal", @"metal/get_rows.metal", @"metal/sum_rows.metal",
-        @"metal/softmax.metal", @"metal/repeat.metal", @"metal/glu.metal",
-        @"metal/norm.metal", @"metal/bin.metal", @"metal/set_rows.metal",
-        @"metal/q36_ops.metal"
+    NSArray<NSArray<NSString *> *> *required_sources = @[
+        @[@"Q36_METAL_DENSE_SOURCE",    @"metal/dense.metal"],
+        @[@"Q36_METAL_MOE_SOURCE",      @"metal/moe.metal"],
+        @[@"Q36_METAL_NORM_SOURCE",     @"metal/norm.metal"],
+        @[@"Q36_METAL_OPS_SOURCE",      @"metal/ops.metal"],
+        @[@"Q36_METAL_RECURRENT_SOURCE", @"metal/recurrent.metal"],
+        @[@"Q36_METAL_KV_SOURCE",       @"metal/kv.metal"],
+        @[@"Q36_METAL_ATTN_SOURCE",     @"metal/attention.metal"]
     ];
-    NSMutableString *source = [NSMutableString string];
-    for (NSString *path in paths) {
-        NSError *error = nil;
-        NSString *part = [NSString stringWithContentsOfFile:path
-                                                   encoding:NSUTF8StringEncoding
-                                                      error:&error];
-        if (!part) {
-            fprintf(stderr, "q36: cannot read Metal source %s: %s\n",
-                    path.UTF8String, error.localizedDescription.UTF8String);
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableString *source = [NSMutableString
+        stringWithUTF8String:q36_metal_base_source];
+    for (NSArray<NSString *> *spec in required_sources) {
+        const char *override_path = getenv(spec[0].UTF8String);
+        NSMutableArray<NSString *> *paths = [NSMutableArray array];
+        if (override_path && override_path[0])
+            [paths addObject:[NSString stringWithUTF8String:override_path]];
+        [paths addObject:spec[1]];
+        [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+
+        NSString *loaded = nil;
+        NSString *loaded_path = nil;
+        for (NSString *path in paths) {
+            if (![fm fileExistsAtPath:path]) continue;
+            NSError *error = nil;
+            loaded = [NSString stringWithContentsOfFile:path
+                                               encoding:NSUTF8StringEncoding
+                                                  error:&error];
+            if (!loaded) {
+                fprintf(stderr, "q36: failed to read Metal source %s: %s\n",
+                        path.UTF8String,
+                        error.localizedDescription.UTF8String);
+                return nil;
+            }
+            loaded_path = path;
+            break;
+        }
+        if (!loaded) {
+            fprintf(stderr,
+                    "q36: Metal source %s not found (set %s to override)\n",
+                    spec[1].UTF8String, spec[0].UTF8String);
             return nil;
         }
-        [source appendString:part];
-        [source appendString:@"\n"];
+        [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
 }
@@ -1056,11 +1117,12 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
                                  const void *map, uint64_t size,
                                  uint64_t weight_offset,
                                  uint32_t width, uint32_t rows, float eps) {
-    const char *ds4_env = getenv("Q36_METAL_DS4_NORM");
-    bool ds4_norm = (!ds4_env || !ds4_env[0] || ds4_env[0] != '0') &&
-                    width >= 512u && (width & 3u) == 0u;
+    const char *fused_norm_env = getenv("Q36_METAL_FUSED_NORM");
+    bool fused_norm = (!fused_norm_env || !fused_norm_env[0] ||
+                       fused_norm_env[0] != '0') &&
+                      width >= 512u && (width & 3u) == 0u;
     uint64_t bytes = (uint64_t)width * rows * sizeof(float);
-    if (ds4_norm && out_norm && out_sum && a && b && map &&
+    if (fused_norm && out_norm && out_sum && a && b && map &&
         bytes <= out_norm->bytes && bytes <= out_sum->bytes &&
         bytes <= a->bytes && bytes <= b->bytes &&
         weight_offset <= size &&

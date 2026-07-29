@@ -1,9 +1,9 @@
-// DS4 Metal matvec kernels used by generation.
+// Q36 Metal matvec kernels used by generation.
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 
-struct ds4_metal_args_mul_mv {
+struct q36_metal_args_mul_mv {
     int ne00;
     int ne01;
     int ne02;
@@ -25,14 +25,14 @@ struct ds4_metal_args_mul_mv {
     short r3;
 };
 
-struct ds4_metal_args_compressor_pair_store {
+struct q36_metal_args_compressor_pair_store {
     uint32_t width;
     uint32_t ratio;
     uint32_t pos;
     uint32_t ape_type;
 };
 
-struct ds4_metal_args_mul_mm {
+struct q36_metal_args_mul_mm {
     int32_t ne00;
     int32_t ne02;
     uint64_t nb01;
@@ -49,7 +49,7 @@ struct ds4_metal_args_mul_mm {
     int16_t r3;
 };
 
-struct ds4_metal_args_mul_mv_ext {
+struct q36_metal_args_mul_mv_ext {
     int32_t ne00;
     int32_t ne01;
     int32_t ne02;
@@ -182,11 +182,11 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-// Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
+// Decode-time Q8_0 matrix-vector multiply. Q36 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]
 kernel void kernel_mul_mv_q8_0_f32(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -194,12 +194,12 @@ kernel void kernel_mul_mv_q8_0_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_r4")]]
 kernel void kernel_mul_mv_q8_0_f32_r4(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -207,13 +207,13 @@ kernel void kernel_mul_mv_q8_0_f32_r4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_impl<4, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Output projection alias used by the optimized host dispatch.
 [[host_name("kernel_mul_mv_q8_0_f32_nr4")]]
 kernel void kernel_mul_mv_q8_0_f32_nr4(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -221,7 +221,7 @@ kernel void kernel_mul_mv_q8_0_f32_nr4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_q8_0_f32_impl<4, constant q36_metal_args_mul_mv &>(
         args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
@@ -231,8 +231,8 @@ kernel void kernel_mul_mv_q8_0_f32_nr4(
 // the activation load and threadgroup scheduling are shared.
 [[host_name("kernel_mul_mv_q8_0_f32_pair")]]
 kernel void kernel_mul_mv_q8_0_f32_pair(
-        constant ds4_metal_args_mul_mv & args0,
-        constant ds4_metal_args_mul_mv & args1,
+        constant q36_metal_args_mul_mv & args0,
+        constant q36_metal_args_mul_mv & args1,
         device const char * src0_a,
         device const char * src0_b,
         device const char * src1,
@@ -349,15 +349,15 @@ kernel void kernel_mul_mv_q8_0_f32_pair(
 //
 //     mid = silu(min(gate, limit)) * clamp(up, -limit, limit)
 //
-// DS4's shared expert uses two Q8_0 matrices with the same input row.  This
+// Q36's shared expert uses two Q8_0 matrices with the same input row.  This
 // kernel preserves the exact Q8_0 dot-product reduction shape for both
 // projections, still writes gate/up for diagnostics, and derives `mid` in the
 // same lane that owns the reduced output row.  The point is not to fuse two
 // independent weight streams into one matmul; it is to remove the separate
 // activation pass and its reread of the two 2048-wide rows.
 template<short NR0, bool STORE_GATE_UP>
-void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
-        constant ds4_metal_args_mul_mv & args,
+void kernel_q36_shared_gate_up_swiglu_q8_0_impl(
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -478,9 +478,9 @@ void kernel_dsv4_shared_gate_up_swiglu_q8_0_impl(
     }
 }
 
-[[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0")]]
-kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
-        constant ds4_metal_args_mul_mv & args,
+[[host_name("kernel_q36_shared_gate_up_swiglu_q8_0")]]
+kernel void kernel_q36_shared_gate_up_swiglu_q8_0(
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -492,14 +492,14 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
+    kernel_q36_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
-[[host_name("kernel_dsv4_shared_gate_up_swiglu_q8_0_r4")]]
-kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_r4(
-        constant ds4_metal_args_mul_mv & args,
+[[host_name("kernel_q36_shared_gate_up_swiglu_q8_0_r4")]]
+kernel void kernel_q36_shared_gate_up_swiglu_q8_0_r4(
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -511,14 +511,14 @@ kernel void kernel_dsv4_shared_gate_up_swiglu_q8_0_r4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<4, true>(
+    kernel_q36_shared_gate_up_swiglu_q8_0_impl<4, true>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
-[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0")]]
-kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
-        constant ds4_metal_args_mul_mv & args,
+[[host_name("kernel_q36_shared_mid_swiglu_q8_0")]]
+kernel void kernel_q36_shared_mid_swiglu_q8_0(
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -530,14 +530,14 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false>(
+    kernel_q36_shared_gate_up_swiglu_q8_0_impl<N_R0_Q8_0, false>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
-[[host_name("kernel_dsv4_shared_mid_swiglu_q8_0_r4")]]
-kernel void kernel_dsv4_shared_mid_swiglu_q8_0_r4(
-        constant ds4_metal_args_mul_mv & args,
+[[host_name("kernel_q36_shared_mid_swiglu_q8_0_r4")]]
+kernel void kernel_q36_shared_mid_swiglu_q8_0_r4(
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -549,7 +549,7 @@ kernel void kernel_dsv4_shared_mid_swiglu_q8_0_r4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_shared_gate_up_swiglu_q8_0_impl<4, false>(
+    kernel_q36_shared_gate_up_swiglu_q8_0_impl<4, false>(
             args, src0_gate, src0_up, src1, dst_gate, dst_up, dst_mid,
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
@@ -648,10 +648,10 @@ void kernel_mul_mv_t_t_disp(
 }
 
 // Decode-time dense F32/F16 matrix-vector multiply. The instantiated kernels
-// handle unquantized DS4 weights and activations that are already float rows.
+// handle unquantized Q36 weights and activations that are already float rows.
 template<typename T0, typename T1>
 kernel void kernel_mul_mv_t_t(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -659,7 +659,7 @@ kernel void kernel_mul_mv_t_t(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_t_t_disp<T0, T1, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_t_t_disp<T0, T1, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
@@ -765,11 +765,11 @@ void kernel_mul_mv_t_t_4_disp(
     };
 }
 
-// Vectorized dense matvec using float4/half4 loads. DS4 uses this where the
+// Vectorized dense matvec using float4/half4 loads. Q36 uses this where the
 // inner dimension and alignment make vector loads cheaper than scalar lanes.
 template<typename T0, typename T04, typename T1, typename T14>
 kernel void kernel_mul_mv_t_t_4(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -777,7 +777,7 @@ kernel void kernel_mul_mv_t_t_4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_t_t_4_disp<T0, T04, T1, T14, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_t_t_4_disp<T0, T04, T1, T14, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
@@ -786,7 +786,7 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 
-// DS4 compressor projections always compute two same-shaped F16 matvecs from
+// Q36 compressor projections always compute two same-shaped F16 matvecs from
 // the same normalized activation: one for projected KV and one for pooling
 // scores.  This paired variant keeps the exact dense F16 row-reduction shape
 // for each matrix, but shares one dispatch and one activation stream.
@@ -907,7 +907,7 @@ void kernel_mul_mv_f16_f32_pair_4_disp(
 }
 
 kernel void kernel_mul_mv_f16_f32_pair_4(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0_a,
         device const char * src0_b,
         device const char * src1,
@@ -917,7 +917,7 @@ kernel void kernel_mul_mv_f16_f32_pair_4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_f16_f32_pair_4_disp<constant ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_f16_f32_pair_4_disp<constant q36_metal_args_mul_mv &>(
             args, src0_a, src0_b, src1, dst_a, dst_b, shmem, tgpig, tiisg, sgitg);
 }
 
@@ -925,10 +925,10 @@ kernel void kernel_mul_mv_f16_f32_pair_4(
 // matvec remains unchanged and still materializes both F32 outputs. After a
 // device-memory barrier, the first NR0 threads reload those exact stored bits
 // and perform the same state write and score+APE addition as
-// kernel_dsv4_compressor_store_one.
+// kernel_q36_compressor_store_one.
 kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
-        constant ds4_metal_args_mul_mv & args,
-        constant ds4_metal_args_compressor_pair_store & store,
+        constant q36_metal_args_mul_mv & args,
+        constant q36_metal_args_compressor_pair_store & store,
         device const char * src0_a,
         device const char * src0_b,
         device const char * src1,
@@ -942,7 +942,7 @@ kernel void kernel_mul_mv_f16_f32_pair_compressor_store_4(
         ushort tiitg [[thread_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_f16_f32_pair_4_disp<constant ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_f16_f32_pair_4_disp<constant q36_metal_args_mul_mv &>(
             args, src0_a, src0_b, src1, dst_a, dst_b,
             shmem, tgpig, tiisg, sgitg);
 
@@ -1013,16 +1013,16 @@ void kernel_mul_mv_t_t_short_impl(
 }
 
 // Scalar fallback for short rows. It trades parallelism for lower dispatch and
-// reduction overhead when DS4 asks for tiny dense matvecs.
+// reduction overhead when Q36 asks for tiny dense matvecs.
 template<typename T0, typename T1>
 kernel void kernel_mul_mv_t_t_short(
-        constant ds4_metal_args_mul_mv & args,
+        constant q36_metal_args_mul_mv & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
-    kernel_mul_mv_t_t_short_impl<T0, T1, constant ds4_metal_args_mul_mv &>(
+    kernel_mul_mv_t_t_short_impl<T0, T1, constant q36_metal_args_mul_mv &>(
         args,
         src0,
         src1,
@@ -1061,26 +1061,26 @@ void dequantize_q8_0(device const block_q8_0 *xb, short il, thread type4x4 & reg
     reg = (type4x4) reg_f;
 }
 
-struct ds4_dense_block_q4_0 {
+struct q36_dense_block_q4_0 {
     half d;
     uchar qs[16];
 };
 
-struct ds4_dense_block_q4_K {
+struct q36_dense_block_q4_K {
     half d;
     half dmin;
     uchar scales[12];
     uchar qs[128];
 };
 
-static inline uchar2 ds4_dense_q4_K_scale_min(int j, int k, device const uchar *q) {
+static inline uchar2 q36_dense_q4_K_scale_min(int j, int k, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}
                  : uchar2{uchar((q[j + 4 + k] & 0x0f) | ((q[j - 4 + k] & 0xc0) >> 2)),
                           uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))};
 }
 
 template <typename type4x4>
-void dequantize_dense_q4_0(device const ds4_dense_block_q4_0 *xb, short il, thread type4x4 &reg) {
+void dequantize_dense_q4_0(device const q36_dense_block_q4_0 *xb, short il, thread type4x4 &reg) {
     float4x4 reg_f;
     const float d = (float)xb->d;
     const int base = 16 * (int)il;
@@ -1095,12 +1095,12 @@ void dequantize_dense_q4_0(device const ds4_dense_block_q4_0 *xb, short il, thre
 }
 
 template <typename type4x4>
-void dequantize_dense_q4_K(device const ds4_dense_block_q4_K *xb, short il, thread type4x4 &reg) {
+void dequantize_dense_q4_K(device const q36_dense_block_q4_K *xb, short il, thread type4x4 &reg) {
     device const uchar *q = xb->qs;
     short is = (il / 4) * 2;
     q = q + (il / 4) * 32 + 16 * (il & 1);
     il = il & 3;
-    const uchar2 sc = ds4_dense_q4_K_scale_min(is, il / 2, xb->scales);
+    const uchar2 sc = q36_dense_q4_K_scale_min(is, il / 2, xb->scales);
     const float d = il < 2 ? (float)xb->d : (float)xb->d * (1.0f / 16.0f);
     const float min = (float)xb->dmin;
     const float dl = d * sc[0];
@@ -1146,7 +1146,7 @@ void dequantize_q8_0_t4(device const block_q8_0 *xb, short il, thread type4 & re
 }
 
 template <typename type4>
-void dequantize_dense_q4_0_t4(device const ds4_dense_block_q4_0 *xb, short il, thread type4 &reg) {
+void dequantize_dense_q4_0_t4(device const q36_dense_block_q4_0 *xb, short il, thread type4 &reg) {
     const float d = (float)xb->d;
     const int base = 4 * (int)il;
     for (int i = 0; i < 4; i++) {
@@ -1159,7 +1159,7 @@ void dequantize_dense_q4_0_t4(device const ds4_dense_block_q4_0 *xb, short il, t
 }
 
 template <typename type4>
-void dequantize_dense_q4_K_t4(device const ds4_dense_block_q4_K *xb, short il, thread type4 &reg) {
+void dequantize_dense_q4_K_t4(device const q36_dense_block_q4_K *xb, short il, thread type4 &reg) {
     float4x4 tmp;
     dequantize_dense_q4_K(xb, il / 4, tmp);
     const short row = il & 3;
@@ -1168,10 +1168,10 @@ void dequantize_dense_q4_K_t4(device const ds4_dense_block_q4_K *xb, short il, t
     }
 }
 
-// DS4 small-batch mat-vec kernel used for 2..8 prompt tokens.
+// Q36 small-batch mat-vec kernel used for 2..8 prompt tokens.
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
 void kernel_mul_mv_ext_q4_f32_impl(
-        constant ds4_metal_args_mul_mv_ext & args,
+        constant q36_metal_args_mul_mv_ext & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -1269,10 +1269,10 @@ void kernel_mul_mv_ext_q4_f32_impl(
 }
 
 // Small-batch prompt matvec for 2..5 tokens. It bridges decode-style matvec and
-// full matmul when DS4 prefill chunks are too small to amortize matrix tiles.
+// full matmul when Q36 prefill chunks are too small to amortize matrix tiles.
 template<short r1ptg, typename q_t, short epb, void (*deq_t4)(device const q_t *, short, thread float4 &)>
 kernel void kernel_mul_mv_ext_q4_f32_disp(
-        constant ds4_metal_args_mul_mv_ext & args,
+        constant q36_metal_args_mul_mv_ext & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -1286,14 +1286,10 @@ typedef decltype(kernel_mul_mv_ext_q4_f32_disp<2, block_q8_0, 32, dequantize_q8_
 
 // Host-visible small-batch variants for r1=2..5 during tiny prompt/support
 // paths.
-template [[host_name("kernel_mul_mv_ext_f32_f32_r1_2")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, float4,     4,  dequantize_f32_t4>;
-template [[host_name("kernel_mul_mv_ext_f32_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, float4,     4,  dequantize_f32_t4>;
-template [[host_name("kernel_mul_mv_ext_f32_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, float4,     4,  dequantize_f32_t4>;
-template [[host_name("kernel_mul_mv_ext_f32_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, float4,     4,  dequantize_f32_t4>;
 
 template<short r1ptg>
 void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
-        constant ds4_metal_args_mul_mv_ext & args,
+        constant q36_metal_args_mul_mv_ext & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -1425,7 +1421,7 @@ void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_impl(
 
 template<short r1ptg>
 kernel void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp(
-        constant ds4_metal_args_mul_mv_ext & args,
+        constant q36_metal_args_mul_mv_ext & args,
         device const char * src0_gate,
         device const char * src0_up,
         device const char * src1,
@@ -1443,29 +1439,25 @@ kernel void kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp(
 
 typedef decltype(kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<2>) mul_mv_ext_q8_0_pair_swiglu_f32_t;
 
-// Host-visible small-batch variants. DS4 currently needs F16 and Q8_0 weights
+// Host-visible small-batch variants. Q36 currently needs F16 and Q8_0 weights
 // for r1=2..5 during the prompt path.
-template [[host_name("kernel_mul_mv_ext_f16_f32_r1_2")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, half4,      4,  dequantize_f16_t4>;
-template [[host_name("kernel_mul_mv_ext_f16_f32_r1_3")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, half4,      4,  dequantize_f16_t4>;
-template [[host_name("kernel_mul_mv_ext_f16_f32_r1_4")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, half4,      4,  dequantize_f16_t4>;
-template [[host_name("kernel_mul_mv_ext_f16_f32_r1_5")]]  kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, half4,      4,  dequantize_f16_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_q8_0, 32, dequantize_q8_0_t4>;
 template [[host_name("kernel_mul_mv_ext_q8_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_q8_0, 32, dequantize_q8_0_t4>;
 
-template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, q36_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, q36_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, q36_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, q36_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, q36_dense_block_q4_0, 32,  dequantize_dense_q4_0_t4>;
 
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
-template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, ds4_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_1")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<1, q36_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, q36_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, q36_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, q36_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
+template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, q36_dense_block_q4_K, 256, dequantize_dense_q4_K_t4>;
 
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_2")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<2>;
 template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_3")]] kernel mul_mv_ext_q8_0_pair_swiglu_f32_t kernel_mul_mv_ext_q8_0_pair_swiglu_f32_disp<3>;
@@ -1475,14 +1467,14 @@ template [[host_name("kernel_mul_mv_ext_q8_0_pair_swiglu_f32_r1_5")]] kernel mul
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
 
-#ifdef DS4_METAL_HAS_TENSOR
+#ifdef Q36_METAL_HAS_TENSOR
 template<
     short NR0, short NR1,
     typename SA, typename SA_4x4, typename block_q, short nl,
     void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1>
 kernel void kernel_mul_mm_mpp(
-        constant ds4_metal_args_mul_mm & args,
+        constant q36_metal_args_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
@@ -1598,7 +1590,7 @@ template [[host_name("kernel_mul_mm_f16_f32_mpp")]]  kernel mul_mm_mpp_t kernel_
 // Retained Metal4/TensorOps dense prefill kernel.  The legacy MPP prototype
 // staged both operands in threadgroup memory; this version stages only the
 // model weight tile and lets MPP read the dense RHS activation matrix directly
-// from device memory.  That direct-RHS shape was the clear win for DS4's large
+// from device memory.  That direct-RHS shape was the clear win for Q36's large
 // aligned F16/Q8_0 prompt matmuls.  The host selects the widest token tile that
 // evenly divides the batch, with 128-token tiles retained after the 64-token
 // retest was neutral or slower.
@@ -1613,7 +1605,7 @@ template<
     void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
     typename T0, typename T0_4x4, typename T1>
 kernel void kernel_mul_mm_mpp_direct_rhs(
-        constant ds4_metal_args_mul_mm & args,
+        constant q36_metal_args_mul_mm & args,
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
@@ -1717,24 +1709,24 @@ typedef decltype(kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, float4x4, 1, de
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n64")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
 template [[host_name("kernel_mul_mm_f16_f32_mpp_direct_rhs_n128")]]  kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, half4x4, 1, dequantize_f16,  half,  half4x4,  float>;
-template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
-template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, q36_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, q36_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, q36_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, q36_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, q36_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
+template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, q36_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float>;
 
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 #endif
 
-// Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses
+// Tiled matrix-matrix kernel used for prompt batches larger than 8. Q36 uses
 // this to turn prefill into large simdgroup matrix operations; each block_q
 // contains 16*nl weights.
 template<typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm(
-        constant ds4_metal_args_mul_mm & args,
+        constant q36_metal_args_mul_mm & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -1939,7 +1931,7 @@ kernel void kernel_mul_mm(
 // only arithmetic change versus materializing RMSNorm first is where x*scale is
 // rounded from F32 to F16.
 kernel void kernel_mul_mm_f16_f32_scaled(
-        constant ds4_metal_args_mul_mm & args,
+        constant q36_metal_args_mul_mm & args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
@@ -2145,7 +2137,7 @@ kernel void kernel_mul_mm_f16_f32_scaled(
 }
 
 kernel void kernel_mul_mm_f16_f32_pair(
-        constant ds4_metal_args_mul_mm & args,
+        constant q36_metal_args_mul_mm & args,
         device const char * src0_a,
         device const char * src0_b,
         device const char * src1,
@@ -2385,5 +2377,5 @@ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, 
 // Host-visible prefill matmul variants for F16 and Q8_0 weights.
 template [[host_name("kernel_mul_mm_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, half4x4, 1, dequantize_f16,  half,  half4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
-template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, ds4_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_0_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, q36_dense_block_q4_0, 2, dequantize_dense_q4_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_q4_K_f32")]] kernel mul_mm_t kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, q36_dense_block_q4_K, 16, dequantize_dense_q4_K, float, float4x4, float, float2x4>;

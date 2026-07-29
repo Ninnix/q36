@@ -30,6 +30,7 @@ GPU_CFLAGS := $(CFLAGS) -D_GNU_SOURCE -fno-finite-math-only
 LDLIBS ?= -lm -pthread
 GPU_LDLIBS := $(LDLIBS) -ldl -lvulkan
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
 	vulkan/matmul_f16.spv \
 	vulkan/matmul_f32.spv \
@@ -173,7 +174,7 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu metal metal-shaders-check q36-quality-score test test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-batching test-release release-build-check benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu metal q36-quality-score test test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-batching test-release release-build-check benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
@@ -195,17 +196,13 @@ help:
 
 gpu: all
 
-metal: metal-shaders-check q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
+metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(GPU_CFLAGS) -o q36-server q36_server.o rax.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(GPU_CFLAGS) -o q36-bench q36_bench.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(GPU_CFLAGS) -o q36-agent q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(GPU_CFLAGS) -o q36-eval q36_eval.o q36_help.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(GPU_CFLAGS) -o q36_test q36_test.o rax.o q36_ssd.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
-
-metal-shaders-check:
-	sh metal/compile-metal.sh /tmp/q36-metal-check.air
-	rm -f /tmp/q36-metal-check.air
 
 q36: q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
@@ -255,7 +252,7 @@ q36_cli_metal.o: q36_cli.c q36.h q36_ssd.h linenoise.h
 q36_vulkan.o: q36_vulkan.c q36_gpu.h q36_quant.h q36_iq2_tables_vulkan.inc q36_iq_tables.h $(VULKAN_SHADERS)
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_vulkan.c
 
-q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h $(wildcard metal/*.metal)
+q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h $(METAL_SRCS)
 	$(CC) $(GPU_CFLAGS) -fobjc-arc -c -o $@ q36_metal.m
 
 q36_cli.o: q36_cli.c q36.h q36_ssd.h linenoise.h
