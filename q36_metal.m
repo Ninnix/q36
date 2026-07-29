@@ -1826,7 +1826,7 @@ int q36_gpu_attn_decode_tensor(
             offset:(has_sinks ? (NSUInteger)sink_inner : qg->offset)
            atIndex:6];
     [enc setBytes:&args length:sizeof(args) atIndex:7];
-    [enc setThreadgroupMemoryLength:sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc endEncoding];

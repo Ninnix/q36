@@ -730,14 +730,32 @@ kernel void q36_attention_q8_q4_parallel(
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
+    float local_max = -INFINITY;
+    for (uint pos = tid; pos < count; pos += 256u)
+        local_max = max(local_max, sh[pos]);
+    local_max = simd_max(local_max);
+    if (lane == 0u) shared[simdgroup] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0u) {
         float maxv = args.has_sinks ? sinks[head] : -INFINITY;
-        for (uint pos = 0; pos < count; pos++) maxv = max(maxv, sh[pos]);
+        for (uint sg = 0; sg < 8u; sg++) maxv = max(maxv, shared[sg]);
+        shared[0] = maxv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float maxv = shared[0];
+    float local_sum = 0.0f;
+    for (uint pos = tid; pos < count; pos += 256u) {
+        float value = exp(sh[pos] - maxv);
+        sh[pos] = value;
+        local_sum += value;
+    }
+    local_sum = simd_sum(local_sum);
+    if (lane == 0u) shared[simdgroup] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
         float denom = args.has_sinks ? exp(sinks[head] - maxv) : 0.0f;
-        for (uint pos = 0; pos < count; pos++) {
-            sh[pos] = exp(sh[pos] - maxv);
-            denom += sh[pos];
-        }
+        for (uint sg = 0; sg < 8u; sg++) denom += shared[sg];
         shared[0] = denom > 0.0f ? 1.0f / denom : 1.0f;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
