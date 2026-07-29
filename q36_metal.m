@@ -1056,6 +1056,52 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
                                  const void *map, uint64_t size,
                                  uint64_t weight_offset,
                                  uint32_t width, uint32_t rows, float eps) {
+    const char *ds4_env = getenv("Q36_METAL_DS4_NORM");
+    bool ds4_norm = (!ds4_env || !ds4_env[0] || ds4_env[0] != '0') &&
+                    width >= 512u && (width & 3u) == 0u;
+    uint64_t bytes = (uint64_t)width * rows * sizeof(float);
+    if (ds4_norm && out_norm && out_sum && a && b && map &&
+        bytes <= out_norm->bytes && bytes <= out_sum->bytes &&
+        bytes <= a->bytes && bytes <= b->bytes &&
+        weight_offset <= size &&
+        (uint64_t)width * sizeof(float) <= size - weight_offset) {
+        id<MTLBuffer> weight = [q36_device
+            newBufferWithBytes:(const uint8_t *)map + weight_offset
+                        length:(NSUInteger)width * sizeof(float)
+                       options:MTLResourceStorageModeShared];
+        struct {
+            int32_t ne00, ne00_t;
+            uint64_t nb1, nb2, nb3;
+            float eps;
+            int32_t nef1[3], nef2[3], nef3[3];
+            uint64_t nbf1[3], nbf2[3], nbf3[3];
+        } args = {0};
+        args.ne00 = (int32_t)width;
+        args.ne00_t = (int32_t)(width / 4u);
+        args.nb1 = (uint64_t)width * sizeof(float);
+        args.nb2 = args.nb1 * rows;
+        args.nb3 = args.nb2;
+        args.eps = eps;
+        for (uint32_t i = 0; i < 3; i++) {
+            args.nef1[i] = args.nef2[i] = args.nef3[i] = 1;
+        }
+        args.nef1[0] = (int32_t)rows;
+        args.nbf1[0] = (uint64_t)width * sizeof(float);
+        id<MTLComputeCommandEncoder> enc =
+            q36_encoder(@"kernel_add_rms_norm_mul_f32_4");
+        if (!weight || !enc) return 0;
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:a->buffer offset:a->offset atIndex:1];
+        [enc setBuffer:b->buffer offset:b->offset atIndex:2];
+        [enc setBuffer:weight offset:0 atIndex:3];
+        [enc setBuffer:out_sum->buffer offset:out_sum->offset atIndex:4];
+        [enc setBuffer:out_norm->buffer offset:out_norm->offset atIndex:5];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        return 1;
+    }
     return q36_gpu_add_tensor(out_sum, a, b, width * rows) &&
            q36_gpu_rms_norm_weight_rows_tensor(
                out_norm, out_sum, map, size, weight_offset, width, rows, eps);
@@ -1812,6 +1858,90 @@ int q36_gpu_attn_decode_tensor(
         pos0, heads, kv_heads, dim, heads * dim * 2u,
         has_sinks ? 1u : 0u, heads * (pos0 + tokens)
     };
+    uint32_t n_spans = (pos0 + tokens + 511u) / 512u;
+    const char *split_env = getenv("Q36_METAL_ATTN_SPLIT");
+    bool split_enabled = !split_env || !split_env[0] || split_env[0] != '0';
+    const char *gqa_env = getenv("Q36_METAL_ATTN_GQA");
+    bool gqa_enabled = !gqa_env || !gqa_env[0] || gqa_env[0] != '0';
+    uint32_t gqa_groups = (pos0 + tokens + 4095u) / 4096u;
+    bool gqa = gqa_enabled && quant && tokens >= 2u &&
+        pos0 + tokens > 1024u && heads == 16u && kv_heads == 2u &&
+        dim == 256u &&
+        (uint64_t)tokens * heads * gqa_groups * (dim + 2u) * sizeof(float)
+            <= scores->bytes;
+    if (gqa) {
+        struct {
+            uint32_t pos0, heads, kv_heads, dim;
+            uint32_t qg_stride, has_sinks, n_spans;
+        } gqa_args = {
+            pos0, heads, kv_heads, dim, heads * dim * 2u,
+            has_sinks ? 1u : 0u, gqa_groups
+        };
+        id<MTLComputeCommandEncoder> gqa_enc =
+            q36_encoder(@"q36_attention_q8_q4_gqa8");
+        if (!gqa_enc) return 0;
+        [gqa_enc setBuffer:scores->buffer offset:scores->offset atIndex:0];
+        [gqa_enc setBuffer:q->buffer offset:q->offset atIndex:1];
+        [gqa_enc setBuffer:kcache->buffer offset:kcache->offset atIndex:2];
+        [gqa_enc setBuffer:vcache->buffer offset:vcache->offset atIndex:3];
+        [gqa_enc setBytes:&gqa_args length:sizeof(gqa_args) atIndex:4];
+        [gqa_enc setThreadgroupMemoryLength:6208u * sizeof(float) atIndex:0];
+        [gqa_enc dispatchThreadgroups:MTLSizeMake(kv_heads, tokens, gqa_groups)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [gqa_enc endEncoding];
+        id<MTLComputeCommandEncoder> combine =
+            q36_encoder(@"q36_attention_gqa8_combine");
+        if (!combine) return 0;
+        [combine setBuffer:out->buffer offset:out->offset atIndex:0];
+        [combine setBuffer:scores->buffer offset:scores->offset atIndex:1];
+        [combine setBuffer:qg->buffer offset:qg->offset atIndex:2];
+        [combine setBuffer:sink_buffer
+                    offset:(has_sinks ? (NSUInteger)sink_inner : qg->offset)
+                   atIndex:3];
+        [combine setBytes:&gqa_args length:sizeof(gqa_args) atIndex:4];
+        [combine dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [combine endEncoding];
+        return 1;
+    }
+    bool split = split_enabled && quant && pos0 + tokens > 1024u &&
+        (uint64_t)tokens * heads * n_spans * (dim + 2u) * sizeof(float)
+            <= scores->bytes;
+    if (split) {
+        struct {
+            uint32_t pos0, heads, kv_heads, dim;
+            uint32_t qg_stride, has_sinks, n_spans;
+        } split_args = {
+            pos0, heads, kv_heads, dim, heads * dim * 2u,
+            has_sinks ? 1u : 0u, n_spans
+        };
+        id<MTLComputeCommandEncoder> split_enc =
+            q36_encoder(@"q36_attention_q8_q4_split");
+        if (!split_enc) return 0;
+        [split_enc setBuffer:scores->buffer offset:scores->offset atIndex:0];
+        [split_enc setBuffer:q->buffer offset:q->offset atIndex:1];
+        [split_enc setBuffer:kcache->buffer offset:kcache->offset atIndex:2];
+        [split_enc setBuffer:vcache->buffer offset:vcache->offset atIndex:3];
+        [split_enc setBytes:&split_args length:sizeof(split_args) atIndex:4];
+        [split_enc setThreadgroupMemoryLength:520u * sizeof(float) atIndex:0];
+        [split_enc dispatchThreadgroups:MTLSizeMake(heads, tokens, n_spans)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [split_enc endEncoding];
+        id<MTLComputeCommandEncoder> combine =
+            q36_encoder(@"q36_attention_split_combine");
+        if (!combine) return 0;
+        [combine setBuffer:out->buffer offset:out->offset atIndex:0];
+        [combine setBuffer:scores->buffer offset:scores->offset atIndex:1];
+        [combine setBuffer:qg->buffer offset:qg->offset atIndex:2];
+        [combine setBuffer:sink_buffer
+                    offset:(has_sinks ? (NSUInteger)sink_inner : qg->offset)
+                   atIndex:3];
+        [combine setBytes:&split_args length:sizeof(split_args) atIndex:4];
+        [combine dispatchThreadgroups:MTLSizeMake(heads, tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [combine endEncoding];
+        return 1;
+    }
     id<MTLComputeCommandEncoder> enc =
         q36_encoder(quant ? @"q36_attention_q8_q4_parallel"
                           : @"q36_attention_f16_parallel");
