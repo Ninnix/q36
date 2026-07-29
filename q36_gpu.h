@@ -50,6 +50,7 @@ int q36_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int q36_gpu_set_model_fd(int fd);
 int q36_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int q36_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+int q36_gpu_finish_model_cache(void);
 int q36_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int q36_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void q36_gpu_set_quality(bool quality);
@@ -225,6 +226,16 @@ int q36_gpu_rms_norm_weight_rows_tensor(
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
+int q36_gpu_recurrent_norm_gate_tensor(
+        q36_gpu_tensor       *state,
+        const q36_gpu_tensor *gate,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                width,
         uint32_t                rows,
         float                   eps);
 
@@ -505,6 +516,14 @@ int q36_gpu_router_topk_tensor(
         uint32_t                n_used,
         uint32_t                n_tok,
         float                   route_scale);
+
+/* Find the highest and second-highest F32 entries on the GPU.  The result is
+ * two int32 token ids in descending logit order.  Unsupported backends return
+ * zero so their existing host-logit path remains unchanged. */
+int q36_gpu_top2_tensor(
+        q36_gpu_tensor       *out_ids,
+        const q36_gpu_tensor *logits,
+        uint32_t              count);
 
 /* One routed expert weight: GGUF offset/type of the 3D expert tensor plus the
  * optional per-expert ".scale" tensor (n_expert f32). */

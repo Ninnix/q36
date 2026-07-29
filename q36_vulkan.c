@@ -3083,6 +3083,10 @@ int q36_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
     return ok;
 }
 
+int q36_gpu_finish_model_cache(void) {
+    return 1;
+}
+
 int q36_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     (void)in_dim;
     (void)out_dim;
@@ -6048,6 +6052,31 @@ int q36_gpu_router_topk_tensor(q36_gpu_tensor *selected,
 done:
     q36_vk_prof_scope_end(&prof);
     return ok;
+}
+
+int q36_gpu_top2_tensor(q36_gpu_tensor *out_ids,
+                        const q36_gpu_tensor *logits,
+                        uint32_t count) {
+    (void)out_ids;
+    (void)logits;
+    (void)count;
+    return 0;
+}
+
+int q36_gpu_recurrent_norm_gate_tensor(
+        q36_gpu_tensor *state, const q36_gpu_tensor *gate,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width,
+        uint32_t rows, float eps) {
+    (void)state;
+    (void)gate;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)width;
+    (void)rows;
+    (void)eps;
+    return 0;
 }
 
 static uint64_t q36_vk_iq_block_bytes(uint32_t type) {

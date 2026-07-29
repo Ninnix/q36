@@ -165,6 +165,39 @@ kernel void q36_delta_gates(
 
 struct q36_delta_net_args { uint heads; uint dim; uint tokens; };
 
+struct q36_recurrent_norm_gate_args {
+    uint width;
+    uint rows;
+    float eps;
+};
+
+// Qwen3.5/3.6 recurrent output is laid out as 32 rows of 128 values. Fuse
+// the per-row RMSNorm with the following elementwise SiLU gate so the
+// normalized state never makes a round trip through device memory.
+kernel void q36_recurrent_norm_gate(
+        device float *state [[buffer(0)]],
+        device const float *gate [[buffer(1)]],
+        device const float *weight [[buffer(2)]],
+        constant q36_recurrent_norm_gate_args &args [[buffer(3)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= args.rows) return;
+    const ulong base = (ulong)row * args.width;
+    float sum = 0.0f;
+    for (uint i = lane; i < args.width; i += 32u) {
+        const float v = state[base + i];
+        sum = fma(v, v, sum);
+    }
+    const float scale =
+        rsqrt(simd_sum(sum) / float(args.width) + args.eps);
+    for (uint i = lane; i < args.width; i += 32u) {
+        const ulong at = base + i;
+        const float z = gate[at];
+        const float normalized = state[at] * scale * weight[i];
+        state[at] = (z / (1.0f + exp(-z))) * normalized;
+    }
+}
+
 kernel void q36_delta_net_decode(
         device float *state [[buffer(0)]],
         device const float *q [[buffer(1)]],

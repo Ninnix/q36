@@ -179,7 +179,8 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(
+        dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. Q36 uses this for Q8_0 dense
@@ -194,7 +195,8 @@ kernel void kernel_mul_mv_q8_0_f32(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant q36_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_r4")]]
@@ -207,7 +209,8 @@ kernel void kernel_mul_mv_q8_0_f32_r4(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<4, constant q36_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q8_0_f32_impl<4, constant q36_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 // Output projection alias used by the optimized host dispatch.
@@ -554,6 +557,99 @@ kernel void kernel_q36_shared_mid_swiglu_q8_0_r4(
             clamp_value, shmem, tgpig, tiisg, sgitg);
 }
 
+struct q36_shared_gate_up_decode_args {
+    uint mid_dim;
+    uint blocks;
+    float gate_scale;
+    float up_scale;
+};
+
+// Direct translation of Q36 Vulkan's decode-only shared expert. Each
+// threadgroup owns one output row; four adjacent lanes consume one Q8_0 block
+// and the two simdgroups are reduced once. Only the activated mid row is
+// materialized.
+kernel void q36_shared_gate_up_decode(
+        device const block_q8_0 *gate_w [[buffer(0)]],
+        device const block_q8_0 *up_w [[buffer(1)]],
+        device const float *x [[buffer(2)]],
+        device float *mid [[buffer(3)]],
+        constant q36_shared_gate_up_decode_args &args [[buffer(4)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]],
+        uint row [[threadgroup_position_in_grid]]) {
+    if (row >= args.mid_dim) return;
+    const uint boff = tid >> 2u;
+    const uint eoff = (tid & 3u) * 8u;
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint b = boff; b < args.blocks; b += 16u) {
+        device const block_q8_0 &gb = gate_w[(ulong)row * args.blocks + b];
+        device const block_q8_0 &ub = up_w[(ulong)row * args.blocks + b];
+        device const float *xb = x + (ulong)b * 32u + eoff;
+        float gd = float(gb.d);
+        float ud = float(ub.d);
+        for (uint i = 0; i < 8u; i++) {
+            float xv = xb[i];
+            gate_acc += float(gb.qs[eoff + i]) * xv * gd;
+            up_acc += float(ub.qs[eoff + i]) * xv * ud;
+        }
+    }
+    gate_acc = simd_sum(gate_acc);
+    up_acc = simd_sum(up_acc);
+    threadgroup float sh_gate[2];
+    threadgroup float sh_up[2];
+    if (lane == 0u) {
+        sh_gate[sg] = gate_acc;
+        sh_up[sg] = up_acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float g = (sh_gate[0] + sh_gate[1]) * args.gate_scale;
+        float u = (sh_up[0] + sh_up[1]) * args.up_scale;
+        mid[row] = (g / (1.0f + exp(-g))) * u;
+    }
+}
+
+struct q36_shared_down_tail_decode_args {
+    uint out_dim;
+    uint blocks;
+    float scale;
+};
+
+kernel void q36_shared_down_tail_decode(
+        device const block_q8_0 *weights [[buffer(0)]],
+        device const float *x [[buffer(1)]],
+        device const float *scalar [[buffer(2)]],
+        device float *out [[buffer(3)]],
+        constant q36_shared_down_tail_decode_args &args [[buffer(4)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint sg [[simdgroup_index_in_threadgroup]],
+        uint row [[threadgroup_position_in_grid]]) {
+    if (row >= args.out_dim) return;
+    const uint boff = tid >> 2u;
+    const uint eoff = (tid & 3u) * 8u;
+    float acc = 0.0f;
+    for (uint b = boff; b < args.blocks; b += 16u) {
+        device const block_q8_0 &wb = weights[(ulong)row * args.blocks + b];
+        device const float *xb = x + (ulong)b * 32u + eoff;
+        float d = float(wb.d);
+        for (uint i = 0; i < 8u; i++)
+            acc += float(wb.qs[eoff + i]) * xb[i] * d;
+    }
+    acc = simd_sum(acc);
+    threadgroup float sh_sum[2];
+    if (lane == 0u) sh_sum[sg] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float s = scalar[0];
+        float z = s >= 0.0f ? exp(-s) : exp(s);
+        float gate = s >= 0.0f ? 1.0f / (1.0f + z) : z / (1.0f + z);
+        out[row] = fma((sh_sum[0] + sh_sum[1]) * args.scale, gate, out[row]);
+    }
+}
+
 template<typename T0, typename T1, short NR0, typename args_t>
 void kernel_mul_mv_t_t_impl(
         args_t args,
@@ -628,7 +724,8 @@ void kernel_mul_mv_t_t_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(
+        dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 template<typename T0, typename T1, typename args_t>
@@ -746,7 +843,8 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(
+        dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 template<typename T0, typename T04, typename T1, typename T14, typename args_t>
@@ -883,9 +981,11 @@ void kernel_mul_mv_f16_f32_pair_4_impl(
     device float * dst_a_f32 = (device float *) dst_a + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
     device float * dst_b_f32 = (device float *) dst_b + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_a_f32, sum_a, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(
+        dst_a_f32, sum_a, r0, args.ne01, tiisg, sgitg, shmem);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    helper_mv_reduce_and_write<NR0>(dst_b_f32, sum_b, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(
+        dst_b_f32, sum_b, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
 template<typename args_t>

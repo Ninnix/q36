@@ -421,6 +421,9 @@ struct q36_session {
     float *logits;
     float *sample_probs;
     float *mtp_logits;
+    bool logits_host_valid;
+    bool gpu_top2_valid;
+    int gpu_top2[2];
     void *runtime;
     q36_session_progress_fn progress;
     void *progress_ud;
@@ -584,6 +587,7 @@ typedef struct {
     q36_gpu_tensor *ffn_shared_out;
     q36_gpu_tensor *ffn_scalar;
     q36_gpu_tensor *logits;
+    q36_gpu_tensor *top2;
     q36_gpu_tensor *scores;
     q36_vulkan_full_attn_cache mtp_full;
     q36_vulkan_recurrent_cache spec_recurrent[Q36_N_LAYER];
@@ -4480,6 +4484,7 @@ static void q36_vulkan_runtime_free(q36_vulkan_runtime *rt) {
     q36_gpu_tensor_free(rt->ffn_shared_out);
     q36_gpu_tensor_free(rt->ffn_scalar);
     q36_gpu_tensor_free(rt->logits);
+    q36_gpu_tensor_free(rt->top2);
     q36_gpu_tensor_free(rt->scores);
     q36_gpu_tensor_free(rt->mtp_full.k);
     q36_gpu_tensor_free(rt->mtp_full.v);
@@ -4581,7 +4586,8 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     if (!q36_gpu_attn_fused_enabled())
         Q36_GPU_ALLOC_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
     rt->logits = q36_gpu_tensor_alloc((uint64_t)Q36_N_VOCAB * sizeof(float));
-    if (!rt->logits) goto fail;
+    rt->top2 = q36_gpu_tensor_alloc(2u * sizeof(int32_t));
+    if (!rt->logits || !rt->top2) goto fail;
     if (enable_mtp) {
         rt->mtp_full.cap = (uint32_t)ctx_size;
         rt->mtp_full.type_k = cache_type_k;
@@ -5604,6 +5610,8 @@ static bool q36_forward_tokens_cpu(q36_session *s,
             fprintf(stderr, "q36: non-finite logits at pos=%u\n", pos0);
             return false;
         }
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
     }
     return true;
 }
@@ -5675,16 +5683,16 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
      * host-written norm, and the shared-expert gate/up dispatches record
      * before the routed pass so the routed block's one flush completes them
      * too. */
-    if (!q36_gpu_tensor_matmul_scaled(m, l->ffn_gate_inp, inp, rt->ffn_gate_logits,
-                                      Q36_N_EMBD, Q36_N_EXPERT, n_tok, 1.0f)) {
-        return false;
-    }
-    if (!q36_gpu_router_topk_tensor(rt->ffn_selected, rt->ffn_weights, rt->ffn_gate_logits,
-                                    Q36_N_EXPERT, Q36_N_EXPERT_USED, n_tok, expert_weights_scale)) {
-        return false;
-    }
-    if (!q36_gpu_tensor_matmul_scaled(m, l->ffn_gate_inp_shexp, inp, rt->ffn_scalar,
-                                      Q36_N_EMBD, 1, n_tok, 1.0f)) {
+    if (!q36_gpu_tensor_matmul_scaled(
+            m, l->ffn_gate_inp, inp, rt->ffn_gate_logits,
+            Q36_N_EMBD, Q36_N_EXPERT, n_tok, 1.0f) ||
+        !q36_gpu_router_topk_tensor(
+            rt->ffn_selected, rt->ffn_weights, rt->ffn_gate_logits,
+            Q36_N_EXPERT, Q36_N_EXPERT_USED, n_tok,
+            expert_weights_scale) ||
+        !q36_gpu_tensor_matmul_scaled(
+            m, l->ffn_gate_inp_shexp, inp, rt->ffn_scalar,
+            Q36_N_EMBD, 1, n_tok, 1.0f)) {
         return false;
     }
     /* Fast routed pass, decode and prefill: f32 activations straight into
@@ -6091,8 +6099,9 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         bool fused = !e->quality && !e->ssd_streaming &&
                      (!env || !env[0] || env[0] != '0') &&
                      q36_gpu_delta_qkv_l2_norm_tensor(
-                         rt->recur_q, rt->recur_k, rt->recur_v, rt->recur_conv,
-                         Q36_N_SSM_DT_RANK, Q36_N_SSM_GROUP, Q36_N_SSM_STATE,
+                         rt->recur_q, rt->recur_k, rt->recur_v,
+                         rt->recur_conv, Q36_N_SSM_DT_RANK,
+                         Q36_N_SSM_GROUP, Q36_N_SSM_STATE,
                          Q36_N_SSM_CONV_DIM, n_tok, Q36_RMS_EPS);
         if (!fused) {
             if (!q36_gpu_delta_qk_l2_norm_tensor(rt->recur_q,
@@ -6109,15 +6118,10 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
             if (!q36_gpu_extract_recurrent_v_tensor(rt->recur_v, rt->recur_conv, n_tok)) return false;
         }
     }
-    if (!q36_gpu_delta_net_gates_tensor(rt->recur_gb,
-                                        rt->recur_alpha,
-                                        rt->recur_beta,
-                                        e->model.map,
-                                        e->model.size,
-                                        l->ssm_dt->abs_offset,
-                                        l->ssm_a->abs_offset,
-                                        Q36_N_SSM_DT_RANK,
-                                        n_tok)) {
+    if (!q36_gpu_delta_net_gates_tensor(
+            rt->recur_gb, rt->recur_alpha, rt->recur_beta,
+            e->model.map, e->model.size, l->ssm_dt->abs_offset,
+            l->ssm_a->abs_offset, Q36_N_SSM_DT_RANK, n_tok)) {
         return false;
     }
     if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_gb, n_tok * Q36_N_SSM_DT_RANK * 2u)) {
@@ -6139,13 +6143,19 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         fprintf(stderr, "q36: recurrent delta decode non-finite at layer=%u\n", il);
         return false;
     }
-    if (!q36_gpu_rms_norm_weight_rows_tensor(rt->recur_proj, rt->recur_proj,
-                                             e->model.map, e->model.size, l->ssm_norm->abs_offset,
-                                             Q36_N_SSM_STATE, n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS)) {
-        return false;
-    }
-    if (!q36_gpu_swiglu_tensor(rt->recur_proj, rt->recur_z, rt->recur_proj,
-                               n_tok * Q36_N_SSM_INNER, 0.0f, 1.0f)) {
+    bool norm_gate_fused = !e->quality &&
+        q36_gpu_recurrent_norm_gate_tensor(
+            rt->recur_proj, rt->recur_z, e->model.map, e->model.size,
+            l->ssm_norm->abs_offset, Q36_N_SSM_STATE,
+            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
+    if (!norm_gate_fused &&
+        (!q36_gpu_rms_norm_weight_rows_tensor(
+             rt->recur_proj, rt->recur_proj,
+             e->model.map, e->model.size, l->ssm_norm->abs_offset,
+             Q36_N_SSM_STATE, n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS) ||
+         !q36_gpu_swiglu_tensor(
+             rt->recur_proj, rt->recur_z, rt->recur_proj,
+             n_tok * Q36_N_SSM_INNER, 0.0f, 1.0f))) {
         return false;
     }
     if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_proj, n_tok * Q36_N_SSM_INNER)) {
@@ -6622,6 +6632,8 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
                 (uint64_t)Q36_N_VOCAB * sizeof(float))) {
             return false;
         }
+        items[i].session->logits_host_valid = true;
+        items[i].session->gpu_top2_valid = false;
     }
     return true;
 }
@@ -6641,8 +6653,22 @@ static bool q36_forward_tokens_vulkan(q36_session *s, const int *tokens, uint32_
     }
     if (!q36_vulkan_update_last_h(rt, n_tok - 1u)) return false;
     if (compute_logits) {
-        if (!q36_gpu_tensor_read(rt->logits, 0, s->logits, (uint64_t)Q36_N_VOCAB * sizeof(*s->logits))) {
-            return false;
+        s->gpu_top2_valid = false;
+        s->logits_host_valid = false;
+        if (q36_gpu_top2_tensor(rt->top2, rt->logits, Q36_N_VOCAB)) {
+            int32_t ids[2] = {-1, -1};
+            if (!q36_gpu_tensor_read(rt->top2, 0, ids, sizeof(ids)))
+                return false;
+            s->gpu_top2[0] = ids[0];
+            s->gpu_top2[1] = ids[1];
+            s->gpu_top2_valid = ids[0] >= 0 && ids[1] >= 0;
+        } else {
+            if (!q36_gpu_tensor_read(
+                    rt->logits, 0, s->logits,
+                    (uint64_t)Q36_N_VOCAB * sizeof(*s->logits))) {
+                return false;
+            }
+            s->logits_host_valid = true;
         }
     }
     return true;
@@ -6718,10 +6744,15 @@ static bool q36_vulkan_verify_suffix_tops(q36_session *s,
                                  (uint64_t)Q36_N_VOCAB * sizeof(*s->logits))) return false;
         row_tops[i] = sample_argmax(s->logits, Q36_N_VOCAB);
     }
-    return q36_gpu_tensor_read(rt->spec_logits,
-                               (uint64_t)(n_tok - 1u) * Q36_N_VOCAB * sizeof(*s->logits),
-                               s->logits,
-                               (uint64_t)Q36_N_VOCAB * sizeof(*s->logits)) != 0;
+    bool ok = q36_gpu_tensor_read(
+        rt->spec_logits,
+        (uint64_t)(n_tok - 1u) * Q36_N_VOCAB * sizeof(*s->logits),
+        s->logits, (uint64_t)Q36_N_VOCAB * sizeof(*s->logits)) != 0;
+    if (ok) {
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
+    }
+    return ok;
 }
 
 static bool q36_mtp_concat(q36_gpu_tensor *out,
@@ -6908,6 +6939,8 @@ static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool 
             fprintf(stderr, "q36: non-finite logits at token=%d pos=%u\n", token, pos);
             return false;
         }
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
     }
     return true;
 }
@@ -8062,6 +8095,10 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
             return 1;
         }
         q36_vulkan_prewarm_weights(e);
+        if (!q36_gpu_finish_model_cache()) {
+            q36_engine_close(e);
+            return 1;
+        }
         if (!q36_engine_seed_streaming_expert_cache(e)) {
             q36_engine_close(e);
             return 1;
@@ -8288,6 +8325,8 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     s->logits = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->logits));
     s->sample_probs = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->sample_probs));
     memset(s->logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->logits));
+    s->logits_host_valid = true;
+    s->gpu_top2_valid = false;
     if (q36_engine_uses_vulkan_runtime(e)) {
 #ifdef Q36_NO_GPU
         s->runtime = NULL;
@@ -8481,8 +8520,27 @@ int q36_session_common_prefix(q36_session *s, const q36_tokens *prompt) {
     return i;
 }
 
+static bool q36_session_ensure_logits_host(q36_session *s) {
+    if (!s || !s->logits) return false;
+    if (s->logits_host_valid) return true;
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+        q36_vulkan_runtime *rt = (q36_vulkan_runtime *)s->runtime;
+        if (rt && q36_gpu_tensor_read(
+                rt->logits, 0, s->logits,
+                (uint64_t)Q36_N_VOCAB * sizeof(*s->logits))) {
+            s->logits_host_valid = true;
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 int q36_session_argmax(q36_session *s) {
     if (!s || !s->logits) return -1;
+    if (s->gpu_top2_valid) return s->gpu_top2[0];
+    if (!q36_session_ensure_logits_host(s)) return -1;
     return sample_argmax(s->logits, Q36_N_VOCAB);
 }
 
@@ -8490,6 +8548,11 @@ int q36_session_argmax_excluding(q36_session *s, int excluded_id) {
     int best = -1;
     float best_logit = Q36_NEG_INF;
     if (!s || !s->logits) return -1;
+    if (s->gpu_top2_valid) {
+        return s->gpu_top2[0] == excluded_id
+            ? s->gpu_top2[1] : s->gpu_top2[0];
+    }
+    if (!q36_session_ensure_logits_host(s)) return -1;
     for (uint32_t i = 0; i < Q36_N_VOCAB; i++) {
         float v;
         if ((int)i == excluded_id) continue;
@@ -8504,7 +8567,8 @@ int q36_session_argmax_excluding(q36_session *s, int excluded_id) {
 
 int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->logits) return -1;
-    if (!rng) return q36_session_argmax(s);
+    if (!rng || temperature <= 0.0f) return q36_session_argmax(s);
+    if (!q36_session_ensure_logits_host(s)) return -1;
     return q36_sample_top_p_min_p(s->logits, Q36_N_VOCAB, temperature,
                                   top_k, top_p, min_p, rng, s->sample_probs);
 }
@@ -8535,7 +8599,8 @@ int q36_session_eos_to_think_close(q36_session *s, int token) {
 int q36_session_top_logprobs(q36_session *s, q36_token_score *out, int k) {
     float max_logit = Q36_NEG_INF;
     double sum = 0.0;
-    if (!s || !out || !s->logits || k <= 0) return 0;
+    if (!s || !out || !s->logits || k <= 0 ||
+        !q36_session_ensure_logits_host(s)) return 0;
     if (k > Q36_N_VOCAB) k = Q36_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -8643,6 +8708,8 @@ static int q36_session_eval_with_draft(q36_session *s, int token, char *err, siz
             s->checkpoint_valid = false;
             return 1;
         }
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
         s->mtp_draft_token = sample_argmax_margin(s->mtp_logits, Q36_N_VOCAB, &s->mtp_draft_margin);
         if (timing) {
             t4 = q36_now_sec();
@@ -8971,11 +9038,13 @@ int q36_session_eval_speculative_argmax(q36_session *s, int first_token,
 
 const float *q36_session_logits(q36_session *s, int *n_vocab) {
     if (n_vocab) *n_vocab = Q36_N_VOCAB;
-    return s ? s->logits : NULL;
+    return q36_session_ensure_logits_host(s) ? s->logits : NULL;
 }
 
 static void q36_session_reset_runtime(q36_session *s) {
     if (!s) return;
+    s->logits_host_valid = false;
+    s->gpu_top2_valid = false;
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
 #ifndef Q36_NO_GPU
         (void)q36_vulkan_runtime_reset((q36_vulkan_runtime *)s->runtime);
@@ -9462,6 +9531,8 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         if (q36_payload_read_bytes(fp, s->logits,
                                    (uint64_t)Q36_N_VOCAB * sizeof(float),
                                    &remaining, err, errlen) != 0) return 1;
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
         for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
             if (q36_layer_is_full_attention(il)) {
                 uint32_t rows = 0;
@@ -9491,6 +9562,8 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         if (q36_payload_read_tensor(rt->logits, fp,
                                     (uint64_t)Q36_N_VOCAB * sizeof(float),
                                     &remaining, err, errlen) != 0) return 1;
+        s->logits_host_valid = false;
+        s->gpu_top2_valid = false;
         for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
             if (q36_layer_is_full_attention(il)) {
                 uint32_t rows = 0;

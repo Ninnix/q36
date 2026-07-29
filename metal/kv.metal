@@ -25,7 +25,7 @@ struct q36_router_args {
     float scale;
 };
 
-kernel void q36_router_topk(
+kernel void q36_router_topk_serial(
         device int *selected [[buffer(0)]],
         device float *weights [[buffer(1)]],
         device const float *logits [[buffer(2)]],
@@ -60,6 +60,89 @@ kernel void q36_router_topk(
         selected[(ulong)tok * args.used + k] = ids[k];
         weights[(ulong)tok * args.used + k] =
             exp(best[k] - best[0]) / sum * args.scale;
+    }
+}
+
+/*
+ * Eight SIMD groups independently select their local top eight, then the
+ * first SIMD group selects the global top eight from those 64 candidates.
+ * This retains the 256-thread router reduction but replaces the old eight
+ * full workgroup trees (64 barriers) with one workgroup rendezvous.
+ */
+kernel void q36_router_topk(
+        device int *selected [[buffer(0)]],
+        device float *weights [[buffer(1)]],
+        device const float *logits [[buffer(2)]],
+        constant q36_router_args &args [[buffer(3)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simdgroup [[simdgroup_index_in_threadgroup]],
+        uint tok [[threadgroup_position_in_grid]]) {
+    if (tok >= args.tokens || args.used > 8u) return;
+    threadgroup float local_values[64];
+    threadgroup uint local_ids[64];
+    threadgroup uint winners[8];
+    threadgroup float winner_values[8];
+
+    float value = tid < args.experts
+        ? logits[(ulong)tok * args.experts + tid] : -INFINITY;
+    const uint id = tid;
+    for (uint k = 0; k < args.used; ++k) {
+        const float best_value = simd_max(value);
+        const uint candidate =
+            value == best_value ? id : 0xffffffffu;
+        const uint best_id = simd_min(candidate);
+        if (lane == 0u) {
+            const uint at = simdgroup * args.used + k;
+            local_values[at] = best_value;
+            local_ids[at] = best_id;
+        }
+        if (id == best_id) value = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simdgroup == 0u) {
+        const uint count = 8u * args.used;
+        float value0 = lane < count ? local_values[lane] : -INFINITY;
+        float value1 = lane + 32u < count
+            ? local_values[lane + 32u] : -INFINITY;
+        uint id0 = lane < count ? local_ids[lane] : 0xffffffffu;
+        uint id1 = lane + 32u < count
+            ? local_ids[lane + 32u] : 0xffffffffu;
+
+        for (uint k = 0; k < args.used; ++k) {
+            const bool take0 =
+                value0 > value1 || (value0 == value1 && id0 < id1);
+            const float local_value = take0 ? value0 : value1;
+            const uint local_id = take0 ? id0 : id1;
+            const float best_value = simd_max(local_value);
+            const uint candidate =
+                local_value == best_value ? local_id : 0xffffffffu;
+            const uint best_id = simd_min(candidate);
+            if (lane == 0u) {
+                winners[k] = best_id;
+                winner_values[k] = best_value;
+            }
+            if (id0 == best_id) value0 = -INFINITY;
+            if (id1 == best_id) value1 = -INFINITY;
+        }
+
+        if (lane == 0u) {
+            float sum = 0.0f;
+            float top_exp[8];
+            for (uint k = 0; k < args.used; ++k) {
+                top_exp[k] =
+                    exp(winner_values[k] - winner_values[0]);
+                sum += top_exp[k];
+            }
+            sum = max(sum, 6.103515625e-5f);
+            for (uint k = 0; k < args.used; ++k) {
+                selected[(ulong)tok * args.used + k] =
+                    int(winners[k]);
+                weights[(ulong)tok * args.used + k] =
+                    top_exp[k] / sum * args.scale;
+            }
+        }
     }
 }
 

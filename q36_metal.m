@@ -37,6 +37,8 @@ static id<MTLLibrary> q36_library;
 static id<MTLCommandBuffer> q36_batch;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *q36_pipelines;
 static NSMutableDictionary<NSString *, NSArray *> *q36_model_views;
+static id q36_model_residency_set;
+static bool q36_model_residency_added;
 static pthread_mutex_t q36_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t q36_live_bytes;
 static uint64_t q36_peak_bytes;
@@ -62,6 +64,23 @@ static id<MTLBuffer> q36_shared_up_scratch;
 static id<MTLBuffer> q36_shared_down_scratch;
 static NSUInteger q36_shared_mid_scratch_bytes;
 static NSUInteger q36_shared_down_scratch_bytes;
+static bool q36_prof_active;
+static double q36_prof_gpu_seconds;
+static uint64_t q36_prof_command_buffers;
+
+static void q36_model_residency_clear(void) {
+    if (@available(macOS 15.0, *)) {
+        if (q36_model_residency_set) {
+            if (q36_model_residency_added && q36_queue &&
+                [q36_queue respondsToSelector:@selector(removeResidencySet:)])
+                [q36_queue removeResidencySet:q36_model_residency_set];
+            [q36_model_residency_set endResidency];
+            [q36_model_residency_set removeAllAllocations];
+        }
+    }
+    q36_model_residency_set = nil;
+    q36_model_residency_added = false;
+}
 
 static int q36_metal_wait(void) {
     id<MTLCommandBuffer> cb = nil;
@@ -76,6 +95,12 @@ static int q36_metal_wait(void) {
         fprintf(stderr, "q36: Metal command buffer failed: %s\n",
                 cb.error.localizedDescription.UTF8String);
         return 0;
+    }
+    if (q36_prof_active) {
+        const double start = cb.GPUStartTime;
+        const double end = cb.GPUEndTime;
+        if (end > start) q36_prof_gpu_seconds += end - start;
+        q36_prof_command_buffers++;
     }
     return 1;
 }
@@ -508,6 +533,7 @@ void q36_gpu_cleanup(void) {
         }
         q36_model_map = NULL;
         q36_model_size = 0;
+        q36_model_residency_clear();
         q36_model_fd = -1;
         q36_queue = nil;
         q36_moe_gate_scratch = nil;
@@ -640,8 +666,10 @@ int q36_gpu_synchronize(void) { return q36_metal_wait(); }
 
 int q36_gpu_set_model_map(const void *map, uint64_t size) {
     if (!map || !size) return 0;
-    if (map != q36_model_map || size != q36_model_size)
+    if (map != q36_model_map || size != q36_model_size) {
+        q36_model_residency_clear();
         [q36_model_views removeAllObjects];
+    }
     q36_model_map = map;
     q36_model_size = size;
     return 1;
@@ -657,10 +685,40 @@ int q36_gpu_cache_model_range(const void *map, uint64_t size,
                               const char *label) {
     (void)label;
     if (!map || offset > size || bytes > size - offset) return 0;
-    /*
-     * Metal's no-copy mmap wrappers are created lazily by projection kernels.
-     * Touching/copying here would double the model's unified-memory footprint.
-     */
+    if (q36_ssd_streaming || map != q36_model_map ||
+        size != q36_model_size) return 1;
+    uint64_t inner = 0;
+    return q36_model_view(map, size, offset, bytes, &inner) != nil;
+}
+
+int q36_gpu_finish_model_cache(void) {
+    if (q36_ssd_streaming || getenv("Q36_METAL_NO_RESIDENCY") ||
+        q36_model_residency_set || q36_model_views.count == 0)
+        return 1;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *desc =
+            [[MTLResidencySetDescriptor alloc] init];
+        desc.label = @"q36_model";
+        desc.initialCapacity = q36_model_views.count;
+        NSError *error = nil;
+        q36_model_residency_set =
+            [q36_device newResidencySetWithDescriptor:desc error:&error];
+        if (!q36_model_residency_set) {
+            fprintf(stderr,
+                    "q36: Metal model residency set creation failed: %s\n",
+                    error.localizedDescription.UTF8String);
+            return 0;
+        }
+        for (NSArray *view in q36_model_views.allValues)
+            [q36_model_residency_set addAllocation:view[0]];
+        [q36_model_residency_set commit];
+        [q36_model_residency_set requestResidency];
+        if (q36_queue &&
+            [q36_queue respondsToSelector:@selector(addResidencySet:)]) {
+            [q36_queue addResidencySet:q36_model_residency_set];
+            q36_model_residency_added = true;
+        }
+    }
     return 1;
 }
 
@@ -755,10 +813,23 @@ int q36_gpu_stream_expert_cache_bias_experts(
     return 1;
 }
 
-void q36_gpu_prof_reset(void) {}
+void q36_gpu_prof_reset(void) {
+    q36_prof_gpu_seconds = 0.0;
+    q36_prof_command_buffers = 0;
+    q36_prof_active = true;
+}
 void q36_gpu_prof_report(const char *label) {
-    (void)label;
-    /* Metal counter sampling is wired when per-kernel dispatch is complete. */
+    q36_prof_active = false;
+    fprintf(stderr,
+            "q36: Metal %s profile command_buffers=%" PRIu64
+            " gpu_busy_ms=%.3f avg_gpu_ms=%.3f\n",
+            label ? label : "GPU",
+            q36_prof_command_buffers,
+            q36_prof_gpu_seconds * 1000.0,
+            q36_prof_command_buffers
+                ? q36_prof_gpu_seconds * 1000.0 /
+                      (double)q36_prof_command_buffers
+                : 0.0);
 }
 
 int q36_gpu_set_model_map_range(const void *map, uint64_t size,
@@ -859,16 +930,19 @@ int q36_gpu_ffn_tail_tensor(q36_gpu_tensor *out,
 }
 
 static int q36_norm(q36_gpu_tensor *out, const q36_gpu_tensor *in,
-                     const void *weight, uint32_t width, uint32_t rows,
-                     float eps) {
+                     const void *map, uint64_t size, uint64_t weight_offset,
+                     uint32_t width, uint32_t rows, float eps) {
     if (!out || !in || (uint64_t)width * rows * 4 > out->bytes ||
         (uint64_t)width * rows * 4 > in->bytes) return 0;
     id<MTLBuffer> wbuf = nil;
-    uint32_t has_weight = weight != NULL;
-    if (weight) {
-        wbuf = [q36_device newBufferWithBytes:weight
-                                       length:(NSUInteger)width * 4
-                                      options:MTLResourceStorageModeShared];
+    uint64_t weight_inner = 0;
+    uint32_t has_weight = map != NULL;
+    if (map) {
+        const uint64_t weight_bytes = (uint64_t)width * sizeof(float);
+        if (weight_offset > size || weight_bytes > size - weight_offset)
+            return 0;
+        wbuf = q36_model_view(map, size, weight_offset, weight_bytes,
+                              &weight_inner);
         if (!wbuf) return 0;
     } else {
         wbuf = in->buffer;
@@ -877,7 +951,9 @@ static int q36_norm(q36_gpu_tensor *out, const q36_gpu_tensor *in,
     if (!enc) return 0;
     [enc setBuffer:out->buffer offset:out->offset atIndex:0];
     [enc setBuffer:in->buffer offset:in->offset atIndex:1];
-    [enc setBuffer:wbuf offset:weight ? 0 : in->offset atIndex:2];
+    [enc setBuffer:wbuf
+            offset:(NSUInteger)(map ? weight_inner : in->offset)
+           atIndex:2];
     [enc setBytes:&width length:sizeof(width) atIndex:3];
     [enc setBytes:&eps length:sizeof(eps) atIndex:4];
     [enc setBytes:&has_weight length:sizeof(has_weight) atIndex:5];
@@ -891,7 +967,7 @@ int q36_gpu_rms_norm_plain_rows_tensor(q36_gpu_tensor *out,
                                         const q36_gpu_tensor *in,
                                         uint32_t width, uint32_t rows,
                                         float eps) {
-    return q36_norm(out, in, NULL, width, rows, eps);
+    return q36_norm(out, in, NULL, 0, 0, width, rows, eps);
 }
 
 int q36_gpu_rms_norm_weight_rows_tensor(q36_gpu_tensor *out,
@@ -900,7 +976,38 @@ int q36_gpu_rms_norm_weight_rows_tensor(q36_gpu_tensor *out,
                                          uint64_t offset, uint32_t width,
                                          uint32_t rows, float eps) {
     if (!map || offset > size || (uint64_t)width * 4 > size - offset) return 0;
-    return q36_norm(out, in, (const uint8_t *)map + offset, width, rows, eps);
+    return q36_norm(out, in, map, size, offset, width, rows, eps);
+}
+
+int q36_gpu_recurrent_norm_gate_tensor(
+        q36_gpu_tensor *state, const q36_gpu_tensor *gate,
+        const void *map, uint64_t size, uint64_t weight_offset,
+        uint32_t width, uint32_t rows, float eps) {
+    const char *env = getenv("Q36_METAL_RECURRENT_NORM_GATE");
+    if (env && env[0] == '0') return 0;
+    const uint64_t bytes = (uint64_t)width * rows * sizeof(float);
+    if (!state || !gate || !map || !width || !rows ||
+        bytes > state->bytes || bytes > gate->bytes ||
+        weight_offset > size ||
+        (uint64_t)width * sizeof(float) > size - weight_offset)
+        return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weight = q36_model_view(
+        map, size, weight_offset, (uint64_t)width * sizeof(float), &inner);
+    if (!weight) return 0;
+    struct { uint32_t width, rows; float eps; } args =
+        { width, rows, eps };
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(@"q36_recurrent_norm_gate");
+    if (!enc) return 0;
+    [enc setBuffer:state->buffer offset:state->offset atIndex:0];
+    [enc setBuffer:gate->buffer offset:gate->offset atIndex:1];
+    [enc setBuffer:weight offset:(NSUInteger)inner atIndex:2];
+    [enc setBytes:&args length:sizeof(args) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    return 1;
 }
 
 int q36_gpu_l2_norm_rows_tensor(q36_gpu_tensor *x, uint32_t width,
@@ -1127,10 +1234,12 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
         bytes <= a->bytes && bytes <= b->bytes &&
         weight_offset <= size &&
         (uint64_t)width * sizeof(float) <= size - weight_offset) {
-        id<MTLBuffer> weight = [q36_device
-            newBufferWithBytes:(const uint8_t *)map + weight_offset
-                        length:(NSUInteger)width * sizeof(float)
-                       options:MTLResourceStorageModeShared];
+        const uint64_t weight_bytes =
+            (uint64_t)width * sizeof(float);
+        uint64_t weight_inner = 0;
+        id<MTLBuffer> weight =
+            q36_model_view(map, size, weight_offset, weight_bytes,
+                            &weight_inner);
         struct {
             int32_t ne00, ne00_t;
             uint64_t nb1, nb2, nb3;
@@ -1155,7 +1264,7 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:a->buffer offset:a->offset atIndex:1];
         [enc setBuffer:b->buffer offset:b->offset atIndex:2];
-        [enc setBuffer:weight offset:0 atIndex:3];
+        [enc setBuffer:weight offset:(NSUInteger)weight_inner atIndex:3];
         [enc setBuffer:out_sum->buffer offset:out_sum->offset atIndex:4];
         [enc setBuffer:out_norm->buffer offset:out_norm->offset atIndex:5];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
@@ -1346,13 +1455,46 @@ int q36_gpu_router_topk_tensor(
         used > 8u || !tokens) return 0;
     struct { uint32_t experts, used, tokens; float scale; } args =
         { experts, used, tokens, scale };
-    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_router_topk");
+    const char *parallel_env = getenv("Q36_METAL_ROUTER_PARALLEL");
+    const bool parallel = !parallel_env || parallel_env[0] != '0';
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(parallel ? @"q36_router_topk"
+                             : @"q36_router_topk_serial");
     if (!enc) return 0;
     [enc setBuffer:selected->buffer offset:selected->offset atIndex:0];
     [enc setBuffer:weights->buffer offset:weights->offset atIndex:1];
     [enc setBuffer:logits->buffer offset:logits->offset atIndex:2];
     [enc setBytes:&args length:sizeof(args) atIndex:3];
-    q36_dispatch_1d(enc, tokens);
+    if (parallel) {
+        [enc dispatchThreadgroups:MTLSizeMake(tokens, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    } else {
+        q36_dispatch_1d(enc, tokens);
+    }
+    return 1;
+}
+
+int q36_gpu_top2_tensor(q36_gpu_tensor *out_ids,
+                        const q36_gpu_tensor *logits,
+                        uint32_t count) {
+    const char *env = getenv("Q36_METAL_GPU_ARGMAX");
+    const uint32_t threads = 256u;
+    if ((env && env[0] == '0') || !out_ids || !logits || count < 2u ||
+        out_ids->bytes < 2u * sizeof(int32_t) ||
+        logits->bytes < (uint64_t)count * sizeof(float)) {
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_top2_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out_ids->buffer offset:out_ids->offset atIndex:0];
+    [enc setBuffer:logits->buffer offset:logits->offset atIndex:1];
+    [enc setBytes:&count length:sizeof(count) atIndex:2];
+    [enc setThreadgroupMemoryLength:threads * 2u * sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:threads * 2u * sizeof(int32_t) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    [enc endEncoding];
     return 1;
 }
 
@@ -1680,6 +1822,57 @@ int q36_gpu_shared_ffn_decode_tensor(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
         float gate_scale, float up_scale, float down_scale) {
+    const char *vk_style_env = getenv("Q36_METAL_SHARED_VK");
+    const bool vk_style = !vk_style_env || vk_style_env[0] != '0';
+    if (vk_style && out && mid && x && scalar && map && in_dim &&
+        !(in_dim & 31u) && mid_dim && !(mid_dim & 31u) && out_dim &&
+        x->bytes >= (uint64_t)in_dim * sizeof(float) &&
+        scalar->bytes >= sizeof(float) &&
+        mid->bytes >= (uint64_t)mid_dim * sizeof(float) &&
+        out->bytes >= (uint64_t)out_dim * sizeof(float)) {
+        const uint64_t gate_row_bytes = (uint64_t)(in_dim / 32u) * 34u;
+        const uint64_t down_row_bytes = (uint64_t)(mid_dim / 32u) * 34u;
+        uint64_t go = 0, uo = 0, doff = 0;
+        id<MTLBuffer> gw = q36_model_view(
+            map, size, gate_offset, gate_row_bytes * mid_dim, &go);
+        id<MTLBuffer> uw = q36_model_view(
+            map, size, up_offset, gate_row_bytes * mid_dim, &uo);
+        id<MTLBuffer> dw = q36_model_view(
+            map, size, down_offset, down_row_bytes * out_dim, &doff);
+        if (gw && uw && dw && (q36_batch || q36_gpu_begin_commands())) {
+            struct {
+                uint32_t mid_dim, blocks;
+                float gate_scale, up_scale;
+            } ga = { mid_dim, in_dim / 32u, gate_scale, up_scale };
+            id<MTLComputeCommandEncoder> enc =
+                q36_encoder(@"q36_shared_gate_up_decode");
+            if (!enc) return 0;
+            [enc setBuffer:gw offset:(NSUInteger)go atIndex:0];
+            [enc setBuffer:uw offset:(NSUInteger)uo atIndex:1];
+            [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+            [enc setBuffer:mid->buffer offset:mid->offset atIndex:3];
+            [enc setBytes:&ga length:sizeof(ga) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(mid_dim, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+
+            struct {
+                uint32_t out_dim, blocks;
+                float scale;
+            } da = { out_dim, mid_dim / 32u, down_scale };
+            enc = q36_encoder(@"q36_shared_down_tail_decode");
+            if (!enc) return 0;
+            [enc setBuffer:dw offset:(NSUInteger)doff atIndex:0];
+            [enc setBuffer:mid->buffer offset:mid->offset atIndex:1];
+            [enc setBuffer:scalar->buffer offset:scalar->offset atIndex:2];
+            [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+            [enc setBytes:&da length:sizeof(da) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+            return 1;
+        }
+    }
     const NSUInteger mid_bytes = (NSUInteger)mid_dim * sizeof(float);
     const NSUInteger down_bytes = (NSUInteger)out_dim * sizeof(float);
     if (q36_shared_mid_scratch_bytes < mid_bytes) {

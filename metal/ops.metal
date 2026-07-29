@@ -22,6 +22,63 @@ kernel void q36_scale_f32(device float *x [[buffer(0)]],
     if (i < n) x[i] *= scale;
 }
 
+kernel void q36_top2_f32(
+        device int *out_ids [[buffer(0)]],
+        device const float *logits [[buffer(1)]],
+        constant uint &count [[buffer(2)]],
+        threadgroup float *scratch_values [[threadgroup(0)]],
+        threadgroup int *scratch_ids [[threadgroup(1)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    float best0 = -INFINITY, best1 = -INFINITY;
+    int id0 = -1, id1 = -1;
+    for (uint i = tid; i < count; i += ntg) {
+        float value = logits[i];
+        if (id0 < 0 || value > best0 ||
+            (value == best0 && int(i) < id0)) {
+            best1 = best0;
+            id1 = id0;
+            best0 = value;
+            id0 = int(i);
+        } else if (id1 < 0 || value > best1 ||
+                   (value == best1 && int(i) < id1)) {
+            best1 = value;
+            id1 = int(i);
+        }
+    }
+    scratch_values[tid] = best0;
+    scratch_values[ntg + tid] = best1;
+    scratch_ids[tid] = id0;
+    scratch_ids[ntg + tid] = id1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) return;
+
+    best0 = -INFINITY;
+    best1 = -INFINITY;
+    id0 = -1;
+    id1 = -1;
+    for (uint i = 0; i < ntg * 2u; i++) {
+        float value = scratch_values[i];
+        int id = scratch_ids[i];
+        if (id < 0) continue;
+        if (id0 < 0 || value > best0 ||
+            (value == best0 && id < id0)) {
+            if (id != id0) {
+                best1 = best0;
+                id1 = id0;
+            }
+            best0 = value;
+            id0 = id;
+        } else if (id != id0 && (id1 < 0 || value > best1 ||
+                   (value == best1 && id < id1))) {
+            best1 = value;
+            id1 = id;
+        }
+    }
+    out_ids[0] = id0;
+    out_ids[1] = id1;
+}
+
 kernel void q36_swiglu_f32(device float *out [[buffer(0)]],
                             device const float *gate [[buffer(1)]],
                             device const float *up [[buffer(2)]],
