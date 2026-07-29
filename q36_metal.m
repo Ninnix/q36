@@ -1139,8 +1139,10 @@ int q36_gpu_delta_net_decode_tensor(
     if (!state || !q || !k || !v || !gb || !out ||
         !heads || !dim || !tokens || (dim & 31u)) return 0;
     struct { uint32_t heads, dim, tokens; } args = { heads, dim, tokens };
-    id<MTLComputeCommandEncoder> enc =
-        q36_encoder(@"q36_delta_net_decode");
+    const char *r4_env = getenv("Q36_METAL_DELTA_R4");
+    bool use_r4 = dim == 128u && (!r4_env || strcmp(r4_env, "0") != 0);
+    id<MTLComputeCommandEncoder> enc = q36_encoder(
+        use_r4 ? @"q36_delta_net_decode_r4" : @"q36_delta_net_decode");
     if (!enc) return 0;
     [enc setBuffer:state->buffer offset:state->offset atIndex:0];
     [enc setBuffer:q->buffer offset:q->offset atIndex:1];
@@ -1149,8 +1151,13 @@ int q36_gpu_delta_net_decode_tensor(
     [enc setBuffer:gb->buffer offset:gb->offset atIndex:4];
     [enc setBuffer:out->buffer offset:out->offset atIndex:5];
     [enc setBytes:&args length:sizeof(args) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(heads, dim / 32u, 1)
-        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    if (use_r4) {
+        [enc dispatchThreadgroups:MTLSizeMake((dim + 3u) / 4u, heads, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(heads, dim / 32u, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
     [enc endEncoding];
     return 1;
 }

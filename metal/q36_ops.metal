@@ -424,6 +424,63 @@ kernel void q36_delta_net_decode(
     }
 }
 
+/*
+ * The recurrent state is private to the Metal backend, so keep it transposed
+ * here: one contiguous row contains all input-state values for one output
+ * channel.  Four SIMD groups update four output channels per threadgroup and
+ * each lane retains four state values in registers across the token loop.
+ */
+kernel void q36_delta_net_decode_r4(
+        device float *state [[buffer(0)]],
+        device const float *q [[buffer(1)]],
+        device const float *k [[buffer(2)]],
+        device const float *v [[buffer(3)]],
+        device const float *gb [[buffer(4)]],
+        device float *out [[buffer(5)]],
+        constant q36_delta_net_args &args [[buffer(6)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint R = 4u;
+    uint col = group.x * R + simdgroup;
+    uint head = group.y;
+    if (head >= args.heads || col >= args.dim) return;
+
+    ulong matrix = (ulong)head * args.dim * args.dim;
+    device float *srow = state + matrix + (ulong)col * args.dim;
+    float ls[R];
+    for (uint j = 0; j < R; j++) {
+        ls[j] = srow[lane * R + j];
+    }
+
+    float norm = rsqrt(float(args.dim));
+    for (uint tok = 0; tok < args.tokens; tok++) {
+        ulong vec = ((ulong)tok * args.heads + head) * args.dim;
+        float decay = gb[(ulong)tok * 2u * args.heads + head];
+        float beta = gb[(ulong)tok * 2u * args.heads + args.heads + head];
+        float sk = 0.0f;
+        for (uint j = 0; j < R; j++) {
+            uint i = lane * R + j;
+            ls[j] *= decay;
+            sk = fma(ls[j], k[vec + i], sk);
+        }
+        sk = simd_sum(sk);
+        float d = (v[vec + col] - sk) * beta;
+        float y = 0.0f;
+        for (uint j = 0; j < R; j++) {
+            uint i = lane * R + j;
+            ls[j] = fma(k[vec + i], d, ls[j]);
+            y = fma(ls[j], q[vec + i], y);
+        }
+        y = simd_sum(y);
+        if (lane == 0) out[vec + col] = y * norm;
+    }
+
+    for (uint j = 0; j < R; j++) {
+        srow[lane * R + j] = ls[j];
+    }
+}
+
 struct q36_kv_store_args {
     uint k_row;
     uint v_row;
