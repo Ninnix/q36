@@ -4030,11 +4030,15 @@ static int parse_case_sequence(const char *arg, int ncases, int **seq_out, int *
 
 static void log_context_memory(q36_backend backend,
                                int         ctx_size,
-                               uint32_t    prefill_chunk) {
+                               uint32_t    prefill_chunk,
+                               q36_kv_cache_type cache_type_k,
+                               q36_kv_cache_type cache_type_v) {
     q36_context_memory m =
-        q36_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
+        q36_context_memory_estimate_configured(backend,
+                                               ctx_size,
+                                               prefill_chunk,
+                                               cache_type_k,
+                                               cache_type_v);
     fprintf(stderr,
             "q36-eval: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -4172,7 +4176,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "q36-eval: model shape %s\n", q36_engine_model_name(engine));
     eval_warn_think_max_downgraded(&cfg);
     trace_write_header(trace, &cfg, q36_engine_model_name(engine), ncases, max_prompt_tokens);
-    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk);
+    log_context_memory(cfg.backend, cfg.ctx_size, cfg.prefill_chunk,
+                       cfg.cache_type_k, cfg.cache_type_v);
 
     q36_session *session = NULL;
     if (q36_session_create(&session, engine, cfg.ctx_size) != 0) {

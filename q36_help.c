@@ -152,7 +152,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--backend NAME", "Backend name: metal, vulkan, or cpu.");
     if (tool != Q36_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", tool == Q36_HELP_AGENT ?
-            "Allocated context tokens. Default: 100000." :
+            "Allocated context tokens. Default: resident Metal 32000; Vulkan and SSD streaming 100000." :
             "Allocated context tokens.");
     }
     opt(fp, c, "-ctk, --cache-type-k TYPE",
@@ -173,7 +173,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-full-layers N", "Keep the first N routed layers fully resident.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "Explicitly preload the first N routed expert slots.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto.");
+    opt(fp, c, "--prefill-chunk N", tool == Q36_HELP_AGENT ?
+        "GPU graph prefill chunk size. Default: resident Metal 512; otherwise auto." :
+        "GPU graph prefill chunk size. Default: auto.");
     if (full) {
         if (tool != Q36_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");

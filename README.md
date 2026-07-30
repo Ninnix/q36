@@ -349,9 +349,12 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-The resident Metal and Vulkan presets use a 100000-token context and Q8_0 keys
-with Q4_0 values. CPU uses F16 KV. SSD-streamed model weights also default to a
-100000-token context, with F16 KV:
+Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values. The Vulkan
+agent retains its 100000-token context. On a 16 GB Mac, the resident Metal
+agent defaults to a 32000-token context and a 512-token prefill chunk; the
+larger context presets exhausted the Metal working set with the standard q2
+model. CPU uses F16 KV. SSD-streamed model weights still default to a
+100000-token context with F16 KV:
 
 ```sh
 ./q36-agent --metal
@@ -1007,6 +1010,14 @@ The Metal binary targets macOS 11. Newer facilities are optional:
   availability checks.
 * Older releases use the same shared/no-copy buffers and baseline Metal
   kernels without residency sets.
+* Host code defaults to the Apple M1 instruction baseline, so a binary built
+  on a newer Mac remains usable on M1. Use
+  `NATIVE_CPU_FLAG=-mcpu=native make metal` only for a local-only build.
+* Routed MoE prefill follows DS4's expert-major batch-MM dispatch and selects
+  the map specialization for the model's actual routed-expert count. If the
+  shape, pipeline, thread count, or threadgroup memory is unsupported, Metal
+  automatically uses the exact matvec path. `Q36_METAL_MOE_MM=0` forces that
+  fallback for diagnostics.
 * Cache auto-sizing uses the device's `recommendedMaxWorkingSetSize`, not a
   hard-coded machine-memory percentage.
 * All model buffers use unified storage; no discrete-GPU transfer or eGPU

@@ -5,7 +5,9 @@ GLSLC ?= ./glslc
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
-NATIVE_CPU_FLAG ?= -mcpu=native
+# Release-safe Apple Silicon baseline. Local-only builds may override this with
+# NATIVE_CPU_FLAG=-mcpu=native, but published binaries must remain M1-capable.
+NATIVE_CPU_FLAG ?= -mcpu=apple-m1
 MACOSX_DEPLOYMENT_TARGET ?= 11.0
 DARWIN_MIN_FLAG := -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 else

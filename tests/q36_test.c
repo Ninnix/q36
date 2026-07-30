@@ -306,6 +306,10 @@ static void test_quant_primitives(void) {
     TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_VULKAN, false) == Q36_KV_CACHE_Q4_0);
     TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_VULKAN, true) == Q36_KV_CACHE_F16);
     TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_VULKAN, true) == Q36_KV_CACHE_F16);
+    TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_METAL, false) == Q36_KV_CACHE_Q8_0);
+    TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_METAL, false) == Q36_KV_CACHE_Q4_0);
+    TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_METAL, true) == Q36_KV_CACHE_F16);
+    TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_METAL, true) == Q36_KV_CACHE_F16);
     TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_CPU, false) == Q36_KV_CACHE_F16);
     TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_CPU, false) == Q36_KV_CACHE_F16);
 
@@ -3078,22 +3082,22 @@ static void test_fill_iq2_xxs(test_block_iq2_xxs *b, uint32_t row) {
     }
 }
 
-/* The routed f32b MoE path against Q36's CPU dequantized-row reference,
- * once through the prefill GEMM kernels and once through the matvec
- * kernels. The router selection is skewed so the GEMM schedule covers
- * full 16-slot tiles, multi-tile experts, and partial tail tiles, and
- * out_dim exercises the row-tile guard. */
+/* The routed f32 MoE path against Q36's CPU dequantized-row reference.
+ * Metal checks its compact top-k=8 prefill MM, the standard DS4-style MM,
+ * and the exact matvec fallback independently. */
 static void test_vulkan_moe_gemm(void) {
     enum {
         in_dim = 2 * TEST_QK_K,
         mid_dim = TEST_QK_K,
 #ifdef Q36_METAL
         out_dim = 128,
+        n_expert = 8,
+        n_used = 8,
 #else
         out_dim = 131,
-#endif
         n_expert = 4,
         n_used = 2,
+#endif
 #ifdef Q36_METAL
         n_tok = 64,
 #else
@@ -3116,6 +3120,9 @@ static void test_vulkan_moe_gemm(void) {
     float *x_host = NULL;
     float *want = NULL;
     float *got_gemm = NULL;
+#ifdef Q36_METAL
+    float *got_standard = NULL;
+#endif
     float *got_mv = NULL;
     float *wrow = NULL;
     float *mid = NULL;
@@ -3156,23 +3163,47 @@ static void test_vulkan_moe_gemm(void) {
     x_host = malloc((size_t)n_tok * in_dim * sizeof(*x_host));
     want = calloc((size_t)n_tok * out_dim, sizeof(*want));
     got_gemm = malloc((size_t)n_tok * out_dim * sizeof(*got_gemm));
+#ifdef Q36_METAL
+    got_standard = malloc((size_t)n_tok * out_dim * sizeof(*got_standard));
+#endif
     got_mv = malloc((size_t)n_tok * out_dim * sizeof(*got_mv));
     wrow = malloc((size_t)in_dim * sizeof(*wrow));
     mid = malloc((size_t)mid_dim * sizeof(*mid));
+#ifdef Q36_METAL
+    TEST_ASSERT(x_host && want && got_gemm && got_standard &&
+                got_mv && wrow && mid);
+    if (!x_host || !want || !got_gemm || !got_standard ||
+        !got_mv || !wrow || !mid) goto done;
+#else
     TEST_ASSERT(x_host && want && got_gemm && got_mv && wrow && mid);
     if (!x_host || !want || !got_gemm || !got_mv || !wrow || !mid) goto done;
+#endif
 
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < in_dim; i++) {
             x_host[(uint64_t)t * in_dim + i] =
                 (float)((int)((t * 13u + i * 7u) % 61u) - 30) / 480.0f;
         }
-        /* Skewed routing: experts 0/1 fill multiple 16-slot tiles, 2/3
-         * only partial ones. */
+#ifdef Q36_METAL
+        float weight_sum = 0.0f;
+        for (uint32_t u = 0; u < n_used; u++) {
+            selected_host[t * n_used + u] =
+                (uint32_t)((t + u) % n_expert);
+            weights_host[t * n_used + u] =
+                1.0f + 0.125f * (float)((t + 3u * u) % 5u);
+            weight_sum += weights_host[t * n_used + u];
+        }
+        for (uint32_t u = 0; u < n_used; u++)
+            weights_host[t * n_used + u] /= weight_sum;
+#else
+        /* Skewed routing covers full tiles, multi-tile experts, and tails. */
         selected_host[t * n_used + 0] = t < 28 ? 0u : 2u;
         selected_host[t * n_used + 1] = t < 28 ? 1u : 3u;
-        weights_host[t * n_used + 0] = 0.35f + 0.005f * (float)(t % 7u);
-        weights_host[t * n_used + 1] = 1.0f - weights_host[t * n_used + 0];
+        weights_host[t * n_used + 0] =
+            0.35f + 0.005f * (float)(t % 7u);
+        weights_host[t * n_used + 1] =
+            1.0f - weights_host[t * n_used + 0];
+#endif
     }
 
     for (uint32_t t = 0; t < n_tok; t++) {
@@ -3221,34 +3252,46 @@ static void test_vulkan_moe_gemm(void) {
 
 #ifdef Q36_METAL
     setenv("Q36_METAL_MOE_MM", "1", 1);
-#else
-    setenv("Q36_VK_MOE_GEMM_MIN", "8", 1);
-#endif
+    unsetenv("Q36_METAL_MOE_COMPACT");
     ok = q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
                                     &gate, &up, &down,
                                     selected, weights, 0, n_used, x, n_tok,
                                     in_dim, mid_dim, out_dim, n_expert);
-#ifdef Q36_METAL
-    unsetenv("Q36_METAL_MOE_MM");
+    TEST_ASSERT(ok != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_gemm,
+                (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
+
+    setenv("Q36_METAL_MOE_COMPACT", "0", 1);
+    ok = q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
+                                    &gate, &up, &down,
+                                    selected, weights, 0, n_used, x, n_tok,
+                                    in_dim, mid_dim, out_dim, n_expert);
+    TEST_ASSERT(ok != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_standard,
+                (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
+
+    setenv("Q36_METAL_MOE_MM", "0", 1);
+    unsetenv("Q36_METAL_MOE_COMPACT");
 #else
+    setenv("Q36_VK_MOE_GEMM_MIN", "8", 1);
+    ok = q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
+                                    &gate, &up, &down,
+                                    selected, weights, 0, n_used, x, n_tok,
+                                    in_dim, mid_dim, out_dim, n_expert);
     unsetenv("Q36_VK_MOE_GEMM_MIN");
-#endif
     TEST_ASSERT(ok != 0);
     TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_gemm, (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
 
-#ifdef Q36_METAL
-    setenv("Q36_METAL_MOE_MM", "0", 1);
-#else
     setenv("Q36_VK_MOE_GEMM", "0", 1);
 #endif
     ok = q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
                                     &gate, &up, &down,
                                     selected, weights, 0, n_used, x, n_tok,
                                     in_dim, mid_dim, out_dim, n_expert);
-#ifdef Q36_METAL
-    unsetenv("Q36_METAL_MOE_MM");
-#else
+#ifndef Q36_METAL
     unsetenv("Q36_VK_MOE_GEMM");
+#else
+    unsetenv("Q36_METAL_MOE_MM");
 #endif
     TEST_ASSERT(ok != 0);
     TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_mv, (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
@@ -3257,32 +3300,59 @@ static void test_vulkan_moe_gemm(void) {
         float mv_max_rel = 0.0f;
         float gemm_max_rel = 0.0f;
         bool differs = false;
+        uint32_t gemm_worst = 0;
+#ifdef Q36_METAL
+        float standard_max_rel = 0.0f;
+        bool compact_differs = false;
+        uint32_t standard_worst = 0;
+#endif
         uint32_t worst = 0;
         for (uint32_t i = 0; i < n_tok * out_dim; i++) {
             float den = fabsf(want[i]) > 1.0f ? fabsf(want[i]) : 1.0f;
             float mv_rel = fabsf(got_mv[i] - want[i]) / den;
-            float gemm_rel = fabsf(got_gemm[i] - want[i]) / den;
-            if (mv_rel > mv_max_rel) mv_max_rel = mv_rel;
-            if (gemm_rel > gemm_max_rel) {
-                gemm_max_rel = gemm_rel;
+            if (mv_rel > mv_max_rel) {
+                mv_max_rel = mv_rel;
                 worst = i;
             }
+            float gemm_rel = fabsf(got_gemm[i] - want[i]) / den;
+            if (gemm_rel > gemm_max_rel) {
+                gemm_max_rel = gemm_rel;
+                gemm_worst = i;
+            }
             if (got_gemm[i] != got_mv[i]) differs = true;
+#ifdef Q36_METAL
+            float standard_rel = fabsf(got_standard[i] - want[i]) / den;
+            if (standard_rel > standard_max_rel) {
+                standard_max_rel = standard_rel;
+                standard_worst = i;
+            }
+            if (got_gemm[i] != got_standard[i]) compact_differs = true;
+#endif
         }
+#ifdef Q36_METAL
         fprintf(stderr,
-                "q36-test: routed gemm mv_max_rel=%g gemm_max_rel=%g worst=%u got=%g want=%g\n",
-                (double)mv_max_rel, (double)gemm_max_rel, worst,
-                (double)got_gemm[worst], (double)want[worst]);
+                "q36-test: routed Metal compact=%g standard=%g matvec=%g "
+                "worst(compact=%u standard=%u matvec=%u) got=%g want=%g\n",
+                (double)gemm_max_rel, (double)standard_max_rel,
+                (double)mv_max_rel, gemm_worst, standard_worst, worst,
+                (double)got_gemm[gemm_worst], (double)want[gemm_worst]);
+        TEST_ASSERT(mv_max_rel < 1.0e-3f);
+        TEST_ASSERT(gemm_max_rel < 5.0e-2f);
+        TEST_ASSERT(standard_max_rel < 5.0e-2f);
+        TEST_ASSERT(differs);
+        TEST_ASSERT(!compact_differs);
+#else
+        fprintf(stderr,
+                "q36-test: routed gemm mv_max_rel=%g gemm_max_rel=%g "
+                "worst(gemm=%u matvec=%u) got=%g want=%g\n",
+                (double)mv_max_rel, (double)gemm_max_rel,
+                gemm_worst, worst,
+                (double)got_gemm[gemm_worst], (double)want[gemm_worst]);
         /* The matvec path computes f32 dots; the GEMM path's bound is set
          * by its designed f16 staging noise through the cancelling down
          * dot.  Indexing or dequant bugs produce order-1 errors. */
         TEST_ASSERT(mv_max_rel < 1.0e-3f);
         TEST_ASSERT(gemm_max_rel < 5.0e-2f);
-#ifdef Q36_METAL
-        /* Metal's routed batch kernel is publication-disabled until its
-         * 64-token numeric oracle passes, so both requests use matvec. */
-        TEST_ASSERT(!differs);
-#else
         /* If the two paths agree bit for bit the GEMM never ran. */
         TEST_ASSERT(differs);
 #endif
@@ -3296,6 +3366,9 @@ done:
     free(mid);
     free(wrow);
     free(got_mv);
+#ifdef Q36_METAL
+    free(got_standard);
+#endif
     free(got_gemm);
     free(want);
     free(x_host);
@@ -6105,7 +6178,6 @@ static float *test_capture_fusion_logits(bool fallback, int *vocab_out) {
         {.name = "Q36_METAL_RECURRENT_NORM_GATE"},
         {.name = "Q36_METAL_DELTA_R4"},
         {.name = "Q36_METAL_FUSED_NORM"},
-        {.name = "Q36_METAL_MOE_MM"},
 #else
         {.name = "Q36_VK_SHARED_FFN_DECODE"},
         {.name = "Q36_VK_MOE_DOWN_SUM_DECODE"},

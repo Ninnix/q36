@@ -2879,20 +2879,43 @@ static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
     return 1;
 }
 
+static const char *q36_moe_mm_map_name(uint32_t used, bool compact) {
+    if (compact) {
+        return used == 8u
+            ? "kernel_mul_mm_id_map0_ne20_8_compact"
+            : NULL;
+    }
+    switch (used) {
+    case 1:  return "kernel_mul_mm_id_map0_ne20_1";
+    case 2:  return "kernel_mul_mm_id_map0_ne20_2";
+    case 4:  return "kernel_mul_mm_id_map0_ne20_4";
+    case 5:  return "kernel_mul_mm_id_map0_ne20_5";
+    case 6:  return "kernel_mul_mm_id_map0_ne20_6";
+    case 8:  return "kernel_mul_mm_id_map0_ne20_8";
+    case 10: return "kernel_mul_mm_id_map0_ne20_10";
+    case 16: return "kernel_mul_mm_id_map0_ne20_16";
+    case 22: return "kernel_mul_mm_id_map0_ne20_22";
+    default: return NULL;
+    }
+}
+
 static int q36_moe_ensure_id_map(
-        uint32_t experts, uint32_t tokens, uint32_t used) {
-    const uint64_t max_blocks =
-        ((uint64_t)tokens * used + 31u) / 32u + experts;
-    uint64_t bytes =
-        ((uint64_t)experts * (tokens + 1u) + 2u * max_blocks) *
-        sizeof(int32_t);
-    if (bytes > NSUIntegerMax) return 0;
+        uint32_t experts, uint32_t tokens, uint32_t used, bool compact) {
+    uint64_t words = (uint64_t)experts * (tokens + 1u);
+    if (compact) {
+        const uint64_t max_blocks =
+            ((uint64_t)tokens * used + 31u) / 32u + experts;
+        if (max_blocks > (UINT64_MAX - words) / 2u) return 0;
+        words += 2u * max_blocks;
+    }
+    if (words > NSUIntegerMax / sizeof(int32_t)) return 0;
+    const NSUInteger bytes = (NSUInteger)(words * sizeof(int32_t));
     if (q36_moe_id_map_bytes < bytes) {
         q36_moe_id_map = [q36_device
-            newBufferWithLength:(NSUInteger)bytes
+            newBufferWithLength:bytes
                         options:MTLResourceStorageModePrivate];
         if (!q36_moe_id_map) return 0;
-        q36_moe_id_map_bytes = (NSUInteger)bytes;
+        q36_moe_id_map_bytes = bytes;
     }
     return 1;
 }
@@ -3062,20 +3085,47 @@ static int q36_moe_iq2_q2_gpu(
     if (!gb || !ub || !db || !gsb || !usb || !dsb || (!q36_batch && !q36_gpu_begin_commands())) return 0;
 
     const char *mm_env = getenv("Q36_METAL_MOE_MM");
-    /*
-     * The routed batch kernels currently fail the isolated 64-token numeric
-     * oracle by order-one margins even though sampled top-1 parity can hide
-     * the drift. Keep the exact matvec route as the publication default until
-     * that kernel has a passing forced-logit gate.
-     */
-    (void)mm_env;
-    const bool use_mm = false;
+    const char *compact_env = getenv("Q36_METAL_MOE_COMPACT");
+    const bool compact = used == 8u &&
+        (!compact_env || compact_env[0] != '0');
+    const char *map_name = q36_moe_mm_map_name(used, compact);
+    bool use_mm = tokens >= 64u && !q36_micro_batch && map_name &&
+        (!mm_env || mm_env[0] != '0');
+    id<MTLComputePipelineState> map_pipeline = nil;
+    id<MTLComputePipelineState> gate_pipeline = nil;
+    id<MTLComputePipelineState> down_pipeline = nil;
+    if (use_mm) {
+        map_pipeline = q36_pipeline_mm(
+            [NSString stringWithUTF8String:map_name], false, false);
+        gate_pipeline = q36_pipeline_mm(
+            compact ? @"kernel_mul_mm_id_iq2_xxs_f32_compact"
+                    : @"kernel_mul_mm_id_iq2_xxs_f32",
+            false, true);
+        down_pipeline = q36_pipeline_mm(
+            compact ? @"kernel_mul_mm_id_q2_K_f32_compact"
+                    : @"kernel_mul_mm_id_q2_K_f32",
+            false, true);
+        const uint64_t map_shmem =
+            (uint64_t)weight_experts * used * sizeof(uint16_t);
+        use_mm = map_pipeline && gate_pipeline && down_pipeline &&
+            weight_experts <= map_pipeline.maxTotalThreadsPerThreadgroup &&
+            128u <= gate_pipeline.maxTotalThreadsPerThreadgroup &&
+            128u <= down_pipeline.maxTotalThreadsPerThreadgroup &&
+            map_shmem <= q36_device.maxThreadgroupMemoryLength &&
+            8192u <= q36_device.maxThreadgroupMemoryLength;
+        if (use_mm) {
+            use_mm = q36_moe_ensure_id_map(
+                weight_experts, tokens, used, compact);
+        }
+    }
+
     q36_moe_mm_args gate_mm = {0};
     q36_moe_mm_args down_mm = {0};
     NSUInteger map_ids_offset = 0;
+    NSUInteger mm_blocks = 0;
     if (use_mm) {
-        if (!q36_moe_ensure_id_map(weight_experts, tokens, used)) return 0;
-        map_ids_offset = (NSUInteger)weight_experts * sizeof(int32_t);
+        map_ids_offset =
+            (NSUInteger)weight_experts * sizeof(int32_t);
         q36_moe_mm_map_args ma = {
             (int32_t)weight_experts, (int32_t)in_dim, 1,
             (uint64_t)in_dim * sizeof(float),
@@ -3083,14 +3133,11 @@ static int q36_moe_iq2_q2_gpu(
             (int32_t)tokens, (int32_t)used,
             (uint64_t)used * sizeof(int32_t)
         };
-        id<MTLComputePipelineState> mp =
-            q36_pipeline_mm(@"kernel_mul_mm_id_map0_ne20_8",
-                            false, false);
         id<MTLComputeCommandEncoder> menc =
-            mp ? [q36_batch computeCommandEncoder] : nil;
+            [q36_batch computeCommandEncoder];
         if (!menc) return 0;
-        menc.label = @"kernel_mul_mm_id_map0_ne20_8";
-        [menc setComputePipelineState:mp];
+        menc.label = [NSString stringWithUTF8String:map_name];
+        [menc setComputePipelineState:map_pipeline];
         [menc setBytes:&ma length:sizeof(ma) atIndex:0];
         [menc setBuffer:weight_selected
                  offset:weight_selected_offset atIndex:1];
@@ -3106,6 +3153,10 @@ static int q36_moe_iq2_q2_gpu(
         down_mm = q36_moe_make_mm_args(
             mid_dim, out_dim, weight_experts, drb, deb,
             used, used, tokens);
+        mm_blocks = compact
+            ? (NSUInteger)(((uint64_t)tokens * used + 31u) / 32u +
+                           weight_experts)
+            : weight_experts;
     }
 
     /* Every routed slot for a token consumes the same input row.  The id
@@ -3116,13 +3167,13 @@ static int q36_moe_iq2_q2_gpu(
         q36_moe_make_args(in_dim, mid_dim, weight_experts,
                           grb, geb, 1, used, tokens);
     id<MTLComputePipelineState> gp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_iq2_xxs_f32",
-                          false, true)
+        ? gate_pipeline
         : q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
     id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
-    enc.label = use_mm ? @"moe.gate.kernel_mul_mm_id_iq2_xxs_f32"
-                       : @"moe.gate_up.kernel_mul_mv_id_iq2_xxs_pair_f32";
+    enc.label = use_mm
+        ? @"moe.gate.kernel_mul_mm_id_iq2_xxs_f32"
+        : @"moe.gate_up.kernel_mul_mv_id_iq2_xxs_pair_f32";
     [enc setComputePipelineState:gp];
     if (use_mm) {
         [enc setBytes:&gate_mm length:sizeof(gate_mm) atIndex:0];
@@ -3133,14 +3184,14 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u,
-                (mid_dim + 63u) / 64u, weight_experts)
+                compact ? 1u : (tokens + 31u) / 32u,
+                (mid_dim + 63u) / 64u, mm_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
 
         enc = [q36_batch computeCommandEncoder];
         enc.label = @"moe.up.kernel_mul_mm_id_iq2_xxs_f32";
-        [enc setComputePipelineState:gp];
+        [enc setComputePipelineState:gate_pipeline];
         [enc setBytes:&gate_mm length:sizeof(gate_mm) atIndex:0];
         [enc setBuffer:ub offset:(NSUInteger)uo atIndex:1];
         [enc setBuffer:x->buffer offset:x->offset atIndex:2];
@@ -3149,8 +3200,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u,
-                (mid_dim + 63u) / 64u, weight_experts)
+                compact ? 1u : (tokens + 31u) / 32u,
+                (mid_dim + 63u) / 64u, mm_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
     } else {
@@ -3195,17 +3246,17 @@ static int q36_moe_iq2_q2_gpu(
         mid_dim, out_dim, weight_experts,
         drb, deb, used, used, tokens);
     id<MTLComputePipelineState> dp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_q2_K_f32",
-                          false, true)
+        ? down_pipeline
         : q36_pipeline_nsg(
             down_sum ? @"kernel_mul_mv_id_q2_K_sum6_f32"
                      : @"kernel_mul_mv_id_q2_K_f32", 2);
     enc = dp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
-    enc.label = use_mm ? @"moe.down.kernel_mul_mm_id_q2_K_f32"
-                       : (down_sum
-                          ? @"moe.down.kernel_mul_mv_id_q2_K_sum6_f32"
-                          : @"moe.down.kernel_mul_mv_id_q2_K_f32");
+    enc.label = use_mm
+        ? @"moe.down.kernel_mul_mm_id_q2_K_f32"
+        : (down_sum
+            ? @"moe.down.kernel_mul_mv_id_q2_K_sum6_f32"
+            : @"moe.down.kernel_mul_mv_id_q2_K_f32");
     [enc setComputePipelineState:dp];
     if (use_mm) {
         [enc setBytes:&down_mm length:sizeof(down_mm) atIndex:0];
@@ -3216,8 +3267,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u,
-                (out_dim + 63u) / 64u, weight_experts)
+                compact ? 1u : (tokens + 31u) / 32u,
+                (out_dim + 63u) / 64u, mm_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
         [enc setBytes:&da length:sizeof(da) atIndex:0];

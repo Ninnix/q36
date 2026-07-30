@@ -34,6 +34,8 @@
 int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 #define AGENT_RESIDENT_CTX 100000
+#define AGENT_METAL_RESIDENT_CTX 32000
+#define AGENT_METAL_RESIDENT_PREFILL_CHUNK 512
 #define AGENT_STREAMING_CTX 100000
 
 static int set_nonblock(int fd, bool on, int *old_flags);
@@ -540,6 +542,7 @@ static agent_config parse_options(int argc, char **argv) {
 
     bool steering_scale_set = false;
     bool ctx_set = false;
+    bool prefill_chunk_set = false;
     bool cache_type_k_set = false;
     bool cache_type_v_set = false;
     for (int i = 1; i < argc; i++) {
@@ -657,6 +660,7 @@ static agent_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
+            prefill_chunk_set = true;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
@@ -682,7 +686,16 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
-    if (c.engine.ssd_streaming && !ctx_set) c.gen.ctx_size = AGENT_STREAMING_CTX;
+    if (!ctx_set) {
+        c.gen.ctx_size = c.engine.ssd_streaming ? AGENT_STREAMING_CTX :
+            (c.engine.backend == Q36_BACKEND_METAL ?
+                AGENT_METAL_RESIDENT_CTX : AGENT_RESIDENT_CTX);
+    }
+    if (!prefill_chunk_set &&
+        c.engine.backend == Q36_BACKEND_METAL &&
+        !c.engine.ssd_streaming) {
+        c.engine.prefill_chunk = AGENT_METAL_RESIDENT_PREFILL_CHUNK;
+    }
     if (c.gen.ctx_size > Q36_CONTEXT_MAX) {
         fprintf(stderr, "q36-agent: --ctx must not exceed %d\n", Q36_CONTEXT_MAX);
         exit(2);
@@ -696,11 +709,15 @@ static agent_config parse_options(int argc, char **argv) {
 
 static void log_context_memory(q36_backend backend,
                                int         ctx_size,
-                               uint32_t    prefill_chunk) {
+                               uint32_t    prefill_chunk,
+                               q36_kv_cache_type cache_type_k,
+                               q36_kv_cache_type cache_type_v) {
     q36_context_memory m =
-        q36_context_memory_estimate_with_prefill(backend,
-                                                 ctx_size,
-                                                 prefill_chunk);
+        q36_context_memory_estimate_configured(backend,
+                                               ctx_size,
+                                               prefill_chunk,
+                                               cache_type_k,
+                                               cache_type_v);
     fprintf(stderr,
             "q36-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -6152,7 +6169,12 @@ static void test_agent_streaming_defaults(void) {
     agent_config cpu = parse_options(2, cpuv);
 
     AGENT_TEST_ASSERT(!def.engine.ssd_streaming);
-    AGENT_TEST_ASSERT(def.gen.ctx_size == AGENT_RESIDENT_CTX);
+    AGENT_TEST_ASSERT(def.gen.ctx_size ==
+        (def.engine.backend == Q36_BACKEND_METAL ?
+            AGENT_METAL_RESIDENT_CTX : AGENT_RESIDENT_CTX));
+    AGENT_TEST_ASSERT(def.engine.prefill_chunk ==
+        (def.engine.backend == Q36_BACKEND_METAL ?
+            AGENT_METAL_RESIDENT_PREFILL_CHUNK : 0));
 #ifdef Q36_NO_GPU
     AGENT_TEST_ASSERT(def.engine.cache_type_k == Q36_KV_CACHE_F16);
     AGENT_TEST_ASSERT(def.engine.cache_type_v == Q36_KV_CACHE_F16);
@@ -6162,6 +6184,7 @@ static void test_agent_streaming_defaults(void) {
 #endif
     AGENT_TEST_ASSERT(stream.engine.ssd_streaming);
     AGENT_TEST_ASSERT(stream.gen.ctx_size == AGENT_STREAMING_CTX);
+    AGENT_TEST_ASSERT(stream.engine.prefill_chunk == 0);
     AGENT_TEST_ASSERT(stream.engine.cache_type_k == Q36_KV_CACHE_F16);
     AGENT_TEST_ASSERT(stream.engine.cache_type_v == Q36_KV_CACHE_F16);
     AGENT_TEST_ASSERT(streamctx.engine.ssd_streaming);
@@ -10206,7 +10229,9 @@ int main(int argc, char **argv) {
     if (q36_engine_open(&engine, &cfg.engine) != 0) return 1;
     log_context_memory(cfg.engine.backend,
                        cfg.gen.ctx_size,
-                       cfg.engine.prefill_chunk);
+                       cfg.engine.prefill_chunk,
+                       cfg.engine.cache_type_k,
+                       cfg.engine.cache_type_v);
 
     struct sigaction old_int;
     struct sigaction sa;
