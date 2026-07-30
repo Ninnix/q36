@@ -442,6 +442,49 @@ static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
     return 1;
 }
 
+static int q36_f32_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
+                          uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                          const q36_gpu_tensor *x) {
+    if (!out || !map || !x || !in_dim || !out_dim ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        in_dim > UINT64_MAX / sizeof(float) ||
+        out_dim > UINT64_MAX / (in_dim * sizeof(float)) ||
+        x->bytes < in_dim * sizeof(float) ||
+        out->bytes < out_dim * sizeof(float)) return 0;
+    const uint64_t row_bytes = in_dim * sizeof(float);
+    uint64_t inner = 0;
+    id<MTLBuffer> weights = q36_model_view(
+        map, size, offset, out_dim * row_bytes, &inner);
+    int16_t nsg = (int16_t)((in_dim + 127u) / 128u);
+    if (nsg > 8) nsg = 8;
+    const int32_t nr0 = 2;
+    NSString *kernel = (in_dim & 3u)
+        ? @"kernel_mul_mv_f32_f32" : @"kernel_mul_mv_f32_f32_4";
+    id<MTLComputePipelineState> p = q36_pipeline_nsg(kernel, nsg);
+    if (!weights || !p ||
+        (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    q36_q8_mv_args args = {
+        (int32_t)in_dim, (int32_t)out_dim, 1,
+        sizeof(float), row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, (int32_t)in_dim, 1, 1,
+        sizeof(float), in_dim * sizeof(float),
+        in_dim * sizeof(float), in_dim * sizeof(float),
+        (int32_t)out_dim, 1, nr0, 1, 1
+    };
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = kernel;
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+    [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
 static int q36_dense(NSString *kernel, q36_gpu_tensor *out,
                       const void *map, uint64_t model_size,
                       uint64_t weight_offset, uint64_t weight_bytes,
@@ -1042,6 +1085,9 @@ int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out, const void *map,
                                      float scale) {
     if (!in_dim || !out_dim ||
         in_dim > UINT64_MAX / out_dim / sizeof(float)) return 0;
+    if (tokens == 1u && scale == 1.0f &&
+        q36_f32_decode(out, map, size, offset, in_dim, out_dim, x))
+        return 1;
     return q36_dense(@"q36_matmul_f32", out, map, size, offset,
                      in_dim * out_dim * sizeof(float),
                      in_dim, out_dim, x, tokens, scale);
