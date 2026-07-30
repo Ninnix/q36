@@ -394,7 +394,7 @@ test-metal: metal q36_agent_test_metal $(SAMPLING_TEST)
 
 test-metal-model: metal
 	@echo "=== Metal model-dependent tests (requires q36moe.gguf) ==="
-	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --vulkan-cpu-parity --vulkan-fusion-parity --ssd-streaming-parity --mtp-verifier
+	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --ssd-streaming-parity --mtp-verifier
 
 test-vulkan: q36_test
 	./q36_test --vulkan-kernels
@@ -409,7 +409,7 @@ test-all: test test-vulkan
 
 test-model: q36_test
 	@echo "=== Model-dependent tests (requires q36moe.gguf) ==="
-	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --vulkan-cpu-parity --vulkan-fusion-parity --mtp-verifier
+	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --mtp-verifier
 
 test-session-batch: q36_test
 	./q36_test --vulkan-session-batch

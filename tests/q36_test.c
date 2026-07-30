@@ -5930,11 +5930,11 @@ done:
     free(prompt_text);
 }
 
-/* CPU capture and Vulkan replay are separate phases. Keeping both engines
+/* CPU capture and GPU replay are separate phases. Keeping both engines
  * resident makes the 16 GB release target page-fault the model continuously. */
-static void test_backend_parity_replay_vulkan(q36_engine *engine,
-                                              const test_backend_parity_case *tc,
-                                              const test_backend_parity_capture *ref) {
+static void test_backend_parity_replay_gpu(q36_engine *engine,
+                                           const test_backend_parity_case *tc,
+                                           const test_backend_parity_capture *ref) {
     q36_session *session = NULL;
     char err[160] = {0};
     TEST_ASSERT(engine != NULL && tc != NULL && ref != NULL);
@@ -5951,19 +5951,19 @@ static void test_backend_parity_replay_vulkan(q36_engine *engine,
         test_logit_comparison result =
             test_compare_logits(logits, ref->logits[step], vocab);
         TEST_ASSERT(result.nonfinite == 0);
-        test_logit_comparison_assert_strict("vulkan-cpu-parity", tc->id,
+        test_logit_comparison_assert_strict("gpu-cpu-parity", tc->id,
                                             step, &result);
         int token = q36_session_argmax(session);
         if (token != ref->tokens[step]) {
             char *cpu_text = test_token_repr(engine, ref->tokens[step]);
-            char *vk_text = test_token_repr(engine, token);
+            char *gpu_text = test_token_repr(engine, token);
             fprintf(stderr,
-                    "q36-test: vulkan-cpu-parity %s step %d argmax mismatch cpu=%d(%s) vulkan=%d(%s)\n",
+                    "q36-test: gpu-cpu-parity %s step %d argmax mismatch cpu=%d(%s) gpu=%d(%s)\n",
                     tc->id, step,
                     ref->tokens[step], cpu_text ? cpu_text : "?",
-                    token, vk_text ? vk_text : "?");
+                    token, gpu_text ? gpu_text : "?");
             free(cpu_text);
-            free(vk_text);
+            free(gpu_text);
         }
         TEST_ASSERT(token == ref->tokens[step]);
         if (step + 1 < ref->steps)
@@ -5983,7 +5983,7 @@ static void test_parity_cache_env(const char *k, const char *v) {
     else unsetenv("Q36_TEST_CACHE_TYPE_V");
 }
 
-static void test_vulkan_cpu_parity(void) {
+static void test_gpu_cpu_parity(void) {
     static const test_backend_parity_case cases[] = {
         {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
         {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", NULL, Q36_THINK_NONE, true, 2, 4096},
@@ -5997,9 +5997,9 @@ static void test_vulkan_cpu_parity(void) {
     memset(captures, 0, sizeof(captures));
     memset(selected, 0, sizeof(selected));
     q36_engine *cpu_engine = NULL;
-    q36_engine *vk_engine = NULL;
+    q36_engine *gpu_engine = NULL;
     if (!test_model_available(test_model_path())) {
-        test_skip("vulkan-cpu-parity", "model file not found");
+        test_skip("gpu-cpu-parity", "model file not found");
         return;
     }
     const char *ref_env = getenv("Q36_TEST_PARITY_REF");
@@ -6011,38 +6011,38 @@ static void test_vulkan_cpu_parity(void) {
                                                      : Q36_BACKEND_CPU,
                                           ref_vulkan ? 1 : test_reference_threads());
     if (!cpu_engine) {
-        test_skip("vulkan-cpu-parity", "reference backend unavailable");
+        test_skip("gpu-cpu-parity", "reference backend unavailable");
         return;
     }
-    if (!test_require_session_backend("vulkan-cpu-parity", cpu_engine, 4096)) {
+    if (!test_require_session_backend("gpu-cpu-parity", cpu_engine, 4096)) {
         q36_engine_close(cpu_engine);
         return;
     }
     for (size_t i = 0; i < N_CASES; i++) {
         if (!cases[i].prompt_text && !test_vector_case_selected(cases[i].id)) continue;
         selected[i] = true;
-        fprintf(stderr, "q36-test: vulkan-cpu-parity CPU capture %s\n", cases[i].id);
+        fprintf(stderr, "q36-test: gpu-cpu-parity CPU capture %s\n", cases[i].id);
         test_backend_parity_capture_cpu(cpu_engine, &cases[i], &captures[i]);
     }
     q36_engine_close(cpu_engine);
 
     test_parity_cache_env(getenv("Q36_TEST_VK_CACHE_TYPE_K"),
                           getenv("Q36_TEST_VK_CACHE_TYPE_V"));
-    vk_engine = test_open_backend_engine(test_model_path(), Q36_BACKEND_VULKAN, 1);
-    if (!vk_engine) {
-        test_skip("vulkan-cpu-parity", "Vulkan backend unavailable");
+    gpu_engine = test_open_backend_engine(test_model_path(), Q36_BACKEND_VULKAN, 1);
+    if (!gpu_engine) {
+        test_skip("gpu-cpu-parity", "GPU backend unavailable");
         goto done;
     }
-    if (!test_require_session_backend("vulkan-cpu-parity", vk_engine, 4096))
+    if (!test_require_session_backend("gpu-cpu-parity", gpu_engine, 4096))
         goto done;
     for (size_t i = 0; i < N_CASES; i++) {
         if (!selected[i]) continue;
-        fprintf(stderr, "q36-test: vulkan-cpu-parity Vulkan replay %s\n", cases[i].id);
-        test_backend_parity_replay_vulkan(vk_engine, &cases[i], &captures[i]);
+        fprintf(stderr, "q36-test: gpu-cpu-parity GPU replay %s\n", cases[i].id);
+        test_backend_parity_replay_gpu(gpu_engine, &cases[i], &captures[i]);
     }
 
 done:
-    q36_engine_close(vk_engine);
+    q36_engine_close(gpu_engine);
     for (size_t i = 0; i < N_CASES; i++)
         test_backend_parity_capture_free(&captures[i]);
 }
@@ -6254,8 +6254,8 @@ static void test_vulkan_fusion_parity(void) {
     free(fallback);
 }
 #else
-static void test_vulkan_cpu_parity(void) {
-    test_skip("vulkan-cpu-parity", "CPU-only build");
+static void test_gpu_cpu_parity(void) {
+    test_skip("gpu-cpu-parity", "CPU-only build");
 }
 
 static void test_ssd_streaming_parity(void) {
@@ -6624,7 +6624,7 @@ static const q36_test_entry test_entries[] = {
     {"--kv-cache-save-restore", "kv-cache-save-restore", "disk KV cache save/restore cycle", test_kv_cache_save_restore},
     {"--session-sync-resume", "session-sync-resume", "warm session sync matches cold rebuild", test_session_sync_resume_matches_cold_rebuild},
     {"--vulkan-session-batch", "vulkan-session-batch", "native Vulkan 1/2/4/8 resident-session decode", test_vulkan_session_batch},
-    {"--vulkan-cpu-parity", "vulkan-cpu-parity", "CPU/Vulkan logits top1/top5/top15/top64 parity", test_vulkan_cpu_parity},
+    {"--gpu-cpu-parity", "gpu-cpu-parity", "CPU/GPU logits top1/top5/top15/top64 parity", test_gpu_cpu_parity},
     {"--ssd-streaming-parity", "ssd-streaming-parity", "resident/warm/cold/cache-pressure GPU parity", test_ssd_streaming_parity},
     {"--vulkan-fusion-parity", "vulkan-fusion-parity", "fused Vulkan path against complete feature fallbacks", test_vulkan_fusion_parity},
     {"--mtp-verifier", "mtp-verifier", "MTP commits replay through plain target decode", test_mtp_verifier_replay},
@@ -6668,6 +6668,8 @@ static void test_print_help(const char *prog) {
 }
 
 static const q36_test_entry *test_find_entry(const char *arg) {
+    if (!strcmp(arg, "--vulkan-cpu-parity"))
+        arg = "--gpu-cpu-parity";
     for (size_t i = 0; i < sizeof(test_entries) / sizeof(test_entries[0]); i++) {
         if (!strcmp(arg, test_entries[i].flag)) return &test_entries[i];
     }

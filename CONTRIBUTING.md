@@ -38,7 +38,7 @@ Useful narrower checks:
 ./q36_test --tool-call-quality
 ./q36_test --qwen-tool-call-quality
 ./q36_test --vulkan-kernels
-./q36_test --vulkan-cpu-parity
+./q36_test --gpu-cpu-parity
 ```
 
 What they cover:
@@ -56,7 +56,7 @@ What they cover:
 - `--qwen-tool-call-quality`: exercises native Qwen tool-call emission through
   the OpenAI-compatible request path.
 - `--vulkan-kernels`: isolated Vulkan kernel numeric checks.
-- `--vulkan-cpu-parity`: compares live CPU and Vulkan logits on the same
+- `--gpu-cpu-parity`: compares live CPU and Metal/Vulkan logits on the same
   generated suffix with Q36 top-1 and top-k overlap gates.
 
 The runner defaults to the q36 model path compiled into `q36.h`. Override paths
@@ -66,7 +66,7 @@ and fixtures when needed:
 Q36_TEST_MODEL=/path/to/model.gguf ./q36_test --logprob-vectors
 Q36_TEST_VECTOR_FILE=/path/to/llama.vec ./q36_test --logprob-vectors
 Q36_TEST_LONG_PROMPT=/path/to/prompt.txt ./q36_test --long-context
-Q36_TEST_VECTOR_CASE=short ./q36_test --vulkan-cpu-parity
+Q36_TEST_VECTOR_CASE=short ./q36_test --gpu-cpu-parity
 ```
 
 For CPU portability, verify that the CPU-only target still builds:
