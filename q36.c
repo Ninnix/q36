@@ -696,6 +696,17 @@ static uint32_t q36_default_vk_prefill_cap(void) {
  * doubles prefill throughput over the resident-path default of 64.  An
  * explicit --prefill-chunk or Q36_VK_PREFILL_CHUNK still wins. */
 static uint32_t q36_engine_vk_prefill_cap(const q36_engine *e) {
+#ifdef Q36_METAL
+    if (e->ssd_streaming) {
+        uint32_t cap = e->prefill_cap_override ?
+            e->prefill_cap_override : q36_default_vk_prefill_cap();
+        uint32_t cache_tokens =
+            e->ssd_streaming_cache_experts / Q36_N_EXPERT_USED;
+        if (cache_tokens < 1) cache_tokens = 1;
+        if (cap > cache_tokens) cap = cache_tokens;
+        return cap;
+    }
+#endif
     if (e->prefill_cap_override) return e->prefill_cap_override;
     if (e->ssd_streaming && !getenv("Q36_VK_PREFILL_CHUNK")) return 512;
     return q36_default_vk_prefill_cap();
@@ -1282,8 +1293,10 @@ uint16_t q36_quant_f32_to_f16(float f) {
 /* Compiled without fast-math: -ffast-math substitutes rcpss approximations
  * for the scale divisions (off by 1 ulp on some inputs, varying across
  * CPUs), which breaks bit-identity with the GPU quantization kernels. */
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
 #pragma GCC optimize ("no-fast-math")
+#endif
 void q36_quant_q8_0(const float *x, void *out, int64_t n) {
     q36_block_q8_0 *y = out;
     int64_t blocks = n / Q36_QK8_0;
@@ -1334,7 +1347,9 @@ void q36_quant_q4_0(const float *x, void *out, int64_t n) {
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
+#endif
 
 void q36_quant_q8_k(const float *x, void *out, int64_t n) {
     q36_block_q8_k *y = out;
@@ -7952,7 +7967,8 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     weights_bind(&e->weights, &e->model);
     if (e->ssd_streaming && !q36_backend_supports_ssd_streaming(e->backend)) {
-        fprintf(stderr, "q36: --ssd-streaming is currently supported only with --vulkan\n");
+        fprintf(stderr,
+                "q36: --ssd-streaming requires a Metal or Vulkan GPU graph backend\n");
         q36_engine_close(e);
         return 1;
     }
@@ -8094,6 +8110,23 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
             q36_engine_close(e);
             return 1;
         }
+#ifdef Q36_METAL
+        if (e->ssd_streaming && e->ssd_streaming_full_layers != 0) {
+            for (uint32_t il = 0;
+                 il < e->ssd_streaming_full_layers; il++) {
+                q36_gpu_stream_expert_table table =
+                    q36_stream_expert_table_make(
+                        &e->model, &e->weights.layer[il], il);
+                if (!q36_gpu_stream_expert_cache_load_layer(&table)) {
+                    fprintf(stderr,
+                            "q36: Metal failed to load full resident routed layer %u\n",
+                            il);
+                    q36_engine_close(e);
+                    return 1;
+                }
+            }
+        }
+#endif
         q36_vulkan_prewarm_weights(e);
         if (!q36_gpu_finish_model_cache()) {
             q36_engine_close(e);
@@ -8820,7 +8853,10 @@ int q36_sessions_eval_batch(q36_decode_item *items, int count,
         bool ok = q36_sessions_eval_batch_vulkan(items, count);
         if (!ok) {
             for (int i = 0; i < count; i++) q36_session_invalidate(items[i].session);
-            if (err && errlen) snprintf(err, errlen, "Vulkan batched decode failed");
+            if (err && errlen) {
+                snprintf(err, errlen, "%s batched decode failed",
+                         q36_backend_name(e->backend));
+            }
             return 1;
         }
         for (int i = 0; i < count; i++) {
@@ -8830,7 +8866,8 @@ int q36_sessions_eval_batch(q36_decode_item *items, int count,
             s->mtp_draft_valid = false;
         }
         if (getenv("Q36_VK_SESSION_BATCH_LOG")) {
-            fprintf(stderr, "q36: Vulkan session batch rows=%d native=1\n", count);
+            fprintf(stderr, "q36: %s session batch rows=%d native=1\n",
+                    q36_backend_name(e->backend), count);
         }
         return 0;
     }

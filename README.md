@@ -17,11 +17,21 @@ Model support is intentionally opportunistic. The project follows the best open
 weights for useful local machine sizes, especially 16 GB machines and 24/32 GB
 workstations. A model may be removed when a better replacement arrives.
 
+Supported runtimes:
+
+* **Metal** on Apple Silicon M1 or newer. A 16 GB Mac can run the default
+  release model resident; 8 GB Macs are intended to use SSD streaming.
+* **Vulkan** on the AMD BC-250 with RADV and external host memory.
+* **CPU** as a portable reference and debugging runtime, not the normal
+  production path.
+
 # So, what can I do with this software?
 
 * You can run a quite capable model on your very cheap hardware, a $150 machine, 
 the BC-250. Even if you don't have enough RAM, with SSD streaming, you can still 
 run it at a decent speed.
+* You can run the same CLI, agent, evaluation harness, benchmark, and server on
+  Apple Silicon through the native Metal graph runtime.
 
 ## Requirements
 
@@ -41,10 +51,12 @@ QuarkStar has two native GPU targets:
 * **Kernel boot parameters**: add `ttm.pages_limit=3959290
   ttm.page_pool_size=3959290` to your bootloader, otherwise `amdgpu` caps
   GPU-accessible memory below 8 GB and the model will fail to load.
-* **Apple Silicon M1 or newer** with macOS and the Command Line Tools. Install
-  the optional shader compiler once with
-  `xcodebuild -downloadComponent MetalToolchain`, then build with `make metal`
-  and run with `./q36 --metal`.
+* **Apple Silicon M1 or newer** with macOS 11 or newer and Xcode or the Command
+  Line Tools providing the macOS SDK and Metal framework. Build with
+  `make metal` and run with `./q36 --metal`. Shader sources are compiled through
+  Metal at runtime, so the build does not require a separate offline
+  `metal` invocation. Metal builds use an Apple Silicon/macOS 11 deployment
+  target; newer residency APIs are selected only at runtime.
 
 There is no support for discrete GPUs, integrated Intel/NVIDIA GPUs, or
 Windows (Windows has no driver support for the BC-250 APU at all). The Metal
@@ -167,10 +179,11 @@ The script downloads from
 `./gguf/`, resumes partial downloads with `curl -C -`, and updates
 `./q36moe.gguf` to point at the selected model for older scripts.
 
-Then build:
+Then build for the target platform:
 
 ```sh
-make
+make        # Linux / Vulkan
+make metal  # macOS / Apple Silicon
 ```
 
 The normal and CPU-only builds are self-contained. They do not require a
@@ -216,6 +229,22 @@ process running at a time.
 
 ![BC-250 t/s](speed-bench/bc250_ts.svg)
 
+### Metal measurements
+
+The following single-process measurements used the default q2 GGUF on a
+16 GB M2 Pro with macOS 26.5. The 256-token rows use
+`tests/test-vectors/prompts/long_code_audit.txt`, a 512-token allocated
+context, greedy decode, and four generated probe tokens:
+
+| Runtime | Expert residency | Prompt | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| Metal | Full model resident | 256 tokens | 170.75 t/s | 38.75 t/s |
+| Metal SSD | 512 expert slots / 0.42 GiB | 256 tokens | 64.13 t/s | 13.90 t/s |
+
+These numbers show the expected capacity tradeoff, not a cross-machine
+performance promise. Metal generation, prefill, and SSD behavior should be
+remeasured on the oldest and smallest supported Mac before a release.
+
 Use `q36-bench` for reproducible prefill and decode measurements. Release
 builds also have a conservative BC-250 performance gate under
 `make benchmark-gate`; record results on the same board and power state when
@@ -223,23 +252,31 @@ comparing changes.
 
 ## Running Models Larger Than Available Memory
 
-Vulkan SSD streaming keeps non-routed weights resident and loads selected
-routed experts into a bounded cache. Without an explicit cache size, Q36 uses
-the Vulkan recommended working set, subtracts non-routed weights, and targets
-80% of the reported budget:
+Metal and Vulkan SSD streaming keep non-routed weights resident and load
+selected routed experts into a bounded backend cache. Without an explicit
+cache size, Q36 uses the GPU's recommended working set, subtracts non-routed
+weights, and targets 80% of the reported budget:
 
 ```sh
-./q36 --ssd-streaming -p "Explain radix trees."
-./q36 --ssd-streaming --ssd-streaming-cache-experts 256 -p "Hello"
-./q36 --ssd-streaming --ssd-streaming-cache-experts 6GB -p "Hello"
+./q36 --metal --ssd-streaming -p "Explain radix trees."
+./q36 --vulkan --ssd-streaming --ssd-streaming-cache-experts 256 -p "Hello"
+./q36 --metal --ssd-streaming --ssd-streaming-cache-experts 1GB -p "Hello"
 ```
+
+`NGB` is a routed-expert byte budget. Q36 converts it to the number of expert
+slots that fit the release GGUF. A plain integer is an exact expert-slot count.
+Non-routed weights, KV cache, activations, and graph scratch need additional
+memory. Startup prints the resolved slot count and actual cache allocation.
 
 A built-in or `Q36_VK_STREAMING_EXPERT_HOTLIST` profile biases eviction
 without reading expert weights at startup. It does not fill the cache with
 arbitrary experts when no profile exists. Use `--ssd-streaming-cold` for an
 empty cache, or `--ssd-streaming-preload-experts N` to request an explicit
 weight preload. Mixed expert-size models keep their unbiased policy because
-one profile cannot rank the incompatible cache paths consistently.
+one profile cannot rank the incompatible cache paths consistently. The
+`Q36_VK_STREAMING_EXPERT_HOTLIST` and
+`Q36_VK_DISABLE_STREAMING_EXPERT_HOTLIST` names are retained for compatibility
+and apply to both graph runtimes.
 
 As in DS4, an explicit routed prefix can stay fully resident:
 
@@ -251,6 +288,43 @@ Full layers are charged at their actual byte size and the remaining budget
 must still hold one layer of dynamic expert slots for prefill. The default is
 zero because the dynamic-only cache is faster on the BC-250. Pass
 `--ssd-streaming-full-layers 0` to disable an explicit setting.
+
+### Metal SSD streaming
+
+Metal follows DS4's bounded expert-cache design. Routed expert bytes are read
+from the GGUF into size-limited shared Metal buffers, selected IDs are remapped
+to cache slots, and cache misses use a biased least-recently-used eviction
+policy. `--ssd-streaming-cache-experts`, preload, cold-cache, and
+full-resident-layer controls therefore allocate and constrain real Metal
+buffers; they are not hints to macOS VM paging.
+
+On a 16 GB Mac, start with the resident q2 model:
+
+```sh
+./q36 --metal -p "Hello"
+```
+
+For the larger release GGUF, or on an 8 GB Mac, start conservatively:
+
+```sh
+./q36 --metal --ssd-streaming --ctx 4096 -p "Hello"
+./q36 --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 512 --ctx 4096 -p "Hello"
+```
+
+The automatic form uses `recommendedMaxWorkingSetSize`. The explicit example
+allocates about 0.42 GiB for this GGUF and leaves more headroom for the OS and
+KV state. Increase it only while memory pressure, swap, and responsiveness
+remain acceptable. A physical 8 GB Apple Silicon run is part of release QA;
+`--simulate-used-memory 8GB` on a larger Mac is diagnostic evidence, not a
+replacement.
+
+`--ssd-streaming-preload-experts N` performs an actual startup read. The normal
+automatic hotlist only biases eviction and does not read expert weights.
+`--ssd-streaming-full-layers N` loads the first `N` routed layers into separate
+full-resident Metal buffers and deducts their exact bytes from the dynamic
+budget. `q36-bench` prints cache slots, cache/full-layer GiB, hits, misses,
+loads, evictions, and GGUF bytes read in its final memory report.
 
 ## Native Agent
 
@@ -275,15 +349,20 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-The resident Vulkan preset uses a 100000-token context and Q8_0 keys with Q4_0
-values. CPU uses F16 KV. SSD-streamed model weights also default to a
+The resident Metal and Vulkan presets use a 100000-token context and Q8_0 keys
+with Q4_0 values. CPU uses F16 KV. SSD-streamed model weights also default to a
 100000-token context, with F16 KV:
 
 ```sh
-./q36-agent --ssd-streaming
+./q36-agent --metal
+./q36-agent --metal --ssd-streaming --ssd-streaming-cache-experts 512
 ```
 
 Explicit `--ctx`, `-ctk`, and `-ctv` values override the preset.
+
+The Metal source-path rule described under Backends also applies before
+`q36-agent --chdir` opens the model. When changing to another project, provide
+the absolute shader-source paths documented there.
 
 Sessions are stored in `~/.q36/kvcache`. Use `/save` to persist the current
 session, `/list` to show saved sessions, and `/switch <sha>` to resume one.
@@ -305,6 +384,9 @@ prefill.
 ```sh
 ./q36-bench --vulkan --prompt-file tests/long_context_story_prompt.txt \
   --ctx-start 2048 --ctx-max 32768 --gen-tokens 128
+
+./q36-bench --metal --prompt-file tests/long_context_story_prompt.txt \
+  --ctx-start 2048 --ctx-max 32768 --gen-tokens 128
 ```
 
 ## Capability Evaluation
@@ -317,6 +399,7 @@ answers, and prints prompt-token, generated-token, and pass/fail results.
 
 ```sh
 ./q36-eval --trace /tmp/q36-eval.txt
+./q36-eval --metal --ssd-streaming --trace /tmp/q36-eval-metal-ssd.txt
 ```
 
 The default run uses a 16000-token generation budget and thinking mode. The
@@ -363,7 +446,18 @@ currently an experimental slight-speedup path.
 Start a local OpenAI/Anthropic-compatible server:
 
 ```sh
-./q36-server --ctx 32768 --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192
+./q36-server --vulkan --ctx 32768 \
+  --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192
+
+./q36-server --metal --ctx 32768 \
+  --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192
+```
+
+On an 8 GB Mac, reduce context and use the bounded Metal cache:
+
+```sh
+./q36-server --metal --ssd-streaming \
+  --ssd-streaming-cache-experts 512 --ctx 4096
 ```
 
 Without extra options the server keeps one mutable backend/KV checkpoint and
@@ -397,12 +491,14 @@ recurrent state, and graph scratch fit. Backend behavior is:
 | --- | --- |
 | Vulkan resident, 2-8 decode-ready rows | Native row-batched shared projections and FFN work with private positions, recurrent state, and typed KV when graph scratch can hold every row. F16/F16 and Q8_0/Q4_0 KV are supported; other KV pairs and unsupported shapes use ordered fallback. |
 | Vulkan SSD streaming | Deterministic ordered fallback, preserving expert-cache ownership. |
-| CPU, batches above 8, or forced `Q36_VK_SESSION_BATCH=0` | Deterministic ordered fallback. |
+| Metal resident, 2-8 decode-ready rows | Native row-batched graph execution where the kernel shape is supported; ordered exact fallback otherwise. |
+| Metal SSD streaming | Deterministic ordered fallback, preserving bounded expert-cache ownership. |
+| CPU, batches above 8, or forced `Q36_VK_SESSION_BATCH=0` | Deterministic ordered fallback. The compatibility environment variable also controls Metal session batching. |
 
 Batch size one calls `q36_session_eval()` directly. If a batched step fails,
 all members are invalidated so none can silently continue from a partially
 advanced frontier. Ordered fallback preserves concurrency and scheduling
-fairness, but does not provide the aggregate throughput gain of native Vulkan
+fairness, but does not provide the aggregate throughput gain of native GPU
 batching.
 
 Supported endpoints:
@@ -689,10 +785,10 @@ independently with `-ctk` and `-ctv`:
 ./q36-server -ctk f16 -ctv f16
 ```
 
-Resident Vulkan frontends default to Q8_0 keys and Q4_0 values. CPU and Vulkan
-SSD streaming default to F16 for both. Explicit flags always override these
-defaults. KV quantization reduces context memory; it does not change model
-weight quantization or extend Qwen3.6's 262144-token native context.
+Resident Metal and Vulkan frontends default to Q8_0 keys and Q4_0 values. CPU
+and SSD streaming default to F16 for both. Explicit flags always override
+these defaults. KV quantization reduces context memory; it does not change
+model weight quantization or extend Qwen3.6's 262144-token native context.
 
 ## Disk KV Cache
 
@@ -877,25 +973,65 @@ since the KV cache files include the verbatim prompt cached.
 
 ## Backends
 
-The default graph backend is Vulkan on Linux:
+Q36 is multi-runtime at the source and API level, but Metal and Vulkan are
+separate native builds rather than one fat executable. Each build produces the
+same command names—`q36`, `q36-server`, `q36-bench`, `q36-agent`, `q36-eval`,
+and `q36_test`—linked to the selected graph runtime:
 
-```sh
-./q36 -p "Hello" --vulkan
-```
+| Platform/runtime | Build | Explicit invocation |
+| --- | --- | --- |
+| Linux / Vulkan | `make` | `./q36 --vulkan -p "Hello"` |
+| macOS / Metal | `make metal` | `./q36 --metal -p "Hello"` |
+| CPU reference | `make cpu` | `./q36 --cpu -p "Hello"` |
 
-There is also a CPU reference/debug path:
+Building another runtime overwrites those local executable names. Use separate
+worktrees or copy build artifacts if Metal, Vulkan, and CPU binaries must be
+kept side by side. The `--backend metal|vulkan|cpu` spelling is equivalent to
+the short backend switches and is accepted by the CLI, server, agent,
+benchmark, and evaluation harness. A Metal-linked binary rejects `--vulkan`,
+and a Vulkan-linked binary rejects `--metal`, so deployment mistakes fail
+before model loading.
 
-```sh
-./q36 -p "Hello" --cpu
-make cpu
-./q36
-./q36 -p "Hello"
-```
+### Metal device and compatibility policy
+
+Like DS4, a normal local Metal process uses `MTLCreateSystemDefaultDevice`.
+Apple Silicon exposes its unified GPU as one logical Metal device, so Q36 does
+not require or expose a device list for M1, M2, M3, M4, or later families.
+There is no layer split or multi-Mac distributed mode: one Q36 process owns one
+default local Metal device and one model. Run only one large model process at a
+time when validating memory and performance.
+
+The Metal binary targets macOS 11. Newer facilities are optional:
+
+* macOS 15 residency sets and `MTLMathMode` are selected only after runtime
+  availability checks.
+* Older releases use the same shared/no-copy buffers and baseline Metal
+  kernels without residency sets.
+* Cache auto-sizing uses the device's `recommendedMaxWorkingSetSize`, not a
+  hard-coded machine-memory percentage.
+* All model buffers use unified storage; no discrete-GPU transfer or eGPU
+  placement path is provided.
+
+The minimum deployment target proves link compatibility, not every driver and
+GPU generation. Release QA must still run on a physical M1 with the oldest
+supported macOS, a representative newer Mac, a 16 GB resident configuration,
+and a physical 8 GB SSD-streaming configuration.
+
+Metal shaders are compiled at runtime from `metal/*.metal`. Run the CLI,
+server, benchmark, and evaluation harness from the Q36 project tree, and ship
+the `metal` directory with binary packages. A frontend that changes working
+directory before model startup must provide absolute paths through
+`Q36_METAL_DENSE_SOURCE`, `Q36_METAL_MOE_SOURCE`,
+`Q36_METAL_NORM_SOURCE`, `Q36_METAL_OPS_SOURCE`,
+`Q36_METAL_RECURRENT_SOURCE`, `Q36_METAL_KV_SOURCE`, and
+`Q36_METAL_ATTN_SOURCE`.
+
+### CPU reference runtime
 
 Do not treat the CPU path as the production target. The CLI and `q36-server`
 support the CPU backend for reference/debug use and share the same KV
-session and snapshot format as Vulkan, but normal inference should use
-Vulkan.
+session and snapshot format as Metal and Vulkan, but normal inference should
+use a GPU graph runtime.
 
 ## Steering
 
@@ -918,8 +1054,8 @@ file is supplied without an explicit scale:
 
 `--dir-steering-attn F` applies the same edit after attention outputs. With no
 file, or with both scales set to zero, inference follows the normal path. CPU
-and Vulkan prefill and decode all apply the same operation; Vulkan keeps the
-matrix resident and projects activations in place.
+and both GPU runtimes apply the same operation during prefill and decode; Metal
+and Vulkan keep the matrix resident and project activations in place.
 
 ## Testing And Release QA
 
@@ -930,13 +1066,20 @@ model:
 make test                 # unit, parser, protocol, cache and fixture tests
 make test-vulkan          # isolated Vulkan kernel coverage
 make test-model           # generation, CPU/Vulkan and fusion parity
+make test-metal           # Metal unit and isolated numeric kernel coverage
+make test-metal-model     # Metal generation, CPU parity, state, and streaming
 make test-session-batch   # Vulkan 1/2/4/8-session full-logit/state oracle
 make test-server-live     # live HTTP, CORS and Responses API smoke test
+make test-server-live-metal # live Metal HTTP/CORS/Responses smoke test
+make test-server-live-metal-ssd # same live Metal surface through SSD streaming
 make test-server-batching # concurrent requests against one 4-slot server
+make test-server-batching-metal # same concurrent server gate on Metal
+make test-server-batching-metal-ssd # Metal batching through bounded SSD cache
 make benchmark-session-batch # old, 1/2/4/8-slot, and ordered-fallback server runs
 make test-streaming       # resident/warm/cold/pressure/full-layer matrix
 make benchmark-gate       # conservative BC-250 throughput floor
 make release-build-check  # Vulkan and CPU release builds with -Werror
+make release-build-check-metal # Metal release build with -Werror
 ```
 
 `make test-release` runs the complete sequence, including reference vectors.

@@ -6,8 +6,11 @@ UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
+MACOSX_DEPLOYMENT_TARGET ?= 11.0
+DARWIN_MIN_FLAG := -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 else
 NATIVE_CPU_FLAG ?= -march=native
+DARWIN_MIN_FLAG :=
 endif
 
 CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
@@ -25,11 +28,12 @@ LLAMA_LIBS := \
 	"$(LLAMA_BUILD_DIR)/ggml/src/libggml-cpu.a" \
 	"$(LLAMA_BUILD_DIR)/ggml/src/libggml-base.a"
 LLAMA_LDLIBS := -lstdc++ -fopenmp
-CPU_CFLAGS := $(filter-out -ffast-math,$(CFLAGS)) -D_GNU_SOURCE -fno-finite-math-only -DQ36_NO_GPU
-GPU_CFLAGS := $(CFLAGS) -D_GNU_SOURCE -fno-finite-math-only
+CPU_CFLAGS := $(filter-out -ffast-math,$(CFLAGS)) $(DARWIN_MIN_FLAG) -D_GNU_SOURCE -fno-finite-math-only -DQ36_NO_GPU
+GPU_CFLAGS := $(CFLAGS) $(DARWIN_MIN_FLAG) -D_GNU_SOURCE -fno-finite-math-only
 LDLIBS ?= -lm -pthread
 GPU_LDLIBS := $(LDLIBS) -ldl -lvulkan
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+METAL_LDFLAGS := $(LDFLAGS) $(DARWIN_MIN_FLAG)
 METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
 	vulkan/matmul_f16.spv \
@@ -174,7 +178,7 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu metal q36-quality-score test test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-batching test-release release-build-check benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu metal q36-quality-score test test-metal test-metal-model test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
@@ -182,6 +186,8 @@ help:
 	@echo "Q36 build targets:"
 	@echo "  make              Build Vulkan ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test (default)"
 	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
+	@echo "  make test-metal   Build Metal and run its model-independent unit and kernel tests"
+	@echo "  make test-metal-model  Run Metal model, parity, streaming, and state tests"
 	@echo "  make cpu          Build CPU-only ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test"
 	@echo "  make q36-quality-score  Build the OpenRouter/Q36 local scorer"
 	@echo "  make test         Build and run tests"
@@ -196,13 +202,13 @@ help:
 
 gpu: all
 
-metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
-	$(CC) $(GPU_CFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(GPU_CFLAGS) -o q36-server q36_server.o rax.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(GPU_CFLAGS) -o q36-bench q36_bench.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(GPU_CFLAGS) -o q36-agent q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(GPU_CFLAGS) -o q36-eval q36_eval.o q36_help.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(GPU_CFLAGS) -o q36_test q36_test.o rax.o q36_ssd.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
+metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test_metal.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
+	$(CC) $(METAL_LDFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36-server q36_server.o rax.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36-bench q36_bench.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36-agent q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36-eval q36_eval.o q36_help.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36_test q36_test_metal.o rax.o q36_ssd.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
 
 q36: q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
@@ -252,7 +258,7 @@ q36_cli_metal.o: q36_cli.c q36.h q36_ssd.h linenoise.h
 q36_vulkan.o: q36_vulkan.c q36_gpu.h q36_quant.h q36_iq2_tables_vulkan.inc q36_iq_tables.h $(VULKAN_SHADERS)
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_vulkan.c
 
-q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h $(METAL_SRCS)
+q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h q36_ssd.h $(METAL_SRCS)
 	$(CC) $(GPU_CFLAGS) -fobjc-arc -c -o $@ q36_metal.m
 
 q36_cli.o: q36_cli.c q36.h q36_ssd.h linenoise.h
@@ -284,6 +290,9 @@ q36_web.o: q36_web.c q36_web.h
 
 q36_test.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h
 	$(CC) $(GPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
+
+q36_test_metal.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h
+	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_test.c
 
 gguf-tools/quality-testing/score_openrouter.o: gguf-tools/quality-testing/score_openrouter.c q36.h q36_ssd.h
 	$(CC) $(GPU_CFLAGS) -I. -c -o $@ gguf-tools/quality-testing/score_openrouter.c
@@ -356,7 +365,7 @@ tests/test_sampling.o: tests/test_sampling.c q36.h
 	$(CC) $(CPU_CFLAGS) -DQ36_TEST_HOOKS -I. -c -o $@ $<
 
 $(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o
-	$(CC) $(CPU_CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) $(DARWIN_MIN_FLAG) -o $@ $^ $(LDLIBS)
 
 linenoise_cpu.o: linenoise.c linenoise.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ linenoise.c
@@ -373,6 +382,17 @@ test: all q36_agent_test $(SAMPLING_TEST)
 test-quick: test
 
 test-unit: test
+
+test-metal: metal q36_agent_test_metal $(SAMPLING_TEST)
+	./q36-eval --self-test-extractors
+	./q36_agent_test_metal
+	./tests/test_sampling
+	./q36_test --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
+	./q36_test --vulkan-kernels
+
+test-metal-model: metal
+	@echo "=== Metal model-dependent tests (requires q36moe.gguf) ==="
+	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --vulkan-cpu-parity --vulkan-fusion-parity --ssd-streaming-parity --mtp-verifier
 
 test-vulkan: q36_test
 	./q36_test --vulkan-kernels
@@ -397,8 +417,20 @@ test-session-batch: q36_test
 test-server-live: q36-server
 	./tests/server_live_smoke.sh
 
+test-server-live-metal: metal
+	./tests/server_live_smoke.sh --metal
+
+test-server-live-metal-ssd: metal
+	./tests/server_live_smoke.sh --metal --ssd-streaming
+
 test-server-batching: q36-server
 	./tests/server_batching.sh
+
+test-server-batching-metal: metal
+	./tests/server_batching.sh --metal
+
+test-server-batching-metal-ssd: metal
+	./tests/server_batching.sh --metal --ssd-streaming
 
 benchmark-session-batch: q36-server
 	./tests/benchmark_server_batching.sh
@@ -410,6 +442,9 @@ release-build-check:
 	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' all
 	$(MAKE) -B CFLAGS='$(filter-out -ffast-math,$(CFLAGS)) -Werror' cpu
 	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' all
+
+release-build-check-metal:
+	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' metal
 
 test-release:
 	$(MAKE) test
@@ -488,5 +523,11 @@ q36_agent_test.o: tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstor
 q36_agent_test: q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
 
+q36_agent_test_metal.o: tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h
+	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_agent_test.c
+
+q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS)
+	$(CC) $(METAL_LDFLAGS) -o $@ q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
+
 clean:
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test $(SAMPLING_TEST) tests/test_sampling.o gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)

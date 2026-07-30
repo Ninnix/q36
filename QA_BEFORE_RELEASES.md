@@ -2,8 +2,9 @@
 
 This is the release gate for QuarkStar. Run it before tagging or publishing a
 release build. It focuses on the paths that have historically regressed:
-Qwen prompt rendering, Vulkan kernels and fusions, SSD expert streaming, long
-context state, disk KV checkpoints, server protocols, and the native agent.
+Qwen prompt rendering, Metal and Vulkan kernels and fusions, SSD expert
+streaming, long context state, disk KV checkpoints, server protocols, and the
+native agent.
 
 Do not run multiple model processes at once. Record the commit, BC-250 firmware
 and Mesa version, GGUF filename and checksum, context size, cache types, and all
@@ -15,6 +16,8 @@ non-default flags for every model-backed run.
 - Run `git diff --check` before committing.
 - Build both release configurations with warnings promoted to errors:
   `make release-build-check`.
+- On macOS, run `make release-build-check-metal`, inspect every release binary
+  with `otool -l`, and require the documented minimum macOS deployment target.
 - Do not fix release warnings with a global suppression. A narrow suppression
   is acceptable only for a test translation unit that intentionally includes
   another C file and leaves unrelated static functions unused.
@@ -22,6 +25,9 @@ non-default flags for every model-backed run.
   `./q36-bench --help`, and `./q36-eval --help` render without stale options.
 - Confirm the release binaries use the intended Vulkan loader and Mesa RADV
   driver with `ldd ./q36` and `vulkaninfo --summary`.
+- Confirm a Metal build reports the expected Apple GPU, unified memory, and a
+  nonzero `recommendedMaxWorkingSetSize`. A normal single-Mac process must use
+  the system default Metal device, matching DS4's local-device policy.
 
 ## 2. Core Regression Tests
 
@@ -65,7 +71,28 @@ not evidence of parity.
   when the conservative absolute gate still passes.
 - Preserve a profiler run when dispatch count or a hot fusion changes.
 
-## 5. SSD Streaming
+## 5. Metal Inference
+
+- Run `make test-metal` and `make test-metal-model`.
+- Run resident inference, benchmark, evaluator, live server, and native-agent
+  smoke tests one model process at a time.
+- Require the CPU/Metal short and long prompt parity gates and every isolated
+  Metal numeric kernel gate to pass.
+- Exercise thinking, no-thinking, native tool calls, session save/restore,
+  disk KV, MTP when shipped, and fusion fallbacks.
+- Run the release GGUF on every advertised Apple GPU generation. At minimum,
+  retain results from an M1-class machine and each materially different GPU
+  generation used for tuning; never infer an all-device pass from one Mac.
+- Exercise the oldest supported macOS release as well as the current release.
+  APIs newer than the deployment target must be protected by runtime
+  availability checks and have an older-OS fallback.
+- Verify the binary deployment target and runtime Metal shader compilation on
+  the oldest supported macOS release. A successful build against the newest
+  SDK alone is not sufficient.
+- Record the selected device name, OS version, RAM, recommended working-set
+  size, and whether the model is resident or VM-backed SSD streaming.
+
+## 6. SSD Streaming
 
 - Run `make test-streaming`. It compares the same short prompt under:
   full residency, warm hotlist streaming, cold streaming with an eight-expert
@@ -86,8 +113,16 @@ not evidence of parity.
 - Full-layer streaming must pass short-prompt parity and exact byte-budget
   accounting. Keep the default at zero unless repeated benchmarks improve over
   routed-expert streaming on the target hardware.
+- On Metal, test the release GGUF on a physical 8 GB Apple Silicon machine.
+  Require the bounded shared-Metal expert cache to stay within its resolved
+  byte budget; record peak memory, swap, SSD reads, eviction behavior, and
+  post-pressure recovery explicitly. A `--simulate-used-memory` run on a
+  larger Mac is useful diagnostics, but does not replace the physical gate.
+- Require `--ssd-streaming-cache-experts`, preload, cold-cache, eviction, and
+  full-resident-layer controls to enforce the same byte accounting and
+  correctness gates on Metal and Vulkan.
 
-## 6. Long Context And Session State
+## 7. Long Context And Session State
 
 - Run `./q36_test --long-context` with the release context and cache types.
 - Run `./q36_test --session-sync-resume` and
@@ -100,11 +135,14 @@ not evidence of parity.
 - Corrupt or truncate a disposable cache file and require a clean rejection,
   never a partial restore.
 
-## 7. Server APIs
+## 8. Server APIs
 
 - Run `./q36_test --server` after HTTP, SSE, prompt, cache, or tool changes.
 - Run `make test-server-live` for an actual 4K-context server process, CORS
   preflight, chat completion, and Responses API SSE cycle.
+- On macOS, also run `make test-server-live-metal`.
+- Run `make test-server-live-metal-ssd` to exercise the same HTTP surfaces
+  through the bounded Metal expert cache.
 - Run `make test-session-batch` with resident Q8_0/Q4_0 and F16/F16 KV. The
   1/2/4/8-session oracle must preserve full logits, token choices, snapshots,
   invalid-input frontiers, and the forced ordered fallback.
@@ -112,6 +150,10 @@ not evidence of parity.
   sends more concurrent streaming and non-streaming requests than fit in the
   resident slots. Seeded pairs must match and the log must contain a native
   Vulkan batch larger than one.
+- On macOS, run `make test-server-batching-metal` and require a native Metal
+  batch larger than one.
+- Before a Metal release, also run `make test-server-batching-metal-ssd` so
+  cache eviction is covered under concurrent sessions and cancellation.
 - Exercise non-streaming and streaming requests for:
   `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, and
   `/v1/messages`.
@@ -135,11 +177,12 @@ not evidence of parity.
 - SSD streaming must use the ordered correctness fallback. Native resident
   Vulkan batching supports 2-8 rows; other row counts must fall back exactly.
 
-## 8. Native Agent
+## 9. Native Agent
 
 - Run `./q36_agent_test`.
-- Start the agent with no streaming flag on Vulkan and require full residency
-  in the startup log. Repeat with `--ssd-streaming` and require SSD streaming.
+- Start the agent with no streaming flag on each release GPU backend and require
+  full residency in the startup log. Repeat with `--ssd-streaming` and require
+  SSD streaming.
 - Run one non-interactive tool call and one interactive edit/read loop.
 - Verify generated calls use Qwen native tags and Hermes tool schemas; no
   foreign protocol parser or prompt text may be present.
@@ -150,7 +193,7 @@ not evidence of parity.
 - Run a context-compaction cycle near the configured limit and verify the task
   summary, tool state, and current working directory survive.
 
-## 9. Directional Steering And MTP
+## 10. Directional Steering And MTP
 
 - `make test-vulkan` must pass the directional-steering numeric test.
 - Run a zero direction file and require identical greedy output.
@@ -158,7 +201,7 @@ not evidence of parity.
 - If MTP is shipped, compare greedy text with MTP disabled and enabled, record
   acceptance, and require clean verifier rollback on a partial accept.
 
-## 10. Model Files And Download Workflow
+## 11. Model Files And Download Workflow
 
 - Run `./download_model.sh --help` and one resumable download in a disposable
   directory.
@@ -168,7 +211,7 @@ not evidence of parity.
 - Test every GGUF advertised in the release notes. Do not infer compatibility
   from a similar filename.
 
-## 11. Performance And Power
+## 12. Performance And Power
 
 - Put the BC-250 in the documented performance mode and record temperatures.
 - Run `make benchmark-gate` with the default thresholds, then repeat the full
@@ -176,16 +219,18 @@ not evidence of parity.
 - Record resident and streaming results independently.
 - Repeat one decode at reduced `--power` and verify throttling does not change
   greedy output or corrupt session state.
+- On macOS, retain resident and SSD-streaming `q36-bench` results per Apple GPU
+  generation; compare like-for-like OS, power state, context, and cache types.
 
-## 12. Release Sign-off
+## 13. Release Sign-off
 
 Record:
 
 - Commit and version/tag.
-- Hardware, kernel, Mesa/RADV, Vulkan loader, and firmware.
+- Hardware, OS/kernel, Metal device or Mesa/RADV and Vulkan loader, and firmware.
 - GGUF path, size, and checksum.
-- Warning-free Vulkan and CPU build results.
-- Unit, Vulkan, model, reference, streaming, server, and agent results.
+- Warning-free Metal, Vulkan, and CPU build results for the platforms tested.
+- Unit, Metal, Vulkan, model, reference, streaming, server, and agent results.
 - OpenRouter quality summaries.
 - Resident and streaming benchmark CSVs.
 - Known skips and why they are safe.

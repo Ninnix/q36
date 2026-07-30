@@ -2,15 +2,16 @@
 #import <Metal/Metal.h>
 
 #include "q36_gpu.h"
+#include "q36_ssd.h"
 #define Q36_QUANT_LINKAGE __attribute__((weak_import))
 #include "q36_quant.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 
 /*
@@ -48,9 +49,57 @@ static int q36_model_fd = -1;
 static bool q36_quality;
 static bool q36_micro_batch;
 static bool q36_ssd_streaming;
+enum {
+    Q36_METAL_STREAM_MAX_LAYERS = 40,
+    Q36_METAL_STREAM_MAX_EXPERTS = 256,
+};
+typedef struct {
+    uint32_t layer;
+    uint32_t expert;
+    uint64_t last_used;
+    uint32_t priority;
+    bool valid;
+} q36_metal_stream_entry;
+typedef struct {
+    id<MTLBuffer> gate;
+    id<MTLBuffer> up;
+    id<MTLBuffer> down;
+    uint64_t gate_bytes;
+    uint64_t up_bytes;
+    uint64_t down_bytes;
+    bool valid;
+} q36_metal_full_layer;
 static uint32_t q36_streaming_full_layers;
 static uint32_t q36_streaming_expert_budget;
+static uint32_t q36_streaming_expert_cap;
+static uint32_t q36_streaming_expert_count;
 static uint64_t q36_streaming_expert_bytes;
+static uint64_t q36_streaming_clock;
+static uint64_t q36_streaming_hits;
+static uint64_t q36_streaming_misses;
+static uint64_t q36_streaming_loads;
+static uint64_t q36_streaming_evictions;
+static uint64_t q36_streaming_read_bytes;
+static uint64_t q36_streaming_route_tokens;
+static uint64_t q36_streaming_gate_bytes;
+static uint64_t q36_streaming_up_bytes;
+static uint64_t q36_streaming_down_bytes;
+static q36_metal_stream_entry *q36_streaming_entries;
+static int32_t
+    q36_streaming_lookup[Q36_METAL_STREAM_MAX_LAYERS]
+                        [Q36_METAL_STREAM_MAX_EXPERTS];
+static uint32_t
+    q36_streaming_bias[Q36_METAL_STREAM_MAX_LAYERS]
+                      [Q36_METAL_STREAM_MAX_EXPERTS];
+static uint32_t
+    q36_streaming_hotness[Q36_METAL_STREAM_MAX_LAYERS]
+                         [Q36_METAL_STREAM_MAX_EXPERTS];
+static id<MTLBuffer> q36_streaming_gate;
+static id<MTLBuffer> q36_streaming_up;
+static id<MTLBuffer> q36_streaming_down;
+static q36_metal_full_layer
+    q36_streaming_full[Q36_METAL_STREAM_MAX_LAYERS];
+static pthread_mutex_t q36_stream_mu = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLBuffer> q36_moe_gate_scratch;
 static id<MTLBuffer> q36_moe_up_scratch;
 static id<MTLBuffer> q36_moe_mid_scratch;
@@ -67,6 +116,8 @@ static NSUInteger q36_shared_down_scratch_bytes;
 static bool q36_prof_active;
 static double q36_prof_gpu_seconds;
 static uint64_t q36_prof_command_buffers;
+
+static void q36_streaming_cache_clear(bool clear_full_layers);
 
 static void q36_model_residency_clear(void) {
     if (@available(macOS 15.0, *)) {
@@ -633,6 +684,7 @@ void q36_gpu_cleanup(void) {
         q36_model_map = NULL;
         q36_model_size = 0;
         q36_model_residency_clear();
+        q36_streaming_cache_clear(true);
         q36_model_fd = -1;
         q36_queue = nil;
         q36_moe_gate_scratch = nil;
@@ -767,6 +819,7 @@ int q36_gpu_set_model_map(const void *map, uint64_t size) {
     if (!map || !size) return 0;
     if (map != q36_model_map || size != q36_model_size) {
         q36_model_residency_clear();
+        q36_streaming_cache_clear(true);
         [q36_model_views removeAllObjects];
     }
     q36_model_map = map;
@@ -832,83 +885,481 @@ int q36_gpu_cache_q8_f16_range(const void *map, uint64_t size,
 void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
 void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
 bool q36_gpu_attn_fused_enabled(void) { return false; }
-void q36_gpu_set_ssd_streaming(bool enabled) { q36_ssd_streaming = enabled; }
+
+static bool q36_streaming_table_valid(
+        const q36_gpu_stream_expert_table *table) {
+    return table && table->model_map && table->model_size &&
+           table->layer < Q36_METAL_STREAM_MAX_LAYERS &&
+           table->n_total_expert > 0 &&
+           table->n_total_expert <= Q36_METAL_STREAM_MAX_EXPERTS &&
+           table->gate_expert_bytes && table->up_expert_bytes &&
+           table->down_expert_bytes;
+}
+
+static bool q36_u64_add3(uint64_t a, uint64_t b, uint64_t c,
+                         uint64_t *out) {
+    if (!out || a > UINT64_MAX - b || a + b > UINT64_MAX - c) return false;
+    *out = a + b + c;
+    return true;
+}
+
+static bool q36_streaming_read(void *dst, uint64_t bytes, uint64_t offset) {
+    if ((!dst && bytes) || !q36_model_map ||
+        offset > q36_model_size || bytes > q36_model_size - offset ||
+        bytes > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+    if (q36_model_fd < 0) {
+        memcpy(dst, (const uint8_t *)q36_model_map + offset, (size_t)bytes);
+        return true;
+    }
+    uint8_t *p = dst;
+    uint64_t done = 0;
+    while (done < bytes) {
+        size_t chunk = (size_t)(bytes - done);
+        if ((uint64_t)chunk != bytes - done) chunk = SIZE_MAX;
+        ssize_t n = pread(q36_model_fd, p + done, chunk,
+                          (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        done += (uint64_t)n;
+    }
+    q36_streaming_read_bytes += bytes;
+    return true;
+}
+
+static void q36_streaming_cache_clear(bool clear_full_layers) {
+    pthread_mutex_lock(&q36_stream_mu);
+    q36_streaming_gate = nil;
+    q36_streaming_up = nil;
+    q36_streaming_down = nil;
+    free(q36_streaming_entries);
+    q36_streaming_entries = NULL;
+    q36_streaming_expert_cap = 0;
+    q36_streaming_expert_count = 0;
+    q36_streaming_gate_bytes = 0;
+    q36_streaming_up_bytes = 0;
+    q36_streaming_down_bytes = 0;
+    for (uint32_t l = 0; l < Q36_METAL_STREAM_MAX_LAYERS; l++)
+        for (uint32_t e = 0; e < Q36_METAL_STREAM_MAX_EXPERTS; e++)
+            q36_streaming_lookup[l][e] = -1;
+    if (clear_full_layers) {
+        for (uint32_t l = 0; l < Q36_METAL_STREAM_MAX_LAYERS; l++) {
+            q36_streaming_full[l].gate = nil;
+            q36_streaming_full[l].up = nil;
+            q36_streaming_full[l].down = nil;
+            q36_streaming_full[l].gate_bytes = 0;
+            q36_streaming_full[l].up_bytes = 0;
+            q36_streaming_full[l].down_bytes = 0;
+            q36_streaming_full[l].valid = false;
+        }
+        memset(q36_streaming_bias, 0, sizeof(q36_streaming_bias));
+        memset(q36_streaming_hotness, 0, sizeof(q36_streaming_hotness));
+        q36_streaming_clock = 0;
+        q36_streaming_hits = 0;
+        q36_streaming_misses = 0;
+        q36_streaming_loads = 0;
+        q36_streaming_evictions = 0;
+        q36_streaming_read_bytes = 0;
+        q36_streaming_route_tokens = 0;
+    }
+    pthread_mutex_unlock(&q36_stream_mu);
+}
+
+static bool q36_streaming_layout_matches(
+        const q36_gpu_stream_expert_table *table) {
+    return !q36_streaming_expert_cap ||
+           (q36_streaming_gate_bytes == table->gate_expert_bytes &&
+            q36_streaming_up_bytes == table->up_expert_bytes &&
+            q36_streaming_down_bytes == table->down_expert_bytes);
+}
+
+static bool q36_streaming_cache_init(
+        const q36_gpu_stream_expert_table *table) {
+    if (!q36_ssd_streaming || !q36_streaming_table_valid(table) ||
+        q36_streaming_expert_budget == 0) return false;
+    if (q36_streaming_expert_cap)
+        return q36_streaming_layout_matches(table);
+    if (q36_streaming_expert_bytes) {
+        uint64_t total = 0;
+        if (!q36_u64_add3(table->gate_expert_bytes,
+                          table->up_expert_bytes,
+                          table->down_expert_bytes, &total) ||
+            total != q36_streaming_expert_bytes) {
+            return false;
+        }
+    }
+
+    uint32_t cap = q36_streaming_expert_budget;
+    const uint32_t max_entries =
+        Q36_METAL_STREAM_MAX_LAYERS * Q36_METAL_STREAM_MAX_EXPERTS;
+    if (cap > max_entries) cap = max_entries;
+    while (cap) {
+        uint64_t gb = table->gate_expert_bytes * (uint64_t)cap;
+        uint64_t ub = table->up_expert_bytes * (uint64_t)cap;
+        uint64_t db = table->down_expert_bytes * (uint64_t)cap;
+        bool overflow =
+            gb / cap != table->gate_expert_bytes ||
+            ub / cap != table->up_expert_bytes ||
+            db / cap != table->down_expert_bytes ||
+            gb > (uint64_t)NSUIntegerMax ||
+            ub > (uint64_t)NSUIntegerMax ||
+            db > (uint64_t)NSUIntegerMax;
+        q36_metal_stream_entry *entries =
+            overflow ? NULL : calloc(cap, sizeof(*entries));
+        id<MTLBuffer> gate = entries ?
+            [q36_device newBufferWithLength:(NSUInteger)gb
+                                    options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> up = gate ?
+            [q36_device newBufferWithLength:(NSUInteger)ub
+                                    options:MTLResourceStorageModeShared] : nil;
+        id<MTLBuffer> down = up ?
+            [q36_device newBufferWithLength:(NSUInteger)db
+                                    options:MTLResourceStorageModeShared] : nil;
+        if (entries && gate && up && down) {
+            gate.label = @"q36_stream_expert_gate";
+            up.label = @"q36_stream_expert_up";
+            down.label = @"q36_stream_expert_down";
+            q36_streaming_entries = entries;
+            q36_streaming_gate = gate;
+            q36_streaming_up = up;
+            q36_streaming_down = down;
+            q36_streaming_expert_cap = cap;
+            q36_streaming_gate_bytes = table->gate_expert_bytes;
+            q36_streaming_up_bytes = table->up_expert_bytes;
+            q36_streaming_down_bytes = table->down_expert_bytes;
+            fprintf(stderr,
+                    "q36: Metal SSD expert cache allocated %u slots (%.2f GiB)\n",
+                    cap, (double)(gb + ub + db) / 1073741824.0);
+            return true;
+        }
+        free(entries);
+        uint32_t next = q36_ssd_shrink_cache_experts(cap);
+        fprintf(stderr,
+                "q36: Metal SSD expert cache allocation failed at %u slots; shrinking to %u\n",
+                cap, next);
+        cap = next;
+    }
+    return false;
+}
+
+static bool q36_streaming_id_protected(
+        const q36_metal_stream_entry *entry,
+        const q36_gpu_stream_expert_table *table,
+        const int32_t *ids, uint32_t count) {
+    if (!entry || !entry->valid || entry->layer != table->layer) return false;
+    for (uint32_t i = 0; i < count; i++)
+        if (ids[i] >= 0 && entry->expert == (uint32_t)ids[i]) return true;
+    return false;
+}
+
+static int32_t q36_streaming_pick_slot(
+        const q36_gpu_stream_expert_table *table,
+        const int32_t *protect_ids, uint32_t protect_count) {
+    for (uint32_t i = 0; i < q36_streaming_expert_cap; i++)
+        if (!q36_streaming_entries[i].valid) return (int32_t)i;
+    int32_t best = -1;
+    uint32_t best_priority = UINT32_MAX;
+    uint64_t best_used = UINT64_MAX;
+    for (uint32_t i = 0; i < q36_streaming_expert_cap; i++) {
+        q36_metal_stream_entry *entry = &q36_streaming_entries[i];
+        if (q36_streaming_id_protected(entry, table,
+                                       protect_ids, protect_count)) continue;
+        uint32_t priority = entry->priority;
+        if (entry->layer < Q36_METAL_STREAM_MAX_LAYERS &&
+            entry->expert < Q36_METAL_STREAM_MAX_EXPERTS) {
+            priority += q36_streaming_bias[entry->layer][entry->expert];
+            priority += q36_streaming_hotness[entry->layer][entry->expert];
+        }
+        if (best < 0 || priority < best_priority ||
+            (priority == best_priority && entry->last_used < best_used)) {
+            best = (int32_t)i;
+            best_priority = priority;
+            best_used = entry->last_used;
+        }
+    }
+    return best;
+}
+
+static bool q36_streaming_load_slot(
+        const q36_gpu_stream_expert_table *table,
+        uint32_t expert, uint32_t slot, uint32_t priority) {
+    if (slot >= q36_streaming_expert_cap ||
+        expert >= table->n_total_expert) return false;
+    q36_metal_stream_entry *entry = &q36_streaming_entries[slot];
+    if (entry->valid) {
+        q36_streaming_lookup[entry->layer][entry->expert] = -1;
+        entry->valid = false;
+        q36_streaming_evictions++;
+    } else {
+        q36_streaming_expert_count++;
+    }
+    uint64_t go = table->gate_offset +
+                  (uint64_t)expert * table->gate_expert_bytes;
+    uint64_t uo = table->up_offset +
+                  (uint64_t)expert * table->up_expert_bytes;
+    uint64_t doff = table->down_offset +
+                    (uint64_t)expert * table->down_expert_bytes;
+    uint8_t *gp = (uint8_t *)q36_streaming_gate.contents +
+                  (uint64_t)slot * table->gate_expert_bytes;
+    uint8_t *up = (uint8_t *)q36_streaming_up.contents +
+                  (uint64_t)slot * table->up_expert_bytes;
+    uint8_t *dp = (uint8_t *)q36_streaming_down.contents +
+                  (uint64_t)slot * table->down_expert_bytes;
+    if (!q36_streaming_read(gp, table->gate_expert_bytes, go) ||
+        !q36_streaming_read(up, table->up_expert_bytes, uo) ||
+        !q36_streaming_read(dp, table->down_expert_bytes, doff)) {
+        q36_streaming_expert_count--;
+        return false;
+    }
+    *entry = (q36_metal_stream_entry) {
+        .layer = table->layer,
+        .expert = expert,
+        .last_used = ++q36_streaming_clock,
+        .priority = priority,
+        .valid = true,
+    };
+    q36_streaming_lookup[table->layer][expert] = (int32_t)slot;
+    q36_streaming_loads++;
+    return true;
+}
+
+static bool q36_streaming_prepare_locked(
+        const q36_gpu_stream_expert_table *table,
+        const int32_t *ids, const uint32_t *priorities, uint32_t count,
+        uint32_t slot_by_expert[Q36_METAL_STREAM_MAX_EXPERTS]) {
+    if (!ids || !q36_streaming_cache_init(table)) return false;
+    bool seen[Q36_METAL_STREAM_MAX_EXPERTS] = {0};
+    uint32_t unique = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= table->n_total_expert)
+            return false;
+        if (!seen[ids[i]]) {
+            seen[ids[i]] = true;
+            unique++;
+        }
+    }
+    if (unique > q36_streaming_expert_cap) return false;
+    if (slot_by_expert)
+        for (uint32_t i = 0; i < Q36_METAL_STREAM_MAX_EXPERTS; i++)
+            slot_by_expert[i] = UINT32_MAX;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t expert = (uint32_t)ids[i];
+        int32_t slot = q36_streaming_lookup[table->layer][expert];
+        uint32_t priority = priorities ? priorities[i] : 0;
+        if (slot >= 0) {
+            q36_metal_stream_entry *entry = &q36_streaming_entries[slot];
+            entry->last_used = ++q36_streaming_clock;
+            if (priority > entry->priority) entry->priority = priority;
+            q36_streaming_hits++;
+        } else {
+            q36_streaming_misses++;
+            slot = q36_streaming_pick_slot(table, ids, count);
+            if (slot < 0 ||
+                !q36_streaming_load_slot(table, expert, (uint32_t)slot,
+                                         priority)) return false;
+        }
+        if (q36_streaming_hotness[table->layer][expert] != UINT32_MAX)
+            q36_streaming_hotness[table->layer][expert]++;
+        if (slot_by_expert) slot_by_expert[expert] = (uint32_t)slot;
+    }
+    return true;
+}
+
+static bool q36_streaming_prepare(
+        const q36_gpu_stream_expert_table *table,
+        const int32_t *ids, const uint32_t *priorities, uint32_t count,
+        uint32_t slot_by_expert[Q36_METAL_STREAM_MAX_EXPERTS]) {
+    if (!q36_metal_wait()) return false;
+    pthread_mutex_lock(&q36_stream_mu);
+    bool ok = q36_streaming_prepare_locked(table, ids, priorities, count,
+                                            slot_by_expert);
+    pthread_mutex_unlock(&q36_stream_mu);
+    return ok;
+}
+
+static bool q36_streaming_full_layer_load(
+        const q36_gpu_stream_expert_table *table) {
+    if (!q36_streaming_table_valid(table) ||
+        table->layer >= q36_streaming_full_layers) return false;
+    q36_metal_full_layer *full = &q36_streaming_full[table->layer];
+    if (full->valid)
+        return full->gate_bytes ==
+                   table->gate_expert_bytes * table->n_total_expert &&
+               full->up_bytes ==
+                   table->up_expert_bytes * table->n_total_expert &&
+               full->down_bytes ==
+                   table->down_expert_bytes * table->n_total_expert;
+    uint64_t gb = table->gate_expert_bytes * table->n_total_expert;
+    uint64_t ub = table->up_expert_bytes * table->n_total_expert;
+    uint64_t db = table->down_expert_bytes * table->n_total_expert;
+    if (gb > NSUIntegerMax || ub > NSUIntegerMax || db > NSUIntegerMax)
+        return false;
+    full->gate = [q36_device newBufferWithLength:(NSUInteger)gb
+                                         options:MTLResourceStorageModeShared];
+    full->up = full->gate ?
+        [q36_device newBufferWithLength:(NSUInteger)ub
+                                 options:MTLResourceStorageModeShared] : nil;
+    full->down = full->up ?
+        [q36_device newBufferWithLength:(NSUInteger)db
+                                 options:MTLResourceStorageModeShared] : nil;
+    if (!full->gate || !full->up || !full->down ||
+        !q36_streaming_read(full->gate.contents, gb, table->gate_offset) ||
+        !q36_streaming_read(full->up.contents, ub, table->up_offset) ||
+        !q36_streaming_read(full->down.contents, db, table->down_offset)) {
+        full->gate = nil;
+        full->up = nil;
+        full->down = nil;
+        return false;
+    }
+    full->gate_bytes = gb;
+    full->up_bytes = ub;
+    full->down_bytes = db;
+    full->valid = true;
+    fprintf(stderr,
+            "q36: Metal SSD full resident routed layer %u loaded (%.2f MiB)\n",
+            table->layer, (double)(gb + ub + db) / 1048576.0);
+    return true;
+}
+
+void q36_gpu_set_ssd_streaming(bool enabled) {
+    if (q36_ssd_streaming != enabled) {
+        (void)q36_metal_wait();
+        q36_streaming_cache_clear(true);
+        q36_ssd_streaming = enabled;
+    }
+}
 void q36_gpu_set_streaming_full_layers(uint32_t layers) {
-    q36_streaming_full_layers = layers;
+    if (layers != q36_streaming_full_layers) {
+        (void)q36_metal_wait();
+        q36_streaming_cache_clear(true);
+        q36_streaming_full_layers = layers;
+    }
 }
 void q36_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    q36_streaming_expert_budget = experts;
+    if (experts != q36_streaming_expert_budget) {
+        (void)q36_metal_wait();
+        q36_streaming_cache_clear(false);
+        q36_streaming_expert_budget = experts;
+    }
 }
 void q36_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    q36_streaming_expert_bytes = bytes;
+    if (bytes != q36_streaming_expert_bytes) {
+        (void)q36_metal_wait();
+        q36_streaming_cache_clear(false);
+        q36_streaming_expert_bytes = bytes;
+    }
 }
 uint32_t q36_gpu_stream_expert_cache_configured_count(void) {
-    return q36_streaming_expert_budget;
+    return q36_streaming_expert_cap ?
+        q36_streaming_expert_cap : q36_streaming_expert_budget;
 }
 uint32_t q36_gpu_stream_expert_cache_current_count(void) {
-    /*
-     * A no-copy Metal buffer wraps the file mapping itself.  Unlike the
-     * discrete Vulkan path there is no second device-local expert cache:
-     * macOS VM is the cache and faults routed pages into unified memory.
-     */
-    return q36_ssd_streaming ? q36_streaming_expert_budget : 0u;
+    return q36_streaming_expert_count;
 }
-void q36_gpu_stream_expert_cache_reset_route_hotness(void) {}
-void q36_gpu_stream_expert_cache_note_tokens(uint32_t tokens) { (void)tokens; }
-void q36_gpu_stream_expert_cache_release_resident(void) {}
+void q36_gpu_stream_expert_cache_reset_route_hotness(void) {
+    pthread_mutex_lock(&q36_stream_mu);
+    memset(q36_streaming_hotness, 0, sizeof(q36_streaming_hotness));
+    pthread_mutex_unlock(&q36_stream_mu);
+}
+void q36_gpu_stream_expert_cache_note_tokens(uint32_t tokens) {
+    if (!q36_ssd_streaming || !tokens) return;
+    pthread_mutex_lock(&q36_stream_mu);
+    q36_streaming_route_tokens += tokens;
+    if ((q36_streaming_route_tokens & 15u) < tokens) {
+        for (uint32_t l = 0; l < Q36_METAL_STREAM_MAX_LAYERS; l++)
+            for (uint32_t e = 0; e < Q36_METAL_STREAM_MAX_EXPERTS; e++)
+                q36_streaming_hotness[l][e] >>= 1;
+    }
+    pthread_mutex_unlock(&q36_stream_mu);
+}
+void q36_gpu_stream_expert_cache_release_resident(void) {
+    (void)q36_metal_wait();
+    q36_streaming_cache_clear(true);
+}
 uint32_t q36_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
-    uint64_t total = gate_bytes + up_bytes + down_bytes;
-    if (!total) return 0;
-    if (q36_streaming_expert_budget) return q36_streaming_expert_budget;
-    uint64_t working = q36_gpu_recommended_working_set_size();
-    uint64_t reserve = q36_model_size < working ? working - q36_model_size : 0;
-    uint64_t count = reserve / total;
-    return count > UINT32_MAX ? UINT32_MAX : (uint32_t)count;
+    uint64_t total = 0;
+    if (!q36_u64_add3(gate_bytes, up_bytes, down_bytes, &total) ||
+        (q36_streaming_expert_bytes &&
+         q36_streaming_expert_bytes != total)) return 0;
+    return q36_gpu_stream_expert_cache_configured_count();
 }
 
 int q36_gpu_stream_expert_cache_seed_selected(
         const q36_gpu_stream_expert_table *table, const int32_t *ids,
         uint32_t count) {
-    (void)table; (void)ids; (void)count;
-    return 1;
+    return q36_streaming_prepare(table, ids, NULL, count, NULL) ? 1 : 0;
 }
 int q36_gpu_stream_expert_cache_begin_selected_load(
         const q36_gpu_stream_expert_table *table, const int32_t *ids,
         uint32_t count) {
-    (void)table; (void)ids; (void)count;
-    return 1;
+    return q36_gpu_stream_expert_cache_seed_selected(table, ids, count);
 }
 int q36_gpu_stream_expert_cache_prepare_selected_batch(
         const q36_gpu_stream_expert_table *table, const int32_t *ids,
         uint32_t tokens, uint32_t selected) {
-    (void)table; (void)ids; (void)tokens; (void)selected;
-    return 1;
+    uint64_t count = (uint64_t)tokens * selected;
+    if (count > UINT32_MAX) return 0;
+    return q36_streaming_prepare(table, ids, NULL, (uint32_t)count, NULL)
+        ? 1 : 0;
 }
 int q36_gpu_stream_expert_cache_load_layer(
         const q36_gpu_stream_expert_table *table) {
-    (void)table;
-    return 1;
+    if (!table) return 0;
+    if (table->layer < q36_streaming_full_layers) {
+        if (!q36_metal_wait()) return 0;
+        pthread_mutex_lock(&q36_stream_mu);
+        bool ok = q36_streaming_full_layer_load(table);
+        pthread_mutex_unlock(&q36_stream_mu);
+        return ok ? 1 : 0;
+    }
+    uint32_t count = table->n_total_expert;
+    uint32_t budget = q36_gpu_stream_expert_cache_configured_count();
+    if (budget && count > budget) count = budget;
+    int32_t *ids = malloc((size_t)count * sizeof(*ids));
+    if (!ids) return 0;
+    for (uint32_t i = 0; i < count; i++) ids[i] = (int32_t)i;
+    int ok = q36_streaming_prepare(table, ids, NULL, count, NULL) ? 1 : 0;
+    free(ids);
+    return ok;
 }
 int q36_gpu_stream_expert_cache_seed_from_layer_selected(
         const q36_gpu_stream_expert_table *table,
         const q36_gpu_tensor *selected, uint32_t tokens,
         uint32_t seed_tokens, uint32_t n_selected) {
-    (void)table; (void)selected; (void)tokens; (void)seed_tokens;
-    (void)n_selected;
-    return 1;
+    if (!selected || !n_selected) return 0;
+    if (seed_tokens > tokens) seed_tokens = tokens;
+    uint64_t count = (uint64_t)seed_tokens * n_selected;
+    if (count > UINT32_MAX ||
+        selected->bytes < count * sizeof(int32_t)) return 0;
+    const int32_t *ids =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)selected);
+    return ids && q36_streaming_prepare(table, ids, NULL,
+                                         (uint32_t)count, NULL) ? 1 : 0;
 }
 int q36_gpu_stream_expert_cache_release_layer_cache(void) { return 1; }
 int q36_gpu_stream_expert_cache_seed_experts(
         const q36_gpu_stream_expert_table *table, const int32_t *ids,
         const uint32_t *priorities, uint32_t count) {
-    (void)table; (void)ids; (void)priorities; (void)count;
-    return 1;
+    return q36_streaming_prepare(table, ids, priorities, count, NULL) ? 1 : 0;
 }
 int q36_gpu_stream_expert_cache_bias_experts(
         const q36_gpu_stream_expert_table *table, const int32_t *ids,
         const uint32_t *priorities, uint32_t count) {
-    (void)table; (void)ids; (void)priorities; (void)count;
+    if (!q36_streaming_table_valid(table) || !ids) return 0;
+    pthread_mutex_lock(&q36_stream_mu);
+    for (uint32_t i = 0; i < count; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= table->n_total_expert) {
+            pthread_mutex_unlock(&q36_stream_mu);
+            return 0;
+        }
+        uint32_t priority = priorities ? priorities[i] : 1u;
+        uint32_t *bias =
+            &q36_streaming_bias[table->layer][(uint32_t)ids[i]];
+        if (priority > *bias) *bias = priority;
+    }
+    pthread_mutex_unlock(&q36_stream_mu);
     return 1;
 }
 
@@ -954,17 +1405,41 @@ void q36_gpu_parallel_for_rows(uint64_t rows, uint64_t grain,
 }
 
 uint64_t q36_gpu_recommended_working_set_size(void) {
-    uint64_t bytes = 0;
-    size_t size = sizeof(bytes);
-    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return 0;
-    return bytes * 4u / 5u;
+    if (!q36_device && !q36_gpu_init()) return 0;
+    return q36_device ? (uint64_t)q36_device.recommendedMaxWorkingSetSize : 0;
 }
 
 void q36_gpu_print_memory_report(const char *label) {
-    fprintf(stderr, "q36: Metal memory%s%s: live %.2f MiB, peak %.2f MiB\n",
+    uint64_t cache_bytes = 0;
+    uint64_t full_bytes = 0;
+    pthread_mutex_lock(&q36_stream_mu);
+    if (q36_streaming_gate) cache_bytes += q36_streaming_gate.length;
+    if (q36_streaming_up) cache_bytes += q36_streaming_up.length;
+    if (q36_streaming_down) cache_bytes += q36_streaming_down.length;
+    for (uint32_t l = 0; l < Q36_METAL_STREAM_MAX_LAYERS; l++) {
+        if (!q36_streaming_full[l].valid) continue;
+        full_bytes += q36_streaming_full[l].gate_bytes;
+        full_bytes += q36_streaming_full[l].up_bytes;
+        full_bytes += q36_streaming_full[l].down_bytes;
+    }
+    fprintf(stderr,
+            "q36: Metal memory%s%s: live %.2f MiB, peak %.2f MiB "
+            "ssd=%s cache=%u/%u cache_gib=%.2f full_gib=%.2f "
+            "hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64
+            " evictions=%" PRIu64 " reads_gib=%.2f\n",
             label ? " " : "", label ? label : "",
             (double)q36_live_bytes / (1024.0 * 1024.0),
-            (double)q36_peak_bytes / (1024.0 * 1024.0));
+            (double)q36_peak_bytes / (1024.0 * 1024.0),
+            q36_ssd_streaming ? "on" : "off",
+            q36_streaming_expert_count,
+            q36_streaming_expert_cap ?
+                q36_streaming_expert_cap : q36_streaming_expert_budget,
+            (double)cache_bytes / 1073741824.0,
+            (double)full_bytes / 1073741824.0,
+            q36_streaming_hits, q36_streaming_misses,
+            q36_streaming_loads, q36_streaming_evictions,
+            (double)q36_streaming_read_bytes / 1073741824.0);
+    pthread_mutex_unlock(&q36_stream_mu);
 }
 
 int q36_gpu_add_tensor(q36_gpu_tensor *out, const q36_gpu_tensor *a,
@@ -2439,13 +2914,113 @@ static q36_moe_mm_args q36_moe_make_mm_args(
     };
 }
 
+typedef struct {
+    id<MTLBuffer> gate;
+    id<MTLBuffer> up;
+    id<MTLBuffer> down;
+    id<MTLBuffer> selected;
+    NSUInteger selected_offset;
+    uint32_t experts;
+} q36_metal_stream_binding;
+
+static bool q36_moe_stream_binding(
+        q36_metal_stream_binding *binding,
+        const void *map, uint64_t size,
+        const q36_gpu_moe_weight *gate,
+        const q36_gpu_moe_weight *up,
+        const q36_gpu_moe_weight *down,
+        const q36_gpu_tensor *selected,
+        uint32_t tokens, uint32_t used, uint32_t experts,
+        uint32_t layer, uint64_t gate_expert_bytes,
+        uint64_t up_expert_bytes, uint64_t down_expert_bytes) {
+    if (!binding || !selected) return false;
+    *binding = (q36_metal_stream_binding) {
+        .selected = selected->buffer,
+        .selected_offset = (NSUInteger)selected->offset,
+        .experts = experts,
+    };
+    if (!q36_ssd_streaming) return true;
+    q36_gpu_stream_expert_table table = {
+        .model_map = map,
+        .model_size = size,
+        .layer = layer,
+        .n_total_expert = experts,
+        .gate_offset = gate->offset,
+        .up_offset = up->offset,
+        .down_offset = down->offset,
+        .gate_scales_offset = gate->scales_offset,
+        .up_scales_offset = up->scales_offset,
+        .down_scales_offset = down->scales_offset,
+        .gate_expert_bytes = gate_expert_bytes,
+        .up_expert_bytes = up_expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+        .gate_type = gate->type,
+        .up_type = up->type,
+        .down_type = down->type,
+        .has_gate_scales = gate->has_scales,
+        .has_up_scales = up->has_scales,
+        .has_down_scales = down->has_scales,
+    };
+    if (layer < q36_streaming_full_layers) {
+        if (!q36_metal_wait()) return false;
+        pthread_mutex_lock(&q36_stream_mu);
+        bool ok = q36_streaming_full_layer_load(&table);
+        if (ok) {
+            q36_metal_full_layer *full = &q36_streaming_full[layer];
+            binding->gate = full->gate;
+            binding->up = full->up;
+            binding->down = full->down;
+        }
+        pthread_mutex_unlock(&q36_stream_mu);
+        return ok;
+    }
+
+    uint64_t count64 = (uint64_t)tokens * used;
+    if (!count64 || count64 > UINT32_MAX ||
+        selected->bytes < count64 * sizeof(int32_t)) return false;
+    const int32_t *ids =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)selected);
+    if (!ids) return false;
+    uint32_t slots[Q36_METAL_STREAM_MAX_EXPERTS];
+    if (!q36_streaming_prepare(&table, ids, NULL, (uint32_t)count64,
+                                slots)) return false;
+    uint32_t *mapped = malloc((size_t)count64 * sizeof(*mapped));
+    if (!mapped) return false;
+    for (uint64_t i = 0; i < count64; i++) {
+        uint32_t expert = (uint32_t)ids[i];
+        if (expert >= experts || slots[expert] == UINT32_MAX) {
+            free(mapped);
+            return false;
+        }
+        mapped[i] = slots[expert];
+    }
+    id<MTLBuffer> mapped_buffer =
+        [q36_device newBufferWithBytes:mapped
+                                length:(NSUInteger)(count64 * sizeof(*mapped))
+                               options:MTLResourceStorageModeShared];
+    free(mapped);
+    if (!mapped_buffer) return false;
+    mapped_buffer.label = @"q36_stream_selected_slots";
+    pthread_mutex_lock(&q36_stream_mu);
+    binding->gate = q36_streaming_gate;
+    binding->up = q36_streaming_up;
+    binding->down = q36_streaming_down;
+    binding->experts = q36_streaming_expert_cap;
+    pthread_mutex_unlock(&q36_stream_mu);
+    binding->selected = mapped_buffer;
+    binding->selected_offset = 0;
+    return binding->gate && binding->up && binding->down &&
+           binding->experts != 0;
+}
+
 static int q36_moe_iq2_q2_gpu(
         q36_gpu_tensor *out, const void *map, uint64_t size,
         const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
         const q36_gpu_moe_weight *down, const q36_gpu_tensor *selected,
         const q36_gpu_tensor *route_weights, uint32_t used,
         const q36_gpu_tensor *x, uint32_t tokens, uint32_t in_dim,
-        uint32_t mid_dim, uint32_t out_dim, uint32_t experts) {
+        uint32_t mid_dim, uint32_t out_dim, uint32_t experts,
+        uint32_t layer) {
     if (!out || !map || !gate || !up || !down || !selected || !route_weights || !x ||
         !used || !tokens || gate->type != 16u || up->type != 16u ||
         down->type != 10u || (in_dim & 255u) || (mid_dim & 255u)) return 0;
@@ -2464,10 +3039,22 @@ static int q36_moe_iq2_q2_gpu(
         !q36_moe_ensure_scratch(pairs * mid_dim * sizeof(float),
                                 pairs * out_dim * sizeof(float))) return 0;
 
+    q36_metal_stream_binding stream = {0};
+    if (!q36_moe_stream_binding(&stream, map, size, gate, up, down,
+                                 selected, tokens, used, experts, layer,
+                                 geb, ueb, deb)) return 0;
+    const uint32_t weight_experts = stream.experts;
+    id<MTLBuffer> weight_selected = stream.selected;
+    const NSUInteger weight_selected_offset = stream.selected_offset;
     uint64_t go = 0, uo = 0, doff = 0, gso = 0, uso = 0, dso = 0;
-    id<MTLBuffer> gb = q36_model_view(map, size, gate->offset, geb * experts, &go);
-    id<MTLBuffer> ub = q36_model_view(map, size, up->offset, ueb * experts, &uo);
-    id<MTLBuffer> db = q36_model_view(map, size, down->offset, deb * experts, &doff);
+    id<MTLBuffer> gb = stream.gate;
+    id<MTLBuffer> ub = stream.up;
+    id<MTLBuffer> db = stream.down;
+    if (!q36_ssd_streaming) {
+        gb = q36_model_view(map, size, gate->offset, geb * experts, &go);
+        ub = q36_model_view(map, size, up->offset, ueb * experts, &uo);
+        db = q36_model_view(map, size, down->offset, deb * experts, &doff);
+    }
     id<MTLBuffer> gsb = route_weights->buffer, usb = route_weights->buffer, dsb = route_weights->buffer;
     if (gate->has_scales) gsb = q36_model_view(map, size, gate->scales_offset, (uint64_t)experts * 4u, &gso);
     if (up->has_scales) usb = q36_model_view(map, size, up->scales_offset, (uint64_t)experts * 4u, &uso);
@@ -2475,44 +3062,50 @@ static int q36_moe_iq2_q2_gpu(
     if (!gb || !ub || !db || !gsb || !usb || !dsb || (!q36_batch && !q36_gpu_begin_commands())) return 0;
 
     const char *mm_env = getenv("Q36_METAL_MOE_MM");
-    const bool use_mm = tokens >= 64u && !q36_micro_batch &&
-        (!mm_env || mm_env[0] != '0');
-    const NSUInteger max_blocks =
-        (NSUInteger)(((uint64_t)tokens * used + 31u) / 32u + experts);
+    /*
+     * The routed batch kernels currently fail the isolated 64-token numeric
+     * oracle by order-one margins even though sampled top-1 parity can hide
+     * the drift. Keep the exact matvec route as the publication default until
+     * that kernel has a passing forced-logit gate.
+     */
+    (void)mm_env;
+    const bool use_mm = false;
     q36_moe_mm_args gate_mm = {0};
     q36_moe_mm_args down_mm = {0};
     NSUInteger map_ids_offset = 0;
     if (use_mm) {
-        if (!q36_moe_ensure_id_map(experts, tokens, used)) return 0;
-        map_ids_offset = (NSUInteger)experts * sizeof(int32_t);
+        if (!q36_moe_ensure_id_map(weight_experts, tokens, used)) return 0;
+        map_ids_offset = (NSUInteger)weight_experts * sizeof(int32_t);
         q36_moe_mm_map_args ma = {
-            (int32_t)experts, (int32_t)in_dim, 1,
+            (int32_t)weight_experts, (int32_t)in_dim, 1,
             (uint64_t)in_dim * sizeof(float),
             (uint64_t)in_dim * sizeof(float),
             (int32_t)tokens, (int32_t)used,
             (uint64_t)used * sizeof(int32_t)
         };
         id<MTLComputePipelineState> mp =
-            q36_pipeline_mm(@"kernel_mul_mm_id_map0_ne20_8_compact",
+            q36_pipeline_mm(@"kernel_mul_mm_id_map0_ne20_8",
                             false, false);
         id<MTLComputeCommandEncoder> menc =
             mp ? [q36_batch computeCommandEncoder] : nil;
         if (!menc) return 0;
-        menc.label = @"kernel_mul_mm_id_map0_ne20_8_compact";
+        menc.label = @"kernel_mul_mm_id_map0_ne20_8";
         [menc setComputePipelineState:mp];
         [menc setBytes:&ma length:sizeof(ma) atIndex:0];
-        [menc setBuffer:selected->buffer offset:selected->offset atIndex:1];
+        [menc setBuffer:weight_selected
+                 offset:weight_selected_offset atIndex:1];
         [menc setBuffer:q36_moe_id_map offset:0 atIndex:2];
         [menc setBuffer:q36_moe_id_map offset:map_ids_offset atIndex:3];
         [menc setThreadgroupMemoryLength:
-            (NSUInteger)experts * used * sizeof(uint16_t) atIndex:0];
+            (NSUInteger)weight_experts * used * sizeof(uint16_t) atIndex:0];
         [menc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(experts, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(weight_experts, 1, 1)];
         [menc endEncoding];
         gate_mm = q36_moe_make_mm_args(
-            in_dim, mid_dim, experts, grb, geb, 1, used, tokens);
+            in_dim, mid_dim, weight_experts, grb, geb, 1, used, tokens);
         down_mm = q36_moe_make_mm_args(
-            mid_dim, out_dim, experts, drb, deb, used, used, tokens);
+            mid_dim, out_dim, weight_experts, drb, deb,
+            used, used, tokens);
     }
 
     /* Every routed slot for a token consumes the same input row.  The id
@@ -2520,9 +3113,10 @@ static int q36_moe_iq2_q2_gpu(
      * using `used` here walks into following token rows (and out of bounds
      * during decode). */
     q36_moe_mv_args ga =
-        q36_moe_make_args(in_dim, mid_dim, experts, grb, geb, 1, used, tokens);
+        q36_moe_make_args(in_dim, mid_dim, weight_experts,
+                          grb, geb, 1, used, tokens);
     id<MTLComputePipelineState> gp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_iq2_xxs_f32_compact",
+        ? q36_pipeline_mm(@"kernel_mul_mm_id_iq2_xxs_f32",
                           false, true)
         : q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
     id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
@@ -2539,7 +3133,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                1u, (mid_dim + 63u) / 64u, max_blocks)
+                (tokens + 31u) / 32u,
+                (mid_dim + 63u) / 64u, weight_experts)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
 
@@ -2554,7 +3149,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                1u, (mid_dim + 63u) / 64u, max_blocks)
+                (tokens + 31u) / 32u,
+                (mid_dim + 63u) / 64u, weight_experts)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
     } else {
@@ -2564,7 +3160,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:x->buffer offset:x->offset atIndex:3];
         [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:4];
         [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
-        [enc setBuffer:selected->buffer offset:selected->offset atIndex:6];
+        [enc setBuffer:weight_selected
+                 offset:weight_selected_offset atIndex:6];
         [enc setThreadgroupMemoryLength:2176u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                 (mid_dim + 7u) / 8u, 1, (NSUInteger)pairs)
@@ -2595,9 +3192,10 @@ static int q36_moe_iq2_q2_gpu(
     [enc endEncoding];
 
     q36_moe_mv_args da = q36_moe_make_args(
-        mid_dim, out_dim, experts, drb, deb, used, used, tokens);
+        mid_dim, out_dim, weight_experts,
+        drb, deb, used, used, tokens);
     id<MTLComputePipelineState> dp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_q2_K_f32_compact",
+        ? q36_pipeline_mm(@"kernel_mul_mm_id_q2_K_f32",
                           false, true)
         : q36_pipeline_nsg(
             down_sum ? @"kernel_mul_mv_id_q2_K_sum6_f32"
@@ -2618,7 +3216,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                1u, (out_dim + 63u) / 64u, max_blocks)
+                (tokens + 31u) / 32u,
+                (out_dim + 63u) / 64u, weight_experts)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
         [enc setBytes:&da length:sizeof(da) atIndex:0];
@@ -2626,7 +3225,8 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:2];
         [enc setBuffer:(down_sum ? out->buffer : q36_moe_down_scratch)
                 offset:(down_sum ? out->offset : 0) atIndex:3];
-        [enc setBuffer:selected->buffer offset:selected->offset atIndex:4];
+        [enc setBuffer:weight_selected
+                 offset:weight_selected_offset atIndex:4];
     }
     if (down_sum) {
         [enc setBuffer:out->buffer offset:out->offset atIndex:5];
@@ -2751,13 +3351,13 @@ int q36_gpu_moe_ffn_f32_tensor(
         uint32_t layer, uint32_t used, const q36_gpu_tensor *x,
         uint32_t tokens, uint32_t in_dim, uint32_t mid_dim,
         uint32_t out_dim, uint32_t experts) {
-    (void)layer;
     const char *gpu_moe = getenv("Q36_METAL_MOE_GPU");
     const char *force_mv = getenv("Q36_VK_MOE_GEMM");
     if ((!gpu_moe || gpu_moe[0] != '0') &&
         (!force_mv || force_mv[0] != '0') &&
         q36_moe_iq2_q2_gpu(out, map, size, gate, up, down, selected, weights,
-                            used, x, tokens, in_dim, mid_dim, out_dim, experts))
+                            used, x, tokens, in_dim, mid_dim, out_dim, experts,
+                            layer))
         return 1;
     const float *xp = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
     return xp && q36_moe_host(out, map, size, gate, up, down,

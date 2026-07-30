@@ -1433,21 +1433,33 @@ static cli_config parse_options(int argc, char **argv) {
 #endif
         ) {
             c.gen.vulkan_graph_test = true;
+#ifdef Q36_METAL
+            c.engine.backend = Q36_BACKEND_METAL;
+#else
             c.engine.backend = Q36_BACKEND_VULKAN;
+#endif
         } else if (!strcmp(arg, "--vulkan-graph-full-test")
 #ifdef Q36_METAL
                    || !strcmp(arg, "--metal-graph-full-test")
 #endif
         ) {
             c.gen.vulkan_graph_full_test = true;
+#ifdef Q36_METAL
+            c.engine.backend = Q36_BACKEND_METAL;
+#else
             c.engine.backend = Q36_BACKEND_VULKAN;
+#endif
         } else if (!strcmp(arg, "--vulkan-graph-prompt-test")
 #ifdef Q36_METAL
                    || !strcmp(arg, "--metal-graph-prompt-test")
 #endif
         ) {
             c.gen.vulkan_graph_prompt_test = true;
+#ifdef Q36_METAL
+            c.engine.backend = Q36_BACKEND_METAL;
+#else
             c.engine.backend = Q36_BACKEND_VULKAN;
+#endif
         } else if (
                    !strcmp(arg, "--cuda")) {
 #ifdef Q36_METAL

@@ -148,8 +148,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 q36_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH);
-    opt(fp, c, "--vulkan | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: vulkan or cpu.");
+    opt(fp, c, "--metal | --vulkan | --cpu", "Select the backend explicitly.");
+    opt(fp, c, "--backend NAME", "Backend name: metal, vulkan, or cpu.");
     if (tool != Q36_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", tool == Q36_HELP_AGENT ?
             "Allocated context tokens. Default: 100000." :
@@ -166,14 +166,14 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
     opt(fp, c, "--ssd-streaming", tool == Q36_HELP_AGENT ?
-        "Vulkan: SSD streaming with a 100000-token, F16 KV default unless explicitly overridden." :
-        "Vulkan: use SSD-backed routed-expert streaming instead of full residency.");
+        "SSD streaming with a 100000-token, F16 KV default unless explicitly overridden." :
+        "Use SSD-backed routed-expert streaming instead of full residency.");
     opt(fp, c, "--ssd-streaming-cold", "SSD streaming: skip default popularity-based expert-cache preload.");
-    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB.");
-    opt(fp, c, "--ssd-streaming-full-layers N", "SSD streaming: keep the first N routed layers fully resident and deduct them from the cache budget.");
-    opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: explicitly preload the first N routed expert slots into the cache.");
+    opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "Routed expert cache as a count or GiB budget.");
+    opt(fp, c, "--ssd-streaming-full-layers N", "Keep the first N routed layers fully resident.");
+    opt(fp, c, "--ssd-streaming-preload-experts N", "Explicitly preload the first N routed expert slots.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "Vulkan graph prefill chunk size. Default: auto.");
+    opt(fp, c, "--prefill-chunk N", "GPU graph prefill chunk size. Default: auto.");
     if (full) {
         if (tool != Q36_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
