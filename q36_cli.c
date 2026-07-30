@@ -24,6 +24,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define CLI_METAL_RESIDENT_PREFILL_CHUNK 512u
+
 typedef struct {
     const char *prompt;
     const char *system;
@@ -125,7 +127,7 @@ static void usage(FILE *fp) {
         "  --simulate-used-memory SIZEGB\n"
         "      Reduce automatic SSD cache planning by pretending SIZEGB is already used.\n"
         "  --prefill-chunk N\n"
-        "      Override prompt prefill chunk size.\n"
+        "      Override prompt prefill chunk size. Default: resident Metal 512, otherwise auto.\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -276,10 +278,11 @@ static q36_backend default_backend(void) {
 }
 
 static void log_context_memory(q36_backend backend, int ctx_size,
+                               uint32_t prefill_chunk,
                                q36_kv_cache_type cache_type_k,
                                q36_kv_cache_type cache_type_v) {
     q36_context_memory m = q36_context_memory_estimate_configured(
-            backend, ctx_size, 0, cache_type_k, cache_type_v);
+            backend, ctx_size, prefill_chunk, cache_type_k, cache_type_v);
     fprintf(stderr,
             "q36: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -1176,6 +1179,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                 } else {
                     cfg->gen.ctx_size = ctx_size;
                     log_context_memory(cfg->engine.backend, cfg->gen.ctx_size,
+                                       cfg->engine.prefill_chunk,
                                        cfg->engine.cache_type_k,
                                        cfg->engine.cache_type_v);
                     rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
@@ -1494,6 +1498,11 @@ static cli_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    if (c.engine.backend == Q36_BACKEND_METAL &&
+        !c.engine.ssd_streaming &&
+        c.engine.prefill_chunk == 0) {
+        c.engine.prefill_chunk = CLI_METAL_RESIDENT_PREFILL_CHUNK;
+    }
     if (c.gen.ctx_size > Q36_CONTEXT_MAX) {
         fprintf(stderr, "q36: --ctx must not exceed %d\n", Q36_CONTEXT_MAX);
         exit(2);
@@ -1522,6 +1531,7 @@ int main(int argc, char **argv) {
     }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size,
+                           cfg.engine.prefill_chunk,
                            cfg.engine.cache_type_k,
                            cfg.engine.cache_type_v);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");

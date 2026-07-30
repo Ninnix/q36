@@ -8516,7 +8516,7 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
         }
         if (!ok) {
             if (err && errlen) snprintf(err, errlen, "%s prefill failed at token %d",
-                                         q36_engine_uses_vulkan_runtime(s->engine) ? "Vulkan" : "CPU", i);
+                                         q36_backend_name(s->engine->backend), i);
             s->checkpoint_valid = false;
             return 1;
         }
@@ -8725,7 +8725,7 @@ static int q36_session_eval_internal(q36_session *s, int token, bool update_mtp,
 #endif
           : q36_forward_token_cpu(s, token, pos, true))) {
         if (err && errlen) snprintf(err, errlen, "%s decode failed at pos %d",
-                                     q36_engine_uses_vulkan_runtime(s->engine) ? "Vulkan" : "CPU",
+                                     q36_backend_name(s->engine->backend),
                                      s->checkpoint.len);
         s->checkpoint_valid = false;
         return 1;
