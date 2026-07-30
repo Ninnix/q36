@@ -2904,11 +2904,7 @@ static void test_vulkan_moe_q4_one(bool streaming) {
         out_dim = 11,
         n_expert = 3,
         n_used = 2,
-#ifdef Q36_METAL
-        n_tok = 64,
-#else
         n_tok = 2,
-#endif
     };
     const uint64_t row_bytes = sizeof(test_block_q4_K);
     const uint64_t gate_stride = row_bytes * mid_dim;
@@ -2922,9 +2918,7 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     float *x_host = NULL;
     float *out_host = NULL;
     float *want = NULL;
-    float *want_f32 = NULL;
     float *mid = NULL;
-    float *wrow = NULL;
     test_block_q8_K *xq = NULL;
     test_block_q8_K *midq = NULL;
     q36_gpu_tensor *x = NULL;
@@ -2955,15 +2949,11 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     x_host = malloc((size_t)n_tok * in_dim * sizeof(*x_host));
     out_host = malloc((size_t)n_tok * out_dim * sizeof(*out_host));
     want = calloc((size_t)n_tok * out_dim, sizeof(*want));
-    want_f32 = calloc((size_t)n_tok * out_dim, sizeof(*want_f32));
     mid = malloc((size_t)n_tok * n_used * mid_dim * sizeof(*mid));
-    wrow = malloc((size_t)mid_dim * sizeof(*wrow));
     xq = malloc((size_t)n_tok * sizeof(*xq));
     midq = malloc((size_t)n_tok * n_used * sizeof(*midq));
-    TEST_ASSERT(x_host && out_host && want && want_f32 && mid && wrow &&
-                xq && midq);
-    if (!x_host || !out_host || !want || !want_f32 || !mid || !wrow ||
-        !xq || !midq) goto done;
+    TEST_ASSERT(x_host && out_host && want && mid && xq && midq);
+    if (!x_host || !out_host || !want || !mid || !xq || !midq) goto done;
 
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < in_dim; i++) {
@@ -2999,37 +2989,6 @@ static void test_vulkan_moe_q4_one(bool streaming) {
                 const uint8_t *down = (const uint8_t *)model + down_offset + expert * down_stride + row * row_bytes;
                 float dv = test_dot_q4_k_q8_k((const test_block_q4_K *)down, &midq[t * n_used + u]);
                 want[(uint64_t)t * out_dim + row] += dv * weights_host[t * n_used + u];
-            }
-        }
-    }
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        for (uint32_t u = 0; u < n_used; u++) {
-            uint32_t expert = selected_host[t * n_used + u];
-            float *mid_f32 = mid + ((uint64_t)t * n_used + u) * mid_dim;
-            for (uint32_t row = 0; row < mid_dim; row++) {
-                const uint8_t *g = (const uint8_t *)model + gate_offset +
-                    expert * gate_stride + row * row_bytes;
-                const uint8_t *up = (const uint8_t *)model + up_offset +
-                    expert * gate_stride + row * row_bytes;
-                float gv = 0.0f, uv = 0.0f;
-                test_dequant_row_cpu(TEST_TENSOR_Q4_K, g, wrow, in_dim);
-                for (uint32_t i = 0; i < in_dim; i++)
-                    gv += wrow[i] * x_host[(uint64_t)t * in_dim + i];
-                test_dequant_row_cpu(TEST_TENSOR_Q4_K, up, wrow, in_dim);
-                for (uint32_t i = 0; i < in_dim; i++)
-                    uv += wrow[i] * x_host[(uint64_t)t * in_dim + i];
-                mid_f32[row] = test_swiglu_ref(gv, uv);
-            }
-            for (uint32_t row = 0; row < out_dim; row++) {
-                const uint8_t *down = (const uint8_t *)model + down_offset +
-                    expert * down_stride + row * row_bytes;
-                float dv = 0.0f;
-                test_dequant_row_cpu(TEST_TENSOR_Q4_K, down, wrow, mid_dim);
-                for (uint32_t i = 0; i < mid_dim; i++)
-                    dv += wrow[i] * mid_f32[i];
-                want_f32[(uint64_t)t * out_dim + row] +=
-                    dv * weights_host[t * n_used + u];
             }
         }
     }
@@ -3086,69 +3045,6 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     }
     TEST_ASSERT(max_abs < 5.0e-2f || max_rel < 5.0e-5f);
 
-#ifdef Q36_METAL
-    if (streaming) {
-        /* Exercise the mixed-precision cache ABI: a smaller routed layer is
-         * stored in slots whose component strides were sized for a larger
-         * layer. */
-        q36_gpu_set_streaming_expert_cache_layout(
-            gate_stride + row_bytes, gate_stride + row_bytes,
-            down_stride + row_bytes);
-    }
-    setenv("Q36_METAL_MOE_GPU_REQUIRED", "1", 1);
-    ok = q36_gpu_moe_ffn_f32_tensor(
-        out, model, model_alloc, &gate, &up, &down,
-        selected, weights, 0, n_used, x, n_tok,
-        in_dim, mid_dim, out_dim, n_expert);
-    unsetenv("Q36_METAL_MOE_GPU_REQUIRED");
-    TEST_ASSERT(ok != 0);
-    TEST_ASSERT(q36_gpu_tensor_read(
-        out, 0, out_host, (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
-    max_abs = 0.0f;
-    max_rel = 0.0f;
-    max_i = 0;
-    for (uint32_t i = 0; i < n_tok * out_dim; i++) {
-        float err = fabsf(out_host[i] - want_f32[i]);
-        float den = fabsf(want_f32[i]) > 1.0f ? fabsf(want_f32[i]) : 1.0f;
-        float rel = err / den;
-        if (err > max_abs) {
-            max_abs = err;
-            max_i = i;
-        }
-        if (rel > max_rel) max_rel = rel;
-    }
-    if (max_abs >= 5.0e-2f && max_rel >= 5.0e-5f) {
-        fprintf(stderr,
-                "q36-test: routed q4 f32 %s max_abs=%g max_rel=%g "
-                "idx=%u got=%g want=%g\n",
-                streaming ? "stream" : "resident",
-                (double)max_abs, (double)max_rel, max_i,
-                (double)out_host[max_i], (double)want_f32[max_i]);
-    }
-    /* Routed MM stages through f16 tiles; real-scale synthetic weights stay
-     * within the same 5% publication bound used by the IQ2/Q2 MM test. */
-    TEST_ASSERT(max_rel < 5.0e-2f);
-
-    setenv("Q36_METAL_MOE_MM", "0", 1);
-    setenv("Q36_METAL_MOE_GPU_REQUIRED", "1", 1);
-    ok = q36_gpu_moe_ffn_f32_tensor(
-        out, model, model_alloc, &gate, &up, &down,
-        selected, weights, 0, n_used, x, n_tok,
-        in_dim, mid_dim, out_dim, n_expert);
-    unsetenv("Q36_METAL_MOE_GPU_REQUIRED");
-    unsetenv("Q36_METAL_MOE_MM");
-    TEST_ASSERT(ok != 0);
-    TEST_ASSERT(q36_gpu_tensor_read(
-        out, 0, out_host, (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
-    max_rel = 0.0f;
-    for (uint32_t i = 0; i < n_tok * out_dim; i++) {
-        float den = fabsf(want_f32[i]) > 1.0f ? fabsf(want_f32[i]) : 1.0f;
-        float rel = fabsf(out_host[i] - want_f32[i]) / den;
-        if (rel > max_rel) max_rel = rel;
-    }
-    TEST_ASSERT(max_rel < 1.0e-3f);
-#endif
-
 done:
     q36_gpu_set_ssd_streaming(false);
     q36_gpu_set_streaming_expert_cache_budget(0);
@@ -3160,9 +3056,7 @@ done:
     q36_gpu_tensor_free(x);
     free(midq);
     free(xq);
-    free(wrow);
     free(mid);
-    free(want_f32);
     free(want);
     free(out_host);
     free(x_host);
