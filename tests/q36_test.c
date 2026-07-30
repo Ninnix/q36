@@ -3086,6 +3086,7 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     }
     TEST_ASSERT(max_abs < 5.0e-2f || max_rel < 5.0e-5f);
 
+#ifdef Q36_METAL
     if (streaming) {
         /* Exercise the mixed-precision cache ABI: a smaller routed layer is
          * stored in slots whose component strides were sized for a larger
@@ -3128,7 +3129,6 @@ static void test_vulkan_moe_q4_one(bool streaming) {
      * within the same 5% publication bound used by the IQ2/Q2 MM test. */
     TEST_ASSERT(max_rel < 5.0e-2f);
 
-#ifdef Q36_METAL
     setenv("Q36_METAL_MOE_MM", "0", 1);
     setenv("Q36_METAL_MOE_GPU_REQUIRED", "1", 1);
     ok = q36_gpu_moe_ffn_f32_tensor(
