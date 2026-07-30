@@ -386,6 +386,62 @@ static int q36_q8_prefill_mm(
     return 1;
 }
 
+/* Router-sized F32 projections are large enough to benefit from tiled
+ * simdgroup matrix arithmetic during prefill. Keep both inputs in F32:
+ * converting the router to half changes expert selection often enough to
+ * fail the strict CPU-parity overlap checks. */
+static int q36_f32_prefill_mm(
+        q36_gpu_tensor *out, const void *map, uint64_t size,
+        uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (!out || !x || !map || tokens < 2u || out_dim < 64u ||
+        !in_dim || (in_dim & 15u) || in_dim > INT32_MAX ||
+        out_dim > INT32_MAX || tokens > INT32_MAX ||
+        out_dim > UINT64_MAX / in_dim / sizeof(float))
+        return 0;
+    const uint64_t row_bytes = in_dim * sizeof(float);
+    uint64_t inner = 0;
+    id<MTLBuffer> weights =
+        q36_model_view(map, size, offset, out_dim * row_bytes, &inner);
+    const bool bc_inp = (in_dim % 32u) != 0;
+    const bool bc_out = (out_dim % 64u) != 0 || (tokens % 32u) != 0;
+    id<MTLComputePipelineState> p =
+        q36_pipeline_mm(@"kernel_mul_mm_f32_ff32", bc_inp, bc_out);
+    if (!weights || !p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    q36_q8_mm_args args = {
+        (int32_t)in_dim, 1, row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, 1, sizeof(float), in_dim * sizeof(float),
+        in_dim * tokens * sizeof(float), in_dim * tokens * sizeof(float),
+        (int32_t)out_dim, (int32_t)tokens, 1, 1
+    };
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mm_f32_ff32";
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+    [enc setThreadgroupMemoryLength:12288u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((tokens + 31u) / 32u,
+                                          (out_dim + 63u) / 64u, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc endEncoding];
+    if (scale != 1.0f) {
+        const uint64_t count64 = tokens * out_dim;
+        if (count64 > UINT32_MAX) return 0;
+        const uint32_t count = (uint32_t)count64;
+        enc = q36_encoder(@"q36_scale_f32");
+        if (!enc) return 0;
+        [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+        [enc setBytes:&count length:sizeof(count) atIndex:1];
+        [enc setBytes:&scale length:sizeof(scale) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+    return 1;
+}
+
 static int q36_q8_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
                          uint64_t offset, uint64_t in_dim, uint64_t out_dim,
                          const q36_gpu_tensor *x, float scale) {
@@ -1087,6 +1143,10 @@ int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out, const void *map,
         in_dim > UINT64_MAX / out_dim / sizeof(float)) return 0;
     if (tokens == 1u && scale == 1.0f &&
         q36_f32_decode(out, map, size, offset, in_dim, out_dim, x))
+        return 1;
+    if (tokens > 1u &&
+        q36_f32_prefill_mm(out, map, size, offset, in_dim, out_dim,
+                           x, tokens, scale))
         return 1;
     return q36_dense(@"q36_matmul_f32", out, map, size, offset,
                      in_dim * out_dim * sizeof(float),
