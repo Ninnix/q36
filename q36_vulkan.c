@@ -1342,6 +1342,159 @@ static int q36_vk_kernel_init(q36_vk_kernel *k) {
     return 1;
 }
 
+/* Allocate from DEVICE_LOCAL-only memory (the VRAM carve-out / BAR
+ * aperture, types 0/1/7 in heap 1 on the BC-250).  The tensor is NOT
+ * host-mapped; writes must go through q36_vk_write_tensor_staged().
+ * Returns NULL on OOM or if no DEVICE_LOCAL-only type supports the
+ * buffer's required memory type bits. */
+static q36_gpu_tensor *q36_vk_tensor_alloc_dl_only_unlocked(uint64_t bytes) {
+    q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
+    if (!tensor) return NULL;
+    tensor->bytes = bytes;
+    tensor->alloc_bytes = bytes ? q36_round_up_u64(bytes, 4) : 4;
+
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = tensor->alloc_bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (vkCreateBuffer(q36_vk.device, &bci, NULL, &tensor->buffer) != VK_SUCCESS) {
+        free(tensor);
+        return NULL;
+    }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(q36_vk.device, tensor->buffer, &req);
+    uint32_t mt = q36_vk_find_memory_type(req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == UINT32_MAX) {
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (vkAllocateMemory(q36_vk.device, &mai, NULL, &tensor->memory) != VK_SUCCESS) {
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+    if (vkBindBufferMemory(q36_vk.device, tensor->buffer, tensor->memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(q36_vk.device, tensor->memory, NULL);
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+    tensor->device_local = true;
+    return tensor;
+}
+
+/* Staging copy helper for DEVICE_LOCAL-only tensors.  Creates a temporary
+ * host-visible staging buffer, copies |bytes| from |src| into it, records a
+ * vkCmdCopyBuffer from staging to the root buffer at |dst_offset|, submits
+ * on its own command buffer (independent of the main batch), and waits for
+ * completion.  Only suitable for one-shot uploads at init time. */
+static int q36_vk_write_tensor_staged(q36_gpu_tensor *tensor, uint64_t dst_offset,
+                                       const void *src, uint64_t bytes) {
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer staging;
+    if (vkCreateBuffer(q36_vk.device, &bci, NULL, &staging) != VK_SUCCESS) return 0;
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(q36_vk.device, staging, &req);
+    uint32_t mt = q36_vk_find_memory_type(req.memoryTypeBits,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) {
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    VkDeviceMemory staging_mem;
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (vkAllocateMemory(q36_vk.device, &mai, NULL, &staging_mem) != VK_SUCCESS) {
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    void *map;
+    if (vkBindBufferMemory(q36_vk.device, staging, staging_mem, 0) != VK_SUCCESS ||
+        vkMapMemory(q36_vk.device, staging_mem, 0, req.size, 0, &map) != VK_SUCCESS)
+    {
+        vkFreeMemory(q36_vk.device, staging_mem, NULL);
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    memcpy(map, src, (size_t)bytes);
+    vkUnmapMemory(q36_vk.device, staging_mem);
+
+    VkCommandBufferAllocateInfo cai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = q36_vk.command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cb;
+    if (vkAllocateCommandBuffers(q36_vk.device, &cai, &cb) != VK_SUCCESS) {
+        vkFreeMemory(q36_vk.device, staging_mem, NULL);
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    VkFence fence;
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS ||
+        vkCreateFence(q36_vk.device, &fci, NULL, &fence) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(q36_vk.device, q36_vk.command_pool, 1, &cb);
+        vkFreeMemory(q36_vk.device, staging_mem, NULL);
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    VkBufferCopy region = { .srcOffset = 0, .dstOffset = dst_offset, .size = bytes };
+    vkCmdCopyBuffer(cb, staging, tensor->buffer, 1, &region);
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
+        vkDestroyFence(q36_vk.device, fence, NULL);
+        vkFreeCommandBuffers(q36_vk.device, q36_vk.command_pool, 1, &cb);
+        vkFreeMemory(q36_vk.device, staging_mem, NULL);
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cb,
+    };
+    VkResult rc = vkQueueSubmit(q36_vk.queue, 1, &si, fence);
+    if (rc != VK_SUCCESS) {
+        vkDestroyFence(q36_vk.device, fence, NULL);
+        vkFreeCommandBuffers(q36_vk.device, q36_vk.command_pool, 1, &cb);
+        vkFreeMemory(q36_vk.device, staging_mem, NULL);
+        vkDestroyBuffer(q36_vk.device, staging, NULL);
+        return 0;
+    }
+    vkWaitForFences(q36_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(q36_vk.device, fence, NULL);
+    vkFreeCommandBuffers(q36_vk.device, q36_vk.command_pool, 1, &cb);
+    vkFreeMemory(q36_vk.device, staging_mem, NULL);
+    vkDestroyBuffer(q36_vk.device, staging, NULL);
+    return 1;
+}
+
 static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool device_pref) {
     q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
     if (!tensor) return NULL;
@@ -1421,7 +1574,7 @@ static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor) {
     if (!tensor) return;
     if (!tensor->owner) {
         q36_gpu_live_bytes -= tensor->bytes;
-        if (tensor->memory) vkUnmapMemory(q36_vk.device, tensor->memory);
+        if (tensor->data) vkUnmapMemory(q36_vk.device, tensor->memory);
         if (tensor->memory) vkFreeMemory(q36_vk.device, tensor->memory, NULL);
         if (tensor->buffer) vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
     }
@@ -1802,12 +1955,18 @@ static q36_gpu_tensor *q36_vk_weight_get_unlocked(const void *source, uint64_t b
         }
     }
 
-    q36_gpu_tensor *tensor = q36_vk_arena_alloc_unlocked(bytes);
+    q36_gpu_tensor *tensor = q36_vk_tensor_alloc_dl_only_unlocked(bytes);
+    if (!tensor) tensor = q36_vk_arena_alloc_unlocked(bytes);
     if (!tensor) return NULL;
     {
         uint64_t offset = 0;
         q36_gpu_tensor *root = q36_gpu_tensor_root(tensor, &offset);
-        if (q36_vk_weight_copy_parallel) {
+        if (!root->data) {
+            if (!q36_vk_write_tensor_staged(root, offset, source, bytes)) {
+                q36_vk_tensor_free_unlocked(tensor);
+                return NULL;
+            }
+        } else if (q36_vk_weight_copy_parallel) {
             q36_vk_weight_copy_ctx c = { root->data + offset, source, bytes };
             q36_gpu_parallel_for_rows((bytes + ((1u << 20) - 1)) >> 20, 8, q36_vk_weight_copy_rows, &c);
         } else {
@@ -4083,7 +4242,8 @@ static q36_gpu_tensor *q36_vk_packed_weight_get_unlocked(const unsigned char *so
     const uint64_t packed_bytes = (uint64_t)row_tiles * blocks * pack_block_bytes;
     if (pack_block_bytes == 0 || blocks == 0 || row_tiles == 0) return NULL;
 
-    q36_gpu_tensor *tensor = q36_vk_arena_alloc_unlocked(packed_bytes);
+    q36_gpu_tensor *tensor = q36_vk_tensor_alloc_dl_only_unlocked(packed_bytes);
+    if (!tensor) tensor = q36_vk_arena_alloc_unlocked(packed_bytes);
     if (!tensor) return NULL;
     uint64_t offset = 0;
     q36_gpu_tensor *root = q36_gpu_tensor_root(tensor, &offset);
@@ -4092,7 +4252,23 @@ static q36_gpu_tensor *q36_vk_packed_weight_get_unlocked(const unsigned char *so
         return NULL;
     }
 
-    if (type == Q36_VK_TENSOR_Q5_K) {
+    if (!root->data) {
+        unsigned char *tmp = malloc((size_t)packed_bytes);
+        if (!tmp) {
+            q36_vk_tensor_free_unlocked(tensor);
+            return NULL;
+        }
+        if (type == Q36_VK_TENSOR_Q5_K)
+            q36_vk_pack_q5_kx8_matrix(tmp, source, out_dim, blocks, (uint32_t)src_row_bytes);
+        else
+            q36_vk_pack_q6_kx8_matrix(tmp, source, out_dim, blocks, (uint32_t)src_row_bytes);
+        int ok = q36_vk_write_tensor_staged(root, offset, tmp, packed_bytes);
+        free(tmp);
+        if (!ok) {
+            q36_vk_tensor_free_unlocked(tensor);
+            return NULL;
+        }
+    } else if (type == Q36_VK_TENSOR_Q5_K) {
         q36_vk_pack_q5_kx8_matrix(root->data + offset, source, out_dim, blocks, (uint32_t)src_row_bytes);
     } else if (type == Q36_VK_TENSOR_Q6_K) {
         q36_vk_pack_q6_kx8_matrix(root->data + offset, source, out_dim, blocks, (uint32_t)src_row_bytes);
@@ -4619,9 +4795,25 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
  * moe_matvec kernel.  Layout must match the TAB_* offsets in the shader. */
 static q36_gpu_tensor *q36_vk_iq_tables_unlocked(void) {
     if (q36_vk.iq_tables) return q36_vk.iq_tables;
-    q36_gpu_tensor *t = q36_vk_tensor_alloc_kind_unlocked(Q36_VK_TAB_TOTAL_BYTES, true);
-    if (!t) return NULL;
-    q36_vk_pack_iq_tables(t->data);
+    q36_gpu_tensor *t = q36_vk_tensor_alloc_dl_only_unlocked(Q36_VK_TAB_TOTAL_BYTES);
+    if (!t) {
+        t = q36_vk_tensor_alloc_kind_unlocked(Q36_VK_TAB_TOTAL_BYTES, true);
+        if (!t) return NULL;
+        q36_vk_pack_iq_tables(t->data);
+    } else {
+        unsigned char *tmp = malloc(Q36_VK_TAB_TOTAL_BYTES);
+        if (!tmp) {
+            q36_vk_tensor_free_unlocked(t);
+            return NULL;
+        }
+        q36_vk_pack_iq_tables(tmp);
+        if (!q36_vk_write_tensor_staged(t, 0, tmp, Q36_VK_TAB_TOTAL_BYTES)) {
+            free(tmp);
+            q36_vk_tensor_free_unlocked(t);
+            return NULL;
+        }
+        free(tmp);
+    }
     q36_vk.iq_tables = t;
     return t;
 }
