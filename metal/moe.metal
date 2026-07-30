@@ -6920,7 +6920,7 @@ kernel void kernel_mul_mv_group24_q4_K_sum6_f32(
 // Builds the compact per-expert work map used by batched MoE matmul. Q36 routes
 // each token to a small fixed top-k list, so this turns token-major ids into
 // expert-major slices that the tiled matmul can consume.
-template<short ne20>
+template<short ne20, bool COMPACT = false>
 kernel void kernel_mul_mm_id_map0(
         constant q36_metal_args_mul_mm_id_map0 & args,
         device  const char * src2,
@@ -6972,9 +6972,40 @@ kernel void kernel_mul_mm_id_map0(
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
     tpe_u32[ide] = n_all;
+
+    // Build a compact list of active 32-row expert blocks.  The fixed-size
+    // dispatch includes a conservative tail; unused entries carry -1 and
+    // return before touching model or activation data.
+    if (COMPACT) {
+        threadgroup uint32_t * block_counts =
+            (threadgroup uint32_t *) shmem;
+        block_counts[ide] = (n_all + 31u) / 32u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ide == 0) {
+            device int32_t * blocks =
+                (device int32_t *) hids + args.ne02 * args.ne21;
+            uint32_t nb = 0;
+            for (int32_t expert = 0; expert < args.ne02; expert++) {
+                for (uint32_t block = 0; block < block_counts[expert]; block++) {
+                    blocks[2u * nb] = expert;
+                    blocks[2u * nb + 1u] = (int32_t)(block * 32u);
+                    nb++;
+                }
+            }
+            const uint32_t max_blocks =
+                ((uint32_t)args.ne21 * (uint32_t)args.ne20 + 31u) / 32u +
+                (uint32_t)args.ne02;
+            for (; nb < max_blocks; nb++) {
+                blocks[2u * nb] = -1;
+                blocks[2u * nb + 1u] = 0;
+            }
+        }
+    }
 }
 
 typedef decltype(kernel_mul_mm_id_map0<1>) kernel_mul_mm_id_map0_t;
+typedef decltype(kernel_mul_mm_id_map0<8, true>)
+    kernel_mul_mm_id_map0_compact_t;
 
 // Host-visible map builders for the routed-expert counts used by Q36 graph
 // shapes. Some arities are generic leftovers retained for nearby batch sizes.
@@ -6984,6 +7015,8 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_4" )]] kernel kernel_mul_mm_id_
 template [[host_name("kernel_mul_mm_id_map0_ne20_5" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_6" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8>;
+template [[host_name("kernel_mul_mm_id_map0_ne20_8_compact")]]
+kernel kernel_mul_mm_id_map0_compact_t kernel_mul_mm_id_map0<8, true>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
 template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
@@ -6991,7 +7024,7 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_
 // Batched routed-expert matmul. It reads the expert-major map produced above,
 // loads selected expert weights, and writes results back to token-major slots
 // so the Q36 FFN can apply SwiGLU, weighting, and the down projection.
-template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+template<short NR1, typename S0, typename S0_4x4, typename S0_8x8, typename S1, typename S1_2x4, typename S1_8x8, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &), typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool COMPACT = false>
 kernel void kernel_mul_mm_id(
         constant q36_metal_args_mul_mm_id & args,
         device const char * src0,
@@ -7015,12 +7048,23 @@ kernel void kernel_mul_mm_id(
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
 
-    const int im = tgpig.z;
-    const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
-
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+    int im;
+    int r1;
+    if (COMPACT) {
+        device const int32_t * blocks =
+            ids_i32 + args.ne02 * args.ne21;
+        im = blocks[2u * tgpig.z];
+        if (im < 0) {
+            return;
+        }
+        r1 = blocks[2u * tgpig.z + 1u];
+    } else {
+        im = tgpig.z;
+        r1 = tgpig.x * NR1;
+    }
+    const int r0 = tgpig.y*NR0;
 
     const int32_t neh1 = tpe_u32[im];
 
@@ -7624,6 +7668,7 @@ template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id
 template [[host_name("kernel_mul_mm_id_q5_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q5 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q5_K, QK_NL, dequantize_q5_K>;
 
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id;
+typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, true>) mul_mm_id_compact;
 typedef decltype(kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>) mul_mm_id_f16_rhs;
 typedef decltype(kernel_mul_mm_id<32, float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_ff32;
 typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>) mul_mm_id_addr;
@@ -7636,6 +7681,10 @@ template [[host_name("kernel_mul_mm_id_q4_K_f32")]]         kernel mul_mm_id ker
 template [[host_name("kernel_mul_mm_id_q5_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32")]]      kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q2_K_f32_compact")]]
+kernel mul_mm_id_compact kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4, true>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_compact")]]
+kernel mul_mm_id_compact kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4, true>;
 template [[host_name("kernel_mul_mm_id_q8_0_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    half, half4x4, half, half2x4>;

@@ -2404,8 +2404,13 @@ static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
     return 1;
 }
 
-static int q36_moe_ensure_id_map(uint32_t experts, uint32_t tokens) {
-    uint64_t bytes = (uint64_t)experts * (tokens + 1u) * sizeof(int32_t);
+static int q36_moe_ensure_id_map(
+        uint32_t experts, uint32_t tokens, uint32_t used) {
+    const uint64_t max_blocks =
+        ((uint64_t)tokens * used + 31u) / 32u + experts;
+    uint64_t bytes =
+        ((uint64_t)experts * (tokens + 1u) + 2u * max_blocks) *
+        sizeof(int32_t);
     if (bytes > NSUIntegerMax) return 0;
     if (q36_moe_id_map_bytes < bytes) {
         q36_moe_id_map = [q36_device
@@ -2472,11 +2477,13 @@ static int q36_moe_iq2_q2_gpu(
     const char *mm_env = getenv("Q36_METAL_MOE_MM");
     const bool use_mm = tokens >= 64u && !q36_micro_batch &&
         (!mm_env || mm_env[0] != '0');
+    const NSUInteger max_blocks =
+        (NSUInteger)(((uint64_t)tokens * used + 31u) / 32u + experts);
     q36_moe_mm_args gate_mm = {0};
     q36_moe_mm_args down_mm = {0};
     NSUInteger map_ids_offset = 0;
     if (use_mm) {
-        if (!q36_moe_ensure_id_map(experts, tokens)) return 0;
+        if (!q36_moe_ensure_id_map(experts, tokens, used)) return 0;
         map_ids_offset = (NSUInteger)experts * sizeof(int32_t);
         q36_moe_mm_map_args ma = {
             (int32_t)experts, (int32_t)in_dim, 1,
@@ -2486,11 +2493,12 @@ static int q36_moe_iq2_q2_gpu(
             (uint64_t)used * sizeof(int32_t)
         };
         id<MTLComputePipelineState> mp =
-            q36_pipeline_mm(@"kernel_mul_mm_id_map0_ne20_8", false, false);
+            q36_pipeline_mm(@"kernel_mul_mm_id_map0_ne20_8_compact",
+                            false, false);
         id<MTLComputeCommandEncoder> menc =
             mp ? [q36_batch computeCommandEncoder] : nil;
         if (!menc) return 0;
-        menc.label = @"kernel_mul_mm_id_map0_ne20_8";
+        menc.label = @"kernel_mul_mm_id_map0_ne20_8_compact";
         [menc setComputePipelineState:mp];
         [menc setBytes:&ma length:sizeof(ma) atIndex:0];
         [menc setBuffer:selected->buffer offset:selected->offset atIndex:1];
@@ -2514,7 +2522,8 @@ static int q36_moe_iq2_q2_gpu(
     q36_moe_mv_args ga =
         q36_moe_make_args(in_dim, mid_dim, experts, grb, geb, 1, used, tokens);
     id<MTLComputePipelineState> gp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_iq2_xxs_f32", false, true)
+        ? q36_pipeline_mm(@"kernel_mul_mm_id_iq2_xxs_f32_compact",
+                          false, true)
         : q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
     id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
@@ -2530,7 +2539,7 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u, (mid_dim + 63u) / 64u, experts)
+                1u, (mid_dim + 63u) / 64u, max_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
 
@@ -2545,7 +2554,7 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u, (mid_dim + 63u) / 64u, experts)
+                1u, (mid_dim + 63u) / 64u, max_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
     } else {
@@ -2588,7 +2597,8 @@ static int q36_moe_iq2_q2_gpu(
     q36_moe_mv_args da = q36_moe_make_args(
         mid_dim, out_dim, experts, drb, deb, used, used, tokens);
     id<MTLComputePipelineState> dp = use_mm
-        ? q36_pipeline_mm(@"kernel_mul_mm_id_q2_K_f32", false, true)
+        ? q36_pipeline_mm(@"kernel_mul_mm_id_q2_K_f32_compact",
+                          false, true)
         : q36_pipeline_nsg(
             down_sum ? @"kernel_mul_mv_id_q2_K_sum6_f32"
                      : @"kernel_mul_mv_id_q2_K_f32", 2);
@@ -2608,7 +2618,7 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:5];
         [enc setThreadgroupMemoryLength:8192u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (tokens + 31u) / 32u, (out_dim + 63u) / 64u, experts)
+                1u, (out_dim + 63u) / 64u, max_blocks)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
         [enc setBytes:&da length:sizeof(da) atIndex:0];
