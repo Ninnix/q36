@@ -159,6 +159,10 @@ projections, routing) are left untouched to guarantee quality. The resulting
 weight footprint is roughly 10-11 GB, which fits the BC-250 with room left
 for KV cache and OS.
 
+The higher-quality mixed model keeps that layout for layers 0..33 and uses
+`Q4_K` routed gate, up, and down tensors in layers 34..39. Its roughly 13 GB
+weight file is intended for SSD streaming on 16 GB machines.
+
 Download one main model.
 
 ```sh
@@ -272,8 +276,9 @@ A built-in or `Q36_VK_STREAMING_EXPERT_HOTLIST` profile biases eviction
 without reading expert weights at startup. It does not fill the cache with
 arbitrary experts when no profile exists. Use `--ssd-streaming-cold` for an
 empty cache, or `--ssd-streaming-preload-experts N` to request an explicit
-weight preload. Mixed expert-size models keep their unbiased policy because
-one profile cannot rank the incompatible cache paths consistently. The
+weight preload. Metal stores mixed expert sizes in component-wise padded cache
+slots, so the IQ2/Q2 and Q4 routed layers share one bounded cache and one
+hotlist policy. Vulkan retains its original single-size-class behavior. The
 `Q36_VK_STREAMING_EXPERT_HOTLIST` and
 `Q36_VK_DISABLE_STREAMING_EXPERT_HOTLIST` names are retained for compatibility
 and apply to both graph runtimes.
@@ -298,6 +303,11 @@ policy. `--ssd-streaming-cache-experts`, preload, cold-cache, and
 full-resident-layer controls therefore allocate and constrain real Metal
 buffers; they are not hints to macOS VM paging.
 
+For the mixed 13 GB model, each dynamic slot is sized for the largest routed
+tensor layout. Smaller IQ2/Q2 experts and the six Q4_K expert layers can remain
+cached together; changing precision at layer 34 does not reset the cache or
+fall back to the CPU.
+
 On a 16 GB Mac, start with the resident q2 model:
 
 ```sh
@@ -313,9 +323,10 @@ For the larger release GGUF, or on an 8 GB Mac, start conservatively:
 ```
 
 The automatic form uses `recommendedMaxWorkingSetSize`. The explicit example
-allocates about 0.42 GiB for this GGUF and leaves more headroom for the OS and
-KV state. Increase it only while memory pressure, swap, and responsiveness
-remain acceptable. A physical 8 GB Apple Silicon run is part of release QA;
+allocates about 0.42 GiB for the q2 model or 0.85 GiB for the mixed model,
+whose slots are padded for Q4_K. It leaves more headroom for the OS and KV
+state. Increase it only while memory pressure, swap, and responsiveness remain
+acceptable. A physical 8 GB Apple Silicon run is part of release QA;
 `--simulate-used-memory 8GB` on a larger Mac is diagnostic evidence, not a
 replacement.
 

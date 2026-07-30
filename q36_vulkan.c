@@ -3137,6 +3137,14 @@ void q36_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     }
     pthread_mutex_unlock(&q36_vk_mu);
 }
+void q36_gpu_set_streaming_expert_cache_layout(
+        uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    uint64_t total = 0;
+    if (gate_bytes <= UINT64_MAX - up_bytes &&
+        gate_bytes + up_bytes <= UINT64_MAX - down_bytes)
+        total = gate_bytes + up_bytes + down_bytes;
+    q36_gpu_set_streaming_expert_cache_expert_bytes(total);
+}
 
 uint64_t q36_gpu_recommended_working_set_size(void) {
     uint64_t best = 0;

@@ -74,6 +74,9 @@ static uint32_t q36_streaming_expert_budget;
 static uint32_t q36_streaming_expert_cap;
 static uint32_t q36_streaming_expert_count;
 static uint64_t q36_streaming_expert_bytes;
+static uint64_t q36_streaming_config_gate_bytes;
+static uint64_t q36_streaming_config_up_bytes;
+static uint64_t q36_streaming_config_down_bytes;
 static uint64_t q36_streaming_clock;
 static uint64_t q36_streaming_hits;
 static uint64_t q36_streaming_misses;
@@ -969,9 +972,9 @@ static void q36_streaming_cache_clear(bool clear_full_layers) {
 static bool q36_streaming_layout_matches(
         const q36_gpu_stream_expert_table *table) {
     return !q36_streaming_expert_cap ||
-           (q36_streaming_gate_bytes == table->gate_expert_bytes &&
-            q36_streaming_up_bytes == table->up_expert_bytes &&
-            q36_streaming_down_bytes == table->down_expert_bytes);
+           (q36_streaming_gate_bytes >= table->gate_expert_bytes &&
+            q36_streaming_up_bytes >= table->up_expert_bytes &&
+            q36_streaming_down_bytes >= table->down_expert_bytes);
 }
 
 static bool q36_streaming_cache_init(
@@ -985,23 +988,33 @@ static bool q36_streaming_cache_init(
         if (!q36_u64_add3(table->gate_expert_bytes,
                           table->up_expert_bytes,
                           table->down_expert_bytes, &total) ||
-            total != q36_streaming_expert_bytes) {
+            total > q36_streaming_expert_bytes) {
             return false;
         }
     }
 
+    const uint64_t gate_stride = q36_streaming_config_gate_bytes
+        ? q36_streaming_config_gate_bytes : table->gate_expert_bytes;
+    const uint64_t up_stride = q36_streaming_config_up_bytes
+        ? q36_streaming_config_up_bytes : table->up_expert_bytes;
+    const uint64_t down_stride = q36_streaming_config_down_bytes
+        ? q36_streaming_config_down_bytes : table->down_expert_bytes;
+    if (gate_stride < table->gate_expert_bytes ||
+        up_stride < table->up_expert_bytes ||
+        down_stride < table->down_expert_bytes)
+        return false;
     uint32_t cap = q36_streaming_expert_budget;
     const uint32_t max_entries =
         Q36_METAL_STREAM_MAX_LAYERS * Q36_METAL_STREAM_MAX_EXPERTS;
     if (cap > max_entries) cap = max_entries;
     while (cap) {
-        uint64_t gb = table->gate_expert_bytes * (uint64_t)cap;
-        uint64_t ub = table->up_expert_bytes * (uint64_t)cap;
-        uint64_t db = table->down_expert_bytes * (uint64_t)cap;
+        uint64_t gb = gate_stride * (uint64_t)cap;
+        uint64_t ub = up_stride * (uint64_t)cap;
+        uint64_t db = down_stride * (uint64_t)cap;
         bool overflow =
-            gb / cap != table->gate_expert_bytes ||
-            ub / cap != table->up_expert_bytes ||
-            db / cap != table->down_expert_bytes ||
+            gb / cap != gate_stride ||
+            ub / cap != up_stride ||
+            db / cap != down_stride ||
             gb > (uint64_t)NSUIntegerMax ||
             ub > (uint64_t)NSUIntegerMax ||
             db > (uint64_t)NSUIntegerMax;
@@ -1025,9 +1038,9 @@ static bool q36_streaming_cache_init(
             q36_streaming_up = up;
             q36_streaming_down = down;
             q36_streaming_expert_cap = cap;
-            q36_streaming_gate_bytes = table->gate_expert_bytes;
-            q36_streaming_up_bytes = table->up_expert_bytes;
-            q36_streaming_down_bytes = table->down_expert_bytes;
+            q36_streaming_gate_bytes = gate_stride;
+            q36_streaming_up_bytes = up_stride;
+            q36_streaming_down_bytes = down_stride;
             fprintf(stderr,
                     "q36: Metal SSD expert cache allocated %u slots (%.2f GiB)\n",
                     cap, (double)(gb + ub + db) / 1073741824.0);
@@ -1101,11 +1114,11 @@ static bool q36_streaming_load_slot(
     uint64_t doff = table->down_offset +
                     (uint64_t)expert * table->down_expert_bytes;
     uint8_t *gp = (uint8_t *)q36_streaming_gate.contents +
-                  (uint64_t)slot * table->gate_expert_bytes;
+                  (uint64_t)slot * q36_streaming_gate_bytes;
     uint8_t *up = (uint8_t *)q36_streaming_up.contents +
-                  (uint64_t)slot * table->up_expert_bytes;
+                  (uint64_t)slot * q36_streaming_up_bytes;
     uint8_t *dp = (uint8_t *)q36_streaming_down.contents +
-                  (uint64_t)slot * table->down_expert_bytes;
+                  (uint64_t)slot * q36_streaming_down_bytes;
     if (!q36_streaming_read(gp, table->gate_expert_bytes, go) ||
         !q36_streaming_read(up, table->up_expert_bytes, uo) ||
         !q36_streaming_read(dp, table->down_expert_bytes, doff)) {
@@ -1248,6 +1261,25 @@ void q36_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
         (void)q36_metal_wait();
         q36_streaming_cache_clear(false);
         q36_streaming_expert_bytes = bytes;
+        q36_streaming_config_gate_bytes = 0;
+        q36_streaming_config_up_bytes = 0;
+        q36_streaming_config_down_bytes = 0;
+    }
+}
+void q36_gpu_set_streaming_expert_cache_layout(
+        uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    uint64_t total = 0;
+    if (!q36_u64_add3(gate_bytes, up_bytes, down_bytes, &total)) total = 0;
+    if (gate_bytes != q36_streaming_config_gate_bytes ||
+        up_bytes != q36_streaming_config_up_bytes ||
+        down_bytes != q36_streaming_config_down_bytes ||
+        total != q36_streaming_expert_bytes) {
+        (void)q36_metal_wait();
+        q36_streaming_cache_clear(false);
+        q36_streaming_config_gate_bytes = gate_bytes;
+        q36_streaming_config_up_bytes = up_bytes;
+        q36_streaming_config_down_bytes = down_bytes;
+        q36_streaming_expert_bytes = total;
     }
 }
 uint32_t q36_gpu_stream_expert_cache_configured_count(void) {
@@ -1282,7 +1314,13 @@ uint32_t q36_gpu_stream_expert_cache_budget_for_expert_size(
     uint64_t total = 0;
     if (!q36_u64_add3(gate_bytes, up_bytes, down_bytes, &total) ||
         (q36_streaming_expert_bytes &&
-         q36_streaming_expert_bytes != total)) return 0;
+         q36_streaming_expert_bytes < total) ||
+        (q36_streaming_config_gate_bytes &&
+         q36_streaming_config_gate_bytes < gate_bytes) ||
+        (q36_streaming_config_up_bytes &&
+         q36_streaming_config_up_bytes < up_bytes) ||
+        (q36_streaming_config_down_bytes &&
+         q36_streaming_config_down_bytes < down_bytes)) return 0;
     return q36_gpu_stream_expert_cache_configured_count();
 }
 
@@ -2941,6 +2979,9 @@ typedef struct {
     id<MTLBuffer> gate;
     id<MTLBuffer> up;
     id<MTLBuffer> down;
+    uint64_t gate_expert_stride;
+    uint64_t up_expert_stride;
+    uint64_t down_expert_stride;
     id<MTLBuffer> selected;
     NSUInteger selected_offset;
     uint32_t experts;
@@ -2958,6 +2999,9 @@ static bool q36_moe_stream_binding(
         uint64_t up_expert_bytes, uint64_t down_expert_bytes) {
     if (!binding || !selected) return false;
     *binding = (q36_metal_stream_binding) {
+        .gate_expert_stride = gate_expert_bytes,
+        .up_expert_stride = up_expert_bytes,
+        .down_expert_stride = down_expert_bytes,
         .selected = selected->buffer,
         .selected_offset = (NSUInteger)selected->offset,
         .experts = experts,
@@ -3028,6 +3072,9 @@ static bool q36_moe_stream_binding(
     binding->gate = q36_streaming_gate;
     binding->up = q36_streaming_up;
     binding->down = q36_streaming_down;
+    binding->gate_expert_stride = q36_streaming_gate_bytes;
+    binding->up_expert_stride = q36_streaming_up_bytes;
+    binding->down_expert_stride = q36_streaming_down_bytes;
     binding->experts = q36_streaming_expert_cap;
     pthread_mutex_unlock(&q36_stream_mu);
     binding->selected = mapped_buffer;
@@ -3036,7 +3083,7 @@ static bool q36_moe_stream_binding(
            binding->experts != 0;
 }
 
-static int q36_moe_iq2_q2_gpu(
+static int q36_moe_gpu(
         q36_gpu_tensor *out, const void *map, uint64_t size,
         const q36_gpu_moe_weight *gate, const q36_gpu_moe_weight *up,
         const q36_gpu_moe_weight *down, const q36_gpu_tensor *selected,
@@ -3044,12 +3091,17 @@ static int q36_moe_iq2_q2_gpu(
         const q36_gpu_tensor *x, uint32_t tokens, uint32_t in_dim,
         uint32_t mid_dim, uint32_t out_dim, uint32_t experts,
         uint32_t layer) {
-    if (!out || !map || !gate || !up || !down || !selected || !route_weights || !x ||
-        !used || !tokens || gate->type != 16u || up->type != 16u ||
-        down->type != 10u || (in_dim & 255u) || (mid_dim & 255u)) return 0;
-    const uint64_t grb = q36_quant_row_bytes(16u, in_dim);
-    const uint64_t urb = q36_quant_row_bytes(16u, in_dim);
-    const uint64_t drb = q36_quant_row_bytes(10u, mid_dim);
+    if (!out || !map || !gate || !up || !down || !selected ||
+        !route_weights || !x || !used || !tokens ||
+        (in_dim & 255u) || (mid_dim & 255u)) return 0;
+    const bool iq2_q2 =
+        gate->type == 16u && up->type == 16u && down->type == 10u;
+    const bool q4 =
+        gate->type == 12u && up->type == 12u && down->type == 12u;
+    if (!iq2_q2 && !q4) return 0;
+    const uint64_t grb = q36_quant_row_bytes(gate->type, in_dim);
+    const uint64_t urb = q36_quant_row_bytes(up->type, in_dim);
+    const uint64_t drb = q36_quant_row_bytes(down->type, mid_dim);
     const uint64_t geb = grb * mid_dim, ueb = urb * mid_dim, deb = drb * out_dim;
     const uint64_t pairs = (uint64_t)tokens * used;
     if (gate->offset > size || geb * experts > size - gate->offset ||
@@ -3073,6 +3125,13 @@ static int q36_moe_iq2_q2_gpu(
     id<MTLBuffer> gb = stream.gate;
     id<MTLBuffer> ub = stream.up;
     id<MTLBuffer> db = stream.down;
+    uint64_t gate_stride = stream.gate_expert_stride;
+    uint64_t up_stride = stream.up_expert_stride;
+    uint64_t down_stride = stream.down_expert_stride;
+    /* The paired gate/up kernels share one expert-stride field.  Q36 model
+     * layouts keep these tensors symmetric; reject malformed asymmetric
+     * layouts instead of indexing the up buffer with the gate stride. */
+    if (gate_stride != up_stride) return 0;
     if (!q36_ssd_streaming) {
         gb = q36_model_view(map, size, gate->offset, geb * experts, &go);
         ub = q36_model_view(map, size, up->offset, ueb * experts, &uo);
@@ -3086,7 +3145,7 @@ static int q36_moe_iq2_q2_gpu(
 
     const char *mm_env = getenv("Q36_METAL_MOE_MM");
     const char *compact_env = getenv("Q36_METAL_MOE_COMPACT");
-    const bool compact = used == 8u &&
+    const bool compact = iq2_q2 && used == 8u &&
         (!compact_env || compact_env[0] != '0');
     const char *map_name = q36_moe_mm_map_name(used, compact);
     bool use_mm = tokens >= 64u && !q36_micro_batch && map_name &&
@@ -3098,12 +3157,14 @@ static int q36_moe_iq2_q2_gpu(
         map_pipeline = q36_pipeline_mm(
             [NSString stringWithUTF8String:map_name], false, false);
         gate_pipeline = q36_pipeline_mm(
-            compact ? @"kernel_mul_mm_id_iq2_xxs_f32_compact"
-                    : @"kernel_mul_mm_id_iq2_xxs_f32",
+            compact ? @"kernel_mul_mm_id_iq2_xxs_f32_compact" :
+            (q4 ? @"kernel_mul_mm_id_q4_K_f32"
+                : @"kernel_mul_mm_id_iq2_xxs_f32"),
             false, true);
         down_pipeline = q36_pipeline_mm(
-            compact ? @"kernel_mul_mm_id_q2_K_f32_compact"
-                    : @"kernel_mul_mm_id_q2_K_f32",
+            compact ? @"kernel_mul_mm_id_q2_K_f32_compact" :
+            (q4 ? @"kernel_mul_mm_id_q4_K_f32"
+                : @"kernel_mul_mm_id_q2_K_f32"),
             false, true);
         const uint64_t map_shmem =
             (uint64_t)weight_experts * used * sizeof(uint16_t);
@@ -3149,9 +3210,10 @@ static int q36_moe_iq2_q2_gpu(
              threadsPerThreadgroup:MTLSizeMake(weight_experts, 1, 1)];
         [menc endEncoding];
         gate_mm = q36_moe_make_mm_args(
-            in_dim, mid_dim, weight_experts, grb, geb, 1, used, tokens);
+            in_dim, mid_dim, weight_experts, grb, gate_stride,
+            1, used, tokens);
         down_mm = q36_moe_make_mm_args(
-            mid_dim, out_dim, weight_experts, drb, deb,
+            mid_dim, out_dim, weight_experts, drb, down_stride,
             used, used, tokens);
         mm_blocks = compact
             ? (NSUInteger)(((uint64_t)tokens * used + 31u) / 32u +
@@ -3165,10 +3227,13 @@ static int q36_moe_iq2_q2_gpu(
      * during decode). */
     q36_moe_mv_args ga =
         q36_moe_make_args(in_dim, mid_dim, weight_experts,
-                          grb, geb, 1, used, tokens);
+                          grb, gate_stride, 1, used, tokens);
+    ga.nr0 = q4 ? 2 : 4;
     id<MTLComputePipelineState> gp = use_mm
         ? gate_pipeline
-        : q36_pipeline_nsg(@"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
+        : q36_pipeline_nsg(
+            q4 ? @"kernel_mul_mv_id_q4_K_pair_f32"
+               : @"kernel_mul_mv_id_iq2_xxs_pair_f32", 2);
     id<MTLComputeCommandEncoder> enc = gp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
     enc.label = use_mm
@@ -3213,9 +3278,10 @@ static int q36_moe_iq2_q2_gpu(
         [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:5];
         [enc setBuffer:weight_selected
                  offset:weight_selected_offset atIndex:6];
-        [enc setThreadgroupMemoryLength:2176u atIndex:0];
+        [enc setThreadgroupMemoryLength:q4 ? 0u : 2176u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (mid_dim + 7u) / 8u, 1, (NSUInteger)pairs)
+                (mid_dim + (q4 ? 3u : 7u)) / (q4 ? 4u : 8u),
+                1, (NSUInteger)pairs)
              threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         [enc endEncoding];
     }
@@ -3244,12 +3310,16 @@ static int q36_moe_iq2_q2_gpu(
 
     q36_moe_mv_args da = q36_moe_make_args(
         mid_dim, out_dim, weight_experts,
-        drb, deb, used, used, tokens);
+        drb, down_stride, used, used, tokens);
+    da.nr0 = q4 ? 2 : 4;
     id<MTLComputePipelineState> dp = use_mm
         ? down_pipeline
         : q36_pipeline_nsg(
-            down_sum ? @"kernel_mul_mv_id_q2_K_sum6_f32"
-                     : @"kernel_mul_mv_id_q2_K_f32", 2);
+            down_sum
+                ? (q4 ? @"kernel_mul_mv_id_q4_K_sum6_f32"
+                      : @"kernel_mul_mv_id_q2_K_sum6_f32")
+                : (q4 ? @"kernel_mul_mv_id_q4_K_f32"
+                      : @"kernel_mul_mv_id_q2_K_f32"), 2);
     enc = dp ? [q36_batch computeCommandEncoder] : nil;
     if (!enc) return 0;
     enc.label = use_mm
@@ -3282,11 +3352,13 @@ static int q36_moe_iq2_q2_gpu(
     if (down_sum) {
         [enc setBuffer:out->buffer offset:out->offset atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(
-                (out_dim + 7u) / 8u, tokens, 1)
+                (out_dim + (q4 ? 3u : 7u)) / (q4 ? 4u : 8u),
+                tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     } else if (!use_mm) {
         [enc dispatchThreadgroups:MTLSizeMake(
-                (out_dim + 7u) / 8u, 1, (NSUInteger)pairs)
+                (out_dim + (q4 ? 3u : 7u)) / (q4 ? 4u : 8u),
+                1, (NSUInteger)pairs)
              threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
     }
     [enc endEncoding];
@@ -3403,13 +3475,15 @@ int q36_gpu_moe_ffn_f32_tensor(
         uint32_t tokens, uint32_t in_dim, uint32_t mid_dim,
         uint32_t out_dim, uint32_t experts) {
     const char *gpu_moe = getenv("Q36_METAL_MOE_GPU");
+    const char *gpu_moe_required = getenv("Q36_METAL_MOE_GPU_REQUIRED");
     const char *force_mv = getenv("Q36_VK_MOE_GEMM");
     if ((!gpu_moe || gpu_moe[0] != '0') &&
         (!force_mv || force_mv[0] != '0') &&
-        q36_moe_iq2_q2_gpu(out, map, size, gate, up, down, selected, weights,
-                            used, x, tokens, in_dim, mid_dim, out_dim, experts,
-                            layer))
+        q36_moe_gpu(out, map, size, gate, up, down, selected, weights,
+                    used, x, tokens, in_dim, mid_dim, out_dim, experts,
+                    layer))
         return 1;
+    if (gpu_moe_required && gpu_moe_required[0] != '0') return 0;
     const float *xp = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
     return xp && q36_moe_host(out, map, size, gate, up, down,
                               selected, weights, used, xp, tokens,

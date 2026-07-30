@@ -3494,28 +3494,74 @@ static bool q36_streaming_layer_routed_expert_bytes(const q36_layer_weights *lay
     return total != 0;
 }
 
-static bool q36_streaming_routed_expert_bytes(const q36_weights *weights,
-                                              uint64_t *per_expert_bytes_out) {
+static bool q36_streaming_routed_expert_layout(
+        const q36_weights *weights,
+        uint64_t *gate_bytes_out, uint64_t *up_bytes_out,
+        uint64_t *down_bytes_out, uint64_t *per_expert_bytes_out) {
+    uint64_t max_gate = 0, max_up = 0, max_down = 0, total = 0;
+    if (gate_bytes_out) *gate_bytes_out = 0;
+    if (up_bytes_out) *up_bytes_out = 0;
+    if (down_bytes_out) *down_bytes_out = 0;
     if (per_expert_bytes_out) *per_expert_bytes_out = 0;
     if (!weights || !per_expert_bytes_out) return false;
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
-        if (q36_streaming_layer_routed_expert_bytes(&weights->layer[il], NULL, NULL, NULL,
-                                                    per_expert_bytes_out)) {
-            return true;
+        uint64_t gate = 0, up = 0, down = 0;
+        if (q36_streaming_layer_routed_expert_bytes(
+                &weights->layer[il], &gate, &up, &down, NULL)) {
+#ifdef Q36_METAL
+            if (gate > max_gate) max_gate = gate;
+            if (up > max_up) max_up = up;
+            if (down > max_down) max_down = down;
+#else
+            /* Preserve the Vulkan single-size-class cache ABI. */
+            max_gate = gate;
+            max_up = up;
+            max_down = down;
+            break;
+#endif
         }
     }
-    return false;
+    if (max_gate > UINT64_MAX - max_up) return false;
+    total = max_gate + max_up;
+    if (total > UINT64_MAX - max_down) return false;
+    total += max_down;
+    if (gate_bytes_out) *gate_bytes_out = max_gate;
+    if (up_bytes_out) *up_bytes_out = max_up;
+    if (down_bytes_out) *down_bytes_out = max_down;
+    *per_expert_bytes_out = total;
+    return total != 0;
+}
+
+static bool q36_streaming_routed_expert_bytes(const q36_weights *weights,
+                                              uint64_t *per_expert_bytes_out) {
+    return q36_streaming_routed_expert_layout(
+        weights, NULL, NULL, NULL, per_expert_bytes_out);
 }
 
 #ifndef Q36_NO_GPU
-static bool q36_weights_streaming_layer_experts_uniform(const q36_weights *weights,
-                                                        uint32_t il) {
+static bool q36_weights_streaming_layer_experts_uniform(
+        const q36_weights *weights, uint32_t il) {
+#ifdef Q36_METAL
+    (void)weights;
+    (void)il;
+    /* Metal uses component-wise padded expert slots, so every routed
+     * precision class is cache-compatible. */
+    return true;
+#else
     uint64_t base = 0;
     uint64_t bytes = 0;
     if (!weights || il >= Q36_N_LAYER) return true;
-    if (!q36_streaming_routed_expert_bytes(weights, &base)) return true;
-    if (!q36_streaming_layer_routed_expert_bytes(&weights->layer[il], NULL, NULL, NULL, &bytes)) return true;
+    for (uint32_t base_il = 0; base_il < Q36_N_LAYER; base_il++) {
+        if (q36_streaming_layer_routed_expert_bytes(
+                &weights->layer[base_il], NULL, NULL, NULL, &base))
+            break;
+    }
+    if (base == 0 ||
+        !q36_streaming_layer_routed_expert_bytes(
+            &weights->layer[il], NULL, NULL, NULL, &bytes))
+        return true;
     return bytes == base;
+#endif
 }
 
 static bool q36_streaming_full_layer_budget(const q36_weights *weights,
@@ -8075,29 +8121,20 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
                                           e->ssd_streaming_full_layers : 0);
         q36_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         if (e->ssd_streaming) {
-            uint64_t slab_expert_bytes = 0;
-            if (q36_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
-                q36_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
-                uint32_t routed = 0, boosted = 0;
+            uint64_t slab_gate_bytes = 0, slab_up_bytes = 0;
+            uint64_t slab_down_bytes = 0, slab_expert_bytes = 0;
+            if (q36_streaming_routed_expert_layout(
+                    &e->weights, &slab_gate_bytes, &slab_up_bytes,
+                    &slab_down_bytes, &slab_expert_bytes)) {
+                q36_gpu_set_streaming_expert_cache_layout(
+                    slab_gate_bytes, slab_up_bytes, slab_down_bytes);
+                uint32_t routed = 0;
                 for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
                     const q36_layer_weights *l = &e->weights.layer[il];
                     if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
                     routed++;
-                    if (!q36_weights_streaming_layer_experts_uniform(&e->weights, il)) boosted++;
                 }
-                if (boosted > 0) {
-                    fprintf(stderr,
-                            "q36: SSD streaming mixed-precision model: %u/%u routed layers off the slab size class will bypass the expert cache\n",
-                            boosted,
-                            routed);
-                }
-                if (boosted * 2 > routed && routed != 0) {
-                    fprintf(stderr,
-                            "q36: WARNING: most routed layers (%u/%u) are off the SSD streaming slab size class; expert-cache hit rate will be poor\n",
-                            boosted,
-                            routed);
-                }
-                uint32_t cache_floor = 2u * (routed - boosted) * Q36_N_EXPERT_USED;
+                uint32_t cache_floor = 2u * routed * Q36_N_EXPERT_USED;
                 if (e->ssd_streaming_cache_experts < cache_floor) {
                     fprintf(stderr,
                             "q36: WARNING: SSD streaming cache has %u experts; %u are recommended to retain two decode routes per cacheable layer\n",

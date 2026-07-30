@@ -62,6 +62,9 @@ void q36_gpu_set_ssd_streaming(bool enabled);
 void q36_gpu_set_streaming_full_layers(uint32_t layers);
 void q36_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void q36_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+void q36_gpu_set_streaming_expert_cache_layout(uint64_t gate_bytes,
+                                               uint64_t up_bytes,
+                                               uint64_t down_bytes);
 uint64_t q36_gpu_recommended_working_set_size(void);
 uint32_t q36_gpu_stream_expert_cache_configured_count(void);
 uint32_t q36_gpu_stream_expert_cache_current_count(void);
