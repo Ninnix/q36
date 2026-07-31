@@ -2902,15 +2902,21 @@ static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
     if (pair_bytes > NSUIntegerMax || down_bytes > NSUIntegerMax) return 0;
     if (q36_moe_pair_scratch_bytes < pair_bytes) {
         q36_moe_gate_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
-        q36_moe_up_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
-        if (!q36_moe_gate_scratch || !q36_moe_up_scratch) return 0;
+        if (!q36_moe_gate_scratch) return 0;
         q36_moe_pair_scratch_bytes = (NSUInteger)pair_bytes;
     }
-    if (q36_moe_down_scratch_bytes < down_bytes) {
-        q36_moe_down_scratch = [q36_device newBufferWithLength:(NSUInteger)down_bytes options:MTLResourceStorageModePrivate];
+    /* Up activations are consumed when the in-place SiLU writes gate scratch;
+     * only then does down projection need its output buffer. Reuse the down
+     * allocation for up, keeping gate/mid separate because down reads it. */
+    const uint64_t shared_bytes = down_bytes > pair_bytes ? down_bytes : pair_bytes;
+    if (q36_moe_down_scratch_bytes < shared_bytes) {
+        q36_moe_down_scratch = [q36_device
+            newBufferWithLength:(NSUInteger)shared_bytes
+                        options:MTLResourceStorageModePrivate];
         if (!q36_moe_down_scratch) return 0;
-        q36_moe_down_scratch_bytes = (NSUInteger)down_bytes;
+        q36_moe_down_scratch_bytes = (NSUInteger)shared_bytes;
     }
+    q36_moe_up_scratch = q36_moe_down_scratch;
     return 1;
 }
 

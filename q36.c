@@ -1172,28 +1172,40 @@ static uint64_t q36_vulkan_scratch_bytes(
         q36_kv_cache_type cache_type_k,
         q36_kv_cache_type cache_type_v) {
     uint64_t bytes = 0;
+    uint64_t metal_attention_bytes = backend == Q36_BACKEND_METAL ?
+        q36_metal_attention_scratch_bytes(
+            ctx, cap, cache_type_k, cache_type_v) : 0;
     bytes += (uint64_t)cap * Q36_N_EMBD * 5u * sizeof(float);
     bytes += (uint64_t)Q36_N_EMBD * sizeof(float);
-    bytes += (uint64_t)cap *
-             ((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) *
-             Q36_VK_Q8_K_BYTES;
+    if (backend != Q36_BACKEND_METAL) {
+        bytes += (uint64_t)cap *
+                 ((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) *
+                 Q36_VK_Q8_K_BYTES;
+    }
     bytes += (uint64_t)cap *
              (Q36_N_HEAD * Q36_N_HEAD_DIM * 4u +
-              Q36_N_HEAD_KV * (Q36_N_HEAD_DIM + Q36_N_VALUE_DIM)) *
+              (backend == Q36_BACKEND_METAL ? 0u : Q36_N_HEAD_KV) *
+                  (Q36_N_HEAD_DIM + Q36_N_VALUE_DIM)) *
              sizeof(float);
-    bytes += (uint64_t)cap *
-             (Q36_N_SSM_CONV_DIM +
-              Q36_N_SSM_INNER * 3u +
-              Q36_N_SSM_DT_RANK * 4u) *
-             sizeof(float);
-    bytes += (uint64_t)cap *
-             (Q36_N_EXPERT + Q36_N_EXPERT_USED * 2u +
-              Q36_N_FF_SHARED * 2u + Q36_N_EMBD + 1u) *
-             sizeof(float);
+    bytes += (uint64_t)cap * Q36_N_SSM_INNER *
+             (backend == Q36_BACKEND_METAL ? 1u : 3u) * sizeof(float);
+    {
+        uint64_t recurrent_aux_bytes = (uint64_t)cap *
+            (Q36_N_SSM_CONV_DIM + Q36_N_SSM_DT_RANK * 4u) * sizeof(float);
+        if (backend != Q36_BACKEND_METAL ||
+            metal_attention_bytes < recurrent_aux_bytes) {
+            bytes += recurrent_aux_bytes;
+        }
+    }
+    if (backend != Q36_BACKEND_METAL) {
+        bytes += (uint64_t)cap *
+                 (Q36_N_EXPERT + Q36_N_EXPERT_USED * 2u +
+                  Q36_N_FF_SHARED * 2u + Q36_N_EMBD + 1u) *
+                 sizeof(float);
+    }
     bytes += (uint64_t)Q36_N_VOCAB * sizeof(float);
     if (backend == Q36_BACKEND_METAL) {
-        bytes += q36_metal_attention_scratch_bytes(
-            ctx, cap, cache_type_k, cache_type_v);
+        bytes += metal_attention_bytes;
     } else {
         bytes += (uint64_t)cap * Q36_N_HEAD *
                  ((ctx + 8191u) / 8192u) *
@@ -4669,46 +4681,26 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALLOC_F32(norm, Q36_N_EMBD);
     rt->last_h = q36_gpu_tensor_alloc((uint64_t)Q36_N_EMBD * sizeof(float));
     if (!rt->last_h) goto fail;
+#ifdef Q36_METAL
+    Q36_GPU_ALLOC_F32(recur_v, Q36_N_SSM_INNER);
+    {
+        const uint64_t attn_kv_bytes =
+            (uint64_t)Q36_N_HEAD_KV *
+            (Q36_N_HEAD_DIM + Q36_N_VALUE_DIM) *
+            prefill_cap * sizeof(float);
+        const uint64_t inp_q8_bytes =
+            (uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) *
+            Q36_VK_Q8_K_BYTES * prefill_cap;
+        rt->inp_q8 = q36_gpu_tensor_view(
+            rt->recur_v, attn_kv_bytes, inp_q8_bytes);
+        if (!rt->inp_q8) goto fail;
+    }
+#else
     rt->inp_q8 = q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
     if (!rt->inp_q8) goto fail;
-    Q36_GPU_ALLOC_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
-    Q36_GPU_ALLOC_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
-    Q36_GPU_ALLOC_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
-    Q36_GPU_ALLOC_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
-    Q36_GPU_ALLOC_F32(attn_out, Q36_N_SSM_INNER);
-    /* A layer is attention or recurrent, never both. These equal-sized
-     * views remove 64 MiB of mutually exclusive 1024-row scratch. */
-    rt->recur_qkv = q36_gpu_tensor_view(rt->attn_qg, 0,
-        (uint64_t)Q36_N_SSM_CONV_DIM * prefill_cap * sizeof(float));
-    if (!rt->recur_qkv) goto fail;
-    if (!rt->recur_conv_fused)
-        Q36_GPU_ALLOC_F32(recur_window, (uint64_t)Q36_N_SSM_CONV * Q36_N_SSM_CONV_DIM);
-    Q36_GPU_ALLOC_F32(recur_conv, Q36_N_SSM_CONV_DIM);
-    rt->recur_z = q36_gpu_tensor_view(rt->attn_q, 0,
-        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
-    if (!rt->recur_z) goto fail;
-    Q36_GPU_ALLOC_F32(recur_alpha, Q36_N_SSM_DT_RANK);
-    Q36_GPU_ALLOC_F32(recur_beta, Q36_N_SSM_DT_RANK);
-    Q36_GPU_ALLOC_F32(recur_gb, Q36_N_SSM_DT_RANK * 2u);
-    Q36_GPU_ALLOC_F32(recur_q, Q36_N_SSM_INNER);
-    Q36_GPU_ALLOC_F32(recur_k, Q36_N_SSM_INNER);
-    Q36_GPU_ALLOC_F32(recur_v, Q36_N_SSM_INNER);
-    rt->recur_proj = q36_gpu_tensor_view(rt->attn_out, 0,
-        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
-    if (!rt->recur_proj) goto fail;
-    Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
-    Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
-    Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
-    Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
-    rt->ffn_shared_mid = q36_gpu_tensor_view(rt->ffn_shared_gate, 0,
-        (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
-    if (!rt->ffn_shared_mid) goto fail;
-    Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
-    Q36_GPU_ALLOC_F32(ffn_scalar, 1);
-    /* Fused attention needs no scores tensor. Metal sizes its tensor below
-     * for the dense prefix and grouped long-context kernels rather than the
-     * much larger chunk-by-context matrix. */
+#endif
+    /* Allocate attention partials before recurrent scratch: on Metal, large
+     * contexts can reuse this owner on layers where attention is inactive. */
     if (!q36_gpu_attn_fused_enabled()) {
 #ifdef Q36_METAL
         uint64_t score_bytes = q36_metal_attention_scratch_bytes(
@@ -4719,6 +4711,127 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         Q36_GPU_ALLOC_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
 #endif
     }
+    Q36_GPU_ALLOC_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
+    Q36_GPU_ALLOC_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
+#ifdef Q36_METAL
+    rt->attn_k = q36_gpu_tensor_view(rt->recur_v, 0,
+        (uint64_t)Q36_N_HEAD_KV * Q36_N_HEAD_DIM *
+            prefill_cap * sizeof(float));
+    rt->attn_v = q36_gpu_tensor_view(rt->recur_v,
+        (uint64_t)Q36_N_HEAD_KV * Q36_N_HEAD_DIM *
+            prefill_cap * sizeof(float),
+        (uint64_t)Q36_N_HEAD_KV * Q36_N_VALUE_DIM *
+            prefill_cap * sizeof(float));
+    if (!rt->attn_k || !rt->attn_v) goto fail;
+#else
+    Q36_GPU_ALLOC_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+    Q36_GPU_ALLOC_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
+#endif
+    Q36_GPU_ALLOC_F32(attn_out, Q36_N_SSM_INNER);
+    /* A layer is attention or recurrent, never both. These equal-sized
+     * views remove 64 MiB of mutually exclusive 1024-row scratch. */
+    rt->recur_qkv = q36_gpu_tensor_view(rt->attn_qg, 0,
+        (uint64_t)Q36_N_SSM_CONV_DIM * prefill_cap * sizeof(float));
+    if (!rt->recur_qkv) goto fail;
+    if (!rt->recur_conv_fused)
+        Q36_GPU_ALLOC_F32(recur_window, (uint64_t)Q36_N_SSM_CONV * Q36_N_SSM_CONV_DIM);
+#ifdef Q36_METAL
+    {
+        const uint64_t conv_bytes =
+            (uint64_t)Q36_N_SSM_CONV_DIM * prefill_cap * sizeof(float);
+        const uint64_t alpha_bytes =
+            (uint64_t)Q36_N_SSM_DT_RANK * prefill_cap * sizeof(float);
+        const uint64_t gb_bytes = alpha_bytes * 2u;
+        const uint64_t aux_bytes = conv_bytes + alpha_bytes * 2u + gb_bytes;
+        if (rt->scores && q36_gpu_tensor_bytes(rt->scores) >= aux_bytes) {
+            uint64_t offset = 0;
+            rt->recur_conv = q36_gpu_tensor_view(
+                rt->scores, offset, conv_bytes);
+            offset += conv_bytes;
+            rt->recur_alpha = q36_gpu_tensor_view(
+                rt->scores, offset, alpha_bytes);
+            offset += alpha_bytes;
+            rt->recur_beta = q36_gpu_tensor_view(
+                rt->scores, offset, alpha_bytes);
+            offset += alpha_bytes;
+            rt->recur_gb = q36_gpu_tensor_view(
+                rt->scores, offset, gb_bytes);
+            if (!rt->recur_conv || !rt->recur_alpha ||
+                !rt->recur_beta || !rt->recur_gb) goto fail;
+        } else {
+            Q36_GPU_ALLOC_F32(recur_conv, Q36_N_SSM_CONV_DIM);
+            Q36_GPU_ALLOC_F32(recur_alpha, Q36_N_SSM_DT_RANK);
+            Q36_GPU_ALLOC_F32(recur_beta, Q36_N_SSM_DT_RANK);
+            Q36_GPU_ALLOC_F32(recur_gb, Q36_N_SSM_DT_RANK * 2u);
+        }
+    }
+#else
+    Q36_GPU_ALLOC_F32(recur_conv, Q36_N_SSM_CONV_DIM);
+#endif
+    rt->recur_z = q36_gpu_tensor_view(rt->attn_q, 0,
+        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
+    if (!rt->recur_z) goto fail;
+#ifndef Q36_METAL
+    Q36_GPU_ALLOC_F32(recur_alpha, Q36_N_SSM_DT_RANK);
+    Q36_GPU_ALLOC_F32(recur_beta, Q36_N_SSM_DT_RANK);
+    Q36_GPU_ALLOC_F32(recur_gb, Q36_N_SSM_DT_RANK * 2u);
+#endif
+#ifdef Q36_METAL
+    /* Recurrent QKV is dead once convolution has produced recur_conv.  The
+     * following delta-net stage needs Q and K simultaneously, so split that
+     * now-dead 8192-float row into two 4096-float views.  Command-buffer
+     * ordering keeps the reuse after convolution without adding a wait. */
+    rt->recur_q = q36_gpu_tensor_view(rt->attn_qg, 0,
+        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
+    rt->recur_k = q36_gpu_tensor_view(rt->attn_qg,
+        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float),
+        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
+    if (!rt->recur_q || !rt->recur_k) goto fail;
+#else
+    Q36_GPU_ALLOC_F32(recur_q, Q36_N_SSM_INNER);
+    Q36_GPU_ALLOC_F32(recur_k, Q36_N_SSM_INNER);
+#endif
+#ifndef Q36_METAL
+    Q36_GPU_ALLOC_F32(recur_v, Q36_N_SSM_INNER);
+#endif
+    rt->recur_proj = q36_gpu_tensor_view(rt->attn_out, 0,
+        (uint64_t)Q36_N_SSM_INNER * prefill_cap * sizeof(float));
+    if (!rt->recur_proj) goto fail;
+#ifdef Q36_METAL
+    /* FFN starts after attention/recurrent output and the residual norm, so
+     * their QGV storage is dead for the rest of the layer. Pack all FFN
+     * control/shared tensors into non-overlapping views of that 32 MiB owner. */
+    uint64_t ffn_alias_offset = 0;
+#define Q36_GPU_ALIAS_FFN(field, n, type) do { \
+        uint64_t alias_bytes = (uint64_t)(n) * prefill_cap * sizeof(type); \
+        rt->field = q36_gpu_tensor_view( \
+            rt->attn_qg, ffn_alias_offset, alias_bytes); \
+        if (!rt->field) goto fail; \
+        ffn_alias_offset += alias_bytes; \
+    } while (0)
+    Q36_GPU_ALIAS_FFN(ffn_gate_logits, Q36_N_EXPERT, float);
+    Q36_GPU_ALIAS_FFN(ffn_selected, Q36_N_EXPERT_USED, uint32_t);
+    Q36_GPU_ALIAS_FFN(ffn_weights, Q36_N_EXPERT_USED, float);
+    Q36_GPU_ALIAS_FFN(ffn_shared_gate, Q36_N_FF_SHARED, float);
+    Q36_GPU_ALIAS_FFN(ffn_shared_up, Q36_N_FF_SHARED, float);
+#else
+    Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
+    Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
+    Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
+    Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
+#endif
+    rt->ffn_shared_mid = q36_gpu_tensor_view(rt->ffn_shared_gate, 0,
+        (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
+    if (!rt->ffn_shared_mid) goto fail;
+#ifdef Q36_METAL
+    Q36_GPU_ALIAS_FFN(ffn_shared_out, Q36_N_EMBD, float);
+    Q36_GPU_ALIAS_FFN(ffn_scalar, 1, float);
+#undef Q36_GPU_ALIAS_FFN
+#else
+    Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
+    Q36_GPU_ALLOC_F32(ffn_scalar, 1);
+#endif
     rt->logits = q36_gpu_tensor_alloc((uint64_t)Q36_N_VOCAB * sizeof(float));
     rt->top2 = q36_gpu_tensor_alloc(2u * sizeof(int32_t));
     if (!rt->logits || !rt->top2) goto fail;
