@@ -28,6 +28,8 @@ void q36_gpu_parallel_for_rows(uint64_t n_rows,
                                void *ctx);
 
 q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes);
+/* Output-only scratch. Contents are undefined until a GPU command writes it. */
+q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes);
 q36_gpu_tensor *q36_gpu_tensor_view(const q36_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void q36_gpu_tensor_free(q36_gpu_tensor *tensor);
 uint64_t q36_gpu_tensor_bytes(const q36_gpu_tensor *tensor);
