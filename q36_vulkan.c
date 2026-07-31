@@ -1493,6 +1493,7 @@ static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor);
 
 static q36_gpu_tensor *q36_vk_tensor_alloc_scratch_unlocked(uint64_t bytes) {
     const uint64_t alloc_bytes = bytes ? q36_round_up_u64(bytes, 4) : 4;
+    if (q36_gpu_quality) return q36_vk_tensor_alloc_kind_unlocked(bytes, false);
     for (uint32_t i = 0; i < q36_vk_private_pool_n; i++) {
         q36_gpu_tensor *tensor = q36_vk_private_pool[i];
         if (tensor->alloc_bytes != alloc_bytes) continue;

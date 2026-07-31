@@ -8992,10 +8992,10 @@ int q36_session_eval(q36_session *s, int token, char *err, size_t errlen) {
     return q36_session_eval_internal(s, token, false, err, errlen);
 }
 
+#ifndef Q36_NO_GPU
 static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
                                                       int count,
                                                       q36_engine *e) {
-#ifndef Q36_NO_GPU
     const char *enabled = getenv("Q36_VK_SESSION_BATCH");
     if ((enabled && enabled[0] && !strcmp(enabled, "0")) ||
         !items || count < 2 || count > 8 || !e ||
@@ -9020,13 +9020,8 @@ static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
         }
     }
     return true;
-#else
-    (void)items;
-    (void)count;
-    (void)e;
-    return false;
-#endif
 }
+#endif
 
 int q36_sessions_eval_batch(q36_decode_item *items, int count,
                             char *err, size_t errlen) {
@@ -9676,9 +9671,15 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
 #else
     q36_vulkan_runtime *rt = (q36_vulkan_runtime *)s->runtime;
     if (!rt) return q36_unsupported_runtime(err, errlen);
-    if (q36_payload_write_tensor(fp, rt->logits,
-                                 (uint64_t)Q36_N_VOCAB * sizeof(float),
-                                 err, errlen) != 0) return 1;
+    if (s->logits_host_valid) {
+        if (q36_payload_write_bytes(fp, s->logits,
+                                    (uint64_t)Q36_N_VOCAB * sizeof(float),
+                                    err, errlen) != 0) return 1;
+    } else if (q36_payload_write_tensor(fp, rt->logits,
+                                        (uint64_t)Q36_N_VOCAB * sizeof(float),
+                                        err, errlen) != 0) {
+        return 1;
+    }
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         if (q36_layer_is_full_attention(il)) {
             q36_vulkan_full_attn_cache *c = &rt->full[il];
