@@ -37,9 +37,11 @@ typedef struct q36_gpu_tensor {
     unsigned char *data;
     uint64_t bytes;
     uint64_t alloc_bytes;
+    uint64_t private_charge;
     uint64_t offset;
     struct q36_gpu_tensor *owner;
     bool device_local;
+    bool private_scratch;
     bool weight_only;           /* arena-backed weights: uploaded once, never
                                  * written by dispatches, skipped by the
                                  * batch hazard tracker */
@@ -335,17 +337,21 @@ typedef struct {
 
 static q36_vk_stream_cache q36_vk_stream;
 
-/* Free-list of retired scratch tensors.  Decode allocates the same handful
- * of small buffers every layer (q8 activations, expert mids, attention aux);
- * reusing them skips a vkAllocateMemory/vkFreeMemory round-trip per buffer.
- * Reused tensors are re-zeroed so semantics match a fresh allocation. */
+/* Decode allocates the same output-only buffers every layer. Reusing them
+ * avoids a vkAllocateMemory/vkFreeMemory round-trip without CPU mapping. */
 enum {
     Q36_VK_POOL_CAP = 256,
     Q36_VK_POOL_MAX_BYTES = 1u << 20,
+    Q36_VK_PRIVATE_POOL_CAP = 64,
+    Q36_VK_PRIVATE_LIMIT = 512u << 20,
     Q36_VK_MAX_THREADS = 32,
 };
 static q36_gpu_tensor *q36_vk_pool[Q36_VK_POOL_CAP];
 static uint32_t q36_vk_pool_n;
+static q36_gpu_tensor *q36_vk_private_pool[Q36_VK_PRIVATE_POOL_CAP];
+static uint32_t q36_vk_private_pool_n;
+static uint64_t q36_vk_private_bytes;
+static uint64_t q36_vk_private_peak;
 
 typedef struct {
     pthread_mutex_t mu;
@@ -1216,6 +1222,17 @@ static uint32_t q36_vk_find_memory_type(uint32_t bits, VkMemoryPropertyFlags wan
     return UINT32_MAX;
 }
 
+static uint32_t q36_vk_find_memory_type_avoiding(uint32_t bits,
+                                                 VkMemoryPropertyFlags want,
+                                                 VkMemoryPropertyFlags avoid) {
+    for (uint32_t i = 0; i < q36_vk.mem_props.memoryTypeCount; i++) {
+        if ((bits & (1u << i)) == 0) continue;
+        VkMemoryPropertyFlags flags = q36_vk.mem_props.memoryTypes[i].propertyFlags;
+        if ((flags & want) == want && (flags & avoid) == 0) return i;
+    }
+    return UINT32_MAX;
+}
+
 static void q36_vk_kernel_destroy(q36_vk_kernel *k) {
     if (!q36_vk.device || !k) return;
     if (k->pipeline) vkDestroyPipeline(q36_vk.device, k->pipeline, NULL);
@@ -1342,6 +1359,61 @@ static int q36_vk_kernel_init(q36_vk_kernel *k) {
     return 1;
 }
 
+static q36_gpu_tensor *q36_vk_tensor_alloc_dl_unlocked(uint64_t bytes) {
+    q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
+    if (!tensor) return NULL;
+    tensor->bytes = bytes;
+    tensor->alloc_bytes = bytes ? q36_round_up_u64(bytes, 4) : 4;
+
+    VkBufferCreateInfo bci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = tensor->alloc_bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (vkCreateBuffer(q36_vk.device, &bci, NULL, &tensor->buffer) != VK_SUCCESS) {
+        free(tensor);
+        return NULL;
+    }
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(q36_vk.device, tensor->buffer, &req);
+    tensor->private_charge = req.size;
+    uint32_t mt = q36_vk_find_memory_type_avoiding(
+            req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (mt == UINT32_MAX) {
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+
+    VkMemoryAllocateInfo mai = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size,
+        .memoryTypeIndex = mt,
+    };
+    if (vkAllocateMemory(q36_vk.device, &mai, NULL, &tensor->memory) != VK_SUCCESS) {
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+    if (vkBindBufferMemory(q36_vk.device, tensor->buffer, tensor->memory, 0) != VK_SUCCESS) {
+        vkFreeMemory(q36_vk.device, tensor->memory, NULL);
+        vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
+        free(tensor);
+        return NULL;
+    }
+
+    tensor->device_local = true;
+    q36_gpu_live_bytes += bytes;
+    if (q36_gpu_live_bytes > q36_gpu_peak_bytes) q36_gpu_peak_bytes = q36_gpu_live_bytes;
+    return tensor;
+}
+
 static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool device_pref) {
     q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
     if (!tensor) return NULL;
@@ -1417,11 +1489,43 @@ static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool de
     return tensor;
 }
 
+static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor);
+
+static q36_gpu_tensor *q36_vk_tensor_alloc_scratch_unlocked(uint64_t bytes) {
+    const uint64_t alloc_bytes = bytes ? q36_round_up_u64(bytes, 4) : 4;
+    for (uint32_t i = 0; i < q36_vk_private_pool_n; i++) {
+        q36_gpu_tensor *tensor = q36_vk_private_pool[i];
+        if (tensor->alloc_bytes != alloc_bytes) continue;
+        q36_vk_private_pool[i] = q36_vk_private_pool[--q36_vk_private_pool_n];
+        tensor->bytes = bytes;
+        tensor->gpu_written = false;
+        tensor->last_use_seq = 0;
+        q36_gpu_live_bytes += bytes;
+        if (q36_gpu_live_bytes > q36_gpu_peak_bytes) q36_gpu_peak_bytes = q36_gpu_live_bytes;
+        return tensor;
+    }
+    if (q36_vk_private_bytes <= Q36_VK_PRIVATE_LIMIT &&
+        alloc_bytes <= Q36_VK_PRIVATE_LIMIT - q36_vk_private_bytes) {
+        q36_gpu_tensor *tensor = q36_vk_tensor_alloc_dl_unlocked(bytes);
+        if (tensor && tensor->private_charge <=
+                      Q36_VK_PRIVATE_LIMIT - q36_vk_private_bytes) {
+            tensor->private_scratch = true;
+            q36_vk_private_bytes += tensor->private_charge;
+            if (q36_vk_private_bytes > q36_vk_private_peak)
+                q36_vk_private_peak = q36_vk_private_bytes;
+            return tensor;
+        }
+        q36_vk_tensor_free_unlocked(tensor);
+    }
+    return q36_vk_tensor_alloc_kind_unlocked(bytes, false);
+}
+
 static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor) {
     if (!tensor) return;
     if (!tensor->owner) {
         q36_gpu_live_bytes -= tensor->bytes;
-        if (tensor->memory) vkUnmapMemory(q36_vk.device, tensor->memory);
+        if (tensor->private_scratch) q36_vk_private_bytes -= tensor->private_charge;
+        if (tensor->data) vkUnmapMemory(q36_vk.device, tensor->memory);
         if (tensor->memory) vkFreeMemory(q36_vk.device, tensor->memory, NULL);
         if (tensor->buffer) vkDestroyBuffer(q36_vk.device, tensor->buffer, NULL);
     }
@@ -1433,8 +1537,21 @@ static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor) {
  * every slot with chunk-sized scratch and decode-sized buffers can never
  * enter, turning each decode step into fresh vkAllocateMemory calls. */
 static uint32_t q36_vk_pool_rr;
+static uint32_t q36_vk_private_pool_rr;
 static void q36_vk_tensor_retire_unlocked(q36_gpu_tensor *tensor) {
-    if (!tensor->owner && !tensor->device_local && tensor->data &&
+    if (!tensor->owner && tensor->private_scratch) {
+        q36_gpu_live_bytes -= tensor->bytes;
+        tensor->bytes = 0;
+        if (q36_vk_private_pool_n < Q36_VK_PRIVATE_POOL_CAP) {
+            q36_vk_private_pool[q36_vk_private_pool_n++] = tensor;
+        } else {
+            q36_vk_private_pool[q36_vk_private_pool_rr]->bytes = 0;
+            q36_vk_tensor_free_unlocked(q36_vk_private_pool[q36_vk_private_pool_rr]);
+            q36_vk_private_pool[q36_vk_private_pool_rr] = tensor;
+            q36_vk_private_pool_rr =
+                (q36_vk_private_pool_rr + 1u) % Q36_VK_PRIVATE_POOL_CAP;
+        }
+    } else if (!tensor->owner && !tensor->device_local && tensor->data &&
         tensor->alloc_bytes <= Q36_VK_POOL_MAX_BYTES) {
         q36_gpu_live_bytes -= tensor->bytes;
         if (q36_vk_pool_n < Q36_VK_POOL_CAP) {
@@ -2740,6 +2857,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_hazard_reset();
     while (q36_vk_retired_n) q36_vk_tensor_free_unlocked(q36_vk_retired[--q36_vk_retired_n]);
     while (q36_vk_pool_n) q36_vk_tensor_free_unlocked(q36_vk_pool[--q36_vk_pool_n]);
+    while (q36_vk_private_pool_n)
+        q36_vk_tensor_free_unlocked(q36_vk_private_pool[--q36_vk_private_pool_n]);
     q36_vk_weight_cache_free_unlocked();
     q36_vk_tensor_free_unlocked(q36_vk.iq_tables);
     q36_vk.iq_tables = NULL;
@@ -2830,6 +2949,8 @@ void q36_gpu_cleanup(void) {
     q36_gpu_model_fd = -1;
     q36_gpu_quality = false;
     q36_gpu_commands_open = false;
+    q36_vk_private_bytes = 0;
+    q36_vk_private_peak = 0;
     q36_vk_moe_bank_cache = true;
     pthread_mutex_unlock(&q36_vk_mu);
     q36_vk_host_threads_shutdown();
@@ -2853,6 +2974,14 @@ q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
         break;
     }
     if (!tensor) tensor = q36_vk_tensor_alloc_kind_unlocked(bytes, false);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return tensor;
+}
+
+q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes) {
+    if (!q36_gpu_init()) return NULL;
+    pthread_mutex_lock(&q36_vk_mu);
+    q36_gpu_tensor *tensor = q36_vk_tensor_alloc_scratch_unlocked(bytes);
     pthread_mutex_unlock(&q36_vk_mu);
     return tensor;
 }
@@ -3263,11 +3392,17 @@ int q36_gpu_stream_expert_cache_bias_experts(const q36_gpu_stream_expert_table *
 
 void q36_gpu_print_memory_report(const char *label) {
     fprintf(stderr,
-            "q36: Vulkan memory%s%s live=%" PRIu64 " peak=%" PRIu64 " fd=%d quality=%s ssd_streaming=%s cache=%u/%u requested=%u allocation_failures=%u lookup=%s lookup_steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " device=%s api=%u.%u.%u\n",
+            "q36: Vulkan memory%s%s live=%" PRIu64 " peak=%" PRIu64
+            " scratch_private=%" PRIu64 " scratch_private_peak=%" PRIu64
+            " scratch_private_limit=%" PRIu64
+            " fd=%d quality=%s ssd_streaming=%s cache=%u/%u requested=%u allocation_failures=%u lookup=%s lookup_steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " device=%s api=%u.%u.%u\n",
             label ? " " : "",
             label ? label : "",
             q36_gpu_live_bytes,
             q36_gpu_peak_bytes,
+            q36_vk_private_bytes,
+            q36_vk_private_peak,
+            (uint64_t)Q36_VK_PRIVATE_LIMIT,
             q36_gpu_model_fd,
             q36_gpu_quality ? "high" : "fast",
             q36_vk_stream.enabled ? "on" : "off",
@@ -5653,7 +5788,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
             q36_gpu_tensor *part = q36_vk.attn_part;
             if (!part || q36_vk.attn_part_bytes < part_bytes) {
                 q36_vk_tensor_release_unlocked(q36_vk.attn_part);
-                part = q36_vk_tensor_alloc_kind_unlocked(part_bytes, true);
+                part = q36_vk_tensor_alloc_scratch_unlocked(part_bytes);
                 q36_vk.attn_part = part;
                 q36_vk.attn_part_bytes = part ? part_bytes : 0;
             }
@@ -5724,7 +5859,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
             q36_gpu_tensor *part = q36_vk.attn_part;
             if (!part || q36_vk.attn_part_bytes < part_bytes) {
                 q36_vk_tensor_release_unlocked(q36_vk.attn_part);
-                part = q36_vk_tensor_alloc_kind_unlocked(part_bytes, true);
+                part = q36_vk_tensor_alloc_scratch_unlocked(part_bytes);
                 q36_vk.attn_part = part;
                 q36_vk.attn_part_bytes = part ? part_bytes : 0;
             }
@@ -5798,7 +5933,9 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
         pthread_mutex_unlock(&q36_vk_mu);
     }
     if (!ok) return 0;
-    aux = q36_gpu_tensor_alloc(aux_floats * n_tok * sizeof(float));
+    aux = q36_gpu_quality ?
+        q36_gpu_tensor_alloc(aux_floats * n_tok * sizeof(float)) :
+        q36_gpu_tensor_alloc_scratch(aux_floats * n_tok * sizeof(float));
     if (!aux) return 0;
 
     if (!q36_gpu_quality && q36_vk_use_gpu_attn_post()) {
@@ -6075,7 +6212,7 @@ static q36_gpu_tensor *q36_vk_quantize_q8_k_alloc_tensor(const q36_gpu_tensor *x
         !q36_u64_mul_ok(q8_count, sizeof(q36_vk_block_q8_K), &q8_bytes)) {
         return NULL;
     }
-    q8 = q36_gpu_tensor_alloc(q8_bytes);
+    q8 = q36_gpu_tensor_alloc_scratch(q8_bytes);
     if (!q8) return NULL;
     if (!q36_gpu_quantize_q8_k_tensor(q8, x, in_dim, n_tok)) {
         q36_gpu_tensor_free(q8);
@@ -6110,7 +6247,7 @@ static q36_gpu_tensor *q36_vk_moe_tiles_gpu(const q36_gpu_tensor *selected, uint
     tile_bound = q36_vk_moe_tile_bound(n_slot, n_expert, pair_tile);
     tile_words = 1u + pair_tile;
     if (!q36_u64_mul_ok(tile_bound, tile_words, &words)) return NULL;
-    q36_gpu_tensor *tiles = q36_gpu_tensor_alloc(words * sizeof(uint32_t));
+    q36_gpu_tensor *tiles = q36_gpu_tensor_alloc_scratch(words * sizeof(uint32_t));
     q36_gpu_tensor *map = NULL;
     if (!tiles) return NULL;
     if (slot_map) {
@@ -6666,15 +6803,15 @@ int q36_gpu_moe_ffn_q8_tensor(q36_gpu_tensor *out,
         }
     }
 
-    mid8 = q36_gpu_tensor_alloc(mid_bytes * n_tok);
-    down8 = q36_gpu_tensor_alloc(down_bytes * n_tok);
+    mid8 = q36_gpu_tensor_alloc_scratch(mid_bytes * n_tok);
+    down8 = q36_gpu_tensor_alloc_scratch(down_bytes * n_tok);
     ok = qx && mid8 && down8 &&
           q36_vk_moe_gate_up_iq2_swiglu(mid8, model_map, model_size, gate, up,
                                          selected, qx, stream_slots, resident_bank,
                                          n_used, n_tok, in_dim, mid_dim, n_expert);
     if (!ok && mid8 && down8) {
-        gate8 = q36_gpu_tensor_alloc(mid_bytes * n_tok);
-        up8 = q36_gpu_tensor_alloc(mid_bytes * n_tok);
+        gate8 = q36_gpu_tensor_alloc_scratch(mid_bytes * n_tok);
+        up8 = q36_gpu_tensor_alloc_scratch(mid_bytes * n_tok);
         ok = gate8 && up8 &&
              q36_vk_moe_matvec(gate8, model_map, model_size, gate, qx, false, false,
                                 stream_slots ? Q36_VK_STREAM_PART_GATE : Q36_VK_STREAM_PART_NONE,
@@ -6861,8 +6998,8 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
         if (!tiles) goto done;
         tile_count = q36_vk_moe_tile_bound((uint32_t)n_slot, n_expert, pair_tile);
     }
-    mid8 = q36_gpu_tensor_alloc(n_slot * mid_dim * sizeof(float));
-    if (!down_sum_decode) down8 = q36_gpu_tensor_alloc(n_slot * out_dim * sizeof(float));
+    mid8 = q36_gpu_tensor_alloc_scratch(n_slot * mid_dim * sizeof(float));
+    if (!down_sum_decode) down8 = q36_gpu_tensor_alloc_scratch(n_slot * out_dim * sizeof(float));
     if (!mid8 || (!down_sum_decode && !down8)) goto done;
 
     uint32_t wave = 0;

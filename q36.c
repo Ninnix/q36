@@ -4523,6 +4523,12 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         rt->field = q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(float)); \
         if (!rt->field) goto fail; \
     } while (0)
+#define Q36_GPU_ALLOC_SCRATCH_F32(field, n) do { \
+        rt->field = quality ? \
+            q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(float)) : \
+            q36_gpu_tensor_alloc_scratch((uint64_t)(n) * prefill_cap * sizeof(float)); \
+        if (!rt->field) goto fail; \
+    } while (0)
 #define Q36_GPU_ALLOC_U32(field, n) do { \
         rt->field = q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(uint32_t)); \
         if (!rt->field) goto fail; \
@@ -4535,16 +4541,18 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALLOC_F32(next_hidden, Q36_N_EMBD);
     Q36_GPU_ALLOC_F32(embed_stage[0], Q36_N_EMBD);
     Q36_GPU_ALLOC_F32(embed_stage[1], Q36_N_EMBD);
-    Q36_GPU_ALLOC_F32(norm, Q36_N_EMBD);
+    Q36_GPU_ALLOC_SCRATCH_F32(norm, Q36_N_EMBD);
     rt->last_h = q36_gpu_tensor_alloc((uint64_t)Q36_N_EMBD * sizeof(float));
     if (!rt->last_h) goto fail;
-    rt->inp_q8 = q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
+    rt->inp_q8 = quality ?
+        q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap) :
+        q36_gpu_tensor_alloc_scratch((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
     if (!rt->inp_q8) goto fail;
-    Q36_GPU_ALLOC_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
-    Q36_GPU_ALLOC_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
-    Q36_GPU_ALLOC_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
-    Q36_GPU_ALLOC_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
-    Q36_GPU_ALLOC_F32(attn_out, Q36_N_SSM_INNER);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_out, Q36_N_SSM_INNER);
     /* A layer is attention or recurrent, never both. These equal-sized
      * views remove 64 MiB of mutually exclusive 1024-row scratch. */
     rt->recur_qkv = q36_gpu_tensor_view(rt->attn_qg, 0,
@@ -4568,15 +4576,15 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
     Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
     Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
-    Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_mid, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
-    Q36_GPU_ALLOC_F32(ffn_scalar, 1);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_gate, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_up, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_mid, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_out, Q36_N_EMBD);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_scalar, 1);
     /* The fused attention path never touches the scores scratch; skipping it
      * saves ctx_size * n_head * prefill_cap floats (128 MiB at ctx 32k). */
     if (!q36_gpu_attn_fused_enabled())
-        Q36_GPU_ALLOC_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
+        Q36_GPU_ALLOC_SCRATCH_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
     rt->logits = q36_gpu_tensor_alloc((uint64_t)Q36_N_VOCAB * sizeof(float));
     if (!rt->logits) goto fail;
     if (enable_mtp) {
@@ -4622,11 +4630,13 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     }
     if (!q36_vulkan_runtime_reset(rt)) goto fail;
 #undef Q36_GPU_ALLOC_F32
+#undef Q36_GPU_ALLOC_SCRATCH_F32
 #undef Q36_GPU_ALLOC_U32
 #undef Q36_GPU_ALLOC_MTP_F32
     return rt;
 fail:
 #undef Q36_GPU_ALLOC_F32
+#undef Q36_GPU_ALLOC_SCRATCH_F32
 #undef Q36_GPU_ALLOC_U32
 #undef Q36_GPU_ALLOC_MTP_F32
     q36_vulkan_runtime_free(rt);
