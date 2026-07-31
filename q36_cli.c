@@ -24,8 +24,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLI_METAL_RESIDENT_PREFILL_CHUNK 512u
-
 typedef struct {
     const char *prompt;
     const char *system;
@@ -127,7 +125,7 @@ static void usage(FILE *fp) {
         "  --simulate-used-memory SIZEGB\n"
         "      Reduce automatic SSD cache planning by pretending SIZEGB is already used.\n"
         "  --prefill-chunk N\n"
-        "      Override prompt prefill chunk size. Default: resident Metal 512, otherwise auto.\n"
+        "      Override prompt prefill chunk size. Default: auto (resident Metal resolves to 1024).\n"
         "\n"
         "Prompt and generation:\n"
         "  -p, --prompt TEXT\n"
@@ -1497,11 +1495,6 @@ static cli_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
-    }
-    if (c.engine.backend == Q36_BACKEND_METAL &&
-        !c.engine.ssd_streaming &&
-        c.engine.prefill_chunk == 0) {
-        c.engine.prefill_chunk = CLI_METAL_RESIDENT_PREFILL_CHUNK;
     }
     if (c.gen.ctx_size > Q36_CONTEXT_MAX) {
         fprintf(stderr, "q36: --ctx must not exceed %d\n", Q36_CONTEXT_MAX);

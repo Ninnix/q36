@@ -41,6 +41,7 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     double step_mul;
+    uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint32_t ssd_streaming_full_layers;
     uint64_t ssd_streaming_cache_bytes;
@@ -82,6 +83,7 @@ static void usage(FILE *fp) {
         "  --metal | --vulkan | --cpu | --backend NAME\n"
         "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "  -t, --threads N        CPU helper threads.\n"
+        "  --prefill-chunk N      Override GPU graph prefill width. Default: auto; resident GPU resolves to 1024.\n"
         "  --quality              Prefer exact kernels where applicable.\n"
         "  -ctk, --cache-type-k TYPE\n"
         "                         KV cache K type: f16, q8_0, or q4_0.\n"
@@ -259,6 +261,9 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.threads = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-chunk")) {
+            c.prefill_chunk = (uint32_t)parse_int(
+                need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
             c.backend = parse_backend(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--vulkan")) {
@@ -388,7 +393,8 @@ static int next_frontier(const bench_config *c, int cur) {
 
 static void log_context_memory(const bench_config *c) {
     q36_context_memory m = q36_context_memory_estimate_configured(
-            c->backend, c->ctx_alloc, 0, c->cache_type_k, c->cache_type_v);
+            c->backend, c->ctx_alloc, c->prefill_chunk,
+            c->cache_type_k, c->cache_type_v);
     fprintf(stderr,
             "q36-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -408,6 +414,7 @@ int main(int argc, char **argv) {
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .prefill_chunk = cfg.prefill_chunk,
         .mtp_draft_tokens = cfg.mtp_draft_tokens,
         .mtp_margin = cfg.mtp_margin,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,

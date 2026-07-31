@@ -526,9 +526,9 @@ static __thread int q36_cpu_parallel_depth;
  * MoE GEMM tiles ~full (8192 slots, 32 per expert on average); the 8192-slot
  * schedule cap and the attention-partials scratch (which scales with
  * chunk x context spans) are why this does not go higher.  Chunk width was
- * never numerics-invariant once the prefill GEMM kernels landed; streaming
- * sessions keep their own 512 default. */
-enum { Q36_VK_NTOK_DEFAULT = 1024 };
+ * never numerics-invariant once the prefill GEMM kernels landed; Vulkan SSD
+ * streaming keeps its own 512 default. */
+enum { Q36_GPU_PREFILL_CHUNK_DEFAULT = 1024 };
 
 typedef struct {
     uint32_t cap;
@@ -684,8 +684,11 @@ static uint32_t q36_default_cpu_prefill_cap(void) {
 }
 
 #ifndef Q36_NO_GPU
-static uint32_t q36_default_vk_prefill_cap(void) {
-    uint32_t cap = q36_parse_env_u32("Q36_VK_PREFILL_CHUNK", Q36_VK_NTOK_DEFAULT);
+static uint32_t q36_default_gpu_prefill_cap(void) {
+    /* Keep the established environment name for compatibility; this graph
+     * default is shared by Vulkan and Metal. */
+    uint32_t cap = q36_parse_env_u32(
+        "Q36_VK_PREFILL_CHUNK", Q36_GPU_PREFILL_CHUNK_DEFAULT);
     if (cap < 1) cap = 1;
     return cap;
 }
@@ -695,11 +698,11 @@ static uint32_t q36_default_vk_prefill_cap(void) {
  * 1/chunk.  Measured on UD-Q4_K_M (ctx512, thermal-gated A/B): chunk 512
  * doubles prefill throughput over the resident-path default of 64.  An
  * explicit --prefill-chunk or Q36_VK_PREFILL_CHUNK still wins. */
-static uint32_t q36_engine_vk_prefill_cap(const q36_engine *e) {
+static uint32_t q36_engine_gpu_prefill_cap(const q36_engine *e) {
 #ifdef Q36_METAL
     if (e->ssd_streaming) {
         uint32_t cap = e->prefill_cap_override ?
-            e->prefill_cap_override : q36_default_vk_prefill_cap();
+            e->prefill_cap_override : q36_default_gpu_prefill_cap();
         uint32_t cache_tokens =
             e->ssd_streaming_cache_experts / Q36_N_EXPERT_USED;
         if (cache_tokens < 1) cache_tokens = 1;
@@ -709,7 +712,7 @@ static uint32_t q36_engine_vk_prefill_cap(const q36_engine *e) {
 #endif
     if (e->prefill_cap_override) return e->prefill_cap_override;
     if (e->ssd_streaming && !getenv("Q36_VK_PREFILL_CHUNK")) return 512;
-    return q36_default_vk_prefill_cap();
+    return q36_default_gpu_prefill_cap();
 }
 #endif
 
@@ -1114,7 +1117,60 @@ q36_think_mode q36_think_mode_for_context(q36_think_mode mode, int ctx_size) {
     return mode;
 }
 
-static uint64_t q36_vulkan_scratch_bytes(uint32_t ctx, uint32_t cap) {
+static uint64_t q36_metal_attention_scratch_bytes(
+        uint32_t ctx, uint32_t cap,
+        q36_kv_cache_type cache_type_k,
+        q36_kv_cache_type cache_type_v) {
+#ifdef Q36_METAL
+    uint64_t bytes;
+    const char *gqa_env = getenv("Q36_METAL_ATTN_GQA");
+    const char *split_env = getenv("Q36_METAL_ATTN_SPLIT");
+    const bool gqa = !gqa_env || !gqa_env[0] || gqa_env[0] != '0';
+    const bool split = !split_env || !split_env[0] || split_env[0] != '0';
+    const bool compact = cache_type_k == Q36_KV_CACHE_Q8_0 &&
+                         cache_type_v == Q36_KV_CACHE_Q4_0;
+
+    if (!compact) return (uint64_t)cap * Q36_N_HEAD * ctx * sizeof(float);
+
+    /* Up to 1024 keys Metal uses the dense parallel kernel.  Above that,
+     * normal multi-token prefill uses one partial per 4096-key GQA group;
+     * a one-token tail/decode uses split-K partials.  Size for each path so
+     * compacting this buffer cannot change kernel selection or numerics. */
+    const uint32_t prefix = ctx < 1024u ? ctx : 1024u;
+    const uint32_t prefix_rows = cap < prefix ? cap : prefix;
+    bytes = (uint64_t)prefix_rows * Q36_N_HEAD * prefix * sizeof(float);
+    if (gqa) {
+        uint64_t grouped = (uint64_t)cap * Q36_N_HEAD *
+            ((ctx + 4095u) / 4096u) * (Q36_N_HEAD_DIM + 2u) * sizeof(float);
+        if (grouped > bytes) bytes = grouped;
+    } else if (split) {
+        uint64_t grouped = (uint64_t)cap * Q36_N_HEAD *
+            ((ctx + 511u) / 512u) * (Q36_N_HEAD_DIM + 2u) * sizeof(float);
+        if (grouped > bytes) bytes = grouped;
+    } else {
+        uint64_t dense = (uint64_t)cap * Q36_N_HEAD * ctx * sizeof(float);
+        if (dense > bytes) bytes = dense;
+    }
+    if (split) {
+        uint64_t tail = (uint64_t)Q36_N_HEAD *
+            ((ctx + 511u) / 512u) * (Q36_N_HEAD_DIM + 2u) * sizeof(float);
+        if (tail > bytes) bytes = tail;
+    } else {
+        uint64_t dense_rows = (uint64_t)Q36_N_HEAD * ctx * sizeof(float);
+        if (dense_rows > bytes) bytes = dense_rows;
+    }
+    return bytes;
+#else
+    (void)cache_type_k;
+    (void)cache_type_v;
+    return (uint64_t)cap * Q36_N_HEAD * ctx * sizeof(float);
+#endif
+}
+
+static uint64_t q36_vulkan_scratch_bytes(
+        q36_backend backend, uint32_t ctx, uint32_t cap,
+        q36_kv_cache_type cache_type_k,
+        q36_kv_cache_type cache_type_v) {
     uint64_t bytes = 0;
     bytes += (uint64_t)cap * Q36_N_EMBD * 5u * sizeof(float);
     bytes += (uint64_t)Q36_N_EMBD * sizeof(float);
@@ -1132,12 +1188,17 @@ static uint64_t q36_vulkan_scratch_bytes(uint32_t ctx, uint32_t cap) {
              sizeof(float);
     bytes += (uint64_t)cap *
              (Q36_N_EXPERT + Q36_N_EXPERT_USED * 2u +
-              Q36_N_FF_SHARED * 3u + Q36_N_EMBD + 1u) *
+              Q36_N_FF_SHARED * 2u + Q36_N_EMBD + 1u) *
              sizeof(float);
     bytes += (uint64_t)Q36_N_VOCAB * sizeof(float);
-    bytes += (uint64_t)cap * Q36_N_HEAD *
-             ((ctx + 8191u) / 8192u) *
-             (Q36_N_HEAD_DIM + 2u) * sizeof(float);
+    if (backend == Q36_BACKEND_METAL) {
+        bytes += q36_metal_attention_scratch_bytes(
+            ctx, cap, cache_type_k, cache_type_v);
+    } else {
+        bytes += (uint64_t)cap * Q36_N_HEAD *
+                 ((ctx + 8191u) / 8192u) *
+                 (Q36_N_HEAD_DIM + 2u) * sizeof(float);
+    }
     return bytes;
 }
 
@@ -1150,11 +1211,11 @@ q36_context_memory q36_context_memory_estimate_configured(
     q36_context_memory m = {0};
     uint32_t cpu_prefill_cap = q36_default_cpu_prefill_cap();
 #ifndef Q36_NO_GPU
-    uint32_t vk_prefill_cap = q36_default_vk_prefill_cap();
+    uint32_t gpu_prefill_cap = q36_default_gpu_prefill_cap();
 #endif
     if (ctx_size <= 0) return m;
 #ifndef Q36_NO_GPU
-    m.prefill_cap = q36_backend_uses_graph(backend) ? vk_prefill_cap : cpu_prefill_cap;
+    m.prefill_cap = q36_backend_uses_graph(backend) ? gpu_prefill_cap : cpu_prefill_cap;
 #else
     m.prefill_cap = cpu_prefill_cap;
 #endif
@@ -1174,8 +1235,9 @@ q36_context_memory q36_context_memory_estimate_configured(
                                   Q36_N_SSM_CONV_DIM * sizeof(float) +
                               (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE *
                                   Q36_N_SSM_DT_RANK * sizeof(float));
-        m.scratch_bytes = q36_vulkan_scratch_bytes((uint32_t)ctx_size,
-                                                   m.prefill_cap);
+        m.scratch_bytes = q36_vulkan_scratch_bytes(
+            backend, (uint32_t)ctx_size, m.prefill_cap,
+            cache_type_k, cache_type_v);
     } else {
         m.raw_bytes = (uint64_t)Q36_N_LAYER * Q36_N_HEAD_KV *
                       Q36_N_HEAD_DIM * (uint64_t)ctx_size * sizeof(float);
@@ -4639,13 +4701,24 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
     Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
     Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_mid, Q36_N_FF_SHARED);
+    rt->ffn_shared_mid = q36_gpu_tensor_view(rt->ffn_shared_gate, 0,
+        (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
+    if (!rt->ffn_shared_mid) goto fail;
     Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
     Q36_GPU_ALLOC_F32(ffn_scalar, 1);
-    /* The fused attention path never touches the scores scratch; skipping it
-     * saves ctx_size * n_head * prefill_cap floats (128 MiB at ctx 32k). */
-    if (!q36_gpu_attn_fused_enabled())
+    /* Fused attention needs no scores tensor. Metal sizes its tensor below
+     * for the dense prefix and grouped long-context kernels rather than the
+     * much larger chunk-by-context matrix. */
+    if (!q36_gpu_attn_fused_enabled()) {
+#ifdef Q36_METAL
+        uint64_t score_bytes = q36_metal_attention_scratch_bytes(
+            (uint32_t)ctx_size, prefill_cap, cache_type_k, cache_type_v);
+        rt->scores = q36_gpu_tensor_alloc(score_bytes);
+        if (!rt->scores) goto fail;
+#else
         Q36_GPU_ALLOC_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
+#endif
+    }
     rt->logits = q36_gpu_tensor_alloc((uint64_t)Q36_N_VOCAB * sizeof(float));
     rt->top2 = q36_gpu_tensor_alloc(2u * sizeof(int32_t));
     if (!rt->logits || !rt->top2) goto fail;
@@ -8402,7 +8475,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         s->runtime = NULL;
 #else
         s->runtime = q36_vulkan_runtime_create(ctx_size,
-                                               q36_engine_vk_prefill_cap(e),
+                                               q36_engine_gpu_prefill_cap(e),
                                                e->mtp_ready,
                                                e->quality,
                                                e->ssd_streaming,

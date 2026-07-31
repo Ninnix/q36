@@ -360,12 +360,11 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values. The Vulkan
-agent retains its 100000-token context. On a 16 GB Mac, the resident Metal
-agent defaults to a 32000-token context and a 512-token prefill chunk; the
-larger context presets exhausted the Metal working set with the standard q2
-model. CPU uses F16 KV. SSD-streamed model weights still default to a
-100000-token context with F16 KV:
+Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values and default to a
+100000-token agent context. The backend's automatic resident GPU prefill width
+resolves to 1024 tokens. Compact Metal attention scratch keeps this faster
+chunk width practical at long contexts. CPU uses F16 KV. SSD-streamed model
+weights also default to a 100000-token context with F16 KV:
 
 ```sh
 ./q36-agent --metal

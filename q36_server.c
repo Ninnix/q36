@@ -8724,7 +8724,7 @@ static void usage(FILE *fp) {
         "  -t, --threads N\n"
         "      CPU helper threads for lightweight host-side work.\n"
         "  --prefill-chunk N\n"
-        "      GPU graph prefill chunk size. Default: auto.\n"
+        "      GPU graph prefill chunk size. Default: auto; resident GPU resolves to 1024.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"

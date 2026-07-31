@@ -105,7 +105,6 @@ static q36_metal_full_layer
 static pthread_mutex_t q36_stream_mu = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLBuffer> q36_moe_gate_scratch;
 static id<MTLBuffer> q36_moe_up_scratch;
-static id<MTLBuffer> q36_moe_mid_scratch;
 static id<MTLBuffer> q36_moe_down_scratch;
 static id<MTLBuffer> q36_moe_id_map;
 static NSUInteger q36_moe_pair_scratch_bytes;
@@ -692,7 +691,6 @@ void q36_gpu_cleanup(void) {
         q36_queue = nil;
         q36_moe_gate_scratch = nil;
         q36_moe_up_scratch = nil;
-        q36_moe_mid_scratch = nil;
         q36_moe_down_scratch = nil;
         q36_moe_id_map = nil;
         q36_moe_pair_scratch_bytes = 0;
@@ -2905,8 +2903,7 @@ static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
     if (q36_moe_pair_scratch_bytes < pair_bytes) {
         q36_moe_gate_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
         q36_moe_up_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
-        q36_moe_mid_scratch = [q36_device newBufferWithLength:(NSUInteger)pair_bytes options:MTLResourceStorageModePrivate];
-        if (!q36_moe_gate_scratch || !q36_moe_up_scratch || !q36_moe_mid_scratch) return 0;
+        if (!q36_moe_gate_scratch || !q36_moe_up_scratch) return 0;
         q36_moe_pair_scratch_bytes = (NSUInteger)pair_bytes;
     }
     if (q36_moe_down_scratch_bytes < down_bytes) {
@@ -3295,7 +3292,10 @@ static int q36_moe_gpu(
     };
     enc = q36_encoder(@"q36_moe_activation_f32");
     if (!enc) return 0;
-    [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:0];
+    /* Activation consumes gate element i before replacing the same element
+     * with SiLU(gate)*up.  Reusing the gate buffer removes one 16 MiB
+     * 1024-token routed-expert scratch allocation without changing order. */
+    [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:0];
     [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:1];
     [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:2];
     [enc setBuffer:selected->buffer offset:selected->offset atIndex:3];
@@ -3331,7 +3331,7 @@ static int q36_moe_gpu(
     if (use_mm) {
         [enc setBytes:&down_mm length:sizeof(down_mm) atIndex:0];
         [enc setBuffer:db offset:(NSUInteger)doff atIndex:1];
-        [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:2];
+        [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:2];
         [enc setBuffer:q36_moe_id_map offset:0 atIndex:3];
         [enc setBuffer:q36_moe_id_map offset:map_ids_offset atIndex:4];
         [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:5];
@@ -3343,7 +3343,7 @@ static int q36_moe_gpu(
     } else {
         [enc setBytes:&da length:sizeof(da) atIndex:0];
         [enc setBuffer:db offset:(NSUInteger)doff atIndex:1];
-        [enc setBuffer:q36_moe_mid_scratch offset:0 atIndex:2];
+        [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:2];
         [enc setBuffer:(down_sum ? out->buffer : q36_moe_down_scratch)
                 offset:(down_sum ? out->offset : 0) atIndex:3];
         [enc setBuffer:weight_selected
