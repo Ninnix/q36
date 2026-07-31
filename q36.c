@@ -4666,6 +4666,12 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         rt->field = q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(float)); \
         if (!rt->field) goto fail; \
     } while (0)
+#define Q36_GPU_ALLOC_SCRATCH_F32(field, n) do { \
+        rt->field = quality ? \
+            q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(float)) : \
+            q36_gpu_tensor_alloc_scratch((uint64_t)(n) * prefill_cap * sizeof(float)); \
+        if (!rt->field) goto fail; \
+    } while (0)
 #define Q36_GPU_ALLOC_U32(field, n) do { \
         rt->field = q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(uint32_t)); \
         if (!rt->field) goto fail; \
@@ -4678,7 +4684,7 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALLOC_F32(next_hidden, Q36_N_EMBD);
     Q36_GPU_ALLOC_F32(embed_stage[0], Q36_N_EMBD);
     Q36_GPU_ALLOC_F32(embed_stage[1], Q36_N_EMBD);
-    Q36_GPU_ALLOC_F32(norm, Q36_N_EMBD);
+    Q36_GPU_ALLOC_SCRATCH_F32(norm, Q36_N_EMBD);
     rt->last_h = q36_gpu_tensor_alloc((uint64_t)Q36_N_EMBD * sizeof(float));
     if (!rt->last_h) goto fail;
 #ifdef Q36_METAL
@@ -4695,25 +4701,16 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
             rt->recur_v, attn_kv_bytes, inp_q8_bytes);
         if (!rt->inp_q8) goto fail;
     }
-#else
-    rt->inp_q8 = q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
-    if (!rt->inp_q8) goto fail;
-#endif
     /* Allocate attention partials before recurrent scratch: on Metal, large
      * contexts can reuse this owner on layers where attention is inactive. */
     if (!q36_gpu_attn_fused_enabled()) {
-#ifdef Q36_METAL
         uint64_t score_bytes = q36_metal_attention_scratch_bytes(
             (uint32_t)ctx_size, prefill_cap, cache_type_k, cache_type_v);
         rt->scores = q36_gpu_tensor_alloc(score_bytes);
         if (!rt->scores) goto fail;
-#else
-        Q36_GPU_ALLOC_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
-#endif
     }
     Q36_GPU_ALLOC_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
     Q36_GPU_ALLOC_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
-#ifdef Q36_METAL
     rt->attn_k = q36_gpu_tensor_view(rt->recur_v, 0,
         (uint64_t)Q36_N_HEAD_KV * Q36_N_HEAD_DIM *
             prefill_cap * sizeof(float));
@@ -4723,11 +4720,18 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         (uint64_t)Q36_N_HEAD_KV * Q36_N_VALUE_DIM *
             prefill_cap * sizeof(float));
     if (!rt->attn_k || !rt->attn_v) goto fail;
-#else
-    Q36_GPU_ALLOC_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
-    Q36_GPU_ALLOC_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
-#endif
     Q36_GPU_ALLOC_F32(attn_out, Q36_N_SSM_INNER);
+#else
+    rt->inp_q8 = quality ?
+        q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap) :
+        q36_gpu_tensor_alloc_scratch((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
+    if (!rt->inp_q8) goto fail;
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
+    Q36_GPU_ALLOC_SCRATCH_F32(attn_out, Q36_N_SSM_INNER);
+#endif
     /* A layer is attention or recurrent, never both. These equal-sized
      * views remove 64 MiB of mutually exclusive 1024-row scratch. */
     rt->recur_qkv = q36_gpu_tensor_view(rt->attn_qg, 0,
@@ -4814,23 +4818,25 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALIAS_FFN(ffn_weights, Q36_N_EXPERT_USED, float);
     Q36_GPU_ALIAS_FFN(ffn_shared_gate, Q36_N_FF_SHARED, float);
     Q36_GPU_ALIAS_FFN(ffn_shared_up, Q36_N_FF_SHARED, float);
-#else
-    Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
-    Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
-    Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
-    Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
-    Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
-#endif
     rt->ffn_shared_mid = q36_gpu_tensor_view(rt->ffn_shared_gate, 0,
         (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
     if (!rt->ffn_shared_mid) goto fail;
-#ifdef Q36_METAL
     Q36_GPU_ALIAS_FFN(ffn_shared_out, Q36_N_EMBD, float);
     Q36_GPU_ALIAS_FFN(ffn_scalar, 1, float);
 #undef Q36_GPU_ALIAS_FFN
 #else
-    Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
-    Q36_GPU_ALLOC_F32(ffn_scalar, 1);
+    Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
+    Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
+    Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_gate, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_up, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_mid, Q36_N_FF_SHARED);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_shared_out, Q36_N_EMBD);
+    Q36_GPU_ALLOC_SCRATCH_F32(ffn_scalar, 1);
+    /* The fused attention path never touches the scores scratch; skipping it
+     * saves ctx_size * n_head * prefill_cap floats (128 MiB at ctx 32k). */
+    if (!q36_gpu_attn_fused_enabled())
+        Q36_GPU_ALLOC_SCRATCH_F32(scores, (uint64_t)ctx_size * Q36_N_HEAD);
 #endif
     rt->logits = q36_gpu_tensor_alloc((uint64_t)Q36_N_VOCAB * sizeof(float));
     rt->top2 = q36_gpu_tensor_alloc(2u * sizeof(int32_t));
@@ -4878,11 +4884,13 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     }
     if (!q36_vulkan_runtime_reset(rt)) goto fail;
 #undef Q36_GPU_ALLOC_F32
+#undef Q36_GPU_ALLOC_SCRATCH_F32
 #undef Q36_GPU_ALLOC_U32
 #undef Q36_GPU_ALLOC_MTP_F32
     return rt;
 fail:
 #undef Q36_GPU_ALLOC_F32
+#undef Q36_GPU_ALLOC_SCRATCH_F32
 #undef Q36_GPU_ALLOC_U32
 #undef Q36_GPU_ALLOC_MTP_F32
     q36_vulkan_runtime_free(rt);

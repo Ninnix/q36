@@ -3883,12 +3883,21 @@ static void test_long_security_continuation(void) {
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
-    q36_engine *engine = test_get_engine(false);
+    q36_backend backend = test_default_backend();
+    q36_engine_options opt = {
+        .model_path = test_model_path(),
+        .backend = backend,
+        .cache_type_k = q36_default_kv_cache_type_k(backend, false),
+        .cache_type_v = q36_default_kv_cache_type_v(backend, false),
+    };
+    q36_engine *engine = NULL;
+    TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
     if (!engine) {
         free(prompt_text);
         return;
     }
     if (!test_require_session_backend("long-context", engine, 100000)) {
+        q36_engine_close(engine);
         free(prompt_text);
         return;
     }
@@ -3901,6 +3910,7 @@ static void test_long_security_continuation(void) {
     TEST_ASSERT(q36_session_create(&session, engine, 100000) == 0);
     if (!session) {
         q36_tokens_free(&prompt);
+        q36_engine_close(engine);
         free(prompt_text);
         return;
     }
@@ -3930,16 +3940,19 @@ static void test_long_security_continuation(void) {
     }
 
     const char *text = out.ptr ? out.ptr : "";
+    const char *answer = strstr(text, "</think>");
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(generated > 0);
-    TEST_ASSERT(strstr(text, "</think>") != NULL);
+    TEST_ASSERT(answer != NULL);
     TEST_ASSERT(test_count_substr(text, "</think>") == 1);
-    TEST_ASSERT(test_count_substr(text, "The most critical security issue") == 1);
-    TEST_ASSERT(strstr(text, "arbitrary file") != NULL);
+    answer = answer ? answer + strlen("</think>") : text;
+    TEST_ASSERT(test_count_substr(answer, "The most critical security issue") == 1);
+    TEST_ASSERT(strstr(answer, "arbitrary file") != NULL);
 
     buf_free(&out);
     q36_session_free(session);
     q36_tokens_free(&prompt);
+    q36_engine_close(engine);
     free(prompt_text);
 }
 
