@@ -21,7 +21,8 @@ Supported runtimes:
 
 * **Metal** on Apple Silicon M1 or newer. A 16 GB Mac can run the default
   release model resident; 8 GB Macs are intended to use SSD streaming.
-* **Vulkan** on the AMD BC-250 with RADV and external host memory.
+* **Vulkan** on Linux. The backend is generic; its current fast path was
+  developed and tuned on the AMD BC-250 with RADV.
 * **CPU** as a portable reference and debugging runtime, not the normal
   production path.
 
@@ -35,15 +36,17 @@ run it at a decent speed.
 
 ## Requirements
 
-QuarkStar has two native GPU targets:
+QuarkStar has two native GPU backends:
 
+* **Linux with Vulkan 1.1 or newer** and support for shader `float64` and
+  `int64`. Subgroup arithmetic, 16-bit storage, and native `float16` are
+  detected at runtime; optimized kernels fall back when an optional feature
+  is unavailable.
 * **AMD BC-250** (Cyan Skillfish, RDNA 2, 24 CUs / 1536 shaders, 16 GB
-  unified GDDR6) — the ex-PS5 mining board.
-* **Linux** with a recent Mesa stack. The RADV driver is required; AMDVLK is
-  not tested.
-* **Vulkan 1.3** with `VK_EXT_external_memory_host`. This is what lets us
-  map the GGUF directly as a `VkBuffer` with zero copies. Check with
-  `vulkaninfo | grep external_memory_host`.
+  unified GDDR6) is the primary tested Vulkan device. Its vendor/device ID
+  selects the existing tuned fast path automatically. RADV is the tested
+  driver; other drivers and Vulkan GPUs need their own correctness and speed
+  validation.
 * **BIOS**: modded firmware with the Chipset menu unlocked. Set Integrated
   Graphics → UMA Mode → `UMA_SPECIFIED` and VRAM allocation to `512 MB`
   (dynamic). Counterintuitively, the small split is correct: it lets the GPU
@@ -58,10 +61,8 @@ QuarkStar has two native GPU targets:
   `metal` invocation. Metal builds use an Apple Silicon/macOS 11 deployment
   target; newer residency APIs are selected only at runtime.
 
-There is no support for discrete GPUs, integrated Intel/NVIDIA GPUs, or
-Windows (Windows has no driver support for the BC-250 APU at all). The Metal
-backend uses unified-memory, mmap-backed model buffers and is independent of
-the Vulkan/BC-250 build.
+Windows is not currently a build target. The Metal backend uses unified-memory,
+mmap-backed model buffers and is independent of the Vulkan build.
 
 ## Motivations
 
@@ -186,8 +187,10 @@ The script downloads from
 Then build for the target platform:
 
 ```sh
-make        # Linux / Vulkan
-make metal  # macOS / Apple Silicon
+make                  # Linux / generic Vulkan, automatic BC-250 fast path
+make vulkan-generic   # explicit generic Vulkan build
+make vulkan-bc250     # Vulkan build that requires a BC-250 at runtime
+make metal            # macOS / Apple Silicon
 ```
 
 The normal and CPU-only builds are self-contained. They do not require a
@@ -993,7 +996,8 @@ and `q36_test`—linked to the selected graph runtime:
 
 | Platform/runtime | Build | Explicit invocation |
 | --- | --- | --- |
-| Linux / Vulkan | `make` | `./q36 --vulkan -p "Hello"` |
+| Linux / generic Vulkan | `make` or `make vulkan-generic` | `./q36 --vulkan -p "Hello"` |
+| Linux / BC-250 checked Vulkan | `make vulkan-bc250` | `./q36 --vulkan -p "Hello"` |
 | macOS / Metal | `make metal` | `./q36 --metal -p "Hello"` |
 | CPU reference | `make cpu` | `./q36 --cpu -p "Hello"` |
 
@@ -1004,6 +1008,20 @@ the short backend switches and is accepted by the CLI, server, agent,
 benchmark, and evaluation harness. A Metal-linked binary rejects `--vulkan`,
 and a Vulkan-linked binary rejects `--metal`, so deployment mistakes fail
 before model loading.
+
+### Vulkan device and compatibility policy
+
+The generic and BC-250 targets contain the same Vulkan backend and SPIR-V.
+`vulkan-generic` queries device capabilities and uses portable fallbacks when
+the subgroup or 16-bit features required by a tuned kernel are absent. A
+BC-250 is recognized at runtime and keeps the current optimized path.
+`vulkan-bc250` adds a vendor/device check so a board-specific release artifact
+cannot silently run on different hardware.
+
+The generic target removes the hard device identity restriction, not the need
+to validate a new GPU. Before calling another Vulkan device supported, run the
+isolated kernel suite and the short CPU/GPU parity gate, then record prefill
+and decode throughput at the intended context sizes.
 
 ### Metal device and compatibility policy
 
@@ -1099,7 +1117,7 @@ make test-server-batching-metal-ssd # Metal batching through bounded SSD cache
 make benchmark-session-batch # old, 1/2/4/8-slot, and ordered-fallback server runs
 make test-streaming       # resident/warm/cold/pressure/full-layer matrix
 make benchmark-gate       # conservative BC-250 throughput floor
-make release-build-check  # Vulkan and CPU release builds with -Werror
+make release-build-check  # generic/BC-250 Vulkan and CPU builds with -Werror
 make release-build-check-metal # Metal release build with -Werror
 ```
 

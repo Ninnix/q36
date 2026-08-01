@@ -119,6 +119,11 @@ typedef struct {
     bool prof_ops;
     bool prof_kernel;
     bool have_f16;
+    bool have_storage16;
+    bool subgroup_arithmetic;
+    bool subgroup_clustered;
+    bool bc250;
+    uint32_t subgroup_size;
 
     q36_vk_kernel matmul_f16;
     q36_vk_kernel matmul_f32;
@@ -988,6 +993,11 @@ static bool q36_vk_env_default_on(const char *name) {
     return !env || !env[0] || env[0] != '0';
 }
 
+static bool q36_vk_have_subgroups(bool clustered) {
+    return q36_vk.subgroup_size >= 32u && q36_vk.subgroup_arithmetic &&
+           (!clustered || q36_vk.subgroup_clustered);
+}
+
 static bool q36_vk_use_gpu_attn_post(void) {
     return q36_vk_env_default_on("Q36_VK_GPU_ATTN_POST");
 }
@@ -1002,7 +1012,8 @@ static uint32_t q36_vk_moe_gemm_min(void) {
 }
 
 static bool q36_vk_use_moe_down_sum_decode(void) {
-    return q36_vk_env_default_on("Q36_VK_MOE_DOWN_SUM_DECODE");
+    return q36_vk.have_storage16 && q36_vk_have_subgroups(false) &&
+           q36_vk_env_default_on("Q36_VK_MOE_DOWN_SUM_DECODE");
 }
 
 /* Sampled once: the runtime skips the scores scratch allocation when the
@@ -1010,17 +1021,17 @@ static bool q36_vk_use_moe_down_sum_decode(void) {
 static bool q36_vk_use_attn_qtile(void) {
     static int cached = -1;
     if (cached < 0) cached = q36_vk_env_default_on("Q36_VK_ATTN_QTILE") ? 1 : 0;
-    return cached != 0;
+    return cached != 0 && q36_vk_have_subgroups(true);
 }
 
 static bool q36_vk_use_attn_qtile2(void) {
-    return q36_vk_env_default_on("Q36_VK_ATTN_QTILE2");
+    return q36_vk_have_subgroups(true) && q36_vk_env_default_on("Q36_VK_ATTN_QTILE2");
 }
 
 static bool q36_vk_use_attn_fused(void) {
     static int cached = -1;
     if (cached < 0) cached = q36_vk_env_default_on("Q36_VK_ATTN_FUSED") ? 1 : 0;
-    return cached != 0;
+    return cached != 0 && q36_vk_have_subgroups(true);
 }
 
 bool q36_gpu_attn_fused_enabled(void) {
@@ -1044,7 +1055,7 @@ static bool q36_vk_use_delta_fast_prefill(void) {
 }
 
 static bool q36_vk_use_delta_col_prefill(void) {
-    return q36_vk_env_default_on("Q36_VK_DELTA_COL_PREFILL");
+    return q36_vk_have_subgroups(false) && q36_vk_env_default_on("Q36_VK_DELTA_COL_PREFILL");
 }
 
 static bool q36_vk_use_delta_decode(void) {
@@ -1052,7 +1063,7 @@ static bool q36_vk_use_delta_decode(void) {
 }
 
 static bool q36_vk_use_attn_splitk(void) {
-    return q36_vk_env_default_on("Q36_VK_ATTN_SPLITK");
+    return q36_vk_have_subgroups(true) && q36_vk_env_default_on("Q36_VK_ATTN_SPLITK");
 }
 
 static uint32_t q36_vk_kv_cache_row_bytes(uint32_t type, uint32_t n) {
@@ -1063,7 +1074,7 @@ static uint32_t q36_vk_kv_cache_row_bytes(uint32_t type, uint32_t n) {
 }
 
 static bool q36_vk_use_f32_fast(void) {
-    return q36_vk_env_default_on("Q36_VK_F32_FAST");
+    return q36_vk_have_subgroups(false) && q36_vk_env_default_on("Q36_VK_F32_FAST");
 }
 
 static bool q36_vk_use_gpu_ffn_tail(void) {
@@ -1075,7 +1086,7 @@ static bool q36_vk_use_gpu_swiglu(void) {
 }
 
 static bool q36_vk_use_moe_fast(void) {
-    return q36_vk_env_default_on("Q36_VK_MOE_FAST");
+    return q36_vk_have_subgroups(true) && q36_vk_env_default_on("Q36_VK_MOE_FAST");
 }
 
 static bool q36_vk_use_moe_gate_up(void) {
@@ -1092,7 +1103,8 @@ static bool q36_vk_use_q8_0_gpu(void) {
 }
 
 static bool q36_vk_use_q8_0_f32b(void) {
-    return q36_vk_env_default_on("Q36_VK_Q8_0_F32B");
+    return q36_vk.have_storage16 && q36_vk_have_subgroups(false) &&
+           q36_vk_env_default_on("Q36_VK_Q8_0_F32B");
 }
 
 static int q36_vk_quantize_q8_k_dispatch(q36_gpu_tensor *q8,
@@ -2681,6 +2693,15 @@ int q36_gpu_init(void) {
     }
 
     for (uint32_t di = 0; di < ndev && !q36_vk.physical; di++) {
+        VkPhysicalDeviceProperties candidate_props;
+        VkPhysicalDeviceFeatures candidate_features;
+        vkGetPhysicalDeviceProperties(devs[di], &candidate_props);
+        vkGetPhysicalDeviceFeatures(devs[di], &candidate_features);
+        if (candidate_props.apiVersion < VK_API_VERSION_1_1 ||
+            !candidate_features.shaderFloat64 || !candidate_features.shaderInt64) continue;
+#ifdef Q36_VULKAN_REQUIRE_BC250
+        if (candidate_props.vendorID != 0x1002u || candidate_props.deviceID != 0x13feu) continue;
+#endif
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(devs[di], &nq, NULL);
         VkQueueFamilyProperties *qprops = calloc(nq, sizeof(qprops[0]));
@@ -2696,9 +2717,38 @@ int q36_gpu_init(void) {
         free(qprops);
     }
     free(devs);
-    if (!q36_vk.physical) goto fail;
+    if (!q36_vk.physical) {
+        fprintf(stderr, "q36: no compatible Vulkan compute device found\n");
+        goto fail;
+    }
 
     vkGetPhysicalDeviceProperties(q36_vk.physical, &q36_vk.props);
+    if (q36_vk.api_version < VK_API_VERSION_1_1 ||
+        q36_vk.props.apiVersion < VK_API_VERSION_1_1) {
+        fprintf(stderr, "q36: Vulkan 1.1 or newer is required\n");
+        goto fail;
+    }
+    VkPhysicalDeviceSubgroupProperties subgroup = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 props2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &subgroup,
+    };
+    vkGetPhysicalDeviceProperties2(q36_vk.physical, &props2);
+    q36_vk.props = props2.properties;
+    q36_vk.subgroup_size = subgroup.subgroupSize;
+    q36_vk.subgroup_arithmetic =
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+    q36_vk.subgroup_clustered =
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) != 0;
+    q36_vk.bc250 = q36_vk.props.vendorID == 0x1002u && q36_vk.props.deviceID == 0x13feu;
+#ifdef Q36_VULKAN_REQUIRE_BC250
+    if (!q36_vk.bc250) {
+        fprintf(stderr, "q36: this vulkan-bc250 build requires an AMD BC-250 (1002:13fe)\n");
+        goto fail;
+    }
+#endif
     vkGetPhysicalDeviceMemoryProperties(q36_vk.physical, &q36_vk.mem_props);
 
     uint64_t device_bytes = 0;
@@ -2712,6 +2762,8 @@ int q36_gpu_init(void) {
     } else {
         fprintf(stderr, "q36: Vulkan device %s\n", q36_vk.props.deviceName);
     }
+    fprintf(stderr, "q36: Vulkan generic backend%s, subgroup %u\n",
+            q36_vk.bc250 ? ", BC-250 fast path" : "", q36_vk.subgroup_size);
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {
@@ -2724,12 +2776,32 @@ int q36_gpu_init(void) {
      * emulate correctly rounded f32 fma via int64 bit ops to stay bit-exact
      * against the CPU reference engine, so shaderFloat64 and shaderInt64 are
      * hard requirements (RADV exposes both on the BC-250 target). */
-    VkPhysicalDeviceFeatures supported;
-    vkGetPhysicalDeviceFeatures(q36_vk.physical, &supported);
-    if (!supported.shaderFloat64 || !supported.shaderInt64) goto fail;
+    VkPhysicalDevice16BitStorageFeatures storage16_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+    };
+    VkPhysicalDeviceShaderFloat16Int8Features f16_query = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
+    };
+    if (q36_vk.api_version >= VK_API_VERSION_1_2 &&
+        q36_vk.props.apiVersion >= VK_API_VERSION_1_2) {
+        storage16_query.pNext = &f16_query;
+    }
+    VkPhysicalDeviceFeatures2 feat2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &storage16_query,
+    };
+    vkGetPhysicalDeviceFeatures2(q36_vk.physical, &feat2);
+    if (!feat2.features.shaderFloat64 || !feat2.features.shaderInt64) {
+        fprintf(stderr, "q36: Vulkan shaderFloat64 and shaderInt64 are required\n");
+        goto fail;
+    }
+    q36_vk.have_storage16 = storage16_query.storageBuffer16BitAccess != 0;
+    q36_vk.have_f16 = q36_vk.have_storage16 && f16_query.shaderFloat16;
     VkPhysicalDeviceFeatures enabled = { .shaderFloat64 = VK_TRUE, .shaderInt64 = VK_TRUE };
-    /* f16 arithmetic is optional: the packed-f16 prefill GEMM needs it, and
-     * falls back to the f32 kernel when the device lacks the feature. */
+    VkPhysicalDevice16BitStorageFeatures storage16_enable = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+        .storageBuffer16BitAccess = VK_TRUE,
+    };
     VkPhysicalDeviceShaderFloat16Int8Features f16_enable = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
         .shaderFloat16 = VK_TRUE,
@@ -2740,20 +2812,9 @@ int q36_gpu_init(void) {
         .pQueueCreateInfos = &qci,
         .pEnabledFeatures = &enabled,
     };
-    if (q36_vk.api_version >= VK_API_VERSION_1_2 &&
-        q36_vk.props.apiVersion >= VK_API_VERSION_1_2) {
-        VkPhysicalDeviceShaderFloat16Int8Features f16_query = {
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES,
-        };
-        VkPhysicalDeviceFeatures2 feat2 = {
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-            .pNext = &f16_query,
-        };
-        vkGetPhysicalDeviceFeatures2(q36_vk.physical, &feat2);
-        if (f16_query.shaderFloat16) {
-            q36_vk.have_f16 = true;
-            dci.pNext = &f16_enable;
-        }
+    if (q36_vk.have_storage16) {
+        dci.pNext = &storage16_enable;
+        if (q36_vk.have_f16) storage16_enable.pNext = &f16_enable;
     }
     if (vkCreateDevice(q36_vk.physical, &dci, NULL, &q36_vk.device) != VK_SUCCESS) goto fail;
     vkGetDeviceQueue(q36_vk.device, q36_vk.queue_family, 0, &q36_vk.queue);
@@ -3723,6 +3784,7 @@ static int q36_vk_matmul_q8_0_gpu(q36_gpu_tensor *out,
                                   uint64_t n_tok,
                                   uint64_t blocks,
                                   float scale) {
+    if (n_tok > 1u && !q36_vk_have_subgroups(true)) return 0;
     q36_gpu_tensor *xq_tensor = q36_gpu_tensor_alloc(xq_bytes);
     if (!xq_tensor) return 0;
     unsigned char *xq_host = q36_vk_tensor_contents_labeled(xq_tensor, "submit_wait_q8_0_stage_xq");
@@ -3764,7 +3826,8 @@ static int q36_vk_matmul_q8_0_gpu(q36_gpu_tensor *out,
 }
 
 static bool q36_vk_use_q8_mm_f16(void) {
-    return q36_vk.have_f16 && q36_vk_env_default_on("Q36_VK_Q8_MM_F16");
+    return q36_vk.have_f16 && q36_vk.have_storage16 &&
+           q36_vk_env_default_on("Q36_VK_Q8_MM_F16");
 }
 
 static bool q36_vk_use_q8_mm_f16_out32(void) {
@@ -6940,7 +7003,8 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
     bool streamed = q36_vk_stream.enabled && layer >= q36_vk_stream.full_layers;
     int ok = 0;
 
-    if (q36_gpu_quality || n_tok == 0 || n_used == 0 || n_used > 8u || n_slot > 8192u) return 0;
+    if (q36_gpu_quality || !q36_vk.have_storage16 || !q36_vk_have_subgroups(false) ||
+        n_tok == 0 || n_used == 0 || n_used > 8u || n_slot > 8192u) return 0;
     if (!q36_vk_env_default_on("Q36_VK_MOE_F32B")) return 0;
     if (!streamed && !q36_vk_moe_bank_cache) return 0;
     if (!q4k &&

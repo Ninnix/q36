@@ -14,7 +14,8 @@ non-default flags for every model-backed run.
 
 - Start from a clean tree: `git status --short`.
 - Run `git diff --check` before committing.
-- Build both release configurations with warnings promoted to errors:
+- Build generic Vulkan, BC-250-checked Vulkan, and CPU release configurations
+  with warnings promoted to errors:
   `make release-build-check`.
 - On macOS, run `make release-build-check-metal`, inspect every release binary
   with `otool -l`, and require the documented minimum macOS deployment target.
@@ -58,6 +59,9 @@ not evidence of parity.
 
 ## 4. Vulkan Inference
 
+- Build and start both `make vulkan-generic` and `make vulkan-bc250` on the
+  BC-250. Both must report the BC-250 fast path. On any additional Vulkan test
+  host, use `make vulkan-generic` and record the reported device and subgroup.
 - Run `make test-vulkan`; all isolated kernels must pass their numeric gates.
 - Run `make test-model`; CPU/Vulkan short and long prompt parity must retain the
   same greedy token and satisfy the top-5/top-20/top-64 overlap gates.

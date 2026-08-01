@@ -12,11 +12,14 @@ correctness bug and the tradeoff is explicit.
 
 ## Correctness Regression Tests
 
-Build the default Vulkan backend first:
+Build both Vulkan targets first. The generic binary still selects the BC-250
+fast path automatically when it sees that device; the checked target rejects
+other devices at startup.
 
 ```sh
 make clean
-make
+make vulkan-generic
+make vulkan-bc250
 ```
 
 The C test runner is `q36_test`. Running it without arguments is equivalent to

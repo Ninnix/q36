@@ -32,6 +32,7 @@ LLAMA_LIBS := \
 LLAMA_LDLIBS := -lstdc++ -fopenmp
 CPU_CFLAGS := $(filter-out -ffast-math,$(CFLAGS)) $(DARWIN_MIN_FLAG) -D_GNU_SOURCE -fno-finite-math-only -DQ36_NO_GPU
 GPU_CFLAGS := $(CFLAGS) $(DARWIN_MIN_FLAG) -D_GNU_SOURCE -fno-finite-math-only
+VULKAN_CFLAGS ?=
 LDLIBS ?= -lm -pthread
 GPU_LDLIBS := $(LDLIBS) -ldl -lvulkan
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -180,13 +181,15 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu metal q36-quality-score test test-metal test-metal-model test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
 help:
 	@echo "Q36 build targets:"
-	@echo "  make              Build Vulkan ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test (default)"
+	@echo "  make              Build generic Vulkan with automatic BC-250 fast-path selection (default)"
+	@echo "  make vulkan-generic  Build generic Vulkan for runtime capability detection"
+	@echo "  make vulkan-bc250    Build Vulkan and require an AMD BC-250 at runtime"
 	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
 	@echo "  make test-metal   Build Metal and run its model-independent unit and kernel tests"
 	@echo "  make test-metal-model  Run Metal model, parity, streaming, and state tests"
@@ -202,7 +205,15 @@ help:
 	@echo "  make test-llama           Build optional live CPU-vs-llama.cpp tests"
 	@echo "  make clean        Remove build outputs"
 
-gpu: all
+gpu: vulkan-generic
+
+vulkan: vulkan-generic
+
+vulkan-generic:
+	$(MAKE) -B all VULKAN_CFLAGS=
+
+vulkan-bc250:
+	$(MAKE) -B all VULKAN_CFLAGS=-DQ36_VULKAN_REQUIRE_BC250
 
 metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o rax.o q36_test_metal.o q36_gpu_core_metal_test.o $(METAL_CORE_OBJS)
 	$(CC) $(METAL_LDFLAGS) -o q36 q36_cli_metal.o q36_ssd.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
@@ -258,7 +269,7 @@ q36_cli_metal.o: q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36_cli.c
 
 q36_vulkan.o: q36_vulkan.c q36_gpu.h q36_quant.h q36_iq2_tables_vulkan.inc q36_iq_tables.h $(VULKAN_SHADERS)
-	$(CC) $(GPU_CFLAGS) -c -o $@ q36_vulkan.c
+	$(CC) $(GPU_CFLAGS) $(VULKAN_CFLAGS) -c -o $@ q36_vulkan.c
 
 q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h q36_ssd.h $(METAL_SRCS)
 	$(CC) $(GPU_CFLAGS) -fobjc-arc -c -o $@ q36_metal.m
@@ -441,9 +452,10 @@ benchmark-gate: q36-bench
 	./tests/release_bench_gate.sh
 
 release-build-check:
-	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' all
+	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' VULKAN_CFLAGS= all
+	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' VULKAN_CFLAGS=-DQ36_VULKAN_REQUIRE_BC250 all
 	$(MAKE) -B CFLAGS='$(filter-out -ffast-math,$(CFLAGS)) -Werror' cpu
-	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' all
+	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' VULKAN_CFLAGS= all
 
 release-build-check-metal:
 	$(MAKE) -B CFLAGS='$(CFLAGS) -Werror' metal
