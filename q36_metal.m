@@ -2555,9 +2555,38 @@ int q36_gpu_rms_norm_rope_qwen_rows_tensor(
         const void *map, uint64_t size, uint64_t weight_offset,
         uint32_t src_stride, uint32_t heads,
         uint32_t pos0, uint32_t tokens, float eps) {
+    if (!heads || !tokens || tokens > UINT32_MAX / heads) return 0;
     uint32_t rows = heads * tokens;
-    if (!rows || src_stride < 256u ||
-        !q36_copy_rows(dst, src, (q36_copy_rows_args){
+    const char *fused_env = getenv("Q36_METAL_NORM_ROPE");
+    const bool fused = !fused_env || fused_env[0] != '0';
+    if (src_stride < 256u || !dst || !src || !map ||
+        dst->bytes < (uint64_t)rows * 256u * sizeof(float) ||
+        src->bytes < ((uint64_t)(rows - 1u) * src_stride + 256u) *
+                     sizeof(float) ||
+        weight_offset > size ||
+        256u * sizeof(float) > size - weight_offset) return 0;
+    if (fused) {
+        uint64_t weight_inner = 0;
+        id<MTLBuffer> weight = q36_model_view(
+            map, size, weight_offset, 256u * sizeof(float), &weight_inner);
+        id<MTLComputeCommandEncoder> enc = weight
+            ? q36_encoder(@"q36_rms_norm_rope_qwen_f32") : nil;
+        if (enc) {
+            struct {
+                uint32_t src_stride, heads, pos0, tokens;
+                float eps;
+            } args = { src_stride, heads, pos0, tokens, eps };
+            [enc setBuffer:dst->buffer offset:dst->offset atIndex:0];
+            [enc setBuffer:src->buffer offset:src->offset atIndex:1];
+            [enc setBuffer:weight offset:(NSUInteger)weight_inner atIndex:2];
+            [enc setBytes:&args length:sizeof(args) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc endEncoding];
+            return 1;
+        }
+    }
+    if (!q36_copy_rows(dst, src, (q36_copy_rows_args){
             src_stride, 256u, 0u, 256u, rows
         })) return 0;
     return q36_gpu_rms_norm_weight_rows_tensor(

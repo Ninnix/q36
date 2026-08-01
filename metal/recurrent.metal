@@ -63,6 +63,55 @@ kernel void q36_recurrent_conv_silu(
 
 struct q36_rope_args { uint heads; uint pos0; uint tokens; };
 
+struct q36_norm_rope_args {
+    uint src_stride;
+    uint heads;
+    uint pos0;
+    uint tokens;
+    float eps;
+};
+
+// Consume the interleaved Q/K projection row directly, apply the learned
+// per-head weight and RMSNorm, then rotate the first 64 Qwen head dimensions.
+// The lane reduction and RoPE expressions mirror the standalone kernels so
+// this only changes dispatch and intermediate traffic, not the arithmetic.
+kernel void q36_rms_norm_rope_qwen_f32(
+        device float *dst [[buffer(0)]],
+        device const float *src [[buffer(1)]],
+        device const float *weight [[buffer(2)]],
+        constant q36_norm_rope_args &args [[buffer(3)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint rows = args.heads * args.tokens;
+    if (row >= rows) return;
+    device const float *in = src + (ulong)row * args.src_stride;
+    device float *out = dst + (ulong)row * 256u;
+
+    float sum = 0.0f;
+    for (uint i = lane; i < 256u; i += 32u) {
+        const float v = in[i];
+        sum += v * v;
+    }
+    sum = simd_sum(sum);
+    const float scale = rsqrt(sum / 256.0f + args.eps);
+
+    const uint pair = lane;
+    const uint tok = row / args.heads;
+    float theta = float(args.pos0 + tok) *
+                  pow(10000000.0f, -2.0f * float(pair) / 64.0f);
+    const uint axis = pair < 11u ? 0u : (pair < 22u ? 1u : 2u);
+    if (axis == 3u) theta = 0.0f;
+    const float cs = cos(theta);
+    const float sn = sin(theta);
+    const float a = in[pair] * scale * weight[pair];
+    const float b = in[pair + 32u] * scale * weight[pair + 32u];
+    out[pair] = fma(-b, sn, a * cs);
+    out[pair + 32u] = fma(a, sn, b * cs);
+
+    for (uint i = lane + 64u; i < 256u; i += 32u)
+        out[i] = in[i] * scale * weight[i];
+}
+
 kernel void q36_rope_qwen(device float *x [[buffer(0)]],
                            constant q36_rope_args &args [[buffer(1)]],
                            uint2 gid [[thread_position_in_grid]]) {
