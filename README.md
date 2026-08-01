@@ -239,15 +239,23 @@ process running at a time.
 
 ### Metal measurements
 
-The following single-process measurements used the default q2 GGUF on a
-16 GB M2 Pro with macOS 26.5. The 256-token rows use
-`tests/test-vectors/prompts/long_code_audit.txt`, a 512-token allocated
-context, greedy decode, and four generated probe tokens:
+The following single-process measurements used the default q2 GGUF fully
+resident and the mixed q2-q4 GGUF with SSD streaming on a 16 GB M2 Pro with
+macOS 26.5. The SSD run used the automatic 4240-expert (6.99 GiB) cache. Both
+runs used `tests/long_context_story_prompt.txt`, incremental prefill at doubling
+context frontiers, greedy decoding with 128 generated tokens per frontier, and
+Q8_0 K / Q4_0 V cache:
 
-| Runtime | Expert residency | Prompt | Prefill | Generation |
-| --- | --- | ---: | ---: | ---: |
-| Metal | Full model resident | 256 tokens | 170.75 t/s | 38.75 t/s |
-| Metal SSD | 512 expert slots / 0.42 GiB | 256 tokens | 64.13 t/s | 13.90 t/s |
+| Runtime | Quant | Expert residency | Prompt | Prefill | Generation |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Metal | q2 | Full model resident | 2048 ctx | 448.75 t/s | 37.78 t/s |
+| Metal | q2 | Full model resident | 4096 ctx | 366.19 t/s | 34.93 t/s |
+| Metal | q2 | Full model resident | 8192 ctx | 270.02 t/s | 31.08 t/s |
+| Metal | q2 | Full model resident | 16384 ctx | 177.21 t/s | 25.64 t/s |
+| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 4096 ctx | 58.74 t/s | 8.97 t/s |
+| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 8192 ctx | 55.32 t/s | 9.20 t/s |
+
+![M2 Pro Metal Q2 t/s](speed-bench/metal_q2_ts.svg)
 
 These numbers show the expected capacity tradeoff, not a cross-machine
 performance promise. Metal generation, prefill, and SSD behavior should be
