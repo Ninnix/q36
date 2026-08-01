@@ -281,14 +281,32 @@ static void log_context_memory(q36_backend backend, int ctx_size,
                                q36_kv_cache_type cache_type_v) {
     q36_context_memory m = q36_context_memory_estimate_configured(
             backend, ctx_size, prefill_chunk, cache_type_k, cache_type_v);
+    const uint64_t kv_bytes = m.raw_bytes + m.compressed_bytes;
+    const bool color = q36_log_is_tty(stderr);
+    const char *green = color ? "\x1b[32m" : "";
+    const char *bright_green = color ? "\x1b[1;32m" : "";
+    const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
-            "q36: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
+            "%sq36: memory: KV %.2f GiB (raw %.2f + compressed %.2f) "
+            "+ buffers %.2f GiB = %s%.2f GiB context%s\n",
+            green,
+            (double)kv_bytes / 1073741824.0,
+            (double)m.raw_bytes / 1073741824.0,
+            (double)m.compressed_bytes / 1073741824.0,
+            (double)m.scratch_bytes / 1073741824.0,
+            bright_green,
+            (double)m.total_bytes / 1073741824.0,
+            reset);
+    fprintf(stderr,
+            "%sq36: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
+            "compressed_kv_rows=%u backend=%s%s\n",
+            green,
             ctx_size,
-            q36_backend_name(backend),
             m.prefill_cap,
             m.raw_cap,
-            m.comp_cap);
+            m.comp_cap,
+            q36_backend_name(backend),
+            reset);
 }
 
 static q36_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
@@ -1522,17 +1540,17 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return rc;
     }
+    q36_engine *engine = NULL;
+    if (q36_engine_open(&engine, &cfg.engine) != 0) {
+        free(cfg.prompt_owned);
+        return 1;
+    }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size,
                            cfg.engine.prefill_chunk,
                            cfg.engine.cache_type_k,
                            cfg.engine.cache_type_v);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
-    }
-    q36_engine *engine = NULL;
-    if (q36_engine_open(&engine, &cfg.engine) != 0) {
-        free(cfg.prompt_owned);
-        return 1;
     }
     int rc = 0;
     if (cfg.inspect) {

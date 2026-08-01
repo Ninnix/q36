@@ -326,6 +326,8 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
 static int agent_worker_sync_tokens(agent_worker *w, const q36_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
+static void agent_format_welcome_banner(const agent_config *cfg,
+                                        char *buf, size_t len);
 
 /* ============================================================================
  * Small Utilities And Command-Line Parsing
@@ -708,14 +710,32 @@ static void log_context_memory(q36_backend backend,
                                                prefill_chunk,
                                                cache_type_k,
                                                cache_type_v);
+    const uint64_t kv_bytes = m.raw_bytes + m.compressed_bytes;
+    const bool color = q36_log_is_tty(stderr);
+    const char *green = color ? "\x1b[32m" : "";
+    const char *bright_green = color ? "\x1b[1;32m" : "";
+    const char *reset = color ? "\x1b[0m" : "";
     fprintf(stderr,
-            "q36-agent: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
-            (double)m.total_bytes / (1024.0 * 1024.0),
+            "%sq36: memory: KV %.2f GiB (raw %.2f + compressed %.2f) "
+            "+ buffers %.2f GiB = %s%.2f GiB context%s\n",
+            green,
+            (double)kv_bytes / 1073741824.0,
+            (double)m.raw_bytes / 1073741824.0,
+            (double)m.compressed_bytes / 1073741824.0,
+            (double)m.scratch_bytes / 1073741824.0,
+            bright_green,
+            (double)m.total_bytes / 1073741824.0,
+            reset);
+    fprintf(stderr,
+            "%sq36: memory detail: ctx=%d prefill_cap=%u raw_kv_rows=%u "
+            "compressed_kv_rows=%u backend=%s%s\n",
+            green,
             ctx_size,
-            q36_backend_name(backend),
             m.prefill_cap,
             m.raw_cap,
-            m.comp_cap);
+            m.comp_cap,
+            q36_backend_name(backend),
+            reset);
 }
 
 static q36_think_mode effective_think_mode(const agent_config *cfg) {
@@ -6201,11 +6221,22 @@ static void test_agent_streaming_defaults(void) {
     AGENT_TEST_ASSERT(cpu.engine.cache_type_v == Q36_KV_CACHE_F16);
 }
 
+static void test_agent_welcome_banner(void) {
+    agent_config cfg = {0};
+    char banner[256];
+    cfg.gen.ctx_size = 100000;
+    agent_format_welcome_banner(&cfg, banner, sizeof(banner));
+    AGENT_TEST_ASSERT(strstr(banner, "Quark") != NULL);
+    AGENT_TEST_ASSERT(strstr(banner, "Star") != NULL);
+    AGENT_TEST_ASSERT(strstr(banner, "context 100k tokens") != NULL);
+}
+
 static void q36_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_qwen_tool_parser();
     test_agent_streaming_defaults();
+    test_agent_welcome_banner();
 }
 #endif
 
@@ -9406,10 +9437,10 @@ static void agent_format_welcome_banner(const agent_config *cfg,
     agent_format_ctx_size(cfg->gen.ctx_size, ctx, sizeof(ctx));
     if (stdout_is_tty()) {
         snprintf(buf, len,
-                 "\x1b[1;97mq36\x1b[0m Agent, context %s tokens\n\n",
+                 "\x1b[1;97mQuark\x1b[1;95mStar\x1b[0m 🔮 Agent, context %s tokens\n\n",
                  ctx);
     } else {
-        snprintf(buf, len, "q36 Agent, context %s tokens\n\n", ctx);
+        snprintf(buf, len, "QuarkStar Agent, context %s tokens\n\n", ctx);
     }
 }
 

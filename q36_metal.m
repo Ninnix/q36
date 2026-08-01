@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 /*
@@ -49,6 +50,25 @@ static int q36_model_fd = -1;
 static bool q36_quality;
 static bool q36_micro_batch;
 static bool q36_ssd_streaming;
+
+static uint64_t q36_gpu_system_memory_bytes(void) {
+    uint64_t bytes = 0;
+    size_t len = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0) return 0;
+    return len == sizeof(bytes) ? bytes : 0;
+}
+
+static void q36_gpu_print_device_summary(void) {
+    const char *name = q36_device.name ? q36_device.name.UTF8String : "unknown Metal device";
+    uint64_t mem = q36_gpu_system_memory_bytes();
+    if (mem) {
+        fprintf(stderr, "q36: Metal device %s, %.2f GiB RAM\n",
+                name, (double)mem / 1073741824.0);
+    } else {
+        fprintf(stderr, "q36: Metal device %s\n", name);
+    }
+}
+
 enum {
     Q36_METAL_STREAM_MAX_LAYERS = 40,
     Q36_METAL_STREAM_MAX_EXPERTS = 256,
@@ -642,6 +662,7 @@ int q36_gpu_init(void) {
             fprintf(stderr, "q36: no Metal device is available\n");
             return 0;
         }
+        q36_gpu_print_device_summary();
         q36_queue = [q36_device newCommandQueue];
         if (!q36_queue) {
             q36_device = nil;
@@ -669,9 +690,6 @@ int q36_gpu_init(void) {
         }
         q36_pipelines = [NSMutableDictionary dictionary];
         q36_model_views = [NSMutableDictionary dictionary];
-        fprintf(stderr, "q36: Metal device: %s (unified memory: %s)\n",
-                q36_device.name.UTF8String,
-                q36_device.hasUnifiedMemory ? "yes" : "no");
         return 1;
     }
 }

@@ -2701,6 +2701,18 @@ int q36_gpu_init(void) {
     vkGetPhysicalDeviceProperties(q36_vk.physical, &q36_vk.props);
     vkGetPhysicalDeviceMemoryProperties(q36_vk.physical, &q36_vk.mem_props);
 
+    uint64_t device_bytes = 0;
+    for (uint32_t i = 0; i < q36_vk.mem_props.memoryHeapCount; i++) {
+        if (q36_vk.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            device_bytes += q36_vk.mem_props.memoryHeaps[i].size;
+    }
+    if (device_bytes) {
+        fprintf(stderr, "q36: Vulkan device %s, %.2f GiB memory\n",
+                q36_vk.props.deviceName, (double)device_bytes / 1073741824.0);
+    } else {
+        fprintf(stderr, "q36: Vulkan device %s\n", q36_vk.props.deviceName);
+    }
+
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
