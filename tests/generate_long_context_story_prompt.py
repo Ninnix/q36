@@ -137,7 +137,7 @@ def make_story() -> str:
     fact_by_scene = {7 + i * 11: fact for i, fact in enumerate(FACTS)}
     scenes: list[str] = []
 
-    for scene_index in range(190):
+    for scene_index in range(210):
         lead = rng.choice(names)
         friend = rng.choice([n for n in names if n != lead])
         template = SCENE_TEMPLATES[scene_index % len(SCENE_TEMPLATES)]

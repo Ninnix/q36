@@ -216,25 +216,26 @@ meaningful generation-speed win.
 
 ## Speed
 
-Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor limited
-to 500-1500 MHz, 85 °C thermal ceiling — a hot summer in Italy). These are
-full-model resident Vulkan runs with greedy decoding, `--gen-tokens 128`,
-and the extended long-context story prompt. All runs use Q8_0 K / Q4_0 V
+Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor performance
+mode at 500-2000 MHz, 85 °C thermal ceiling — a hot summer in Italy). Runs
+use greedy decoding, `--gen-tokens 128`, the extended long-context story
+prompt, and Q8_0 K / Q4_0 V cache. The q2 model is fully resident. The mixed
+q2-q4 model uses SSD streaming with the automatic 5724-expert (4.72 GiB)
 cache. Each row was measured in a separate process, with only one benchmark
 process running at a time.
 
-| Machine | Quant | Prompt | Prefill | Generation |
-| --- | ---: | ---: | ---: | ---: |
-| BC-250 (40 CU) | q2 | 2048 ctx | 451.34 t/s | 69.21 t/s |
-| BC-250 (40 CU) | q2 | 8192 ctx | 290.07 t/s | 56.54 t/s |
-| BC-250 (40 CU) | q2 | 16384 ctx | 217.04 t/s | 47.85 t/s |
-| BC-250 (40 CU) | q2 | 24576 ctx | 165.75 t/s | 41.89 t/s |
-| BC-250 (40 CU) | q2 | 32768 ctx | 134.17 t/s | 38.41 t/s |
-| BC-250 (40 CU) | q2 | 40960 ctx | 115.09 t/s | 34.14 t/s |
-| BC-250 (40 CU) | q2 | 49152 ctx | 100.01 t/s | 31.10 t/s |
-| BC-250 (40 CU) | q2 | 57344 ctx | 88.75 t/s | 28.12 t/s |
+| Machine | Quant | Mode | Prompt | Prefill | Generation |
+| --- | ---: | --- | ---: | ---: | ---: |
+| BC-250 (40 CU) | q2 | Resident | 2048 ctx | 639.85 t/s | 81.85 t/s |
+| BC-250 (40 CU) | q2 | Resident | 4096 ctx | 597.10 t/s | 79.74 t/s |
+| BC-250 (40 CU) | q2 | Resident | 8192 ctx | 501.50 t/s | 74.72 t/s |
+| BC-250 (40 CU) | q2 | Resident | 16384 ctx | 373.32 t/s | 65.04 t/s |
+| BC-250 (40 CU) | q2 | Resident | 24576 ctx | 287.24 t/s | 56.17 t/s |
+| BC-250 (40 CU) | q2 | Resident | 32768 ctx | 244.06 t/s | 51.26 t/s |
+| BC-250 (40 CU) | q2-q4 | SSD streaming | 4096 ctx | 45.43 t/s | 14.52 t/s |
+| BC-250 (40 CU) | q2-q4 | SSD streaming | 8192 ctx | 48.78 t/s | 13.98 t/s |
 
-![BC-250 t/s](speed-bench/bc250_ts.svg)
+![BC-250 Q2 t/s](speed-bench/bc250_ts.svg)
 
 ### Metal measurements
 
