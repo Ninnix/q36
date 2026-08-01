@@ -803,7 +803,7 @@ static void q36_kv_cache_store_row(uint8_t *dst, q36_kv_cache_type type, const f
     } else if (type == Q36_KV_CACHE_Q8_0) {
         q36_quant_q8_0(src, dst, (int64_t)n);
     } else if (type == Q36_KV_CACHE_Q4_0) {
-        q36_quant_q4_0(src, dst, (int64_t)n);
+        q36_quant_q4_0_kv(src, dst, (int64_t)n);
     }
 }
 
@@ -1394,7 +1394,8 @@ void q36_quant_q8_0(const float *x, void *out, int64_t n) {
     }
 }
 
-void q36_quant_q4_0(const float *x, void *out, int64_t n) {
+static void q36_quant_q4_0_impl(const float *x, void *out, int64_t n,
+                               bool refine) {
     q36_block_q4_0 *y = out;
     int64_t blocks = n / Q36_QK4_0;
     if (!x || !out || n < 0 || n % Q36_QK4_0) return;
@@ -1411,15 +1412,43 @@ void q36_quant_q4_0(const float *x, void *out, int64_t n) {
         }
         float d = max / -8.0f;
         float inv = d ? (float)(1.0 / (double)d) : 0.0f;
+        /* KV values favor reconstruction error over canonical Q4_0 bytes. */
+        if (refine) {
+            double num = 0.0;
+            int den = 0;
+            for (uint32_t i = 0; i < Q36_QK4_0; i++) {
+                int q = (int)(row[i] * inv + 8.5f);
+                if (q < 0) q = 0;
+                if (q > 15) q = 15;
+                q -= 8;
+                num += (double)row[i] * (double)q;
+                den += q * q;
+            }
+            if (den) {
+                float fit = (float)(num / (double)den);
+                d = d + (fit - d) * 0.25f;
+                inv = d ? (float)(1.0 / (double)d) : 0.0f;
+            }
+        }
         y[b].d = q36_quant_f32_to_f16(d);
         for (uint32_t i = 0; i < Q36_QK4_0 / 2u; i++) {
             int q0 = (int8_t)(row[i] * inv + 8.5f);
             int q1 = (int8_t)(row[i + Q36_QK4_0 / 2u] * inv + 8.5f);
+            if (refine && q0 < 0) q0 = 0;
+            if (refine && q1 < 0) q1 = 0;
             if (q0 > 15) q0 = 15;
             if (q1 > 15) q1 = 15;
             y[b].qs[i] = (uint8_t)(q0 | (q1 << 4));
         }
     }
+}
+
+void q36_quant_q4_0(const float *x, void *out, int64_t n) {
+    q36_quant_q4_0_impl(x, out, n, false);
+}
+
+void q36_quant_q4_0_kv(const float *x, void *out, int64_t n) {
+    q36_quant_q4_0_impl(x, out, n, true);
 }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
@@ -4967,16 +4996,6 @@ static void q36_recurrent_conv_step(q36_recurrent_cache *cache, const float *cur
 
 static void q36_ssm_conv_apply(const float *window, const float *kernel, float *out) {
     for (uint32_t c = 0; c < Q36_N_SSM_CONV_DIM; c++) {
-        double acc = 0.0;
-        for (uint32_t t = 0; t < Q36_N_SSM_CONV; t++) {
-            acc += (double)window[(uint64_t)t * Q36_N_SSM_CONV_DIM + c] * (double)kernel[(uint64_t)c * Q36_N_SSM_CONV + t];
-        }
-        out[c] = (float)acc;
-    }
-}
-
-static void q36_ssm_conv_apply_f32(const float *window, const float *kernel, float *out) {
-    for (uint32_t c = 0; c < Q36_N_SSM_CONV_DIM; c++) {
         float acc = 0.0f;
         for (uint32_t t = 0; t < Q36_N_SSM_CONV; t++) {
             acc += window[(uint64_t)t * Q36_N_SSM_CONV_DIM + c] * kernel[(uint64_t)c * Q36_N_SSM_CONV + t];
@@ -5231,7 +5250,7 @@ static bool q36_forward_recurrent(const q36_engine *e, const q36_layer_weights *
     q36_scale_inplace(qkv, Q36_N_SSM_CONV_DIM,
                       q36_tensor_scalar_or(&e->model, l->attn_qkv_scale, 1.0f));
     q36_recurrent_conv_step(cache, qkv, window);
-    q36_ssm_conv_apply_f32(window, kernel, conv);
+    q36_ssm_conv_apply(window, kernel, conv);
     for (uint32_t i = 0; i < Q36_N_SSM_CONV_DIM; i++) conv[i] = q36_siluf(conv[i]);
     if (!q36_all_finite(conv, Q36_N_SSM_CONV_DIM)) {
         fprintf(stderr, "q36: recurrent conv non-finite at layer=%u\n", il);

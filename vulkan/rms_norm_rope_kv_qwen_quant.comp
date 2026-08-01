@@ -157,6 +157,32 @@ void main(void) {
         float id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
         precise float pv = vval * id + 8.5;
         sh_qv[lid] = clamp(int(pv), 0, 15);
+        barrier();
+        /* Keep the compact cache layout, but reduce value reconstruction
+         * error with a bounded least-squares scale correction. */
+        if (lane == 0u) {
+            double num = 0.0;
+            int den = 0;
+            uint base = blk * 32u;
+            for (uint i = 0u; i < 32u; i++) {
+                int q = sh_qv[base + i] - 8;
+                num += double(sh_v[base + i]) * double(q);
+                den += q * q;
+            }
+            if (den != 0) {
+                float fit = float(num / double(den));
+                precise float refined = d + (fit - d) * 0.25;
+                sh_red[base] = refined;
+            } else {
+                sh_red[base] = d;
+            }
+        }
+        barrier();
+        d = sh_red[blk * 32u];
+        if (extreme == 0.0) d = uintBitsToFloat(0x80000000u);
+        id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
+        precise float refined = vval * id + 8.5;
+        sh_qv[lid] = clamp(int(refined), 0, 15);
         if (lane == 0u) sh_scale_v[blk] = f16_rte(d);
         barrier();
         /* Pack 144 bytes = 36 uints per head */

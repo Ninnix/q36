@@ -2078,11 +2078,11 @@ static void test_vulkan_kv_store_quant_case(uint32_t type_k, uint32_t type_v) {
         if (type_k == Q36_KV_CACHE_Q8_0)
             q36_quant_q8_0(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
         else
-            q36_quant_q4_0(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
+            q36_quant_q4_0_kv(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
         if (type_v == Q36_KV_CACHE_Q8_0)
             q36_quant_q8_0(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
         else
-            q36_quant_q4_0(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
+            q36_quant_q4_0_kv(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
     }
     k = q36_gpu_tensor_alloc(values * sizeof(float));
     v = q36_gpu_tensor_alloc(values * sizeof(float));
@@ -3550,7 +3550,7 @@ static void test_kv_store_row(uint8_t *dst, uint32_t type, const float *src, uin
     } else if (type == Q36_KV_CACHE_Q8_0) {
         q36_quant_q8_0(src, dst, n);
     } else {
-        q36_quant_q4_0(src, dst, n);
+        q36_quant_q4_0_kv(src, dst, n);
     }
 }
 

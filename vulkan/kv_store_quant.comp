@@ -91,6 +91,32 @@ void main(void) {
         /* fp64 divide: f32 rcp is 2.5 ulp on RADV, the host divide is exact */
         float id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
 
+        /* Nudge the KV scale toward its least-squares fit without changing
+         * the Q4_0 block layout. */
+        if (pc.qtype == 2u) {
+            if (lid == 0u) {
+                double num = 0.0;
+                int den = 0;
+                for (uint i = 0u; i < QK; i++) {
+                    precise float p = sh_blk[i] * id + 8.5;
+                    int q = clamp(int(p), 0, 15) - 8;
+                    num += double(sh_blk[i]) * double(q);
+                    den += q * q;
+                }
+                if (den != 0) {
+                    float fit = float(num / double(den));
+                    precise float refined = d + (fit - d) * 0.25;
+                    sh_extreme = refined;
+                } else {
+                    sh_extreme = d;
+                }
+            }
+            barrier();
+            d = sh_extreme;
+            if (extreme == 0.0) d = uintBitsToFloat(0x80000000u);
+            id = d != 0.0 ? float(double(1.0) / double(d)) : 0.0;
+        }
+
         uint blk_off = blk * blk_bytes;
         uint scale_u = f16_rte(d);
 
