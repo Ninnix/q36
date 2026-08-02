@@ -2,9 +2,10 @@
   <img src="logo.svg" alt="QuarkStar logo" width="220">
 </p>
 
-**QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B**. 
+**QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B** and
+**KAT-Coder-V2.5-Dev**.
 It is self-contained and deliberately narrow, not a general GGUF runner. 
-The main paths are Qwen3.6-35B-A3B-specific Vulkan and Metal graph executors with
+The main paths are `qwen35moe`-specific Vulkan and Metal graph executors with
 Q36-specific loading, prompt rendering, tool calls, KV state, HTTP server,
 and coding agent. The repository also includes tools and data for GGUF,
 imatrix, quality, and speed.
@@ -181,6 +182,7 @@ Download one main model.
 ```sh
 ./download_model.sh q2-imatrix   # 16 GB unified memory machines
 ./download_model.sh q2-q4-imatrix # higher quality; stream on 16 GB machines
+./download_model.sh kat-coder     # KAT-Coder V2.5 Dev IQ2_XXS imatrix
 ```
 
 Choose one. The first target matches the compiled default path. Select the
@@ -191,9 +193,10 @@ second explicitly:
   --ssd-streaming -p "Hello"
 ```
 
-The script downloads from
-`https://huggingface.co/Ninnix96/Qwen3.6-35B-A3B-gguf`, stores files under
-`./gguf/`, resumes partial downloads with `curl -C -`, and updates
+The script downloads Qwen models from
+`https://huggingface.co/Ninnix96/Qwen3.6-35B-A3B-gguf` and KAT-Coder from
+`https://huggingface.co/Ninnix96/KAT-Coder-V2.5-Dev-gguf`. It stores files
+under `./gguf/`, resumes partial downloads with `curl -C -`, and updates
 `./q36moe.gguf` to point at the selected model for older scripts.
 
 Then build for the target platform:
