@@ -8542,6 +8542,20 @@ bool q36_engine_is_kat_coder(q36_engine *e) {
     return e && e->kat_coder;
 }
 
+void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p) {
+    if (!temperature || !top_k || !top_p || !min_p) return;
+    *temperature = Q36_DEFAULT_TEMPERATURE;
+    *top_k = 0;
+    *top_p = Q36_DEFAULT_TOP_P;
+    *min_p = Q36_DEFAULT_MIN_P;
+    if (!e || !e->kat_coder) return;
+    *temperature = 0.7f;
+    *top_k = 20;
+    *top_p = 0.8f;
+    *min_p = 0.05f;
+}
+
 int q36_inspect_model(const char *model_path) {
     q36_engine *e = NULL;
     q36_engine_options opt;

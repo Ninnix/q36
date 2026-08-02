@@ -56,10 +56,15 @@ typedef struct {
     int n_predict;
     int ctx_size;
     float temperature;
+    int top_k;
     float top_p;
     float min_p;
     uint64_t seed;
     q36_think_mode think_mode;
+    bool temperature_set;
+    bool top_k_set;
+    bool top_p_set;
+    bool min_p_set;
 } agent_generation_options;
 
 typedef struct {
@@ -534,6 +539,7 @@ static agent_config parse_options(int argc, char **argv) {
             .n_predict = 50000,
             .ctx_size = AGENT_RESIDENT_CTX,
             .temperature = Q36_DEFAULT_TEMPERATURE,
+            .top_k = 0,
             .top_p = Q36_DEFAULT_TOP_P,
             .min_p = Q36_DEFAULT_MIN_P,
             .think_mode = Q36_THINK_HIGH,
@@ -587,10 +593,16 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.gen.temperature_set = true;
+        } else if (!strcmp(arg, "--top-k")) {
+            c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.gen.top_p_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.gen.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
@@ -697,6 +709,16 @@ static agent_config parse_options(int argc, char **argv) {
     if (!cache_type_v_set)
         c.engine.cache_type_v = q36_default_kv_cache_type_v(c.engine.backend, c.engine.ssd_streaming);
     return c;
+}
+
+static void agent_apply_sampling_defaults(agent_config *c, q36_engine *engine) {
+    float temperature, top_p, min_p;
+    int top_k;
+    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!c->gen.temperature_set) c->gen.temperature = temperature;
+    if (!c->gen.top_k_set) c->gen.top_k = top_k;
+    if (!c->gen.top_p_set) c->gen.top_p = top_p;
+    if (!c->gen.min_p_set) c->gen.min_p = min_p;
 }
 
 static void log_context_memory(q36_backend backend,
@@ -6183,6 +6205,10 @@ static void test_agent_streaming_defaults(void) {
     char *metalv[] = {"q36-agent", "--metal"};
     char *vulkanv[] = {"q36-agent", "--vulkan"};
     char *chunkv[] = {"q36-agent", "--prefill-chunk", "1024"};
+    char *samplingv[] = {"q36-agent", "--temp", "0.7", "--top-k", "20",
+                         "--top-p", "0.95", "--min-p", "0.05"};
+    char *overridev[] = {"q36-agent", "--temp", "0.2", "--top-k", "7",
+                         "--top-p", "0.6", "--min-p", "0.01"};
     agent_config def = parse_options(1, defv);
     agent_config stream = parse_options(2, streamv);
     agent_config streamctx = parse_options(4, streamctxv);
@@ -6193,6 +6219,9 @@ static void test_agent_streaming_defaults(void) {
     agent_config metal = parse_options(2, metalv);
     agent_config vulkan = parse_options(2, vulkanv);
     agent_config chunk = parse_options(3, chunkv);
+    agent_config sampling = parse_options(9, samplingv);
+    agent_config override = parse_options(9, overridev);
+    agent_apply_sampling_defaults(&override, NULL);
 
     AGENT_TEST_ASSERT(!def.engine.ssd_streaming);
     AGENT_TEST_ASSERT(def.gen.ctx_size == AGENT_RESIDENT_CTX);
@@ -6229,6 +6258,18 @@ static void test_agent_streaming_defaults(void) {
     AGENT_TEST_ASSERT(!cpu.engine.ssd_streaming);
     AGENT_TEST_ASSERT(cpu.engine.cache_type_k == Q36_KV_CACHE_F16);
     AGENT_TEST_ASSERT(cpu.engine.cache_type_v == Q36_KV_CACHE_F16);
+    AGENT_TEST_ASSERT(sampling.gen.temperature == 0.7f);
+    AGENT_TEST_ASSERT(sampling.gen.top_k == 20);
+    AGENT_TEST_ASSERT(sampling.gen.top_p == 0.95f);
+    AGENT_TEST_ASSERT(sampling.gen.min_p == 0.05f);
+    AGENT_TEST_ASSERT(override.gen.temperature == 0.2f);
+    AGENT_TEST_ASSERT(override.gen.top_k == 7);
+    AGENT_TEST_ASSERT(override.gen.top_p == 0.6f);
+    AGENT_TEST_ASSERT(override.gen.min_p == 0.01f);
+    AGENT_TEST_ASSERT(override.gen.temperature_set);
+    AGENT_TEST_ASSERT(override.gen.top_k_set);
+    AGENT_TEST_ASSERT(override.gen.top_p_set);
+    AGENT_TEST_ASSERT(override.gen.min_p_set);
 }
 
 static void test_agent_welcome_banner(void) {
@@ -7677,7 +7718,7 @@ static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
     return q36_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
-                              0,
+                              greedy ? 0 : cfg->gen.top_k,
                               greedy ? 1.0f : cfg->gen.top_p,
                               greedy ? 0.0f : cfg->gen.min_p,
                               rng);
@@ -10269,6 +10310,7 @@ int main(int argc, char **argv) {
     }
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &cfg.engine) != 0) return 1;
+    agent_apply_sampling_defaults(&cfg, engine);
     log_context_memory(cfg.engine.backend,
                        cfg.gen.ctx_size,
                        cfg.engine.prefill_chunk,

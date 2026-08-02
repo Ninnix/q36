@@ -136,6 +136,8 @@ int q36_engine_set_power(q36_engine *e, int power_percent);
 const char *q36_engine_model_name(q36_engine *e);
 int q36_engine_model_id(q36_engine *e);
 bool q36_engine_is_kat_coder(q36_engine *e);
+void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
+                                  int *top_k, float *top_p, float *min_p);
 const char *q36_backend_name(q36_backend backend);
 const char *q36_kv_cache_type_name(q36_kv_cache_type type);
 bool q36_parse_kv_cache_type(const char *s, q36_kv_cache_type *out);

@@ -38,6 +38,10 @@ typedef struct {
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
     q36_think_mode think_mode;
+    bool temperature_set;
+    bool top_k_set;
+    bool top_p_set;
+    bool min_p_set;
     bool head_test;
     bool first_token_test;
     bool vulkan_graph_test;
@@ -1362,12 +1366,16 @@ static cli_config parse_options(int argc, char **argv) {
             cache_type_v_set = true;
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
+            c.gen.temperature_set = true;
         } else if (!strcmp(arg, "--top-k")) {
             c.gen.top_k = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+            c.gen.top_k_set = true;
         } else if (!strcmp(arg, "--top-p")) {
             c.gen.top_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.gen.top_p_set = true;
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
+            c.gen.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
@@ -1526,6 +1534,19 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+static void cli_apply_model_sampling_defaults(
+        q36_engine             *engine,
+        cli_generation_options *gen) {
+    if (!engine || !gen) return;
+    float temperature, top_p, min_p;
+    int top_k;
+    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!gen->temperature_set) gen->temperature = temperature;
+    if (!gen->top_k_set) gen->top_k = top_k;
+    if (!gen->top_p_set) gen->top_p = top_p;
+    if (!gen->min_p_set) gen->min_p = min_p;
+}
+
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
@@ -1545,6 +1566,7 @@ int main(int argc, char **argv) {
         free(cfg.prompt_owned);
         return 1;
     }
+    cli_apply_model_sampling_defaults(engine, &cfg.gen);
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size,
                            cfg.engine.prefill_chunk,

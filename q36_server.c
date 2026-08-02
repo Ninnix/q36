@@ -735,6 +735,16 @@ static void request_set_model_profile(request *r, q36_engine *e) {
     if (r->kat_coder) r->presence_penalty = 1.5f;
 }
 
+static void request_apply_model_sampling_defaults(q36_engine *engine, request *r) {
+    float temperature, top_p, min_p;
+    int top_k;
+    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    if (!r->temperature_set) r->temperature = temperature;
+    if (!r->top_k_set) r->top_k = top_k;
+    if (!r->top_p_set) r->top_p = top_p;
+    if (!r->min_p_set) r->min_p = min_p;
+}
+
 static void request_free(request *r) {
     q36_tokens_free(&r->prompt);
     free(r->model);
@@ -752,19 +762,6 @@ static void request_sampling(const request *r, float *temperature, int *top_k,
     *top_k = r->top_k;
     *top_p = r->top_p;
     *min_p = r->min_p;
-    if (r->kat_coder) {
-        bool think = q36_think_mode_enabled(r->think_mode);
-        if (!r->temperature_set) *temperature = think ? 1.0f : 0.7f;
-        if (!r->top_k_set) *top_k = 20;
-        if (!r->top_p_set) *top_p = think ? 0.95f : 0.8f;
-        if (!r->min_p_set) *min_p = 0.0f;
-        return;
-    }
-    if (!q36_think_mode_enabled(r->think_mode)) return;
-    if (!r->temperature_set) *temperature = Q36_DEFAULT_TEMPERATURE;
-    if (!r->top_k_set) *top_k = 0;
-    if (!r->top_p_set) *top_p = Q36_DEFAULT_TOP_P;
-    if (!r->min_p_set) *min_p = Q36_DEFAULT_MIN_P;
 }
 
 static q36_think_mode think_mode_from_enabled(bool enabled, q36_think_mode effort) {
@@ -8920,6 +8917,7 @@ static void *client_main(void *arg) {
         http_error(fd, 400, err);
         goto done;
     }
+    request_apply_model_sampling_defaults(s->engine, &req);
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, &req, req.prompt.len, ctx_size);
         request_free(&req);
