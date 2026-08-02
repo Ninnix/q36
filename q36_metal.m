@@ -2047,9 +2047,9 @@ int q36_gpu_attn_kv_store_tensor(
                 void *kd = kc + (uint64_t)(pos0 + tok) * k_row_bytes;
                 void *vd = vc + (uint64_t)(pos0 + tok) * v_row_bytes;
                 if (k_type == 1u) q36_quant_q8_0(kp + (uint64_t)tok * k_row, kd, k_row);
-                else q36_quant_q4_0(kp + (uint64_t)tok * k_row, kd, k_row);
+                else q36_quant_q4_0_kv(kp + (uint64_t)tok * k_row, kd, k_row);
                 if (v_type == 1u) q36_quant_q8_0(vp + (uint64_t)tok * v_row, vd, v_row);
-                else q36_quant_q4_0(vp + (uint64_t)tok * v_row, vd, v_row);
+                else q36_quant_q4_0_kv(vp + (uint64_t)tok * v_row, vd, v_row);
             }
             return 1;
         }

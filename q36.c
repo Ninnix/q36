@@ -8284,12 +8284,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     e->prefill_cap_override = opt->prefill_chunk;
     e->cache_type_k = opt->cache_type_k;
     e->cache_type_v = opt->cache_type_v;
-#if defined(Q36_METAL) && defined(Q36_METAL_TEST_COMPAT)
-    if (opt->backend == Q36_BACKEND_VULKAN && !opt->ssd_streaming) {
-        e->cache_type_k = Q36_KV_CACHE_F16;
-        e->cache_type_v = Q36_KV_CACHE_F16;
-    }
-#endif
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;

@@ -219,8 +219,23 @@ kernel void q36_kv_store_q8_q4(
         float d = vmax / -8.0f;
         device uchar *dst = vcache + (ulong)(args.pos0 + tok) *
             args.v_row_bytes + block * 18u;
-        *reinterpret_cast<device half *>(dst) = half(d);
         float inv = d != 0.0f ? 1.0f / d : 0.0f;
+        /* Match the CPU and Vulkan KV-specific Q4_0 scale refinement.  The
+         * compact cache layout stays unchanged; only the reconstruction
+         * error of the stored values is reduced. */
+        float num = 0.0f;
+        int den = 0;
+        for (uint i = 0; i < 32u; i++) {
+            int q = clamp(int(src[i] * inv + 8.5f), 0, 15) - 8;
+            num += src[i] * float(q);
+            den += q * q;
+        }
+        if (den != 0) {
+            float fit = num / float(den);
+            d += (fit - d) * 0.25f;
+            inv = d != 0.0f ? 1.0f / d : 0.0f;
+        }
+        *reinterpret_cast<device half *>(dst) = half(d);
         for (uint i = 0; i < 16u; i++) {
             uint q0 = uint(clamp(int(src[i] * inv + 8.5f), 0, 15));
             uint q1 = uint(clamp(int(src[i + 16u] * inv + 8.5f), 0, 15));
