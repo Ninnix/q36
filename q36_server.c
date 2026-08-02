@@ -605,6 +605,8 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    float presence_penalty;
+    float frequency_penalty;
     bool temperature_set;
     bool top_p_set;
     bool min_p_set;
@@ -614,6 +616,8 @@ typedef struct {
     bool stream_include_usage;
     q36_think_mode think_mode;
     bool has_tools;
+    bool kat_coder;
+    bool preserve_thinking;
     bool prompt_preserves_reasoning;
     tool_replay_stats tool_replay;
 } request;
@@ -724,6 +728,13 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = Q36_THINK_HIGH;
 }
 
+static void request_set_model_profile(request *r, q36_engine *e) {
+    free(r->model);
+    r->model = xstrdup(q36_engine_model_name(e));
+    r->kat_coder = q36_engine_is_kat_coder(e);
+    if (r->kat_coder) r->presence_penalty = 1.5f;
+}
+
 static void request_free(request *r) {
     q36_tokens_free(&r->prompt);
     free(r->model);
@@ -741,6 +752,14 @@ static void request_sampling(const request *r, float *temperature, int *top_k,
     *top_k = r->top_k;
     *top_p = r->top_p;
     *min_p = r->min_p;
+    if (r->kat_coder) {
+        bool think = q36_think_mode_enabled(r->think_mode);
+        if (!r->temperature_set) *temperature = think ? 1.0f : 0.7f;
+        if (!r->top_k_set) *top_k = 20;
+        if (!r->top_p_set) *top_p = think ? 0.95f : 0.8f;
+        if (!r->min_p_set) *min_p = 0.0f;
+        return;
+    }
     if (!q36_think_mode_enabled(r->think_mode)) return;
     if (!r->temperature_set) *temperature = Q36_DEFAULT_TEMPERATURE;
     if (!r->top_k_set) *top_k = 0;
@@ -817,6 +836,47 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
     return true;
 }
 
+static bool parse_chat_template_kwargs(const char **p, bool *thinking_enabled,
+                                       bool *got_thinking, bool *preserve_thinking) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "enable_thinking")) {
+            if (!json_bool(p, thinking_enabled)) {
+                free(key);
+                return false;
+            }
+            *got_thinking = true;
+        } else if (!strcmp(key, "preserve_thinking")) {
+            if (!json_bool(p, preserve_thinking)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 static bool parse_output_config_effort(const char **p, q36_think_mode *effort) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
@@ -852,11 +912,13 @@ static bool parse_output_config_effort(const char **p, q36_think_mode *effort) {
 }
 
 static bool model_alias_disables_thinking(const char *model) {
-    return model && !strcmp(model, "qwen3.6-35b-a3b-nothink");
+    return model && (!strcmp(model, "qwen3.6-35b-a3b-nothink") ||
+                     !strcmp(model, "kat-coder-v2.5-dev-nothink"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model && !strcmp(model, "qwen3.6-35b-a3b-think");
+    return model && (!strcmp(model, "qwen3.6-35b-a3b-think") ||
+                     !strcmp(model, "kat-coder-v2.5-dev-think"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -1889,9 +1951,157 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     q36_think_mode think_mode) {
+static void buf_puts_trimmed(buf *b, const char *s) {
+    const char *start = s ? s : "";
+    const char *end = start + strlen(start);
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    buf_append(b, start, (size_t)(end - start));
+}
+
+static bool text_has_trimmed_content(const char *s) {
+    for (s = s ? s : ""; *s; s++) {
+        if (!isspace((unsigned char)*s)) return true;
+    }
+    return false;
+}
+
+static void append_kat_tools_prompt_text(buf *b, const char *tool_schemas) {
+    buf_puts(b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    if (tool_schemas && tool_schemas[0]) {
+        buf_putc(b, '\n');
+        buf_puts(b, tool_schemas);
+    }
+    buf_puts(b,
+        "\n</tools>\n\n"
+        "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+        "<tool_call>\n"
+        "<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+        "<parameter=example_parameter_2>\n"
+        "This is the value for the second parameter\nthat can span\nmultiple lines\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n\n"
+        "<IMPORTANT>\n"
+        "Reminder:\n"
+        "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        "- Required parameters MUST be specified\n"
+        "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+        "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+        "</IMPORTANT>");
+}
+
+static void append_kat_tool_calls_text(buf *b, const tool_calls *calls,
+                                       const tool_schema_orders *orders,
+                                       bool content_nonempty) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
+        if (content_nonempty) buf_puts(b, "\n\n");
+        buf_puts(b, calls->raw_tool_text);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+        if (i) buf_putc(b, '\n');
+        else if (content_nonempty) buf_puts(b, "\n\n");
+        buf_puts(b, "<tool_call>\n<function=");
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_puts(b, ">\n");
+        append_qwen_arguments(b, tc->arguments, order);
+        buf_puts(b, "</function>\n</tool_call>");
+    }
+}
+
+static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
+                                         const char *tool_schemas,
+                                         const tool_schema_orders *tool_orders,
+                                         q36_think_mode think_mode,
+                                         bool preserve_thinking) {
+    int last_query = -1;
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        if (!strcmp(msgs->v[i].role, "user")) {
+            last_query = i;
+            break;
+        }
+    }
+
+    buf out = {0};
+    bool first_system = msgs->len > 0 && role_is_system(msgs->v[0].role);
+    if (tool_schemas && tool_schemas[0]) {
+        buf_puts(&out, "<|im_start|>system\n");
+        append_kat_tools_prompt_text(&out, tool_schemas);
+        if (first_system && text_has_trimmed_content(msgs->v[0].content)) {
+            buf_puts(&out, "\n\n");
+            buf_puts_trimmed(&out, msgs->v[0].content);
+        }
+        buf_puts(&out, "<|im_end|>\n");
+    } else if (first_system) {
+        buf_puts(&out, "<|im_start|>system\n");
+        buf_puts_trimmed(&out, msgs->v[0].content);
+        buf_puts(&out, "<|im_end|>\n");
+    }
+
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            if (i == 0) continue;
+            buf_puts(&out, "<|im_start|>system\n");
+            buf_puts_trimmed(&out, m->content);
+            buf_puts(&out, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "user")) {
+            buf_puts(&out, "<|im_start|>user\n");
+            buf_puts_trimmed(&out, m->content);
+            buf_puts(&out, "<|im_end|>\n");
+        } else if (!strcmp(m->role, "assistant")) {
+            const char *content = m->content ? m->content : "";
+            char *embedded_reasoning = NULL;
+            const char *reasoning = m->reasoning ? m->reasoning : "";
+            const char *think_end = m->reasoning ? NULL : strstr(content, "</think>");
+            if (think_end) {
+                const char *think_start = strstr(content, "<think>");
+                const char *start = think_start && think_start < think_end ? think_start + 7 : content;
+                embedded_reasoning = xstrndup(start, (size_t)(think_end - start));
+                reasoning = embedded_reasoning;
+                content = think_end + 8;
+            }
+            bool keep_reasoning = preserve_thinking || i > last_query;
+            bool content_nonempty = text_has_trimmed_content(content);
+            buf_puts(&out, "<|im_start|>assistant\n");
+            if (keep_reasoning) {
+                buf_puts(&out, "<think>\n");
+                buf_puts_trimmed(&out, reasoning);
+                buf_puts(&out, "\n</think>\n\n");
+            }
+            buf_puts_trimmed(&out, content);
+            append_kat_tool_calls_text(&out, &m->calls, tool_orders,
+                                       content_nonempty);
+            buf_puts(&out, "<|im_end|>\n");
+            free(embedded_reasoning);
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            bool first = i == 0 || (strcmp(msgs->v[i - 1].role, "tool") &&
+                                    strcmp(msgs->v[i - 1].role, "function"));
+            bool last = i + 1 == msgs->len ||
+                        (strcmp(msgs->v[i + 1].role, "tool") &&
+                         strcmp(msgs->v[i + 1].role, "function"));
+            if (first) buf_puts(&out, "<|im_start|>user");
+            buf_puts(&out, "\n<tool_response>\n");
+            buf_puts_trimmed(&out, m->content);
+            buf_puts(&out, "\n</tool_response>");
+            if (last) buf_puts(&out, "<|im_end|>\n");
+        }
+    }
+
+    buf_puts(&out, "<|im_start|>assistant\n");
+    if (think_mode == Q36_THINK_NONE) buf_puts(&out, "<think>\n\n</think>\n\n");
+    else buf_puts(&out, "<think>\n");
+    return buf_take(&out);
+}
+
+static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          q36_think_mode think_mode) {
     const bool think = q36_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
@@ -1970,6 +2180,41 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     return buf_take(&out);
 }
 
+static char *render_chat_prompt_text_profile(const chat_msgs *msgs,
+                                             const char *tool_schemas,
+                                             const tool_schema_orders *tool_orders,
+                                             q36_think_mode think_mode,
+                                             bool kat_coder,
+                                             bool preserve_thinking) {
+    if (kat_coder) return render_kat_chat_prompt_text(msgs, tool_schemas, tool_orders,
+                                                      think_mode, preserve_thinking);
+    return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+}
+
+#ifdef Q36_SERVER_TEST
+static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     q36_think_mode think_mode) {
+    return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode);
+}
+#endif
+
+static bool kat_prompt_preserves_reasoning(const chat_msgs *msgs,
+                                           bool preserve_thinking) {
+    if (preserve_thinking) return true;
+    int last_query = -1;
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        if (!strcmp(msgs->v[i].role, "user")) {
+            last_query = i;
+            break;
+        }
+    }
+    for (int i = last_query + 1; i < msgs->len; i++) {
+        if (!strcmp(msgs->v[i].role, "assistant")) return true;
+    }
+    return false;
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered Q36 chat/completion
@@ -1977,6 +2222,7 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
 static bool parse_chat_request(q36_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    request_set_model_profile(r, e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
@@ -2062,6 +2308,20 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->presence_penalty = (float)v;
+        } else if (!strcmp(key, "frequency_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->frequency_penalty = (float)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -2082,6 +2342,12 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
             }
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking,
+                                            &r->preserve_thinking)) {
                 free(key);
                 goto bad;
             }
@@ -2132,10 +2398,12 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
+    r->prompt_preserves_reasoning = r->kat_coder ?
+        kat_prompt_preserves_reasoning(&msgs, r->preserve_thinking) :
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_profile(
+        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
+        r->kat_coder, r->preserve_thinking);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
@@ -2324,10 +2592,12 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
                                     int def_tokens, int ctx_size, request *r,
                                     char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    request_set_model_profile(r, e);
     r->api = API_RESPONSES;
     const char *p = body;
     bool got_input = false;
     bool tool_choice_none = false;
+    bool got_thinking = false;
     bool thinking_enabled = true;
     q36_think_mode reasoning_effort = Q36_THINK_HIGH;
     chat_msgs msgs = {0};
@@ -2408,8 +2678,28 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->presence_penalty = (float)v;
+        } else if (!strcmp(key, "frequency_penalty")) {
+            double v;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->frequency_penalty = (float)v;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking,
+                                            &r->preserve_thinking)) {
                 free(key);
                 goto bad;
             }
@@ -2428,6 +2718,7 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
                 free(key);
                 goto bad;
             }
+            got_thinking = true;
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -2451,14 +2742,19 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
         msgs.len++;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
+    if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
+    if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tools = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning = chat_history_uses_tool_context(&msgs, active_tools);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tools,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_preserves_reasoning = r->kat_coder ?
+        kat_prompt_preserves_reasoning(&msgs, r->preserve_thinking) :
+        chat_history_uses_tool_context(&msgs, active_tools);
+    r->prompt_text = render_chat_prompt_text_profile(
+        &msgs, active_tools, &r->tool_orders, r->think_mode,
+        r->kat_coder, r->preserve_thinking);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(instructions);
@@ -2476,6 +2772,7 @@ bad:
 static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, int def_tokens,
                                     int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
+    request_set_model_profile(r, e);
     r->api = API_ANTHROPIC;
     const char *p = body;
     bool got_messages = false;
@@ -2593,6 +2890,20 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->presence_penalty = (float)v;
+        } else if (!strcmp(key, "frequency_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->frequency_penalty = (float)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -2615,6 +2926,12 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
                 goto bad;
             }
             got_thinking = true;
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking,
+                                            &r->preserve_thinking)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "output_config")) {
             if (!parse_output_config_effort(&p, &reasoning_effort)) {
                 free(key);
@@ -2648,7 +2965,13 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
-        chat_msgs_push(&msgs, msg);
+        if (msgs.len == msgs.cap) {
+            msgs.cap = msgs.cap ? msgs.cap * 2 : 8;
+            msgs.v = xrealloc(msgs.v, (size_t)msgs.cap * sizeof(msgs.v[0]));
+        }
+        memmove(msgs.v + 1, msgs.v, (size_t)msgs.len * sizeof(msgs.v[0]));
+        msgs.v[0] = msg;
+        msgs.len++;
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -2658,10 +2981,12 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
-    r->prompt_preserves_reasoning =
+    r->prompt_preserves_reasoning = r->kat_coder ?
+        kat_prompt_preserves_reasoning(&msgs, r->preserve_thinking) :
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
-                                             &r->tool_orders, r->think_mode);
+    r->prompt_text = render_chat_prompt_text_profile(
+        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
+        r->kat_coder, r->preserve_thinking);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
@@ -2709,6 +3034,7 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(q36_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    request_set_model_profile(r, e);
     const char *p = body;
     char *prompt = NULL;
     bool got_thinking = false;
@@ -2769,6 +3095,20 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "presence_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->presence_penalty = (float)v;
+        } else if (!strcmp(key, "frequency_penalty")) {
+            double v = 0.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            r->frequency_penalty = (float)v;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -2789,6 +3129,12 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
             }
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "chat_template_kwargs")) {
+            if (!parse_chat_template_kwargs(&p, &thinking_enabled, &got_thinking,
+                                            &r->preserve_thinking)) {
                 free(key);
                 goto bad;
             }
@@ -2834,12 +3180,19 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     buf rendered = {0};
-    if (r->think_mode == Q36_THINK_MAX) buf_puts(&rendered, q36_think_max_prefix());
+    if (!r->kat_coder && r->think_mode == Q36_THINK_MAX)
+        buf_puts(&rendered, q36_think_max_prefix());
     buf_puts(&rendered, "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n");
     buf_puts(&rendered, "<|im_start|>user\n");
     buf_puts(&rendered, prompt);
     buf_puts(&rendered, "<|im_end|>\n<|im_start|>assistant\n");
-    buf_puts(&rendered, q36_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    if (r->kat_coder) {
+        buf_puts(&rendered, q36_think_mode_enabled(r->think_mode) ?
+            "<think>\n" : "<think>\n\n</think>\n\n");
+        if (r->think_mode == Q36_THINK_MAX) buf_puts(&rendered, q36_think_max_prefix());
+    } else {
+        buf_puts(&rendered, q36_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    }
     r->prompt_text = buf_take(&rendered);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
@@ -6744,12 +7097,13 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\npreserve_thinking: %d\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\npresence_penalty: %.3f\nfrequency_penalty: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             q36_think_mode_name(j->req.think_mode),
+            j->req.preserve_thinking ? 1 : 0,
             j->req.prompt.len,
             effective_prompt_tokens,
             cached,
@@ -6758,6 +7112,8 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            j->req.presence_penalty,
+            j->req.frequency_penalty,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
@@ -7016,7 +7372,8 @@ static int chat_think_tool_recovery(server *s, buf *text,
 static bool should_canonicalize_thinking_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
+    if (r->has_tools && !r->kat_coder) return false;
     if (r->prompt_preserves_reasoning) return false;
     if (!q36_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
@@ -7341,6 +7698,17 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
+    if (r && r->kat_coder) {
+        if (q36_think_mode_enabled(r->think_mode)) {
+            buf_puts_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        buf_puts_trimmed(&suffix, content);
+        append_kat_tool_calls_text(&suffix, calls, &r->tool_orders,
+                                   text_has_trimmed_content(content));
+        buf_puts(&suffix, "<|im_end|>\n");
+        return buf_take(&suffix);
+    }
     if (r && q36_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, "</think>");
@@ -7368,7 +7736,7 @@ static void canonicalize_thinking_checkpoint(server *s, server_slot *slot,
     if (!q36_think_mode_enabled(j->req.think_mode)) return;
 
     size_t pt_len = strlen(j->req.prompt_text);
-    const char *think_tag = "<think>";
+    const char *think_tag = j->req.kat_coder ? "<think>\n" : "<think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(j->req.prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -7380,8 +7748,9 @@ static void canonicalize_thinking_checkpoint(server *s, server_slot *slot,
 
     buf rendered = {0};
     buf_puts(&rendered, stable_prefix.ptr ? stable_prefix.ptr : "");
-    buf_puts(&rendered, "</think>");
-    buf_puts(&rendered, content ? content : "");
+    if (!j->req.kat_coder) buf_puts(&rendered, "</think>");
+    if (j->req.kat_coder) buf_puts_trimmed(&rendered, content);
+    else buf_puts(&rendered, content ? content : "");
     buf_puts(&rendered, "<|im_end|>\n");
 
     q36_tokens stable = {0};
@@ -7735,6 +8104,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     }
 
     buf text = {0};
+    q36_tokens generated_tokens = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
     const char *finish = "length";
@@ -7780,7 +8150,16 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         if (in_tool_call && !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_state)) {
             temperature = 0.0f;
         }
-        int token = q36_session_sample(slot->session, temperature, top_k, top_p, min_p, &rng);
+        float presence_penalty = j->req.presence_penalty;
+        float frequency_penalty = j->req.frequency_penalty;
+        if (in_tool_call && !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_state)) {
+            presence_penalty = 0.0f;
+            frequency_penalty = 0.0f;
+        }
+        int token = q36_session_sample_penalized(
+            slot->session, temperature, top_k, top_p, min_p,
+            generated_tokens.v, generated_tokens.len,
+            presence_penalty, frequency_penalty, &rng);
         token = q36_session_eos_to_think_close(slot->session, token);
         if (token == q36_token_eos(s->engine)) {
             finish = "stop";
@@ -7790,6 +8169,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         int toks[17];
         int ntok = 0;
         if (!s->batched_mode && temperature <= 0.0f &&
+            presence_penalty == 0.0f && frequency_penalty == 0.0f &&
             q36_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("Q36_MTP_SPEC_DISABLE") == NULL)
         {
@@ -7827,6 +8207,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             size_t piece_len = 0;
             char *piece = q36_token_text(s->engine, token, &piece_len);
             completion++;
+            q36_tokens_push(&generated_tokens, token);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -8181,6 +8562,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     tool_calls_free(&parsed_calls);
     openai_stream_free(&openai_live);
     buf_free(&text);
+    q36_tokens_free(&generated_tokens);
     q36_tokens_free(&effective_prompt);
 }
 
@@ -8402,14 +8784,16 @@ typedef struct {
     int fd;
 } client_arg;
 
-static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+static void append_model_json_profile(buf *b, int ctx, int default_tokens,
+                                      const char *id, const char *name) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+    buf_puts(b, "{\"id\":");
+    json_escape(b, id);
+    buf_puts(b, ",\"object\":\"model\",\"created\":1767225600,"
+                "\"owned_by\":\"q36.c\",\"name\":");
+    json_escape(b, name);
     buf_printf(b,
-        "{\"id\":\"qwen3.6-35b-a3b\","
-        "\"object\":\"model\","
-        "\"created\":1767225600,"
-        "\"owned_by\":\"q36.c\","
-        "\"name\":\"Qwen 3.6 35B A3B\","
+        ","
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -8423,17 +8807,30 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"presence_penalty\","
+            "\"frequency_penalty\","
             "\"stop\","
             "\"seed\","
             "\"stream\","
+            "\"chat_template_kwargs\","
             "\"reasoning_effort\"]}",
         ctx,
         ctx,
         max_completion);
 }
 
+#ifdef Q36_SERVER_TEST
+static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+    append_model_json_profile(b, ctx, default_tokens,
+                              "qwen3.6-35b-a3b", "Qwen 3.6 35B A3B");
+}
+#endif
+
 static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, q36_session_ctx(s->session), s->default_tokens);
+    const bool kat = q36_engine_is_kat_coder(s->engine);
+    append_model_json_profile(b, q36_session_ctx(s->session), s->default_tokens,
+                              q36_engine_model_name(s->engine),
+                              kat ? "KAT-Coder V2.5 Dev" : "Qwen 3.6 35B A3B");
 }
 
 static bool send_model(server *s, int fd) {
@@ -8487,7 +8884,10 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/qwen3.6-35b-a3b")) {
+    char model_path[320];
+    snprintf(model_path, sizeof(model_path), "/v1/models/%s",
+             q36_engine_model_name(s->engine));
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, model_path)) {
         send_model(s, fd);
         http_request_free(&hr);
         goto done;
@@ -8766,7 +9166,8 @@ static void usage(FILE *fp) {
         "  Chat requests default to thinking mode with high effort.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max requires --ctx >= 98304; smaller contexts use high.\n"
-        "  thinking={type:disabled}, think=false, or model=qwen3.6-35b-a3b-nothink selects non-thinking mode.\n"
+        "  thinking={type:disabled}, think=false, chat_template_kwargs.enable_thinking=false, or a -nothink model alias selects non-thinking mode.\n"
+        "  KAT-Coder accepts chat_template_kwargs.preserve_thinking=true.\n"
         "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
         "  Thinking defaults apply only to omitted sampling knobs; explicit client values win.\n"
         "\n"
@@ -11420,6 +11821,99 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_kat_template_thinking_controls(void) {
+    chat_msgs msgs = {0};
+    chat_msg system = {.role = xstrdup("system"), .content = xstrdup("  sys  ")};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("  hello  ")};
+    chat_msgs_push(&msgs, system);
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_profile(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, true, false);
+    TEST_ASSERT(!strcmp(prompt,
+        "<|im_start|>system\nsys<|im_end|>\n"
+        "<|im_start|>user\nhello<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"));
+    free(prompt);
+
+    prompt = render_chat_prompt_text_profile(
+        &msgs, NULL, NULL, Q36_THINK_NONE, true, false);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n</think>") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_kat_template_preserve_thinking(void) {
+    chat_msgs msgs = {0};
+    chat_msg user1 = {.role = xstrdup("user"), .content = xstrdup("first")};
+    chat_msg assistant = {
+        .role = xstrdup("assistant"),
+        .content = xstrdup("answer"),
+        .reasoning = xstrdup("old reasoning"),
+    };
+    chat_msg user2 = {.role = xstrdup("user"), .content = xstrdup("next")};
+    chat_msgs_push(&msgs, user1);
+    chat_msgs_push(&msgs, assistant);
+    chat_msgs_push(&msgs, user2);
+
+    char *prompt = render_chat_prompt_text_profile(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, true, false);
+    TEST_ASSERT(strstr(prompt, "old reasoning") == NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\nanswer<|im_end|>") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text_profile(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, true, true);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nanswer<|im_end|>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_kat_template_tool_round(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("inspect")};
+    chat_msg assistant = {
+        .role = xstrdup("assistant"),
+        .reasoning = xstrdup("need reads"),
+    };
+    tool_call call = {
+        .name = xstrdup("read"),
+        .arguments = xstrdup("{\"path\":\"a.c\"}"),
+    };
+    tool_calls_push(&assistant.calls, call);
+    chat_msg tool1 = {.role = xstrdup("tool"), .content = xstrdup("one")};
+    chat_msg tool2 = {.role = xstrdup("tool"), .content = xstrdup("two")};
+    chat_msgs_push(&msgs, user);
+    chat_msgs_push(&msgs, assistant);
+    chat_msgs_push(&msgs, tool1);
+    chat_msgs_push(&msgs, tool2);
+
+    char *prompt = render_chat_prompt_text_profile(
+        &msgs, "{\"name\":\"read\"}", NULL, Q36_THINK_HIGH, true, false);
+    TEST_ASSERT(strstr(prompt, "<IMPORTANT>\nReminder:") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<think>\nneed reads\n</think>\n\n<tool_call>\n<function=read>") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\n<tool_response>\none\n</tool_response>"
+        "\n<tool_response>\ntwo\n</tool_response><|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_chat_template_kwargs_parse(void) {
+    const char *p = "{\"enable_thinking\":false,\"preserve_thinking\":true,\"future\":1}";
+    bool thinking = true;
+    bool got_thinking = false;
+    bool preserve = false;
+    TEST_ASSERT(parse_chat_template_kwargs(&p, &thinking, &got_thinking, &preserve));
+    TEST_ASSERT(!thinking);
+    TEST_ASSERT(got_thinking);
+    TEST_ASSERT(preserve);
+}
+
 static void test_responses_input_parses_qwen_tool_continuation(void) {
     const char *json =
         "[{\"type\":\"message\",\"role\":\"user\","
@@ -11650,6 +12144,10 @@ static void q36_server_unit_tests_run(void) {
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
+    test_kat_template_thinking_controls();
+    test_kat_template_preserve_thinking();
+    test_kat_template_tool_round();
+    test_chat_template_kwargs_parse();
     test_qwen_tool_call_rendering();
     test_tool_separator_whitespace_is_not_content();
     test_qwen_tool_prompt_preserves_tool_supplied_text();

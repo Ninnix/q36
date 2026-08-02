@@ -283,9 +283,16 @@ typedef struct {
     uint64_t cap;
 } str_i32_table;
 
+typedef struct {
+    q36_str text;
+    int id;
+} q36_special_token;
+
 typedef struct q36_vocab {
     q36_str *token;
+    q36_special_token *special;
     int n_vocab;
+    int n_special;
     int bos_id;
     int eos_id;
     int im_start_id;
@@ -411,6 +418,7 @@ struct q36_engine {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool mtp_ready;
+    bool kat_coder;
 };
 
 struct q36_session {
@@ -1032,6 +1040,15 @@ static bool q36_str_eq(q36_str a, q36_str b) {
 static bool q36_streq(q36_str s, const char *z) {
     size_t n = strlen(z);
     return s.len == n && memcmp(s.ptr, z, n) == 0;
+}
+
+static bool q36_str_contains(q36_str s, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n || n > s.len) return false;
+    for (uint64_t i = 0; i <= s.len - n; i++) {
+        if (!memcmp(s.ptr + i, needle, n)) return true;
+    }
+    return false;
 }
 
 static uint64_t hash_bytes(const void *ptr, uint64_t len) {
@@ -7537,11 +7554,18 @@ static int vocab_lookup(const q36_vocab *vocab, const char *text) {
 
 static void vocab_load(q36_vocab *vocab, const q36_model *model) {
     q36_array_ref tokens;
+    q36_array_ref token_types;
     q36_array_ref merges;
     q36_cursor c;
+    q36_cursor types;
+    int special_cap = 0;
     memset(vocab, 0, sizeof(*vocab));
     if (!model_get_array(model, "tokenizer.ggml.tokens", &tokens) || tokens.type != GGUF_VALUE_STRING || tokens.len > INT32_MAX) {
         q36_die("GGUF tokenizer token table is missing or invalid");
+    }
+    if (!model_get_array(model, "tokenizer.ggml.token_type", &token_types) ||
+        token_types.type != GGUF_VALUE_INT32 || token_types.len != tokens.len) {
+        q36_die("GGUF tokenizer token types are missing or invalid");
     }
     if (!model_get_array(model, "tokenizer.ggml.merges", &merges) || merges.type != GGUF_VALUE_STRING) {
         q36_die("GGUF tokenizer merge table is missing or invalid");
@@ -7550,9 +7574,21 @@ static void vocab_load(q36_vocab *vocab, const q36_model *model) {
     vocab->token = xcalloc((size_t)vocab->n_vocab, sizeof(vocab->token[0]));
     table_init(&vocab->token_to_id, tokens.len);
     c = cursor_at(model, tokens.data_pos);
+    types = cursor_at(model, token_types.data_pos);
     for (int i = 0; i < vocab->n_vocab; i++) {
+        uint32_t type;
         if (!cursor_string(&c, &vocab->token[i])) q36_die(c.error);
+        if (!cursor_u32(&types, &type)) q36_die(types.error);
         table_put(&vocab->token_to_id, vocab->token[i], i);
+        if (type == 3 || type == 4) {
+            if (vocab->n_special == special_cap) {
+                special_cap = special_cap ? special_cap * 2 : 32;
+                vocab->special = xrealloc(vocab->special,
+                    (size_t)special_cap * sizeof(vocab->special[0]));
+            }
+            vocab->special[vocab->n_special++] =
+                (q36_special_token){.text = vocab->token[i], .id = i};
+        }
     }
     table_init(&vocab->merge_rank, merges.len);
     c = cursor_at(model, merges.data_pos);
@@ -7576,6 +7612,7 @@ static void vocab_load(q36_vocab *vocab, const q36_model *model) {
 
 static void vocab_free(q36_vocab *vocab) {
     free(vocab->token);
+    free(vocab->special);
     table_free(&vocab->token_to_id);
     table_free(&vocab->merge_rank);
     memset(vocab, 0, sizeof(*vocab));
@@ -7585,25 +7622,14 @@ void q36_tokenize_text(q36_engine *e, const char *text, q36_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
-static bool special_token_at(const q36_vocab *vocab, const char *p, int *token, size_t *len) {
-    struct special {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<|im_start|>", vocab->im_start_id},
-        {"<|im_end|>", vocab->im_end_id},
-        {"<think>", vocab->think_start_id},
-        {"</think>", vocab->think_end_id},
-        {"<|vision_start|>", vocab->vision_start_id},
-        {"<|vision_end|>", vocab->vision_end_id},
-        {"<|image_pad|>", vocab->image_pad_id},
-        {"<|video_pad|>", vocab->video_pad_id},
-    };
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
-        size_t n = strlen(specials[i].text);
-        if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
-            *len = n;
+static bool special_token_at(const q36_vocab *vocab, const char *p,
+                             size_t remain, int *token, size_t *len) {
+    for (int i = 0; i < vocab->n_special; i++) {
+        const q36_special_token *special = &vocab->special[i];
+        if (special->text.len <= remain &&
+            !memcmp(p, special->text.ptr, special->text.len)) {
+            *token = special->id;
+            *len = (size_t)special->text.len;
             return true;
         }
     }
@@ -7623,13 +7649,15 @@ static void tokenize_span(const q36_vocab *vocab, const char *p, size_t n, token
 static void tokenize_rendered_chat_vocab(const q36_vocab *vocab, const char *text, token_vec *out) {
     const char *span;
     const char *p;
+    const char *end;
     if (!text) text = "";
     span = text;
     p = text;
-    while (*p) {
+    end = text + strlen(text);
+    while (p < end) {
         int token = -1;
         size_t len = 0;
-        if (special_token_at(vocab, p, &token, &len)) {
+        if (special_token_at(vocab, p, (size_t)(end - p), &token, &len)) {
             tokenize_span(vocab, span, (size_t)(p - span), out);
             q36_tokens_push(out, token);
             p += len;
@@ -7638,15 +7666,33 @@ static void tokenize_rendered_chat_vocab(const q36_vocab *vocab, const char *tex
         }
         p++;
     }
-    tokenize_span(vocab, span, (size_t)(p - span), out);
+    tokenize_span(vocab, span, (size_t)(end - span), out);
 }
 
 void q36_tokenize_rendered_chat(q36_engine *e, const char *text, q36_tokens *out) {
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+static void q36_tokenize_chat_content(q36_engine *e, const char *text,
+                                      q36_tokens *out) {
+    if (!e->kat_coder) {
+        q36_tokenize_rendered_chat(e, text, out);
+        return;
+    }
+    const char *start = text ? text : "";
+    const char *end = start + strlen(start);
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    char *trimmed = xmalloc((size_t)(end - start) + 1);
+    memcpy(trimmed, start, (size_t)(end - start));
+    trimmed[end - start] = '\0';
+    q36_tokenize_rendered_chat(e, trimmed, out);
+    free(trimmed);
+}
+
 void q36_chat_begin(q36_engine *e, q36_tokens *tokens) {
-    if (e->vocab.bos_id >= 0) q36_tokens_push(tokens, e->vocab.bos_id);
+    if (!e->kat_coder && e->vocab.bos_id >= 0)
+        q36_tokens_push(tokens, e->vocab.bos_id);
 }
 
 static void chat_append_open_role(q36_engine *e, token_vec *tokens, const char *role) {
@@ -7670,23 +7716,25 @@ void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role
     if (!strcmp(role, "developer")) role = "system";
     if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         chat_append_open_role(e, tokens, "user");
-        bpe_tokenize_text(&e->vocab, "<tool_response>\n", tokens);
-        bpe_tokenize_text(&e->vocab, content, tokens);
-        bpe_tokenize_text(&e->vocab, "\n</tool_response>", tokens);
+        q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
+        q36_tokenize_chat_content(e, content, tokens);
+        q36_tokenize_rendered_chat(e, "\n</tool_response>", tokens);
         chat_append_close_role(e, tokens);
         return;
     }
     chat_append_open_role(e, tokens, role);
-    if (!strcmp(role, "assistant")) {
-        q36_tokenize_rendered_chat(e, content, tokens);
-    } else {
-        bpe_tokenize_text(&e->vocab, content, tokens);
-    }
+    q36_tokenize_chat_content(e, content, tokens);
     chat_append_close_role(e, tokens);
 }
 
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode) {
     chat_append_open_role(e, tokens, "assistant");
+    if (e->kat_coder) {
+        q36_tokenize_rendered_chat(e, think_mode == Q36_THINK_NONE ?
+            "<think>\n\n</think>\n\n" : "<think>\n", tokens);
+        if (think_mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(e, tokens);
+        return;
+    }
     if (think_mode == Q36_THINK_NONE) {
         q36_tokenize_rendered_chat(e, "</think>", tokens);
         return;
@@ -8085,6 +8133,40 @@ static int q36_sample_top_p_min_p(const float *logits, uint32_t n_vocab,
     }
 }
 
+static int q36_sample_logits_penalized(float *logits, uint32_t n_vocab,
+                                       float temperature, int top_k,
+                                       float top_p, float min_p,
+                                       const int *tokens, int n_tokens,
+                                       float presence_penalty,
+                                       float frequency_penalty,
+                                       uint64_t *rng, float *scratch) {
+    if (!tokens || n_tokens <= 0 ||
+        (presence_penalty == 0.0f && frequency_penalty == 0.0f)) {
+        return q36_sample_top_p_min_p(logits, n_vocab, temperature, top_k,
+                                      top_p, min_p, rng, scratch);
+    }
+
+    memset(scratch, 0, (size_t)n_vocab * sizeof(scratch[0]));
+    for (int i = 0; i < n_tokens; i++) {
+        int token = tokens[i];
+        if (token < 0 || (uint32_t)token >= n_vocab) continue;
+        if (scratch[token] == 0.0f) logits[token] -= presence_penalty;
+        scratch[token] += 1.0f;
+        logits[token] -= frequency_penalty;
+    }
+    int sampled = q36_sample_top_p_min_p(logits, n_vocab, temperature, top_k,
+                                         top_p, min_p, rng, scratch);
+    memset(scratch, 0, (size_t)n_vocab * sizeof(scratch[0]));
+    for (int i = 0; i < n_tokens; i++) {
+        int token = tokens[i];
+        if (token < 0 || (uint32_t)token >= n_vocab) continue;
+        if (scratch[token] == 0.0f) logits[token] += presence_penalty;
+        scratch[token] += 1.0f;
+        logits[token] += frequency_penalty;
+    }
+    return sampled;
+}
+
 #ifdef Q36_TEST_HOOKS
 int q36_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -8093,6 +8175,20 @@ int q36_test_sample_logits(const float *logits, uint32_t n_vocab,
     if (!logits || !rng || n_vocab == 0) return -1;
     return q36_sample_top_p_min_p(logits, n_vocab, temperature, top_k,
                                   top_p, min_p, rng, prob_scratch);
+}
+
+int q36_test_sample_logits_penalized(float *logits, uint32_t n_vocab,
+                                     float temperature, int top_k,
+                                     float top_p, float min_p,
+                                     const int *tokens, int n_tokens,
+                                     float presence_penalty,
+                                     float frequency_penalty,
+                                     uint64_t *rng, float *prob_scratch) {
+    if (!logits || !rng || !prob_scratch || n_vocab == 0) return -1;
+    return q36_sample_logits_penalized(
+        logits, n_vocab, temperature, top_k, top_p, min_p,
+        tokens, n_tokens, presence_penalty, frequency_penalty,
+        rng, prob_scratch);
 }
 #endif
 
@@ -8222,6 +8318,13 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         return 1;
     }
     model_open(&e->model, opt->model_path, q36_backend_uses_graph(opt->backend));
+    {
+        q36_str name = {0};
+        if (model_get_string(&e->model, "general.name", &name)) {
+            e->kat_coder = q36_str_contains(name, "KAT Coder") ||
+                           q36_str_contains(name, "KAT-Coder");
+        }
+    }
     config_validate_model(&e->model);
     vocab_load(&e->vocab, &e->model);
     weights_bind(&e->weights, &e->model);
@@ -8428,13 +8531,15 @@ int q36_engine_set_power(q36_engine *e, int power_percent) {
 }
 
 const char *q36_engine_model_name(q36_engine *e) {
-    (void)e;
-    return "qwen3.6-35b-a3b";
+    return e && e->kat_coder ? "kat-coder-v2.5-dev" : "qwen3.6-35b-a3b";
 }
 
 int q36_engine_model_id(q36_engine *e) {
-    (void)e;
-    return 1;
+    return e && e->kat_coder ? 2 : 1;
+}
+
+bool q36_engine_is_kat_coder(q36_engine *e) {
+    return e && e->kat_coder;
 }
 
 int q36_inspect_model(const char *model_path) {
@@ -8854,6 +8959,26 @@ int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p
     if (!q36_session_ensure_logits_host(s)) return -1;
     return q36_sample_top_p_min_p(s->logits, Q36_N_VOCAB, temperature,
                                   top_k, top_p, min_p, rng, s->sample_probs);
+}
+
+int q36_session_sample_penalized(q36_session *s,
+                                 float temperature, int top_k,
+                                 float top_p, float min_p,
+                                 const int *tokens, int n_tokens,
+                                 float presence_penalty,
+                                 float frequency_penalty,
+                                 uint64_t *rng) {
+    if (!s || !s->logits || !rng) return -1;
+    if (!tokens || n_tokens <= 0 ||
+        (presence_penalty == 0.0f && frequency_penalty == 0.0f)) {
+        return q36_session_sample(s, temperature, top_k, top_p, min_p, rng);
+    }
+    if (!q36_session_ensure_logits_host(s)) return -1;
+
+    return q36_sample_logits_penalized(
+        s->logits, Q36_N_VOCAB, temperature, top_k, top_p, min_p,
+        tokens, n_tokens, presence_penalty, frequency_penalty,
+        rng, s->sample_probs);
 }
 
 bool q36_session_in_think(q36_session *s) {

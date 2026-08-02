@@ -318,6 +318,25 @@ int main(void) {
                             sizeof(nonfinite_logits[0])),
                  1.0f, 0, 1.0f, 0.05f, "all-nonfinite");
 
+    float penalty_logits[] = {0.0f, -0.5f, -2.0f};
+    float penalty_scratch[3];
+    uint64_t penalty_rng = 1;
+    const int seen_once[] = {0};
+    int token = q36_test_sample_logits_penalized(
+        penalty_logits, 3, 0.0f, 0, 1.0f, 0.0f,
+        seen_once, 1, 1.0f, 0.0f, &penalty_rng, penalty_scratch);
+    CHECK(token == 1, "presence penalty expected token 1, got %d", token);
+    CHECK(fabsf(penalty_logits[0]) < 1.0e-6f && penalty_logits[1] == -0.5f,
+          "presence penalty did not restore logits");
+
+    const int seen_twice[] = {0, 0};
+    token = q36_test_sample_logits_penalized(
+        penalty_logits, 3, 0.0f, 0, 1.0f, 0.0f,
+        seen_twice, 2, 0.0f, 0.3f, &penalty_rng, penalty_scratch);
+    CHECK(token == 1, "frequency penalty expected token 1, got %d", token);
+    CHECK(fabsf(penalty_logits[0]) < 1.0e-6f && penalty_logits[1] == -0.5f,
+          "frequency penalty did not restore logits");
+
     free(logits);
     free(scratch);
 

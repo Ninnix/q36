@@ -297,16 +297,16 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "The default model ID is qwen3.6-35b-a3b; requests use the loaded GGUF.");
+    para(fp, c, "The model ID follows the loaded GGUF: qwen3.6-35b-a3b or kat-coder-v2.5-dev.");
     fputc('\n', fp);
 }
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "Qwen chat requests default to high-effort thinking.");
+    para(fp, c, "Qwen and KAT-Coder chat requests default to high-effort thinking.");
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 98304; smaller contexts use high.");
-    para(fp, c, "thinking={type:disabled} or think=false selects non-thinking mode.");
+    para(fp, c, "thinking={type:disabled}, think=false, or chat_template_kwargs.enable_thinking=false selects non-thinking mode.");
     para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
     fputc('\n', fp);
 }

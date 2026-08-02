@@ -135,6 +135,7 @@ int q36_engine_power(q36_engine *e);
 int q36_engine_set_power(q36_engine *e, int power_percent);
 const char *q36_engine_model_name(q36_engine *e);
 int q36_engine_model_id(q36_engine *e);
+bool q36_engine_is_kat_coder(q36_engine *e);
 const char *q36_backend_name(q36_backend backend);
 const char *q36_kv_cache_type_name(q36_kv_cache_type type);
 bool q36_parse_kv_cache_type(const char *s, q36_kv_cache_type *out);
@@ -217,11 +218,25 @@ int q36_session_common_prefix(q36_session *s, const q36_tokens *prompt);
 int q36_session_argmax(q36_session *s);
 int q36_session_argmax_excluding(q36_session *s, int excluded_id);
 int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int q36_session_sample_penalized(q36_session *s,
+                                 float temperature, int top_k,
+                                 float top_p, float min_p,
+                                 const int *tokens, int n_tokens,
+                                 float presence_penalty,
+                                 float frequency_penalty,
+                                 uint64_t *rng);
 #ifdef Q36_TEST_HOOKS
 int q36_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
+int q36_test_sample_logits_penalized(float *logits, uint32_t n_vocab,
+                                     float temperature, int top_k,
+                                     float top_p, float min_p,
+                                     const int *tokens, int n_tokens,
+                                     float presence_penalty,
+                                     float frequency_penalty,
+                                     uint64_t *rng, float *prob_scratch);
 #endif
 bool q36_session_in_think(q36_session *s);
 int q36_session_eos_to_think_close(q36_session *s, int token);

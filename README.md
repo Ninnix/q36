@@ -147,11 +147,23 @@ and offline tooling. For normal usage, keep reading the next sections.
 
 ## Model Weights
 
-This implementation only works with the Qwen3.6-35B-A3B GGUFs listed
-below. It is not a general GGUF loader, and arbitrary GGUF files will not have
+This implementation works with Qwen3.6-35B-A3B and text-only
+KAT-Coder-V2.5-Dev GGUFs with the same `qwen35moe` tensor shape. It is not a
+general GGUF loader, and arbitrary GGUF files will not have
 the tensor layout, quantization mix, metadata, or optional MTP state expected by
 the engine. The 2 bit quantizations provided here are verified to be actually
 high quality: they behave well, work under coding agents, call tools in a reliable way.
+
+KAT-Coder is selected from `general.name`; no model-name flag is needed. The
+runtime gives it a distinct KV-cache identity, advertises
+`kat-coder-v2.5-dev`, uses its native chat/tool template, and recognizes every
+GGUF control and user-defined tokenizer token. Start it explicitly:
+
+```sh
+./q36-server \
+  -m gguf/KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf \
+  --vulkan
+```
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
@@ -529,7 +541,7 @@ batching.
 Supported endpoints:
 
 - `GET /v1/models`
-- `GET /v1/models/qwen3.6-35b-a3b`
+- `GET /v1/models/<loaded-model-id>`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
@@ -537,9 +549,28 @@ Supported endpoints:
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`,
-`min_p`, `seed`, `stream`, `stream_options.include_usage`, `tools`, and
-`tool_choice`. Tool schemas and calls use Qwen3.6's native tagged format, and
-generated calls are mapped back to OpenAI tool calls.
+`min_p`, `presence_penalty`, `frequency_penalty`, `seed`, `stream`,
+`stream_options.include_usage`, `tools`, and `tool_choice`. Tool schemas and
+calls use the native Qwen3 Coder tagged format, and generated calls are mapped
+back to OpenAI tool calls.
+
+KAT-Coder also accepts its documented template controls:
+
+```json
+"chat_template_kwargs": {
+  "enable_thinking": false,
+  "preserve_thinking": true
+}
+```
+
+`preserve_thinking` retains earlier assistant reasoning verbatim. Without it,
+only reasoning inside the current multi-step tool round is retained, matching
+the model's official template.
+
+When omitted by the client, KAT-Coder sampling follows its model card:
+`temperature=1`, `top_p=0.95`, `top_k=20`, and `presence_penalty=1.5` while
+thinking; non-thinking uses `temperature=0.7` and `top_p=0.8`. Explicit request
+values always win.
 
 `/v1/responses` accepts string or message-array input, instructions, direct
 tool schemas, function-call continuations, function-call outputs, sampling
@@ -784,7 +815,7 @@ prompt again.
 
 ## Thinking Modes
 
-Qwen3.6-35B-A3B has distinct non-thinking and thinking modes, controlled
+Qwen3.6-35B-A3B and KAT-Coder-V2.5-Dev have distinct non-thinking and thinking modes, controlled
 natively by `<think>...</think>` blocks rendered into the prompt. The server
 defaults to thinking mode.
 
@@ -798,7 +829,8 @@ Mapping of API thinking controls to prompt rendering:
   feeding thinking tokens, not how the model decides to reason.
 - `reasoning_effort=minimal` or omitted with no thinking flag → thinking on.
 - Explicit non-thinking: `thinking:{"type":"disabled"}`, `think:false`, or
-  appending the chat-template flag `enable_thinking=false`.
+  `chat_template_kwargs:{"enable_thinking":false}`. KAT uses its trained
+  `<think>\n\n</think>\n\n` non-thinking prefix.
 
 ## KV Cache Quantization
 

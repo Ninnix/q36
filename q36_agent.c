@@ -1033,7 +1033,10 @@ static void agent_append_system_prompt(q36_engine *engine, q36_tokens *tokens,
     /* The built-in prompt is trusted Q36 control text.  User supplied system
      * text remains ordinary chat content. */
     char *tools_prompt = agent_build_tools_prompt();
-    q36_tokenize_rendered_chat(engine, tools_prompt, tokens);
+    if (q36_engine_is_kat_coder(engine))
+        q36_chat_append_message(engine, tokens, "system", tools_prompt);
+    else
+        q36_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
 
     if (!extra || !extra[0]) return;
@@ -1085,17 +1088,24 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    q36_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    if (q36_engine_is_kat_coder(w->engine))
+        q36_chat_append_message(w->engine, &w->transcript, "system", reminder);
+    else
+        q36_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     free(reminder);
 
     const char *extra = w->cfg->gen.system;
     if (extra && extra[0]) {
-        q36_tokenize_text(w->engine,
-            "\nAdditional system instructions reminder:\n", &w->transcript);
-        q36_tokenize_text(w->engine, extra, &w->transcript);
-        q36_tokenize_text(w->engine,
-            "\n[End additional system instructions reminder.]\n\n",
-            &w->transcript);
+        if (q36_engine_is_kat_coder(w->engine)) {
+            q36_chat_append_message(w->engine, &w->transcript, "system", extra);
+        } else {
+            q36_tokenize_text(w->engine,
+                "\nAdditional system instructions reminder:\n", &w->transcript);
+            q36_tokenize_text(w->engine, extra, &w->transcript);
+            q36_tokenize_text(w->engine,
+                "\n[End additional system instructions reminder.]\n\n",
+                &w->transcript);
+        }
     }
     agent_worker_note_system_prompt_seen(w);
 }
