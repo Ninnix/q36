@@ -2,9 +2,11 @@
 set -e
 
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
+KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
 Q2_FILE="Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 Q2_Q4_FILE="Qwen3.6-35B-A3B-Layers34-39Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-Q8Rest-imatrix.gguf"
 MTP_FILE="Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf"
+KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${Q36_GGUF_DIR:-"$ROOT/gguf"}
@@ -21,6 +23,7 @@ QuarkStar GGUF downloader
 Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
+  ./download_model.sh kat-coder [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
 
 Targets:
@@ -34,6 +37,10 @@ Targets:
        Mixed quant: same as q2-imatrix but the last 6 layers (34..39) use
        Q4_K routed experts. About 13 GB on disk, higher quality inference.
        On a 16 GB BC-250 run it with --ssd-streaming to keep memory free.
+
+  kat-coder
+       KAT-Coder V2.5 Dev IQ2_XXS imatrix quant from $KAT_REPO,
+       about 11 GB on disk.
 
   mtp  Optional speculative decoding component for either main-model target.
        It must be enabled explicitly with --mtp when starting a runtime.
@@ -71,10 +78,12 @@ fi
 MODEL=$1
 shift
 LINK_MODEL=1
+MODEL_REPO=$REPO
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_FILE ;;
+    kat-coder) MODEL_REPO=$KAT_REPO; MODEL_FILE=$KAT_FILE ;;
     mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
     -h|--help|help)
         usage
@@ -147,7 +156,7 @@ download_one() {
     mv "$part" "$out"
 }
 
-download_one "$REPO" "$MODEL_FILE" "$MODEL_FILE"
+download_one "$MODEL_REPO" "$MODEL_FILE" "$MODEL_FILE"
 
 if [ "$MODEL" = "mtp" ]; then
     echo
