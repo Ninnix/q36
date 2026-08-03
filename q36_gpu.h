@@ -56,6 +56,7 @@ int q36_gpu_finish_model_cache(void);
 int q36_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int q36_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void q36_gpu_set_quality(bool quality);
+void q36_gpu_set_dense_model(bool dense);
 void q36_gpu_set_micro_batch(bool enabled);
 /* True when the fused attention path will serve q36_gpu_attn_decode_tensor;
  * the runtime then skips the per-context scores scratch. Sampled once. */
@@ -214,6 +215,30 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const q36_gpu_tensor *q8,
+        uint64_t                n_tok,
+        float                   scale);
+
+int q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+        q36_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *q8,
+        uint64_t                n_tok,
+        float                   scale);
+
+int q36_gpu_matmul_iq_quant_scaled_tensor(
+        q36_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x,
         uint64_t                n_tok,
         float                   scale);
 
@@ -541,7 +566,7 @@ typedef struct {
 
 /* Routed expert FFN over n_tok rows of x with per-token expert selections,
  * mirroring the routed half of q36_forward_ffn() including all .scale
- * applications.  Supports Q2_K / Q4_K / Q5_K / Q6_K / IQ2_XXS / IQ2_S / IQ3_S expert quants. */
+ * applications.  Supports Q2_K / Q4_K / Q5_K / Q6_K / IQ2_XXS / IQ3_XXS / IQ2_S / IQ3_S expert quants. */
 int q36_gpu_moe_ffn_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,

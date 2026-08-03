@@ -1,0 +1,221 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    uint type;
+    float scale;
+} pc;
+
+const uint Q2_K = 10u;
+const uint Q4_K = 12u;
+const uint Q5_K = 13u;
+const uint Q6_K = 14u;
+const uint ROWS = 2u;
+const uint Q8K_WORDS = 74u;
+
+uint load_u8(uint off) {
+    return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
+}
+
+uint load_u32(uint off) {
+    uint i = off >> 1u;
+    return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
+}
+
+int load_i8(uint off) {
+    return bitfieldExtract(int(load_u8(off)), 0, 8);
+}
+
+float load_f16(uint off) {
+    return unpackHalf2x16(uint(wh[off >> 1u])).x;
+}
+
+void k4_scale_min(uint base, uint j, out uint sc, out uint mn) {
+    uint s0 = load_u8(base + 4u + j);
+    if (j < 4u) {
+        sc = s0 & 63u;
+        mn = load_u8(base + 8u + j) & 63u;
+    } else {
+        uint s1 = load_u8(base + 8u + j);
+        uint s2 = load_u8(base + j);
+        sc = (s1 & 15u) | ((s2 >> 6u) << 4u);
+        mn = (s1 >> 4u) | ((s0 >> 6u) << 4u);
+    }
+}
+
+uint q2_value(uint base, uint idx) {
+    uint in_idx = idx & 127u;
+    uint off = base + 16u + (idx >> 7u) * 32u + (in_idx & 31u);
+    return (load_u8(off) >> ((in_idx >> 5u) * 2u)) & 3u;
+}
+
+uint q4_value(uint base, uint idx) {
+    uint g = idx >> 5u;
+    uint v = load_u8(base + 16u + (g >> 1u) * 32u + (idx & 31u));
+    return (g & 1u) == 0u ? v & 15u : v >> 4u;
+}
+
+uint q5_value(uint base, uint idx) {
+    uint g = idx >> 5u;
+    uint i = idx & 31u;
+    uint v = load_u8(base + 48u + (g >> 1u) * 32u + i);
+    uint lo = (g & 1u) == 0u ? v & 15u : v >> 4u;
+    return lo | (((load_u8(base + 16u + i) >> g) & 1u) << 4u);
+}
+
+uint q6_value(uint base, uint idx) {
+    uint half_block = idx >> 7u;
+    uint in_idx = idx & 127u;
+    uint l = in_idx & 31u;
+    uint sel = in_idx >> 5u;
+    uint off = half_block * 64u + ((sel & 1u) != 0u ? 32u : 0u) + l;
+    uint low = sel < 2u ? load_u8(base + off) & 15u : load_u8(base + off) >> 4u;
+    uint hi = (load_u8(base + 128u + half_block * 32u + l) >> (2u * sel)) & 3u;
+    return low | (hi << 4u);
+}
+
+vec4 dequant_word(uint row, uint block, uint word) {
+    uint idx = 4u * word;
+    uint base = row * pc.row_bytes;
+    vec4 qv;
+    if (pc.type == Q2_K) {
+        base += 84u * block;
+        uint group = idx >> 4u;
+        qv = vec4(q2_value(base, idx), q2_value(base, idx + 1u),
+                  q2_value(base, idx + 2u), q2_value(base, idx + 3u));
+        return load_f16(base + 80u) * float(load_u8(base + group) & 15u) * qv -
+               load_f16(base + 82u) * float(load_u8(base + group) >> 4u);
+    }
+    if (pc.type == Q4_K || pc.type == Q5_K) {
+        base += (pc.type == Q4_K ? 144u : 176u) * block;
+        uint sc;
+        uint mn;
+        k4_scale_min(base, idx >> 5u, sc, mn);
+        qv = pc.type == Q4_K ?
+            vec4(q4_value(base, idx), q4_value(base, idx + 1u),
+                 q4_value(base, idx + 2u), q4_value(base, idx + 3u)) :
+            vec4(q5_value(base, idx), q5_value(base, idx + 1u),
+                 q5_value(base, idx + 2u), q5_value(base, idx + 3u));
+        return load_f16(base) * float(sc) * qv - load_f16(base + 2u) * float(mn);
+    }
+    base += 210u * block;
+    uint half_block = idx >> 7u;
+    uint in_idx = idx & 127u;
+    uint l = in_idx & 31u;
+    uint sel = in_idx >> 5u;
+    uint ql_off = half_block * 64u + ((sel & 1u) != 0u ? 32u : 0u) + l;
+    uint ql = load_u32(base + ql_off);
+    uint qh = load_u32(base + 128u + half_block * 32u + l);
+    uint low = sel < 2u ? ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+    uint packed = low | (((qh >> (2u * sel)) & 0x03030303u) << 4u);
+    qv = vec4(float(packed & 255u), float((packed >> 8u) & 255u),
+              float((packed >> 16u) & 255u), float(packed >> 24u)) - 32.0;
+    return load_f16(base + 208u) *
+           float(load_i8(base + 192u + (idx >> 4u))) * qv;
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint itid = lid & 15u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
+        vec4 qvec[4];
+        for (uint i = 0u; i < 4u; i++)
+            qvec[i] = unpack_i8(q8[b * Q8K_WORDS + 2u + 4u * itid + i]);
+        float qsum = 0.0;
+        if (pc.type == Q4_K || pc.type == Q6_K) {
+            for (uint i = 0u; i < 4u; i++)
+                qsum += qvec[i].x + qvec[i].y + qvec[i].z + qvec[i].w;
+        }
+        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
+        for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            if (pc.type == Q4_K) {
+                uint base = row * pc.row_bytes + 144u * b;
+                uint group = itid >> 1u;
+                uint sc;
+                uint mn;
+                k4_scale_min(base, group, sc, mn);
+                float qdot = 0.0;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * itid + 4u * i;
+                    uint ql = load_u32(base + 16u + (group >> 1u) * 32u +
+                                       (idx & 31u));
+                    uint packed = (group & 1u) == 0u ?
+                        ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+                    vec4 xv = qvec[i];
+                    qdot += dot(unpack_i8(packed), xv);
+                }
+                float part = load_f16(base) * float(sc) * qdot -
+                             load_f16(base + 2u) * float(mn) * qsum;
+                acc[r] = fma(yd, part, acc[r]);
+                continue;
+            }
+            if (pc.type == Q6_K) {
+                uint base = row * pc.row_bytes + 210u * b;
+                float qdot = 0.0;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * itid + 4u * i;
+                    uint half_block = idx >> 7u;
+                    uint in_idx = idx & 127u;
+                    uint l = in_idx & 31u;
+                    uint sel = in_idx >> 5u;
+                    uint ql_off = half_block * 64u +
+                        ((sel & 1u) != 0u ? 32u : 0u) + l;
+                    uint ql = load_u32(base + ql_off);
+                    uint qh = load_u32(base + 128u + half_block * 32u + l);
+                    uint low = sel < 2u ? ql & 0x0f0f0f0fu :
+                                           (ql >> 4u) & 0x0f0f0f0fu;
+                    uint packed = low |
+                        (((qh >> (2u * sel)) & 0x03030303u) << 4u);
+                    vec4 xv = qvec[i];
+                    qdot += dot(vec4(float(packed & 255u),
+                                     float((packed >> 8u) & 255u),
+                                     float((packed >> 16u) & 255u),
+                                     float(packed >> 24u)), xv);
+                }
+                float part = load_f16(base + 208u) *
+                             float(load_i8(base + 192u + itid)) *
+                             (qdot - 32.0 * qsum);
+                acc[r] = fma(yd, part, acc[r]);
+                continue;
+            }
+            float part = 0.0;
+            for (uint i = 0u; i < 4u; i++)
+                part += dot(dequant_word(row, b, 4u * itid + i),
+                            qvec[i]);
+            acc[r] = fma(yd, part, acc[r]);
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) {
+        float total = subgroupAdd(acc[r]);
+        uint row = first_row + r;
+        if (lid == 0u && row < pc.out_dim) y[row] = total * pc.scale;
+    }
+}

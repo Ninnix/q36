@@ -106,10 +106,34 @@ VULKAN_SHADERS := \
 	vulkan/moe_down_gemm.spv \
 	vulkan/moe_matvec.spv \
 	vulkan/moe_matvec_fast.spv \
+	vulkan/dense_iq3_xxs_decode.spv \
+	vulkan/dense_iq3_xxs_mmq.spv \
+	vulkan/dense_iq3_s_decode.spv \
+	vulkan/dense_iq3_s_mmq.spv \
+	vulkan/dense_kquant_mmq.spv \
+	vulkan/dense_kquant_decode.spv \
 	vulkan/moe_reduce.spv \
 	vulkan/ffn_tail.spv
 
 vulkan/moe_matvec_fast.spv: vulkan/moe_matvec_fast.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_iq3_xxs_decode.spv: vulkan/dense_iq3_xxs_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_iq3_xxs_mmq.spv: vulkan/dense_iq3_xxs_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_iq3_s_decode.spv: vulkan/dense_iq3_s_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_iq3_s_mmq.spv: vulkan/dense_iq3_s_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_kquant_decode.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b.spv: vulkan/matmul_q8_0_f32b.comp

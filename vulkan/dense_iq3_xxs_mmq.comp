@@ -1,0 +1,173 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint wb[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint STRIDE = BK / 2u + 1u;
+const uint Q8K_WORDS = 74u;
+const uint TAB_KSIGNS = 512u;
+const uint TAB_IQ3XXS_GRID = 3104u;
+
+shared f16vec2 buf_a[BM * STRIDE];
+shared f16vec2 buf_b[BN * STRIDE];
+shared uint grid_lut[256];
+shared uint signs_lut[32];
+shared float weight_scale[BM];
+shared float input_scale[BN];
+
+uint load_u8(uint off) {
+    return (wb[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
+}
+
+uint load_u16(uint off) {
+    return (wb[off >> 2u] >> ((off & 3u) * 8u)) & 65535u;
+}
+
+uint load_u32(uint off) {
+    uint shift = (off & 3u) * 8u;
+    uint word = wb[off >> 2u];
+    return shift == 0u ? word :
+        (word >> shift) | (wb[(off >> 2u) + 1u] << (32u - shift));
+}
+
+uint tab_u8(uint word_base, uint byte_idx) {
+    return (signs_lut[byte_idx >> 2u] >> ((byte_idx & 3u) * 8u)) & 255u;
+}
+
+uint sign_mask(uint signs) {
+    return (((signs & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint tok0 = gl_WorkGroupID.y * BN;
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint warp_row = wave & 1u;
+    uint warp_tok = wave >> 1u;
+    uint thread_row = lane & 3u;
+    uint thread_tok = lane >> 2u;
+    f16vec2 sum[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
+    for (uint i = lid; i < 256u; i += 128u)
+        grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
+    if (lid < 32u) signs_lut[lid] = tables[TAB_KSIGNS + lid];
+    barrier();
+
+    for (uint qb = 0u; qb < pc.blocks; qb++) {
+        if (lid < BM) {
+            uint row = row0 + lid;
+            weight_scale[lid] = row < pc.out_dim ?
+                unpackHalf2x16(load_u16(row * pc.row_bytes + 98u * qb)).x *
+                    (0.25 * pc.scale) : 0.0;
+        }
+        if (lid < BN) {
+            uint tok = tok0 + lid;
+            input_scale[lid] = tok < pc.n_tok ?
+                uintBitsToFloat(q8[(tok * pc.blocks + qb) * Q8K_WORDS]) : 0.0;
+        }
+        barrier();
+        for (uint slice = 0u; slice < 8u; slice++) {
+            for (uint i = lid; i < BM * 8u; i += 128u) {
+                uint lr = i >> 3u;
+                uint kw = i & 7u;
+                uint row = row0 + lr;
+                vec4 v = vec4(0.0);
+                if (row < pc.out_dim) {
+                    uint word = slice * 8u + kw;
+                    uint base = row * pc.row_bytes + 98u * qb;
+                    uint ib = word >> 3u;
+                    uint lane4 = word & 7u;
+                    uint aux = load_u32(base + 66u + 4u * ib);
+                    uint signs = tab_u8(TAB_KSIGNS,
+                        (aux >> (7u * (lane4 >> 1u))) & 127u);
+                    uint grid = grid_lut[load_u8(base + 2u + word)];
+                    uint mask = sign_mask(signs >> (4u * (lane4 & 1u)));
+                    float d = weight_scale[lr] * float(2u * (aux >> 28u) + 1u);
+                    v = d * unpack_i8((grid ^ mask) + (mask & 0x01010101u));
+                }
+                uint dst = lr * STRIDE + 2u * kw;
+                buf_a[dst] = f16vec2(v.xy);
+                buf_a[dst + 1u] = f16vec2(v.zw);
+            }
+
+            for (uint i = lid; i < BN * 8u; i += 128u) {
+                uint lt = i >> 3u;
+                uint kw = i & 7u;
+                uint tok = tok0 + lt;
+                vec4 v = vec4(0.0);
+                if (tok < pc.n_tok) {
+                    uint qbase = (tok * pc.blocks + qb) * Q8K_WORDS;
+                    v = input_scale[lt] *
+                        unpack_i8(q8[qbase + 2u + slice * 8u + kw]);
+                }
+                uint dst = lt * STRIDE + 2u * kw;
+                buf_b[dst] = f16vec2(v.xy);
+                buf_b[dst + 1u] = f16vec2(v.zw);
+            }
+            barrier();
+
+            [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
+                f16vec2 av[8];
+                f16vec2 bv[4];
+                [[unroll]] for (uint sr = 0u; sr < 2u; sr++)
+                    [[unroll]] for (uint r = 0u; r < 4u; r++)
+                        av[sr * 4u + r] = buf_a[(warp_row * 32u + sr * 16u +
+                            thread_row * 4u + r) * STRIDE + k];
+                [[unroll]] for (uint st = 0u; st < 2u; st++)
+                    [[unroll]] for (uint t = 0u; t < 2u; t++)
+                        bv[st * 2u + t] = buf_b[(warp_tok * 32u + st * 16u +
+                            thread_tok * 2u + t) * STRIDE + k];
+                [[unroll]] for (uint tp = 0u; tp < 2u; tp++)
+                    [[unroll]] for (uint rr = 0u; rr < 8u; rr++)
+                        sum[tp * 8u + rr] = fma(f16vec2(av[rr].x),
+                            f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
+                            fma(f16vec2(av[rr].y),
+                                f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
+                                sum[tp * 8u + rr]));
+            }
+            barrier();
+        }
+    }
+
+    [[unroll]] for (uint tt = 0u; tt < 4u; tt++) {
+        uint tok = tok0 + warp_tok * 32u + (tt >> 1u) * 16u +
+                   thread_tok * 2u + (tt & 1u);
+        if (tok >= pc.n_tok) continue;
+        [[unroll]] for (uint rr = 0u; rr < 8u; rr++) {
+            uint row = row0 + warp_row * 32u + (rr >> 2u) * 16u +
+                       thread_row * 4u + (rr & 3u);
+            if (row < pc.out_dim)
+                y[tok * pc.out_dim + row] = float((tt & 1u) == 0u ?
+                    sum[(tt >> 1u) * 8u + rr].x :
+                    sum[(tt >> 1u) * 8u + rr].y);
+        }
+    }
+}

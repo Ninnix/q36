@@ -31,6 +31,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 const uint IQ2_XXS = 16u;
+const uint IQ3_XXS = 18u;
 const uint Q2_K = 10u;
 const uint Q4_K = 12u;
 const uint Q5_K = 13u;
@@ -42,6 +43,7 @@ const uint TAB_XXS_GRID = 0u;
 const uint TAB_KSIGNS = 512u;
 const uint TAB_IQ2S_GRID = 544u;
 const uint TAB_IQ3S_GRID = 2592u;
+const uint TAB_IQ3XXS_GRID = 3104u;
 
 const uint PAIR_TILE = 8u;
 const uint TILE_WORDS = 1u + PAIR_TILE;
@@ -363,6 +365,34 @@ void main(void) {
                     for (uint u = 0u; u < PAIR_TILE; u++) if (pair_live[u]) lk[u] += ls * signed_grid4(grid, (lane & 1u) * 4u, sgn, (lane & 1u) * 4u, u, ib * 32u + 4u * lane);
                 }
                 for (uint u = 0u; u < PAIR_TILE; u++) if (pair_live[u]) lane_acc[u] = fma(wd * yd[u], float(lk[u]), lane_acc[u]);
+            } else if (pc.type == IQ3_XXS) {
+                uint qs = base + 2u;
+                uint gas = base + 66u;
+                int lk[PAIR_TILE];
+                for (uint u = 0u; u < PAIR_TILE; u++) lk[u] = 0;
+                for (uint ib = 0u; ib < 8u; ib++) {
+                    uint aux = load_u8(gas + 4u * ib)
+                             | (load_u8(gas + 4u * ib + 1u) << 8u)
+                             | (load_u8(gas + 4u * ib + 2u) << 16u)
+                             | (load_u8(gas + 4u * ib + 3u) << 24u);
+                    int ls = 2 * int(aux >> 28u) + 1;
+                    uint l = lane >> 1u;
+                    uint sgn = tab_u8(TAB_KSIGNS, (aux >> (7u * l)) & 127u);
+                    uint word = tables[TAB_IQ3XXS_GRID + load_u8(qs + 8u * ib + lane)];
+                    for (uint u = 0u; u < PAIR_TILE; u++) {
+                        int s4 = 0;
+                        if (!pair_live[u]) continue;
+                        for (uint j = 0u; j < 4u; j++) {
+                            int prod = int((word >> (8u * j)) & 255u) *
+                                       q8_i8(u, ib * 32u + 4u * lane + j);
+                            s4 += ((sgn >> ((lane & 1u) * 4u + j)) & 1u) != 0u ? -prod : prod;
+                        }
+                        lk[u] += ls * s4;
+                    }
+                }
+                for (uint u = 0u; u < PAIR_TILE; u++) {
+                    if (pair_live[u]) lane_acc[u] = fma(wd * yd[u], float(lk[u]), lane_acc[u]);
+                }
             } else {
                 uint qs = base + 2u;
                 uint qh = base + 66u;
@@ -411,6 +441,7 @@ void main(void) {
             if (pc.type == Q4_K) acc += (sh_min[soff + 0u] + sh_min[soff + 2u]) + (sh_min[soff + 1u] + sh_min[soff + 3u]);
             if (pc.type == Q5_K) acc += sh_min[soff];
             if (pc.type == IQ2_XXS || pc.type == IQ2_S) acc *= 0.125;
+            if (pc.type == IQ3_XXS) acc *= 0.25;
             if (pc.has_scales != 0u) acc *= scales[scale_idx];
             y[p * pc.out_dim + row] = acc;
         }

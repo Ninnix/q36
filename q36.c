@@ -51,7 +51,7 @@
 #define Q36_K_SCALE_SIZE 12u
 #define Q36_Q8_K_BYTES 292u
 #define Q36_VK_Q8_K_BYTES 296u
-#define Q36_MAX_Q8_K_BYTES 4672u
+#define Q36_MAX_Q8_K_BYTES 19856u
 
 #if defined(__GNUC__) || defined(__clang__)
 #define Q36_MAYBE_UNUSED __attribute__((unused))
@@ -68,33 +68,143 @@ static const char Q36_REASONING_EFFORT_MAX_PREFIX[] =
     "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
 
 enum {
-    Q36_N_LAYER = 40,
-    Q36_N_EMBD = 2048,
-    Q36_N_VOCAB = 248320,
-    Q36_TENSOR_COUNT = 733,
-    Q36_CONTEXT_TRAIN = Q36_CONTEXT_MAX,
-    Q36_N_HEAD = 16,
-    Q36_N_HEAD_KV = 2,
-    Q36_N_HEAD_DIM = 256,
-    Q36_N_VALUE_DIM = 256,
-    Q36_N_ROT = 64,
-    Q36_N_EXPERT = 256,
-    Q36_N_EXPERT_USED = 8,
-    Q36_N_FF_EXP = 512,
-    Q36_N_FF_SHARED = 512,
-    Q36_N_SSM_CONV = 4,
-    Q36_N_SSM_STATE = 128,
-    Q36_N_SSM_GROUP = 16,
-    Q36_N_SSM_DT_RANK = 32,
-    Q36_N_SSM_INNER = 4096,
-    Q36_FULL_ATTENTION_INTERVAL = 4,
+    Q36_MAX_LAYER = 64,
     Q36_MTP_MAX_DRAFT = 16,
-    Q36_N_SSM_QK = Q36_N_SSM_GROUP * Q36_N_SSM_STATE,
-    Q36_N_SSM_CONV_DIM = Q36_N_SSM_QK * 2u + Q36_N_SSM_INNER,
-    Q36_CPU_SCRATCH_FLOATS = Q36_N_SSM_CONV * Q36_N_SSM_CONV_DIM,
     Q36_CPU_MAX_THREADS = 32,
     Q36_CPU_PREFILL_CHUNK_DEFAULT = 16,
 };
+
+typedef enum {
+    Q36_VARIANT_35B_A3B,
+    Q36_VARIANT_27B,
+} q36_variant;
+
+typedef struct {
+    const char *name;
+    const char *arch;
+    q36_variant variant;
+    uint32_t n_layer;
+    uint32_t n_embd;
+    uint32_t n_vocab;
+    uint32_t n_tensor;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t n_head_dim;
+    uint32_t n_value_dim;
+    uint32_t n_rot;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_ff_exp;
+    uint32_t n_ff_shared;
+    uint32_t n_ssm_conv;
+    uint32_t n_ssm_state;
+    uint32_t n_ssm_group;
+    uint32_t n_ssm_dt_rank;
+    uint32_t n_ssm_inner;
+    uint32_t full_attention_interval;
+    bool dense;
+} q36_shape;
+
+static const q36_shape Q36_SHAPE_35B_A3B = {
+    .name = "Qwen 3.6 35B A3B",
+    .arch = "qwen35moe",
+    .variant = Q36_VARIANT_35B_A3B,
+    .n_layer = 40,
+    .n_embd = 2048,
+    .n_vocab = 248320,
+    .n_tensor = 733,
+    .n_head = 16,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_ff_exp = 512,
+    .n_ff_shared = 512,
+    .n_ssm_conv = 4,
+    .n_ssm_state = 128,
+    .n_ssm_group = 16,
+    .n_ssm_dt_rank = 32,
+    .n_ssm_inner = 4096,
+    .full_attention_interval = 4,
+};
+
+static const q36_shape Q36_SHAPE_27B = {
+    .name = "Qwen 3.6 27B",
+    .arch = "qwen35",
+    .variant = Q36_VARIANT_27B,
+    .n_layer = 64,
+    .n_embd = 5120,
+    .n_vocab = 248320,
+    .n_tensor = 851,
+    .n_head = 24,
+    .n_head_kv = 4,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 1,
+    .n_expert_used = 1,
+    .n_ff_exp = 17408,
+    .n_ff_shared = 17408,
+    .n_ssm_conv = 4,
+    .n_ssm_state = 128,
+    .n_ssm_group = 16,
+    .n_ssm_dt_rank = 48,
+    .n_ssm_inner = 6144,
+    .full_attention_interval = 4,
+    .dense = true,
+};
+
+static q36_shape g_q36_shape = {
+    .name = "Qwen 3.6 35B A3B",
+    .arch = "qwen35moe",
+    .variant = Q36_VARIANT_35B_A3B,
+    .n_layer = 40,
+    .n_embd = 2048,
+    .n_vocab = 248320,
+    .n_tensor = 733,
+    .n_head = 16,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_ff_exp = 512,
+    .n_ff_shared = 512,
+    .n_ssm_conv = 4,
+    .n_ssm_state = 128,
+    .n_ssm_group = 16,
+    .n_ssm_dt_rank = 32,
+    .n_ssm_inner = 4096,
+    .full_attention_interval = 4,
+};
+
+#define Q36_N_LAYER                 (g_q36_shape.n_layer)
+#define Q36_N_EMBD                  (g_q36_shape.n_embd)
+#define Q36_N_VOCAB                 (g_q36_shape.n_vocab)
+#define Q36_TENSOR_COUNT            (g_q36_shape.n_tensor)
+#define Q36_CONTEXT_TRAIN           Q36_CONTEXT_MAX
+#define Q36_N_HEAD                  (g_q36_shape.n_head)
+#define Q36_N_HEAD_KV               (g_q36_shape.n_head_kv)
+#define Q36_N_HEAD_DIM              (g_q36_shape.n_head_dim)
+#define Q36_N_VALUE_DIM             (g_q36_shape.n_value_dim)
+#define Q36_N_ROT                   (g_q36_shape.n_rot)
+#define Q36_N_EXPERT                (g_q36_shape.n_expert)
+#define Q36_N_EXPERT_USED           (g_q36_shape.n_expert_used)
+#define Q36_N_FF_EXP                (g_q36_shape.n_ff_exp)
+#define Q36_N_FF_SHARED             (g_q36_shape.n_ff_shared)
+#define Q36_N_SSM_CONV              (g_q36_shape.n_ssm_conv)
+#define Q36_N_SSM_STATE             (g_q36_shape.n_ssm_state)
+#define Q36_N_SSM_GROUP             (g_q36_shape.n_ssm_group)
+#define Q36_N_SSM_DT_RANK           (g_q36_shape.n_ssm_dt_rank)
+#define Q36_N_SSM_INNER             (g_q36_shape.n_ssm_inner)
+#define Q36_FULL_ATTENTION_INTERVAL (g_q36_shape.full_attention_interval)
+#define Q36_MODEL_DENSE             (g_q36_shape.dense)
+#define Q36_N_SSM_QK                (Q36_N_SSM_GROUP * Q36_N_SSM_STATE)
+#define Q36_N_SSM_CONV_DIM          (Q36_N_SSM_QK * 2u + Q36_N_SSM_INNER)
+#define Q36_CPU_SCRATCH_FLOATS      (Q36_N_SSM_CONV * Q36_N_SSM_CONV_DIM)
 
 #ifndef Q36_NO_GPU
 #include "q36_streaming_hotlist.inc"
@@ -150,6 +260,7 @@ static const gguf_type_info gguf_types[] = {
     [14] = {"q6_k", 256, 210},
     [15] = {"q8_k", 256, 292},
     [16] = {"iq2_xxs", 256, 66},
+    [18] = {"iq3_xxs", 256, 98},
     [21] = {"iq3_s", 256, 110},
     [22] = {"iq2_s", 256, 82},
     [26] = {"i32", 1, 4},
@@ -164,6 +275,7 @@ enum {
     Q36_TENSOR_Q5_K = 13,
     Q36_TENSOR_Q6_K = 14,
     Q36_TENSOR_IQ2_XXS = 16,
+    Q36_TENSOR_IQ3_XXS = 18,
     Q36_TENSOR_IQ3_S = 21,
     Q36_TENSOR_IQ2_S = 22,
     Q36_TENSOR_I32 = 26,
@@ -240,6 +352,11 @@ typedef struct {
     uint16_t d;
     uint16_t qs[Q36_QK_K / 8];
 } q36_block_iq2_xxs;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[3 * Q36_QK_K / 8];
+} q36_block_iq3_xxs;
 
 typedef struct {
     uint16_t d;
@@ -366,7 +483,7 @@ typedef struct {
     q36_tensor *output_norm;
     q36_tensor *output;
     q36_tensor *output_scale;
-    q36_layer_weights layer[Q36_N_LAYER];
+    q36_layer_weights layer[Q36_MAX_LAYER];
 } q36_weights;
 
 typedef struct {
@@ -419,6 +536,7 @@ struct q36_engine {
     bool ssd_streaming_full_layers_set;
     bool mtp_ready;
     bool kat_coder;
+    q36_variant variant;
 };
 
 struct q36_session {
@@ -469,8 +587,8 @@ typedef struct {
 } q36_recurrent_cache;
 
 typedef struct {
-    q36_full_attn_cache full[Q36_N_LAYER];
-    q36_recurrent_cache recurrent[Q36_N_LAYER];
+    q36_full_attn_cache full[Q36_MAX_LAYER];
+    q36_recurrent_cache recurrent[Q36_MAX_LAYER];
     uint32_t prefill_cap;
     float *hidden;
     float *next_hidden;
@@ -556,8 +674,8 @@ typedef struct {
 typedef struct {
     uint32_t prefill_cap;
     bool recur_conv_fused;
-    q36_vulkan_full_attn_cache full[Q36_N_LAYER];
-    q36_vulkan_recurrent_cache recurrent[Q36_N_LAYER];
+    q36_vulkan_full_attn_cache full[Q36_MAX_LAYER];
+    q36_vulkan_recurrent_cache recurrent[Q36_MAX_LAYER];
     q36_gpu_tensor *hidden;
     q36_gpu_tensor *next_hidden;
     /* Host-written embed staging, ping-ponged across prefill chunks: the
@@ -598,7 +716,7 @@ typedef struct {
     q36_gpu_tensor *top2;
     q36_gpu_tensor *scores;
     q36_vulkan_full_attn_cache mtp_full;
-    q36_vulkan_recurrent_cache spec_recurrent[Q36_N_LAYER];
+    q36_vulkan_recurrent_cache spec_recurrent[Q36_MAX_LAYER];
     q36_gpu_tensor *spec_logits;
     q36_gpu_tensor *mtp_tok_embd;
     q36_gpu_tensor *mtp_e_norm;
@@ -1632,6 +1750,7 @@ static void q36_dequantize_row_q4_k(const q36_block_q4_k *x, float *y, uint64_t 
 static void q36_dequantize_row_q5_k(const q36_block_q5_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_q6_k(const q36_block_q6_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq2_xxs(const q36_block_iq2_xxs *x, float *y, uint64_t k);
+static void q36_dequantize_row_iq3_xxs(const q36_block_iq3_xxs *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq2_s(const q36_block_iq2_s *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq3_s(const q36_block_iq3_s *x, float *y, uint64_t k);
 
@@ -1645,6 +1764,10 @@ static const uint8_t *q36_iq2s_grid_at(uint32_t idx) {
 
 static const uint8_t *q36_iq3s_grid_at(uint32_t idx) {
     return (const uint8_t *)&q36_iq3s_grid[idx];
+}
+
+static const uint8_t *q36_iq3xxs_grid_at(uint32_t idx) {
+    return (const uint8_t *)&q36_iq3xxs_grid[idx];
 }
 
 static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float *dst, uint32_t n) {
@@ -1674,6 +1797,9 @@ static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float
         return true;
     case Q36_TENSOR_IQ2_XXS:
         q36_dequantize_row_iq2_xxs((const q36_block_iq2_xxs *)src, dst, n);
+        return true;
+    case Q36_TENSOR_IQ3_XXS:
+        q36_dequantize_row_iq3_xxs((const q36_block_iq3_xxs *)src, dst, n);
         return true;
     case Q36_TENSOR_IQ2_S:
         q36_dequantize_row_iq2_s((const q36_block_iq2_s *)src, dst, n);
@@ -1875,6 +2001,33 @@ static void q36_dequantize_row_iq2_s(const q36_block_iq2_s *x, float *y, uint64_
     }
 }
 
+static void q36_dequantize_row_iq3_xxs(const q36_block_iq3_xxs *x, float *y, uint64_t k) {
+    if ((k % Q36_QK_K) != 0) q36_die("iq3_xxs row size mismatch");
+    for (uint64_t i = 0; i < k / Q36_QK_K; i++) {
+        const float d = q36_f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *scales_and_signs = qs + Q36_QK_K / 4;
+        for (uint32_t ib32 = 0; ib32 < Q36_QK_K / 32; ib32++) {
+            uint32_t aux;
+            memcpy(&aux, scales_and_signs + 4 * ib32, sizeof(aux));
+            const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t signs = q36_ksigns_iq2xs[(aux >> (7 * l)) & 127u];
+                const uint8_t *grid1 = q36_iq3xxs_grid_at(qs[2 * l]);
+                const uint8_t *grid2 = q36_iq3xxs_grid_at(qs[2 * l + 1]);
+                for (int j = 0; j < 4; j++) {
+                    y[j] = db * (float)grid1[j] *
+                        ((signs & q36_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                    y[j + 4] = db * (float)grid2[j] *
+                        ((signs & q36_kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+    }
+}
+
 static void q36_dequantize_row_iq3_s(const q36_block_iq3_s *x, float *y, uint64_t k) {
     uint64_t nb;
     if ((k % Q36_QK_K) != 0) q36_die("iq3_s row size mismatch");
@@ -1997,6 +2150,7 @@ static bool q36_tensor_type_supports_q8k_dot(uint32_t type) {
     case Q36_TENSOR_Q5_K:
     case Q36_TENSOR_Q6_K:
     case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ3_XXS:
     case Q36_TENSOR_IQ2_S:
     case Q36_TENSOR_IQ3_S:
         return true;
@@ -2736,7 +2890,6 @@ static bool q36_tensor_matvec(const q36_engine *e, const q36_tensor *t, const fl
     if (!e || !t || !x || !out) return false;
     kind = q36_activation_quant_kind_for_type(t->type);
     if (kind != Q36_ACTIVATION_QUANT_NONE &&
-        in_dim <= Q36_N_SSM_INNER &&
         q36_activation_quant_valid_dim(kind, in_dim) &&
         q36_activation_quant_row_bytes(kind, in_dim) <= Q36_MAX_Q8_K_BYTES &&
         q36_quantize_activation_row(kind, x, xq, in_dim)) {
@@ -2787,7 +2940,6 @@ static bool q36_tensor_expert_matvec(const q36_engine *e, const q36_tensor *t, u
     if (!e || !t || !x || !out) return false;
     kind = q36_activation_quant_kind_for_type(t->type);
     if (kind != Q36_ACTIVATION_QUANT_NONE &&
-        in_dim <= Q36_N_SSM_INNER &&
         q36_activation_quant_valid_dim(kind, in_dim) &&
         q36_activation_quant_row_bytes(kind, in_dim) <= Q36_MAX_Q8_K_BYTES &&
         q36_quantize_activation_row(kind, x, xq, in_dim)) {
@@ -3297,6 +3449,36 @@ static void tensor_expect_optional_plain(const q36_tensor *t, uint32_t ndim, uin
     if (t) tensor_expect_plain_layout(t, ndim, d0, d1, d2);
 }
 
+static bool tensor_type_is_cpu_matrix(uint32_t type) {
+    switch (type) {
+    case Q36_TENSOR_F32:
+    case Q36_TENSOR_F16:
+    case Q36_TENSOR_Q8_0:
+    case Q36_TENSOR_Q2_K:
+    case Q36_TENSOR_Q4_K:
+    case Q36_TENSOR_Q5_K:
+    case Q36_TENSOR_Q6_K:
+    case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ3_XXS:
+    case Q36_TENSOR_IQ2_S:
+    case Q36_TENSOR_IQ3_S:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void tensor_expect_cpu_matrix(const q36_tensor *t,
+                                     uint64_t in_dim, uint64_t out_dim) {
+    if (!t) q36_die("internal error: missing matrix tensor while validating layout");
+    if (!tensor_type_is_cpu_matrix(t->type)) {
+        fprintf(stderr, "q36: tensor %.*s has unsupported CPU matrix type %s\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, 2, in_dim, out_dim, 0);
+}
+
 static void tensor_expect_routed_gate_up(const q36_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     uint64_t want[3];
     if (!t) q36_die("internal error: missing routed expert tensor while validating layout");
@@ -3353,6 +3535,7 @@ static int q36_quant_bits_from_type(uint32_t type) {
     case Q36_TENSOR_IQ2_S:
     case Q36_TENSOR_Q2_K:
         return 2;
+    case Q36_TENSOR_IQ3_XXS:
     case Q36_TENSOR_IQ3_S:
         return 3;
     case Q36_TENSOR_Q4_K:
@@ -3370,6 +3553,44 @@ static int q36_quant_bits_from_type(uint32_t type) {
 
 static void weights_validate_layout(const q36_weights *w) {
     if (!w) q36_die("internal error: missing weights while validating layout");
+    if (Q36_MODEL_DENSE) {
+        tensor_expect_cpu_matrix(w->token_embd, Q36_N_EMBD, Q36_N_VOCAB);
+        tensor_expect_layout(w->output_norm, Q36_TENSOR_F32, 1, Q36_N_EMBD, 0, 0);
+        tensor_expect_cpu_matrix(w->output, Q36_N_EMBD, Q36_N_VOCAB);
+        tensor_expect_optional_plain(w->output_scale, 1, 1, 0, 0);
+        for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+            const q36_layer_weights *l = &w->layer[il];
+            tensor_expect_layout(l->attn_norm, Q36_TENSOR_F32, 1, Q36_N_EMBD, 0, 0);
+            tensor_expect_layout(l->post_attention_norm, Q36_TENSOR_F32, 1, Q36_N_EMBD, 0, 0);
+            if (l->kind == Q36_LAYER_FULL_ATTN) {
+                tensor_expect_cpu_matrix(l->attn_q, Q36_N_EMBD, Q36_N_SSM_INNER * 2u);
+                tensor_expect_layout(l->attn_q_norm, Q36_TENSOR_F32, 1, Q36_N_HEAD_DIM, 0, 0);
+                tensor_expect_cpu_matrix(l->attn_k, Q36_N_EMBD,
+                                         (uint64_t)Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+                tensor_expect_layout(l->attn_k_norm, Q36_TENSOR_F32, 1, Q36_N_HEAD_DIM, 0, 0);
+                tensor_expect_cpu_matrix(l->attn_v, Q36_N_EMBD,
+                                         (uint64_t)Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
+                tensor_expect_cpu_matrix(l->attn_output, Q36_N_SSM_INNER, Q36_N_EMBD);
+                tensor_expect_optional_plain(l->attn_sinks, 1, Q36_N_HEAD, 0, 0);
+            } else {
+                tensor_expect_cpu_matrix(l->attn_gate, Q36_N_EMBD, Q36_N_SSM_INNER);
+                tensor_expect_cpu_matrix(l->attn_qkv, Q36_N_EMBD,
+                                         Q36_N_SSM_CONV_DIM);
+                tensor_expect_layout(l->ssm_a, Q36_TENSOR_F32, 1, Q36_N_SSM_DT_RANK, 0, 0);
+                tensor_expect_cpu_matrix(l->ssm_alpha, Q36_N_EMBD, Q36_N_SSM_DT_RANK);
+                tensor_expect_cpu_matrix(l->ssm_beta, Q36_N_EMBD, Q36_N_SSM_DT_RANK);
+                tensor_expect_layout(l->ssm_conv1d, Q36_TENSOR_F32, 2,
+                                     Q36_N_SSM_CONV, Q36_N_SSM_CONV_DIM, 0);
+                tensor_expect_layout(l->ssm_dt, Q36_TENSOR_F32, 1, Q36_N_SSM_DT_RANK, 0, 0);
+                tensor_expect_layout(l->ssm_norm, Q36_TENSOR_F32, 1, Q36_N_SSM_STATE, 0, 0);
+                tensor_expect_cpu_matrix(l->ssm_out, Q36_N_SSM_INNER, Q36_N_EMBD);
+            }
+            tensor_expect_cpu_matrix(l->ffn_gate_shexp, Q36_N_EMBD, Q36_N_FF_SHARED);
+            tensor_expect_cpu_matrix(l->ffn_up_shexp, Q36_N_EMBD, Q36_N_FF_SHARED);
+            tensor_expect_cpu_matrix(l->ffn_down_shexp, Q36_N_FF_SHARED, Q36_N_EMBD);
+        }
+        return;
+    }
     tensor_expect_layout_or_q8_0(w->token_embd, Q36_TENSOR_Q4_K, 2, Q36_N_EMBD, Q36_N_VOCAB, 0);
     tensor_expect_layout(w->output_norm, Q36_TENSOR_F32, 1, Q36_N_EMBD, 0, 0);
     tensor_expect_layout_or_q6_k_or_q8_0(w->output, Q36_TENSOR_Q4_K, 2, Q36_N_EMBD, Q36_N_VOCAB, 0);
@@ -3466,20 +3687,26 @@ static void weights_bind(q36_weights *w, const q36_model *m) {
             l->ssm_beta_scale = tensor_by_namef(m, "blk.%u.ssm_beta.scale", il);
             l->ssm_out_scale = tensor_by_namef(m, "blk.%u.ssm_out.scale", il);
         }
-        l->ffn_gate_inp = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-        l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
-        l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
-        l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
-        l->ffn_up_exps = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
-        l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
-        l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
-        l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
-        l->ffn_gate_exps_scale = tensor_by_namef(m, "blk.%u.ffn_gate_exps.scale", il);
-        l->ffn_gate_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_gate_shexp.scale", il);
-        l->ffn_up_exps_scale = tensor_by_namef(m, "blk.%u.ffn_up_exps.scale", il);
-        l->ffn_up_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_up_shexp.scale", il);
-        l->ffn_down_exps_scale = tensor_by_namef(m, "blk.%u.ffn_down_exps.scale", il);
-        l->ffn_down_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_down_shexp.scale", il);
+        if (Q36_MODEL_DENSE) {
+            l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+            l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+            l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        } else {
+            l->ffn_gate_inp = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+            l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
+            l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+            l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+            l->ffn_up_exps = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+            l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+            l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+            l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+            l->ffn_gate_exps_scale = tensor_by_namef(m, "blk.%u.ffn_gate_exps.scale", il);
+            l->ffn_gate_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_gate_shexp.scale", il);
+            l->ffn_up_exps_scale = tensor_by_namef(m, "blk.%u.ffn_up_exps.scale", il);
+            l->ffn_up_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_up_shexp.scale", il);
+            l->ffn_down_exps_scale = tensor_by_namef(m, "blk.%u.ffn_down_exps.scale", il);
+            l->ffn_down_shexp_scale = tensor_by_namef(m, "blk.%u.ffn_down_shexp.scale", il);
+        }
     }
     weights_validate_layout(w);
 }
@@ -4232,42 +4459,72 @@ static void q36_vulkan_prewarm_weights(const q36_engine *e) {
 #endif
 
 static void config_validate_model(const q36_model *m) {
+    char key[128];
+    const char *prefix;
     uint64_t ctx_train = 0;
     q36_str arch = required_string(m, "general.architecture");
     q36_str tok_model = required_string(m, "tokenizer.ggml.model");
     q36_str tok_pre = required_string(m, "tokenizer.ggml.pre");
-    config_expect_string("general.architecture", arch, "qwen35moe");
+    if (q36_streq(arch, Q36_SHAPE_35B_A3B.arch)) {
+        g_q36_shape = Q36_SHAPE_35B_A3B;
+    } else if (q36_streq(arch, Q36_SHAPE_27B.arch)) {
+        g_q36_shape = Q36_SHAPE_27B;
+    } else {
+        fprintf(stderr, "q36: unsupported architecture: %.*s\n",
+                (int)arch.len, arch.ptr);
+        exit(1);
+    }
+    prefix = g_q36_shape.arch;
+    config_expect_string("general.architecture", arch, prefix);
     config_expect_string("tokenizer.ggml.model", tok_model, "gpt2");
     config_expect_string("tokenizer.ggml.pre", tok_pre, "qwen35");
-    config_expect_u32("qwen35moe.block_count", required_u32(m, "qwen35moe.block_count"), Q36_N_LAYER);
-    if (!model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train)) {
-        fprintf(stderr, "q36: required metadata key is missing: qwen35moe.context_length\n");
+#define Q36_META_KEY(suffix) snprintf(key, sizeof(key), "%s.%s", prefix, suffix)
+#define Q36_EXPECT_U32(suffix, expected) do { \
+    Q36_META_KEY(suffix); \
+    config_expect_u32(key, required_u32(m, key), expected); \
+} while (0)
+#define Q36_EXPECT_F32(suffix, expected) do { \
+    Q36_META_KEY(suffix); \
+    config_expect_f32(key, required_f32(m, key), expected); \
+} while (0)
+    Q36_EXPECT_U32("block_count", Q36_N_LAYER);
+    Q36_META_KEY("context_length");
+    if (!model_get_u64_compat(m, key, &ctx_train)) {
+        fprintf(stderr, "q36: required metadata key is missing: %s\n", key);
         exit(1);
     }
     if (ctx_train != Q36_CONTEXT_TRAIN) {
-        fprintf(stderr, "q36: expected qwen35moe.context_length=%u, got %" PRIu64 "\n", Q36_CONTEXT_TRAIN, ctx_train);
+        fprintf(stderr, "q36: expected %s=%u, got %" PRIu64 "\n",
+                key, Q36_CONTEXT_TRAIN, ctx_train);
         exit(1);
     }
-    config_expect_u32("qwen35moe.embedding_length", required_u32(m, "qwen35moe.embedding_length"), Q36_N_EMBD);
-    config_expect_u32("qwen35moe.attention.head_count", required_u32(m, "qwen35moe.attention.head_count"), Q36_N_HEAD);
-    config_expect_u32("qwen35moe.attention.head_count_kv", required_u32(m, "qwen35moe.attention.head_count_kv"), Q36_N_HEAD_KV);
-    config_expect_u32("qwen35moe.attention.key_length", required_u32(m, "qwen35moe.attention.key_length"), Q36_N_HEAD_DIM);
-    config_expect_u32("qwen35moe.attention.value_length", required_u32(m, "qwen35moe.attention.value_length"), Q36_N_VALUE_DIM);
-    config_expect_u32("qwen35moe.rope.dimension_count", required_u32(m, "qwen35moe.rope.dimension_count"), Q36_N_ROT);
-    config_expect_f32("qwen35moe.rope.freq_base", required_f32(m, "qwen35moe.rope.freq_base"), 10000000.0f);
-    config_expect_u32_array(m, "qwen35moe.rope.dimension_sections", Q36_ROPE_SECTIONS, 4);
-    config_expect_f32("qwen35moe.attention.layer_norm_rms_epsilon",
-                      required_f32(m, "qwen35moe.attention.layer_norm_rms_epsilon"), Q36_RMS_EPS);
-    config_expect_u32("qwen35moe.expert_count", required_u32(m, "qwen35moe.expert_count"), Q36_N_EXPERT);
-    config_expect_u32("qwen35moe.expert_used_count", required_u32(m, "qwen35moe.expert_used_count"), Q36_N_EXPERT_USED);
-    config_expect_u32("qwen35moe.expert_feed_forward_length", required_u32(m, "qwen35moe.expert_feed_forward_length"), Q36_N_FF_EXP);
-    config_expect_u32("qwen35moe.expert_shared_feed_forward_length", required_u32(m, "qwen35moe.expert_shared_feed_forward_length"), Q36_N_FF_SHARED);
-    config_expect_u32("qwen35moe.ssm.conv_kernel", required_u32(m, "qwen35moe.ssm.conv_kernel"), Q36_N_SSM_CONV);
-    config_expect_u32("qwen35moe.ssm.state_size", required_u32(m, "qwen35moe.ssm.state_size"), Q36_N_SSM_STATE);
-    config_expect_u32("qwen35moe.ssm.group_count", required_u32(m, "qwen35moe.ssm.group_count"), Q36_N_SSM_GROUP);
-    config_expect_u32("qwen35moe.ssm.time_step_rank", required_u32(m, "qwen35moe.ssm.time_step_rank"), Q36_N_SSM_DT_RANK);
-    config_expect_u32("qwen35moe.ssm.inner_size", required_u32(m, "qwen35moe.ssm.inner_size"), Q36_N_SSM_INNER);
-    config_expect_u32("qwen35moe.full_attention_interval", required_u32(m, "qwen35moe.full_attention_interval"), Q36_FULL_ATTENTION_INTERVAL);
+    Q36_EXPECT_U32("embedding_length", Q36_N_EMBD);
+    Q36_EXPECT_U32("attention.head_count", Q36_N_HEAD);
+    Q36_EXPECT_U32("attention.head_count_kv", Q36_N_HEAD_KV);
+    Q36_EXPECT_U32("attention.key_length", Q36_N_HEAD_DIM);
+    Q36_EXPECT_U32("attention.value_length", Q36_N_VALUE_DIM);
+    Q36_EXPECT_U32("rope.dimension_count", Q36_N_ROT);
+    Q36_EXPECT_F32("rope.freq_base", 10000000.0f);
+    Q36_META_KEY("rope.dimension_sections");
+    config_expect_u32_array(m, key, Q36_ROPE_SECTIONS, 4);
+    Q36_EXPECT_F32("attention.layer_norm_rms_epsilon", Q36_RMS_EPS);
+    if (Q36_MODEL_DENSE) {
+        Q36_EXPECT_U32("feed_forward_length", Q36_N_FF_SHARED);
+    } else {
+        Q36_EXPECT_U32("expert_count", Q36_N_EXPERT);
+        Q36_EXPECT_U32("expert_used_count", Q36_N_EXPERT_USED);
+        Q36_EXPECT_U32("expert_feed_forward_length", Q36_N_FF_EXP);
+        Q36_EXPECT_U32("expert_shared_feed_forward_length", Q36_N_FF_SHARED);
+    }
+    Q36_EXPECT_U32("ssm.conv_kernel", Q36_N_SSM_CONV);
+    Q36_EXPECT_U32("ssm.state_size", Q36_N_SSM_STATE);
+    Q36_EXPECT_U32("ssm.group_count", Q36_N_SSM_GROUP);
+    Q36_EXPECT_U32("ssm.time_step_rank", Q36_N_SSM_DT_RANK);
+    Q36_EXPECT_U32("ssm.inner_size", Q36_N_SSM_INNER);
+    Q36_EXPECT_U32("full_attention_interval", Q36_FULL_ATTENTION_INTERVAL);
+#undef Q36_EXPECT_F32
+#undef Q36_EXPECT_U32
+#undef Q36_META_KEY
     if (m->n_tensors != Q36_TENSOR_COUNT) {
         fprintf(stderr, "q36: expected %u tensors, got %" PRIu64 "\n", Q36_TENSOR_COUNT, m->n_tensors);
         exit(1);
@@ -4286,7 +4543,8 @@ static void model_summary(const q36_model *m) {
     uint64_t params = 0;
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train);
+    if (!model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train))
+        model_get_u64_compat(m, "qwen35.context_length", &ctx_train);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
@@ -4298,8 +4556,9 @@ static void model_summary(const q36_model *m) {
     printf("train context: %" PRIu64 "\n", ctx_train);
     printf("attention: heads=%u kv_heads=%u head_dim=%u full_interval=%u\n",
            Q36_N_HEAD, Q36_N_HEAD_KV, Q36_N_HEAD_DIM, Q36_FULL_ATTENTION_INTERVAL);
-    printf("experts: count=%u used=%u ff=%u shared_ff=%u\n",
-           Q36_N_EXPERT, Q36_N_EXPERT_USED, Q36_N_FF_EXP, Q36_N_FF_SHARED);
+    if (Q36_MODEL_DENSE) printf("ffn: dense, width=%u\n", Q36_N_FF_SHARED);
+    else printf("experts: count=%u used=%u ff=%u shared_ff=%u\n",
+                Q36_N_EXPERT, Q36_N_EXPERT_USED, Q36_N_FF_EXP, Q36_N_FF_SHARED);
     printf("file size: ");
     print_size(m->size);
     printf("\n");
@@ -4456,7 +4715,7 @@ static bool q36_gpu_embed_tokens(const q36_model *m, const q36_tensor *t,
     float *p = q36_gpu_tensor_contents_named(dst, "submit_wait_embed_tokens");
     if (!p) return false;
     for (uint32_t i = 0; i < n_tok; i++) {
-        if (tokens[i] < 0 || tokens[i] >= Q36_N_VOCAB) return false;
+        if (tokens[i] < 0 || tokens[i] >= (int)Q36_N_VOCAB) return false;
         if (!q36_tensor_row_to_float(m, t, (uint64_t)tokens[i],
                                      p + (uint64_t)i * Q36_N_EMBD, Q36_N_EMBD)) {
             return false;
@@ -4560,6 +4819,11 @@ static bool q36_gpu_tensor_matmul_scaled(const q36_model *m,
         ok = q36_gpu_matmul_k_quant_scaled_tensor(out, m->map, m->size, t->abs_offset,
                                                   t->type, in_dim, out_dim, x, n_tok, scale) != 0;
         break;
+    case Q36_TENSOR_IQ3_XXS:
+    case Q36_TENSOR_IQ3_S:
+        ok = q36_gpu_matmul_iq_quant_scaled_tensor(out, m->map, m->size, t->abs_offset,
+                                                   t->type, in_dim, out_dim, x, n_tok, scale) != 0;
+        break;
     default:
         return false;
     }
@@ -4589,6 +4853,10 @@ static bool q36_gpu_tensor_matmul_q8_scaled(const q36_model *m,
     case Q36_TENSOR_Q6_K:
         return q36_gpu_matmul_k_quant_q8_scaled_tensor(out, m->map, m->size, t->abs_offset,
                                                         t->type, in_dim, out_dim, xq, n_tok, scale) != 0;
+    case Q36_TENSOR_IQ3_XXS:
+    case Q36_TENSOR_IQ3_S:
+        return q36_gpu_matmul_iq_quant_q8_scaled_tensor(out, m->map, m->size, t->abs_offset,
+                                                        t->type, in_dim, out_dim, xq, n_tok, scale) != 0;
     default:
         return false;
     }
@@ -4604,10 +4872,27 @@ static bool q36_gpu_tensor_matmul_q8_or_float_scaled(const q36_model *m,
                                                      uint32_t n_tok,
                                                      float scale) {
     if (!t) return false;
-    if (t->type == Q36_TENSOR_Q8_0) {
+    if (t->type == Q36_TENSOR_F32 || t->type == Q36_TENSOR_F16 ||
+        t->type == Q36_TENSOR_Q8_0) {
         return q36_gpu_tensor_matmul_scaled(m, t, x, out, in_dim, out_dim, n_tok, scale);
     }
     return q36_gpu_tensor_matmul_q8_scaled(m, t, xq, out, in_dim, out_dim, n_tok, scale);
+}
+
+static bool q36_gpu_tensor_matmul_dense_q8_scaled(const q36_model *m,
+                                                   const q36_tensor *t,
+                                                   const q36_gpu_tensor *x,
+                                                   const q36_gpu_tensor *xq,
+                                                   q36_gpu_tensor *out,
+                                                   uint32_t in_dim,
+                                                   uint32_t out_dim,
+                                                   uint32_t n_tok,
+                                                   float scale) {
+    if (!Q36_MODEL_DENSE)
+        return q36_gpu_tensor_matmul_scaled(m, t, x, out,
+                                            in_dim, out_dim, n_tok, scale);
+    return q36_gpu_tensor_matmul_q8_or_float_scaled(m, t, x, xq, out,
+                                                     in_dim, out_dim, n_tok, scale);
 }
 
 static bool q36_vulkan_runtime_reset(q36_vulkan_runtime *rt) {
@@ -4768,9 +5053,11 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     if (!rt->attn_k || !rt->attn_v) goto fail;
     Q36_GPU_ALLOC_F32(attn_out, Q36_N_SSM_INNER);
 #else
+    uint32_t q8_width = Q36_MODEL_DENSE && Q36_N_FF_SHARED > Q36_N_EMBD ?
+        Q36_N_FF_SHARED : Q36_N_EMBD;
     rt->inp_q8 = quality ?
-        q36_gpu_tensor_alloc((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap) :
-        q36_gpu_tensor_alloc_scratch((uint64_t)((Q36_N_EMBD + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
+        q36_gpu_tensor_alloc((uint64_t)((q8_width + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap) :
+        q36_gpu_tensor_alloc_scratch((uint64_t)((q8_width + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
     if (!rt->inp_q8) goto fail;
     Q36_GPU_ALLOC_SCRATCH_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
     Q36_GPU_ALLOC_SCRATCH_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
@@ -4945,7 +5232,7 @@ fail:
 #endif
 
 static bool q36_embed_token(const q36_engine *e, int token, float *out) {
-    if (!e || !out || token < 0 || token >= Q36_N_VOCAB) return false;
+    if (!e || !out || token < 0 || token >= (int)Q36_N_VOCAB) return false;
     return q36_tensor_row_to_float(&e->model, e->weights.token_embd, (uint64_t)token, out, Q36_N_EMBD);
 }
 
@@ -5067,6 +5354,23 @@ static bool q36_forward_ffn(const q36_engine *e, const q36_layer_weights *l, con
     float *mid = rt->work4;
     float *rowbuf = rt->work5;
     float shared_gate;
+    if (Q36_MODEL_DENSE) {
+        inpq_kind = q36_activation_quant_kind_for_type(l->ffn_gate_shexp->type);
+        if (!q36_quantize_activation_row(inpq_kind, inp, inpq, Q36_N_EMBD)) return false;
+        xq = inpq_kind == Q36_ACTIVATION_QUANT_NONE ? NULL : inpq;
+        if (!q36_tensor_matvec_pair_prequant(e,
+                                             l->ffn_gate_shexp,
+                                             l->ffn_up_shexp,
+                                             inp, xq, gate, up, rowbuf,
+                                             Q36_N_EMBD, Q36_N_FF_SHARED,
+                                             1.0f, 1.0f)) {
+            return false;
+        }
+        for (uint32_t j = 0; j < Q36_N_FF_SHARED; j++)
+            mid[j] = q36_siluf(gate[j]) * up[j];
+        return q36_tensor_matvec(e, l->ffn_down_shexp, mid, out, rowbuf,
+                                 Q36_N_FF_SHARED, Q36_N_EMBD);
+    }
     if (!q36_tensor_matvec(e, l->ffn_gate_inp, inp, gate_logits, rowbuf, Q36_N_EMBD, Q36_N_EXPERT)) return false;
     inpq_kind = q36_activation_quant_kind_for_type(l->ffn_gate_exps->type);
     if (!q36_quantize_activation_row(inpq_kind, inp, inpq, Q36_N_EMBD)) return false;
@@ -5526,7 +5830,34 @@ static bool q36_forward_ffn_batch(const q36_engine *e,
     q36_ffn_combine_batch_ctx combine_ctx;
     const float *shared_gate_inp;
     const uint8_t *gate_inp_xq = NULL;
-    q36_activation_quant_kind inpq_kind = q36_activation_quant_kind_for_type(l->ffn_gate_inp->type);
+    q36_activation_quant_kind inpq_kind;
+    if (Q36_MODEL_DENSE) {
+        inpq_kind = q36_activation_quant_kind_for_type(l->ffn_gate_shexp->type);
+        if (!q36_quantize_activation_batch(inpq_kind, inp, rt->batch_xq,
+                                           n_tok, Q36_N_EMBD, e->n_threads)) return false;
+        gate_inp_xq = inpq_kind == Q36_ACTIVATION_QUANT_NONE ? NULL : rt->batch_xq;
+        if (!q36_tensor_matmul_pair_batch_prequant(
+                e, l->ffn_gate_shexp, l->ffn_up_shexp,
+                inp, gate_inp_xq,
+                rt->batch_ffn_shared_gate, rt->batch_ffn_shared_up,
+                n_tok, Q36_N_EMBD, Q36_N_FF_SHARED, 1.0f, 1.0f)) {
+            return false;
+        }
+        q36_swiglu_rows(rt->batch_ffn_shared_mid,
+                        rt->batch_ffn_shared_gate,
+                        rt->batch_ffn_shared_up,
+                        n_tok, Q36_N_FF_SHARED, e->n_threads);
+        if (!q36_quantize_activation_batch_for_type(
+                l->ffn_down_shexp->type, rt->batch_ffn_shared_mid,
+                rt->batch_xq, n_tok, Q36_N_FF_SHARED, e->n_threads)) {
+            return false;
+        }
+        return q36_tensor_matmul_batch_prequant(
+                e, l->ffn_down_shexp, rt->batch_ffn_shared_mid,
+                rt->batch_xq, out, n_tok,
+                Q36_N_FF_SHARED, Q36_N_EMBD, 1.0f);
+    }
+    inpq_kind = q36_activation_quant_kind_for_type(l->ffn_gate_inp->type);
     if (inpq_kind != Q36_ACTIVATION_QUANT_NONE) {
         if (!q36_quantize_activation_batch(inpq_kind, inp, rt->batch_xq, n_tok, Q36_N_EMBD, e->n_threads)) return false;
         gate_inp_xq = rt->batch_xq;
@@ -5958,6 +6289,28 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
     const float *scalar;
     float *outp;
     if (!rt || !m || !l || !inp || !out) return false;
+    if (Q36_MODEL_DENSE) {
+        if (!q36_gpu_quantize_q8_k_tensor(rt->inp_q8, inp, Q36_N_EMBD, n_tok) ||
+            !q36_gpu_tensor_matmul_q8_or_float_scaled(
+                m, l->ffn_gate_shexp, inp, rt->inp_q8,
+                rt->ffn_shared_gate, Q36_N_EMBD, Q36_N_FF_SHARED,
+                n_tok, 1.0f) ||
+            !q36_gpu_tensor_matmul_q8_or_float_scaled(
+                m, l->ffn_up_shexp, inp, rt->inp_q8,
+                rt->ffn_shared_up, Q36_N_EMBD, Q36_N_FF_SHARED,
+                n_tok, 1.0f) ||
+            !q36_gpu_swiglu_tensor(
+                rt->ffn_shared_mid, rt->ffn_shared_gate,
+                rt->ffn_shared_up, n_tok * Q36_N_FF_SHARED, 0.0f, 1.0f) ||
+            !q36_gpu_quantize_q8_k_tensor(
+                rt->inp_q8, rt->ffn_shared_mid, Q36_N_FF_SHARED, n_tok) ||
+            !q36_gpu_tensor_matmul_q8_or_float_scaled(
+                m, l->ffn_down_shexp, rt->ffn_shared_mid, rt->inp_q8,
+                out, Q36_N_FF_SHARED, Q36_N_EMBD, n_tok, 1.0f)) {
+            return false;
+        }
+        return true;
+    }
     gate.offset = l->ffn_gate_exps->abs_offset;
     gate.type = l->ffn_gate_exps->type;
     gate.scales_offset = l->ffn_gate_exps_scale ? l->ffn_gate_exps_scale->abs_offset : 0;
@@ -6372,15 +6725,17 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
                          q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f),
                          q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f));
     if (!pair_projected) {
-        if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_beta, inp, rt->recur_beta,
-                                          Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
-                                          q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f))) {
+        if (!q36_gpu_tensor_matmul_dense_q8_scaled(
+                &e->model, l->ssm_beta, inp, rt->inp_q8, rt->recur_beta,
+                Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
+                q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f))) {
             fprintf(stderr, "q36: recurrent ssm_beta failed at layer=%u\n", il);
             return false;
         }
-        if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_alpha, inp, rt->recur_alpha,
-                                          Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
-                                          q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
+        if (!q36_gpu_tensor_matmul_dense_q8_scaled(
+                &e->model, l->ssm_alpha, inp, rt->inp_q8, rt->recur_alpha,
+                Q36_N_EMBD, Q36_N_SSM_DT_RANK, n_tok,
+                q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
             fprintf(stderr, "q36: recurrent ssm_alpha failed at layer=%u\n", il);
             return false;
         }
@@ -6736,12 +7091,12 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
             &e->model, l->attn_gate, inp, batch->inp_q8, batch->recur_z,
             Q36_N_EMBD, Q36_N_SSM_INNER, rows,
             q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f)) ||
-        !q36_gpu_tensor_matmul_scaled(
-            &e->model, l->ssm_beta, inp, batch->recur_beta,
+        !q36_gpu_tensor_matmul_dense_q8_scaled(
+            &e->model, l->ssm_beta, inp, batch->inp_q8, batch->recur_beta,
             Q36_N_EMBD, Q36_N_SSM_DT_RANK, rows,
             q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f)) ||
-        !q36_gpu_tensor_matmul_scaled(
-            &e->model, l->ssm_alpha, inp, batch->recur_alpha,
+        !q36_gpu_tensor_matmul_dense_q8_scaled(
+            &e->model, l->ssm_alpha, inp, batch->inp_q8, batch->recur_alpha,
             Q36_N_EMBD, Q36_N_SSM_DT_RANK, rows,
             q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
         return false;
@@ -8320,6 +8675,17 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
     config_validate_model(&e->model);
+    e->variant = g_q36_shape.variant;
+    if (Q36_MODEL_DENSE && e->backend == Q36_BACKEND_METAL) {
+        fprintf(stderr, "q36: Qwen3.6 27B dense currently supports CPU and Vulkan\n");
+        q36_engine_close(e);
+        return 1;
+    }
+    if (Q36_MODEL_DENSE && e->ssd_streaming) {
+        fprintf(stderr, "q36: Qwen3.6 27B dense does not use expert SSD streaming\n");
+        q36_engine_close(e);
+        return 1;
+    }
     vocab_load(&e->vocab, &e->model);
     weights_bind(&e->weights, &e->model);
     if (e->ssd_streaming && !q36_backend_supports_ssd_streaming(e->backend)) {
@@ -8357,11 +8723,18 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
                 (double)per_expert_bytes / 1048576.0,
                 budget);
     }
-    e->routed_quant_bits = q36_quant_bits_from_type(e->weights.layer[0].ffn_gate_exps->type);
+    e->routed_quant_bits = q36_quant_bits_from_type(
+        Q36_MODEL_DENSE ? e->weights.layer[0].ffn_gate_shexp->type :
+                          e->weights.layer[0].ffn_gate_exps->type);
     e->expert_weights_scale = 1.0f;
     model_get_f32_compat(&e->model, "qwen35moe.expert_weights_scale", &e->expert_weights_scale);
     e->mtp_expert_weights_scale = e->expert_weights_scale;
     if (opt->mtp_path && opt->mtp_path[0]) {
+        if (Q36_MODEL_DENSE) {
+            fprintf(stderr, "q36: Qwen3.6 27B dense does not support a MoE MTP model\n");
+            q36_engine_close(e);
+            return 1;
+        }
         if (!q36_backend_uses_graph(opt->backend)) {
             fprintf(stderr, "q36: --mtp requires a GPU graph backend\n");
             q36_engine_close(e);
@@ -8384,6 +8757,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
 #ifndef Q36_NO_GPU
     if (q36_backend_uses_graph(opt->backend)) {
         q36_gpu_set_quality(opt->quality);
+        q36_gpu_set_dense_model(Q36_MODEL_DENSE);
         q36_gpu_set_ssd_streaming(e->ssd_streaming);
         if (!q36_engine_configure_streaming_auto_cache(e)) {
             q36_engine_close(e);
@@ -8525,11 +8899,14 @@ int q36_engine_set_power(q36_engine *e, int power_percent) {
 }
 
 const char *q36_engine_model_name(q36_engine *e) {
-    return e && e->kat_coder ? "kat-coder-v2.5-dev" : "qwen3.6-35b-a3b";
+    if (e && e->kat_coder) return "kat-coder-v2.5-dev";
+    if (e && e->variant == Q36_VARIANT_27B) return "qwen3.6-27b";
+    return "qwen3.6-35b-a3b";
 }
 
 int q36_engine_model_id(q36_engine *e) {
-    return e && e->kat_coder ? 2 : 1;
+    if (e && e->kat_coder) return 2;
+    return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
 }
 
 bool q36_engine_is_kat_coder(q36_engine *e) {
@@ -9017,7 +9394,7 @@ int q36_session_top_logprobs(q36_session *s, q36_token_score *out, int k) {
     double sum = 0.0;
     if (!s || !out || !s->logits || k <= 0 ||
         !q36_session_ensure_logits_host(s)) return 0;
-    if (k > Q36_N_VOCAB) k = Q36_N_VOCAB;
+    if (k > (int)Q36_N_VOCAB) k = (int)Q36_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
         out[i].logit = Q36_NEG_INF;
@@ -9200,7 +9577,7 @@ int q36_sessions_eval_batch(q36_decode_item *items, int count,
             }
             return 1;
         }
-        if (items[i].token < 0 || items[i].token >= Q36_N_VOCAB) {
+        if (items[i].token < 0 || items[i].token >= (int)Q36_N_VOCAB) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "decode batch item %d has an invalid token", i);
@@ -9288,7 +9665,7 @@ int q36_sessions_eval_batch_with_prefill(
         if (!s || s == prefill_session ||
             s->engine != prefill_session->engine ||
             !s->checkpoint_valid || s->checkpoint.len >= s->ctx_size ||
-            items[i].token < 0 || items[i].token >= Q36_N_VOCAB) {
+            items[i].token < 0 || items[i].token >= (int)Q36_N_VOCAB) {
             if (err && errlen) snprintf(err, errlen, "invalid mixed decode item %d", i);
             return 1;
         }

@@ -909,6 +909,7 @@ int q36_gpu_cache_q8_f16_range(const void *map, uint64_t size,
 }
 
 void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
+void q36_gpu_set_dense_model(bool dense) { (void)dense; }
 void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
 bool q36_gpu_attn_fused_enabled(void) { return false; }
 

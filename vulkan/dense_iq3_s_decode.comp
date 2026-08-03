@@ -1,0 +1,95 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+const uint ROWS = 4u;
+const uint Q8K_WORDS = 74u;
+const uint TAB_IQ3S_GRID = 2592u;
+
+uint load_u8(uint off) {
+    return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
+}
+
+uint load_u16(uint off) {
+    return uint(wh[off >> 1u]);
+}
+
+uint load_u32(uint off) {
+    uint i = off >> 1u;
+    return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+uint sign_mask(uint signs) {
+    return (((signs & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint itid = lid & 7u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+        uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
+        vec4 qv[8];
+        for (uint l = 0u; l < 8u; l++) qv[l] = unpack_i8(q8[qbase + l]);
+        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
+
+        for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            uint base = row * pc.row_bytes + 110u * b;
+            uint qh = load_u8(base + 66u + itid);
+            uint qs0 = load_u32(base + 2u + 8u * itid);
+            uint qs1 = load_u32(base + 6u + 8u * itid);
+            uint signs4 = load_u32(base + 74u + 4u * itid);
+            float sum = 0.0;
+            for (uint l = 0u; l < 8u; l++) {
+                uint qs = l < 4u ? qs0 >> (8u * l) : qs1 >> (8u * (l - 4u));
+                uint entry = (qs & 255u) |
+                             ((qh << (8u - l)) & 256u);
+                uint signs = (signs4 >> (8u * (l >> 1u))) & 255u;
+                uint mask = sign_mask(signs >> ((l & 1u) * 4u));
+                uint grid = tables[TAB_IQ3S_GRID + entry];
+                uint weight = (grid ^ mask) + (mask & 0x01010101u);
+                sum += dot(unpack_i8(weight), qv[l]);
+            }
+            uint sc = load_u8(base + 106u + (itid >> 1u));
+            int ls = 2 * int((itid & 1u) == 0u ? sc & 15u : sc >> 4u) + 1;
+            float wd = unpackHalf2x16(load_u16(base)).x;
+            acc[r] = fma(wd * yd * float(ls), sum, acc[r]);
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) {
+        float total = subgroupAdd(acc[r]);
+        uint row = first_row + r;
+        if (lid == 0u && row < pc.out_dim)
+            y[row] = total * pc.scale;
+    }
+}

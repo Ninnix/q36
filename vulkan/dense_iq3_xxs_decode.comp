@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+const uint ROWS = 4u;
+const uint Q8K_WORDS = 74u;
+const uint TAB_KSIGNS = 512u;
+const uint TAB_IQ3XXS_GRID = 3104u;
+
+uint load_u8(uint off) {
+    return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
+}
+
+uint load_u16(uint off) {
+    return uint(wh[off >> 1u]);
+}
+
+uint load_u32(uint off) {
+    uint i = off >> 1u;
+    return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
+}
+
+uint tab_u8(uint word_base, uint byte_idx) {
+    return (tables[word_base + (byte_idx >> 2u)] >> ((byte_idx & 3u) * 8u)) & 255u;
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+uint sign_mask(uint signs) {
+    return (((signs & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint itid = lid & 15u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+
+    for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
+        uint qbase = b * Q8K_WORDS;
+        vec4 q0 = unpack_i8(q8[qbase + 2u + 4u * itid]);
+        vec4 q1 = unpack_i8(q8[qbase + 3u + 4u * itid]);
+        vec4 q2 = unpack_i8(q8[qbase + 4u + 4u * itid]);
+        vec4 q3 = unpack_i8(q8[qbase + 5u + 4u * itid]);
+        float yd = uintBitsToFloat(q8[qbase]);
+        uint ib = itid >> 1u;
+        uint part = itid & 1u;
+
+        for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            uint base = row * pc.row_bytes + 98u * b;
+            uint aux = load_u32(base + 66u + 4u * ib);
+            uint qs = load_u32(base + 2u + 8u * ib + 4u * part);
+            float sum = 0.0;
+            for (uint l = 0u; l < 2u; l++) {
+                uint signs = tab_u8(TAB_KSIGNS,
+                                     (aux >> (7u * (2u * part + l))) & 127u);
+                uint grid0 = tables[TAB_IQ3XXS_GRID + ((qs >> (16u * l)) & 255u)];
+                uint grid1 = tables[TAB_IQ3XXS_GRID + ((qs >> (16u * l + 8u)) & 255u)];
+                uint mask0 = sign_mask(signs);
+                uint mask1 = sign_mask(signs >> 4u);
+                uint w0 = (grid0 ^ mask0) + (mask0 & 0x01010101u);
+                uint w1 = (grid1 ^ mask1) + (mask1 & 0x01010101u);
+                sum += dot(unpack_i8(w0), l == 0u ? q0 : q2);
+                sum += dot(unpack_i8(w1), l == 0u ? q1 : q3);
+            }
+            int ls = 2 * int(aux >> 28u) + 1;
+            float wd = unpackHalf2x16(load_u16(base)).x;
+            acc[r] = fma(wd * yd * float(ls), sum, acc[r]);
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) {
+        float total = subgroupAdd(acc[r]);
+        uint row = first_row + r;
+        if (lid == 0u && row < pc.out_dim)
+            y[row] = total * (0.25 * pc.scale);
+    }
+}
