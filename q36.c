@@ -4872,6 +4872,15 @@ static bool q36_gpu_tensor_matmul_q8_or_float_scaled(const q36_model *m,
                                                      uint32_t n_tok,
                                                      float scale) {
     if (!t) return false;
+#if defined(Q36_METAL)
+    /* Dense Metal has native float-RHS IQ3/K-quant kernels.  Keep the original
+     * activation instead of forcing a host-synchronized q8_K staging pass.
+     * Vulkan retains its tuned q8_K dense path unchanged. */
+    if (Q36_MODEL_DENSE) {
+        return q36_gpu_tensor_matmul_scaled(m, t, x, out,
+                                             in_dim, out_dim, n_tok, scale);
+    }
+#endif
     if (t->type == Q36_TENSOR_F32 || t->type == Q36_TENSOR_F16 ||
         t->type == Q36_TENSOR_Q8_0) {
         return q36_gpu_tensor_matmul_scaled(m, t, x, out, in_dim, out_dim, n_tok, scale);
@@ -5138,7 +5147,22 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     /* FFN starts after attention/recurrent output and the residual norm, so
      * their QGV storage is dead for the rest of the layer. Pack all FFN
      * control/shared tensors into non-overlapping views of that 32 MiB owner. */
-    uint64_t ffn_alias_offset = 0;
+    if (Q36_MODEL_DENSE) {
+        /* The 27B dense FFN is 17408 wide, so gate/up cannot fit in the
+         * attention QGV owner sized for the 35B MoE path. */
+        Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
+        Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
+        Q36_GPU_ALLOC_F32(ffn_weights, Q36_N_EXPERT_USED);
+        Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
+        Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
+        rt->ffn_shared_mid = q36_gpu_tensor_view(
+            rt->ffn_shared_gate, 0,
+            (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
+        if (!rt->ffn_shared_mid) goto fail;
+        Q36_GPU_ALLOC_F32(ffn_shared_out, Q36_N_EMBD);
+        Q36_GPU_ALLOC_F32(ffn_scalar, 1);
+    } else {
+        uint64_t ffn_alias_offset = 0;
 #define Q36_GPU_ALIAS_FFN(field, n, type) do { \
         uint64_t alias_bytes = (uint64_t)(n) * prefill_cap * sizeof(type); \
         rt->field = q36_gpu_tensor_view( \
@@ -5157,6 +5181,7 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     Q36_GPU_ALIAS_FFN(ffn_shared_out, Q36_N_EMBD, float);
     Q36_GPU_ALIAS_FFN(ffn_scalar, 1, float);
 #undef Q36_GPU_ALIAS_FFN
+    }
 #else
     Q36_GPU_ALLOC_F32(ffn_gate_logits, Q36_N_EXPERT);
     Q36_GPU_ALLOC_U32(ffn_selected, Q36_N_EXPERT_USED);
@@ -8676,11 +8701,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     }
     config_validate_model(&e->model);
     e->variant = g_q36_shape.variant;
-    if (Q36_MODEL_DENSE && e->backend == Q36_BACKEND_METAL) {
-        fprintf(stderr, "q36: Qwen3.6 27B dense currently supports CPU and Vulkan\n");
-        q36_engine_close(e);
-        return 1;
-    }
     if (Q36_MODEL_DENSE && e->ssd_streaming) {
         fprintf(stderr, "q36: Qwen3.6 27B dense does not use expert SSD streaming\n");
         q36_engine_close(e);

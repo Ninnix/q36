@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "q36_gpu.h"
+#include "q36_iq_tables.h"
 #include "q36_ssd.h"
 #define Q36_QUANT_LINKAGE __attribute__((weak_import))
 #include "q36_quant.h"
@@ -50,6 +51,7 @@ static int q36_model_fd = -1;
 static bool q36_quality;
 static bool q36_micro_batch;
 static bool q36_ssd_streaming;
+static bool q36_dense_model;
 
 static uint64_t q36_gpu_system_memory_bytes(void) {
     uint64_t bytes = 0;
@@ -218,6 +220,41 @@ static const char *q36_metal_base_source =
 "    int16_t bsums[QK_K / 16];\n"
 "};\n";
 
+static void q36_metal_append_u8_table(NSMutableString *source,
+                                       NSString *name,
+                                       const uint8_t *values, size_t count) {
+    [source appendFormat:@"constant uchar %@[%zu] = {", name, count];
+    for (size_t i = 0; i < count; i++)
+        [source appendFormat:(i ? @",%u" : @"%u"), (unsigned)values[i]];
+    [source appendString:@"};\n"];
+}
+
+static void q36_metal_append_u32_table(NSMutableString *source,
+                                        NSString *name,
+                                        const uint32_t *values, size_t count) {
+    [source appendFormat:@"constant uint %@[%zu] = {", name, count];
+    for (size_t i = 0; i < count; i++)
+        [source appendFormat:(i ? @",%u" : @"%u"), values[i]];
+    [source appendString:@"};\n"];
+}
+
+static void q36_metal_append_iq3_tables(NSMutableString *source) {
+    q36_metal_append_u8_table(source, @"q36_dense_kmask_iq3",
+                              q36_kmask_iq2xs,
+                              sizeof(q36_kmask_iq2xs));
+    q36_metal_append_u8_table(source, @"q36_dense_ksigns_iq3",
+                              q36_ksigns_iq2xs,
+                              sizeof(q36_ksigns_iq2xs));
+    q36_metal_append_u32_table(source, @"q36_dense_iq3xxs_grid",
+                               q36_iq3xxs_grid,
+                               sizeof(q36_iq3xxs_grid) /
+                                   sizeof(q36_iq3xxs_grid[0]));
+    q36_metal_append_u32_table(source, @"q36_dense_iq3s_grid",
+                               q36_iq3s_grid,
+                               sizeof(q36_iq3s_grid) /
+                                   sizeof(q36_iq3s_grid[0]));
+}
+
 static NSString *q36_metal_source(void) {
     NSArray<NSArray<NSString *> *> *required_sources = @[
         @[@"Q36_METAL_DENSE_SOURCE",    @"metal/dense.metal"],
@@ -231,6 +268,7 @@ static NSString *q36_metal_source(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableString *source = [NSMutableString
         stringWithUTF8String:q36_metal_base_source];
+    q36_metal_append_iq3_tables(source);
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv(spec[0].UTF8String);
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
@@ -303,6 +341,33 @@ static id<MTLComputePipelineState> q36_pipeline_nsg(NSString *name, int16_t nsg)
     p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
     if (!p) {
         fprintf(stderr, "q36: Metal pipeline %s specialization failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    q36_pipelines[key] = p;
+    return p;
+}
+
+static id<MTLComputePipelineState> q36_pipeline_mv_ext(
+        NSString *name, int16_t nsg, int16_t nxpsg) {
+    NSString *key = [NSString stringWithFormat:@"%@#ext%d:%d", name,
+                     (int)nsg, (int)nxpsg];
+    id<MTLComputePipelineState> p = q36_pipelines[key];
+    if (p) return p;
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    [constants setConstantValue:&nxpsg type:MTLDataTypeShort atIndex:601];
+    NSError *error = nil;
+    id<MTLFunction> fn = [q36_library newFunctionWithName:name
+                                          constantValues:constants error:&error];
+    if (!fn) {
+        fprintf(stderr, "q36: Metal ext function %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "q36: Metal ext pipeline %s failed: %s\n",
                 name.UTF8String, error.localizedDescription.UTF8String);
         return nil;
     }
@@ -614,6 +679,93 @@ static int q36_f32_decode(q36_gpu_tensor *out, const void *map, uint64_t size,
     return 1;
 }
 
+static int q36_scale_rows(q36_gpu_tensor *out, uint64_t count64, float scale) {
+    if (scale == 1.0f) return 1;
+    if (!out || count64 > UINT32_MAX) return 0;
+    uint32_t count = (uint32_t)count64;
+    id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_scale_f32");
+    if (!enc) return 0;
+    [enc setBuffer:out->buffer offset:out->offset atIndex:0];
+    [enc setBytes:&count length:sizeof(count) atIndex:1];
+    [enc setBytes:&scale length:sizeof(scale) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+   threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    return 1;
+}
+
+static int q36_quant_float_matmul(
+        NSString *mv_stem, NSString *mm_kernel, uint64_t block_bytes,
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim, const q36_gpu_tensor *x,
+        uint64_t tokens, float scale) {
+    if (!mv_stem || !mm_kernel || !block_bytes || !out || !map || !x ||
+        !in_dim || (in_dim & 255u) || !out_dim || !tokens ||
+        in_dim > INT32_MAX || out_dim > INT32_MAX || tokens > INT32_MAX ||
+        x->bytes < in_dim * tokens * sizeof(float) ||
+        out->bytes < out_dim * tokens * sizeof(float)) return 0;
+    const uint64_t row_bytes = (in_dim / 256u) * block_bytes;
+    if (!row_bytes || out_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> weights = q36_model_view(
+        map, size, offset, out_dim * row_bytes, &inner);
+    if (!weights || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+
+    if (tokens <= 5u) {
+        NSString *kernel = [NSString stringWithFormat:@"%@%llu", mv_stem,
+                            (unsigned long long)tokens];
+        const int16_t nsg = 4, nxpsg = 32;
+        id<MTLComputePipelineState> p =
+            q36_pipeline_mv_ext(kernel, nsg, nxpsg);
+        if (!p) return 0;
+        q36_q8_mv_args args = {
+            (int32_t)in_dim, (int32_t)out_dim, 1,
+            block_bytes, row_bytes, row_bytes * out_dim,
+            row_bytes * out_dim, (int32_t)in_dim, (int32_t)tokens, 1,
+            sizeof(float), in_dim * sizeof(float),
+            in_dim * tokens * sizeof(float),
+            in_dim * tokens * sizeof(float),
+            (int32_t)out_dim, (int32_t)tokens, 1, 1, 1
+        };
+        id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+        enc.label = kernel;
+        [enc setComputePipelineState:p];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+        [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+                                              1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+        [enc endEncoding];
+    } else {
+        const bool bc_inp = false;
+        const bool bc_out = (out_dim % 64u) != 0 || (tokens % 32u) != 0;
+        id<MTLComputePipelineState> p =
+            q36_pipeline_mm(mm_kernel, bc_inp, bc_out);
+        if (!p) return 0;
+        q36_q8_mm_args args = {
+            (int32_t)in_dim, 1, row_bytes, row_bytes * out_dim,
+            row_bytes * out_dim, 1, sizeof(float), in_dim * sizeof(float),
+            in_dim * tokens * sizeof(float), in_dim * tokens * sizeof(float),
+            (int32_t)out_dim, (int32_t)tokens, 1, 1
+        };
+        id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+        enc.label = mm_kernel;
+        [enc setComputePipelineState:p];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
+        [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+        [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((tokens + 31u) / 32u,
+                                              (out_dim + 63u) / 64u, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [enc endEncoding];
+    }
+    return q36_scale_rows(out, tokens * out_dim, scale);
+}
+
 static int q36_dense(NSString *kernel, q36_gpu_tensor *out,
                       const void *map, uint64_t model_size,
                       uint64_t weight_offset, uint64_t weight_bytes,
@@ -909,7 +1061,7 @@ int q36_gpu_cache_q8_f16_range(const void *map, uint64_t size,
 }
 
 void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
-void q36_gpu_set_dense_model(bool dense) { (void)dense; }
+void q36_gpu_set_dense_model(bool dense) { q36_dense_model = dense; }
 void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
 bool q36_gpu_attn_fused_enabled(void) { return false; }
 
@@ -2291,6 +2443,10 @@ static uint64_t q36_kquant_row_bytes(uint32_t type, uint64_t in_dim) {
 int q36_gpu_quantize_q8_k_tensor(q36_gpu_tensor *out,
                                   const q36_gpu_tensor *x,
                                   uint64_t in_dim, uint64_t tokens) {
+    /* Dense Metal consumes the original float activation in native IQ3/K
+     * kernels.  Its callers retain the shared Vulkan q8_K staging calls, so
+     * acknowledge those without introducing a command-buffer wait. */
+    if (q36_dense_model) return out && x && in_dim && tokens;
     if (!q36_quant_q8_k || !out || !x || !in_dim || (in_dim & 255u) ||
         !tokens || out->bytes < tokens * (in_dim / 256u) * sizeof(q36_metal_q8_k) ||
         x->bytes < tokens * in_dim * sizeof(float)) return 0;
@@ -2345,6 +2501,15 @@ int q36_gpu_matmul_k_quant_scaled_tensor(
         q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
         uint32_t type, uint64_t in_dim, uint64_t out_dim,
         const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (type == 12u || type == 14u) {
+        return q36_quant_float_matmul(
+            type == 12u ? @"kernel_mul_mv_ext_q4_K_f32_r1_"
+                        : @"kernel_mul_mv_ext_q6_K_f32_r1_",
+            type == 12u ? @"kernel_mul_mm_q4_K_f32"
+                        : @"kernel_mul_mm_q6_K_f32",
+            type == 12u ? 144u : 210u,
+            out, map, size, offset, in_dim, out_dim, x, tokens, scale);
+    }
     if (!x || !in_dim || (in_dim & 255u) ||
         x->bytes < tokens * in_dim * sizeof(float)) return 0;
     const float *src = q36_gpu_tensor_contents((q36_gpu_tensor *)x);
@@ -2389,6 +2554,50 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(
         q36_gpu_tensor_contents((q36_gpu_tensor *)q8);
     return blocks && q36_kquant_q8_host(out, map, size, offset, type,
                                         in_dim, out_dim, blocks, tokens, scale);
+}
+
+int q36_gpu_matmul_iq_quant_scaled_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (type != 18u && type != 21u) return 0;
+    return q36_quant_float_matmul(
+        type == 18u ? @"kernel_mul_mv_ext_iq3_xxs_f32_r1_"
+                    : @"kernel_mul_mv_ext_iq3_s_f32_r1_",
+        type == 18u ? @"kernel_mul_mm_iq3_xxs_f32"
+                    : @"kernel_mul_mm_iq3_s_f32",
+        type == 18u ? 98u : 110u,
+        out, map, size, offset, in_dim, out_dim, x, tokens, scale);
+}
+
+int q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+        q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
+        uint32_t type, uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *q8, uint64_t tokens, float scale) {
+    if (!q8 || (type != 18u && type != 21u) || !in_dim ||
+        (in_dim & 255u) || !tokens) return 0;
+    const uint64_t blocks = in_dim / 256u;
+    if (q8->bytes < tokens * blocks * sizeof(q36_metal_q8_k)) return 0;
+    q36_gpu_tensor *x = q36_gpu_tensor_alloc(tokens * in_dim * sizeof(float));
+    if (!x) return 0;
+    const q36_metal_q8_k *src =
+        q36_gpu_tensor_contents((q36_gpu_tensor *)q8);
+    float *dst = q36_gpu_tensor_contents(x);
+    if (!src || !dst) {
+        q36_gpu_tensor_free(x);
+        return 0;
+    }
+    for (uint64_t t = 0; t < tokens; t++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            const q36_metal_q8_k *qb = src + t*blocks + b;
+            for (uint32_t i = 0; i < 256u; i++)
+                dst[t*in_dim + b*256u + i] = qb->d * qb->qs[i];
+        }
+    }
+    int ok = q36_gpu_matmul_iq_quant_scaled_tensor(
+        out, map, size, offset, type, in_dim, out_dim, x, tokens, scale);
+    q36_gpu_tensor_free(x);
+    return ok;
 }
 
 int q36_gpu_matmul_q8_0_pair_scaled_tensor(
