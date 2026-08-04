@@ -1365,7 +1365,7 @@ static void parity_write_report(const parity_config *cfg,
         fprintf(fp, "Top-line result: **%s**.\n\n", all ? "PASS" : "FAIL");
         fprintf(fp, "Generated: %s\n\n", tbuf);
         fprintf(fp, "Model: `%s`\n\n", cfg->model_path);
-        fprintf(fp, "Corpus: `%d` prompts from `gguf-tools/quality-testing/prompts.jsonl` plus `%d` prompts from `tests/test-vectors/prompts`.\n\n",
+        fprintf(fp, "Corpus: `%d` prompts from `gguf-tools/quality-testing/prompts.jsonl` plus `%d` prompts from `tests/test-vectors/qwen3.6-35b-a3b/prompts`.\n\n",
                 prompts->len - (cfg->skip_long ? 3 : 5), cfg->skip_long ? 3 : 5);
         fprintf(fp, "Run mode: empty system prompt, no-thinking chat rendering, greedy q36-token trajectory, max `%d` generated positions per prompt, ctx `%d`.\n\n", cfg->steps, cfg->ctx_size);
         fprintf(fp, "## Pass Criteria\n\n");
@@ -1482,11 +1482,11 @@ static int test_parity_report_main(int argc, char **argv) {
         prompts.len = cfg.quality_limit;
     }
     if ((!cfg.skip_long &&
-         (!parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/long_code_audit.txt", "tv_long_code_audit", "test-vectors/long") ||
-          !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/long_memory_archive.txt", "tv_long_memory_archive", "test-vectors/long"))) ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_code_completion.txt", "tv_short_code_completion", "test-vectors/short") ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_italian_fact.txt", "tv_short_italian_fact", "test-vectors/short") ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_reasoning_plain.txt", "tv_short_reasoning_plain", "test-vectors/short")) {
+         (!parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", "tv_long_code_audit", "test-vectors/long") ||
+          !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", "tv_long_memory_archive", "test-vectors/long"))) ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", "tv_short_code_completion", "test-vectors/short") ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", "tv_short_italian_fact", "test-vectors/short") ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", "tv_short_reasoning_plain", "test-vectors/short")) {
         fprintf(stderr, "parity: failed to load test-vector prompts\n");
         goto done;
     }
@@ -4013,6 +4013,7 @@ typedef struct {
     int len;
     int cap;
     char *template;
+    char *checkpoint;
 } test_vec_manifest;
 
 typedef struct {
@@ -4068,6 +4069,7 @@ static void test_vec_manifest_free(test_vec_manifest *manifest) {
     }
     free(manifest->v);
     free(manifest->template);
+    free(manifest->checkpoint);
     memset(manifest, 0, sizeof(*manifest));
 }
 
@@ -4260,7 +4262,9 @@ static bool test_parse_manifest(const char *json, test_vec_manifest *manifest) {
         bool ok = false;
         if (!json_string(&p, &key)) goto fail;
         if (!test_json_expect(&p, ':')) goto fail;
-        if (!strcmp(key, "template")) {
+        if (!strcmp(key, "checkpoint")) {
+            ok = json_string(&p, &manifest->checkpoint);
+        } else if (!strcmp(key, "template")) {
             ok = json_string(&p, &manifest->template);
         } else if (!strcmp(key, "prompts")) {
             if (!test_json_expect(&p, '[')) goto fail;
@@ -4483,6 +4487,13 @@ static bool test_validate_reference_vector_fixture(const char *vec_path,
     }
     if (!test_parse_manifest(manifest_text, &manifest)) {
         fprintf(stderr, "q36-test: failed to parse vector manifest %s\n", manifest_path);
+        goto done;
+    }
+    const char *checkpoint = strrchr(root, '/');
+    checkpoint = checkpoint ? checkpoint + 1 : root;
+    if (!manifest.checkpoint || strcmp(manifest.checkpoint, checkpoint)) {
+        fprintf(stderr, "q36-test: fixture checkpoint mismatch: directory=%s manifest=%s\n",
+                checkpoint, manifest.checkpoint ? manifest.checkpoint : "missing");
         goto done;
     }
     if (legacy_template)
@@ -4773,7 +4784,7 @@ static void test_logprob_vectors_one(const char *test_name,
 static void test_logprob_vectors(void) {
     test_logprob_vectors_one("logprob-vectors",
                              "Q36_TEST_VECTOR_FILE",
-                             "tests/test-vectors/llama.vec",
+                             "tests/test-vectors/qwen3.6-35b-a3b/llama.vec",
                              false);
 }
 
@@ -5122,9 +5133,9 @@ done:
 
 static void test_llama_parity_seq(void) {
     static const test_llama_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", 3, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", 3, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5162,8 +5173,8 @@ done:
 
 static void test_llama_parity_seq_long(void) {
     static const test_llama_case cases[] = {
-        {"long_memory_archive", "tests/test-vectors/prompts/long_memory_archive.txt", 4, 4096},
-        {"long_code_audit", "tests/test-vectors/prompts/long_code_audit.txt", 4, 4096},
+        {"long_memory_archive", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", 4, 4096},
+        {"long_code_audit", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", 4, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5201,9 +5212,9 @@ done:
 
 static void test_llama_parity_batch_loose(void) {
     static const test_llama_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", 3, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", 3, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5242,7 +5253,7 @@ done:
 
 static void test_vector_fixtures(void) {
     const char *path = getenv("Q36_TEST_LLAMA_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/llama.vec";
+    if (!path || !path[0]) path = "tests/test-vectors/qwen3.6-35b-a3b/llama.vec";
     TEST_ASSERT(test_validate_reference_vector_fixture(path, NULL));
 }
 
@@ -6049,11 +6060,11 @@ static void test_parity_cache_env(const char *k, const char *v) {
 
 static void test_gpu_cpu_parity(void) {
     static const test_backend_parity_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", NULL, Q36_THINK_NONE, true, 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", NULL, Q36_THINK_NONE, true, 3, 4096},
-        {"long_memory_archive", "tests/test-vectors/prompts/long_memory_archive.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
-        {"long_code_audit", "tests/test-vectors/prompts/long_code_audit.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", NULL, Q36_THINK_NONE, true, 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", NULL, Q36_THINK_NONE, true, 3, 4096},
+        {"long_memory_archive", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"long_code_audit", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
     };
     enum { N_CASES = sizeof(cases) / sizeof(cases[0]) };
     test_backend_parity_capture captures[N_CASES];
