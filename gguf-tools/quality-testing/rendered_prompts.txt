@@ -1,400 +1,800 @@
 <|im_start|>user
 Explain B-tree insertion, including splits and the root special case.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a concise design for a TCP echo server that handles slow clients.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Compare mmaped model weights with copying all weights into private buffers on macOS.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Derive why RMSNorm needs a sum of squares and a scaling pass.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why KV cache checkpointing helps agentic sessions.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give pseudocode for a binary heap push operation.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What are the tradeoffs between top-p sampling and temperature zero decoding?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Summarize how speculative decoding preserves exact greedy output.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why a GPU prefill path can be faster than single-token decode.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write three invariants for a tokenizer special-token table.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega come funziona l'inserimento in un B-tree, inclusi split e radice.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi un progetto conciso per un server TCP echo con client lenti.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Confronta mmap dei pesi e copia completa dei pesi su macOS.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Deriva perche RMSNorm richiede somma dei quadrati e riscalamento.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche la cache KV su disco aiuta nelle sessioni agentiche.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi pseudocodice per inserire un elemento in un heap binario.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Quali sono i pro e contro di top-p rispetto a temperatura zero?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Riassumi perche la decodifica speculativa puo mantenere l'output esatto.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche il prefill GPU puo essere piu veloce del decode token singolo.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi tre invarianti per una tabella di token speciali.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Given a sorted array, describe how binary search finds the insertion point.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a short C function that clamps an integer to a range.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain the difference between a mutex and an atomic counter.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What does backpressure mean in a network server?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Describe a safe format for storing a model checkpoint header.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain how a ring buffer wraps and how to avoid overwriting unread data.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a brief plan for testing long-context prompt chunking.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What is an importance matrix in low-bit quantization?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why grouped MoE expert execution can improve prefill.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Describe how to compare two model quantizations without relying on one answer.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Data una lista ordinata, descrivi la ricerca binaria del punto di inserimento.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi una breve funzione C che limita un intero a un intervallo.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega la differenza tra mutex e contatore atomico.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Che cosa significa backpressure in un server di rete?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Descrivi un formato sicuro per salvare l'header di un checkpoint modello.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega come funziona un ring buffer e come evitare sovrascritture.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi un piano breve per testare il chunking di prompt lunghi.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Che cos'e una matrice di importanza nella quantizzazione low-bit?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche raggruppare gli esperti MoE puo accelerare il prefill.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Descrivi come confrontare due quantizzazioni senza fidarsi di una sola risposta.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 A user reports generation slows at long context. List the first five measurements to take.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Why can small logit differences change a greedy continuation?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain online softmax in attention using simple variables.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give a minimal JSON schema for a tool call with name and arguments.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 How would you test that a file-backed mmap is not repeatedly remapped?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why one large Metal buffer can be worse than multiple overlapping views.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What is the role of a router in a mixture-of-experts layer?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Describe the difference between raw KV rows and compressed KV rows.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a checklist for validating that a quantized model still follows instructions.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why evaluating 50 prompts is more informative than one favorite prompt.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Un utente segnala decode lento a contesto lungo. Elenca cinque misure iniziali.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Perche piccole differenze nei logit possono cambiare una continuazione greedy?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega online softmax nell'attenzione con variabili semplici.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Dai uno schema JSON minimo per una tool call con nome e argomenti.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Come testeresti che un mmap su file non venga rimappato ripetutamente?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche un grande buffer Metal puo essere peggiore di viste sovrapposte.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Qual e il ruolo del router in un layer mixture-of-experts?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Descrivi la differenza tra righe KV raw e righe KV compresse.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi una checklist per validare che un modello quantizzato segua ancora le istruzioni.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Perche valutare 50 prompt e piu utile di un singolo prompt preferito?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a tiny Python function that returns the median of three numbers.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why sorted arrays make membership tests faster with binary search.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What does eventual consistency mean in a distributed database?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give a short example of a race condition in C.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain the difference between latency and throughput.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 How does a trie represent a set of strings?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Describe how to test a command-line parser with edge cases.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Why can mmap page residency differ from virtual address space size?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why quantization error can affect rare experts more than common experts.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a short checklist for reviewing a pull request that touches memory lifetimes.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi una piccola funzione Python che restituisce la mediana di tre numeri.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche array ordinati rendono piu veloce la ricerca di appartenenza.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Che cosa significa consistenza eventuale in un database distribuito?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Fai un breve esempio di race condition in C.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega la differenza tra latenza e throughput.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Come rappresenta un trie un insieme di stringhe?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Descrivi come testare un parser da riga di comando con casi limite.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Perche la residenza delle pagine mmap puo differire dalla dimensione virtuale?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Spiega perche l'errore di quantizzazione puo colpire piu gli esperti rari.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Scrivi una breve checklist per revisionare lifetime di memoria in una PR.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Complete this sentence: A good benchmark should measure<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Complete this C comment: /* This lock protects<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Complete this Italian sentence: Il vantaggio principale della cache e<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Translate to Italian: The model should answer only after reading the whole prompt.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Translate to English: La quantizzazione riduce memoria ma puo alterare i logit.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 In one paragraph, explain how a compiler uses an abstract syntax tree.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 In one paragraph, explain why checksums catch accidental corruption.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give three examples of useful server metrics.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Why should a tokenizer treat special tags carefully?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain how a hash table handles collisions.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Describe the role of calibration data when quantizing a neural network.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 What is a confidence interval, in plain language?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Write a simple SQL query that counts rows per category.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Explain why a page cache can make a second file read faster.<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give a short answer: what is the capital of Japan?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give a short answer: what is the derivative of x squared?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Give a short answer: who wrote The Divine Comedy?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Rispondi brevemente: qual e la capitale del Giappone?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Rispondi brevemente: quanto fa 17 per 23?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+
 <|im_start|>user
 Rispondi brevemente: chi ha scritto la Divina Commedia?<|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+
+

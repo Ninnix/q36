@@ -387,6 +387,10 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
+Agent user and system messages accept `<|think_on|>` and `<|think_off|>`.
+The marker is removed before rendering and remains in effect for later turns.
+Historical thinking stays in the append-only transcript until compaction.
+
 Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values and default to a
 100000-token agent context. The backend's automatic resident GPU prefill width
 resolves to 1024 tokens. Compact Metal attention scratch keeps this faster
@@ -557,7 +561,7 @@ Supported endpoints:
 calls use the native Qwen3 Coder tagged format, and generated calls are mapped
 back to OpenAI tool calls.
 
-KAT-Coder also accepts its documented template controls:
+Both Qwen3.6 and KAT-Coder accept the fixed-template controls:
 
 ```json
 "chat_template_kwargs": {
@@ -566,9 +570,11 @@ KAT-Coder also accepts its documented template controls:
 }
 ```
 
-`preserve_thinking` retains earlier assistant reasoning verbatim. Without it,
-only reasoning inside the current multi-step tool round is retained, matching
-the model's official template.
+`preserve_thinking` defaults to `true`, retaining earlier assistant reasoning
+verbatim so later prompts remain a prefix-cache match. Set it to `false` to
+strip reasoning before the latest user query. System and user messages may also
+contain `<|think_on|>` or `<|think_off|>`; Q36 removes the control marker before
+rendering and applies it to subsequent turns.
 
 When omitted by the client, KAT-Coder sampling follows its model card:
 `temperature=1`, `top_p=0.95`, `top_k=20`, and `presence_penalty=1.5` while
@@ -832,7 +838,7 @@ Mapping of API thinking controls to prompt rendering:
   feeding thinking tokens, not how the model decides to reason.
 - `reasoning_effort=minimal` or omitted with no thinking flag → thinking on.
 - Explicit non-thinking: `thinking:{"type":"disabled"}`, `think:false`, or
-  `chat_template_kwargs:{"enable_thinking":false}`. KAT uses its trained
+  `chat_template_kwargs:{"enable_thinking":false}`. Both profiles use the
   `<think>\n\n</think>\n\n` non-thinking prefix.
 
 ## KV Cache Quantization

@@ -123,7 +123,9 @@ The GGUF tokenizer metadata is:
 Q36 renders ChatML prompts with Qwen protocol tokens such as `<|im_start|>` and
 `<|im_end|>`. Thinking mode is controlled with native `<think>...</think>`
 blocks. Q36 defaults to thinking mode; explicit non-thinking requests render
-the chat-template flag equivalent of `enable_thinking=false`.
+the chat-template flag equivalent of `enable_thinking=false`. Historical
+reasoning is preserved by default for stable autoregressive and KV-cache
+prefixes; clients can opt out with `preserve_thinking=false`.
 
 Tool definitions are rendered in the system prompt inside `<tools>...</tools>`.
 Calls use Qwen3.6's native tagged form: `<tool_call>` contains a

@@ -166,12 +166,12 @@ def capture_record(spec: dict, capture_bin: Path, model: Path, prompt_path: Path
             "top_logprobs": TOP_LOGPROBS,
             "threads": threads,
             "think": False,
-            "template": "hf-text-only" if hf_template else "legacy-q36-nothink",
+            "template": "hf-text-only" if hf_template else "q36-fixed-nothink",
         },
         "prompt_tokens": raw.get("prompt_tokens"),
         "ctx": raw.get("ctx"),
         "top_k": raw.get("top_k"),
-        "template": raw.get("template", "hf-text-only" if hf_template else "legacy-q36-nothink"),
+        "template": raw.get("template", "hf-text-only" if hf_template else "q36-fixed-nothink"),
         "steps": steps,
     }
 
@@ -221,7 +221,7 @@ def main() -> int:
 
     if args.hf_template and not args.out:
         raise SystemExit("--hf-template requires --out; the tracked corpus in "
-                         f"{DEFAULT_OUT} is the legacy --nothink render")
+                         f"{DEFAULT_OUT} uses the Q36 chat render")
     root = Path(args.out or DEFAULT_OUT)
     model = Path(args.model)
     capture_bin = Path(args.capture_bin)
@@ -237,10 +237,11 @@ def main() -> int:
 
     wanted = set(args.only or [])
     selected = [spec for spec in PROMPTS if not wanted or spec["id"] in wanted]
+    template = "hf-text-only" if args.hf_template else "q36-fixed-nothink"
     manifest = {
         "schema": "q36-test-vector-manifest-v1",
         "source": "llama.cpp-direct-logits",
-        "template": "hf-text-only" if args.hf_template else "legacy-q36-nothink",
+        "template": template,
         "model": model.name,
         "top_logprobs": TOP_LOGPROBS,
         "max_tokens": MAX_TOKENS,
@@ -257,6 +258,8 @@ def main() -> int:
         else:
             record = capture_record(spec, capture_bin, model, prompt_path, args.hf_template, args.threads)
             out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if record.get("template") != template:
+            raise SystemExit(f"{out_path}: template is {record.get('template')!r}, expected {template!r}")
         manifest["prompts"].append(
             {
                 "id": spec["id"],

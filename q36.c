@@ -7673,20 +7673,50 @@ void q36_tokenize_rendered_chat(q36_engine *e, const char *text, q36_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
+void q36_chat_apply_thinking_control(const char *content, bool *thinking) {
+    if (!content || !thinking) return;
+    if (strstr(content, "<|think_off|>")) *thinking = false;
+    else if (strstr(content, "<|think_on|>")) *thinking = true;
+}
+
 static void q36_tokenize_chat_content(q36_engine *e, const char *text,
-                                      q36_tokens *out) {
-    if (!e->kat_coder) {
-        q36_tokenize_rendered_chat(e, text, out);
-        return;
-    }
+                                      bool controls, q36_tokens *out) {
+    static const char think_off[] = "<|think_off|>";
+    static const char think_on[] = "<|think_on|>";
+    const char *remove = NULL;
+    size_t remove_len = 0;
     const char *start = text ? text : "";
     const char *end = start + strlen(start);
+
+    if (controls && strstr(start, think_off)) {
+        remove = think_off;
+        remove_len = sizeof(think_off) - 1;
+    } else if (controls && strstr(start, think_on)) {
+        remove = think_on;
+        remove_len = sizeof(think_on) - 1;
+    }
+
+    char *plain = xmalloc((size_t)(end - start) + 1);
+    size_t used = 0;
+    while (remove) {
+        const char *p = strstr(start, remove);
+        if (!p) break;
+        size_t n = (size_t)(p - start);
+        memcpy(plain + used, start, n);
+        used += n;
+        start = p + remove_len;
+    }
+    size_t tail = (size_t)(end - start);
+    memcpy(plain + used, start, tail + 1);
+    start = plain;
+    end = plain + used + tail;
     while (start < end && isspace((unsigned char)*start)) start++;
     while (end > start && isspace((unsigned char)end[-1])) end--;
     char *trimmed = xmalloc((size_t)(end - start) + 1);
     memcpy(trimmed, start, (size_t)(end - start));
     trimmed[end - start] = '\0';
     q36_tokenize_rendered_chat(e, trimmed, out);
+    free(plain);
     free(trimmed);
 }
 
@@ -7717,36 +7747,34 @@ void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role
     if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         chat_append_open_role(e, tokens, "user");
         q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
-        q36_tokenize_chat_content(e, content, tokens);
+        q36_tokenize_chat_content(e, content, false, tokens);
         q36_tokenize_rendered_chat(e, "\n</tool_response>", tokens);
         chat_append_close_role(e, tokens);
         return;
     }
     chat_append_open_role(e, tokens, role);
-    q36_tokenize_chat_content(e, content, tokens);
+    q36_tokenize_chat_content(e, content,
+                              !strcmp(role, "system") || !strcmp(role, "user"),
+                              tokens);
     chat_append_close_role(e, tokens);
 }
 
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode) {
     chat_append_open_role(e, tokens, "assistant");
-    if (e->kat_coder) {
-        q36_tokenize_rendered_chat(e, think_mode == Q36_THINK_NONE ?
-            "<think>\n\n</think>\n\n" : "<think>\n", tokens);
-        if (think_mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(e, tokens);
-        return;
-    }
     if (think_mode == Q36_THINK_NONE) {
-        q36_tokenize_rendered_chat(e, "</think>", tokens);
+        q36_tokenize_rendered_chat(e, "<think>\n\n</think>\n\n", tokens);
         return;
     }
-    q36_tokenize_rendered_chat(e, "<think>", tokens);
-    if (think_mode == Q36_THINK_MAX) {
-        bpe_tokenize_text(&e->vocab, "\n", tokens);
-        q36_chat_append_max_effort_prefix(e, tokens);
-    }
+    q36_tokenize_rendered_chat(e, "<think>\n", tokens);
+    if (think_mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(e, tokens);
 }
 
 void q36_encode_chat_prompt(q36_engine *e, const char *system, const char *prompt, q36_think_mode think_mode, q36_tokens *out) {
+    bool thinking = q36_think_mode_enabled(think_mode);
+    q36_chat_apply_thinking_control(system, &thinking);
+    q36_chat_apply_thinking_control(prompt, &thinking);
+    if (!thinking) think_mode = Q36_THINK_NONE;
+    else if (think_mode == Q36_THINK_NONE) think_mode = Q36_THINK_HIGH;
     q36_chat_begin(e, out);
     if (system && system[0]) q36_chat_append_message(e, out, "system", system);
     q36_chat_append_message(e, out, "user", prompt ? prompt : "");

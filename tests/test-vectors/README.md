@@ -8,8 +8,10 @@ defaults to
 regenerate the fixtures before treating this directory as a refreshed Q8_0
 parity corpus.
 
-This directory is the tracked parity corpus, captured with q36's `--nothink`
-render. Normal builds and tests do not need a llama.cpp checkout.
+This directory is the tracked parity corpus. Its manifest records the exact
+template used for each capture; the current fixture predates the fixed
+`--nothink` render, while new captures use it. Normal builds and tests do not
+need a llama.cpp checkout.
 
 Files:
 

@@ -183,6 +183,7 @@ bool q36_tokens_starts_with(const q36_tokens *tokens, const q36_tokens *prefix);
 
 void q36_tokenize_text(q36_engine *e, const char *text, q36_tokens *out);
 void q36_tokenize_rendered_chat(q36_engine *e, const char *text, q36_tokens *out);
+void q36_chat_apply_thinking_control(const char *content, bool *thinking);
 void q36_chat_begin(q36_engine *e, q36_tokens *tokens);
 void q36_encode_chat_prompt(
         q36_engine *e,

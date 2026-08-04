@@ -155,7 +155,7 @@ static void usage(FILE *fp) {
         "  --think-max\n"
         "      Use Think Max when --ctx is at least 98304 tokens; otherwise normal thinking.\n"
         "  --nothink\n"
-        "      Start assistant turns with </think> for direct non-thinking replies.\n"
+        "      Start assistant turns with an empty think block for direct replies.\n"
         "\n"
         "Interactive commands:\n"
         "  /help\n"
@@ -313,8 +313,20 @@ static void log_context_memory(q36_backend backend, int ctx_size,
             reset);
 }
 
+static bool is_rendered_chat_prompt(const char *prompt);
+
 static q36_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
     return q36_think_mode_for_context(gen->think_mode, gen->ctx_size);
+}
+
+static q36_think_mode cli_prompt_think_mode(const cli_generation_options *gen) {
+    q36_think_mode mode = cli_effective_think_mode(gen);
+    if (is_rendered_chat_prompt(gen->prompt)) return mode;
+    bool thinking = q36_think_mode_enabled(mode);
+    q36_chat_apply_thinking_control(gen->system, &thinking);
+    q36_chat_apply_thinking_control(gen->prompt, &thinking);
+    if (!thinking) return Q36_THINK_NONE;
+    return mode == Q36_THINK_NONE ? Q36_THINK_HIGH : mode;
 }
 
 static bool cli_think_max_downgraded(const cli_generation_options *gen) {
@@ -532,7 +544,7 @@ static void build_prompt(q36_engine *engine, const cli_generation_options *gen, 
         q36_tokenize_rendered_chat(engine, gen->prompt, out);
     } else {
         q36_encode_chat_prompt(engine, gen->system, gen->prompt,
-                               cli_effective_think_mode(gen), out);
+                               cli_prompt_think_mode(gen), out);
     }
 }
 
@@ -544,7 +556,7 @@ static int run_sampled_generation(q36_engine *engine, const cli_config *cfg, con
     }
 
     char err[160];
-    q36_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+    q36_think_mode think_mode = cli_prompt_think_mode(&cfg->gen);
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
@@ -846,8 +858,8 @@ static int run_generation(q36_engine *engine, const cli_config *cfg) {
         token_printer printer = {
             .engine = engine,
             .fp = stdout,
-            .format_thinking = q36_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
-            .in_think = q36_think_mode_enabled(cli_effective_think_mode(&cfg->gen)),
+            .format_thinking = q36_think_mode_enabled(cli_prompt_think_mode(&cfg->gen)),
+            .in_think = q36_think_mode_enabled(cli_prompt_think_mode(&cfg->gen)),
             .use_color = isatty(fileno(stdout)) != 0,
             .last_output_newline = true,
         };
@@ -901,7 +913,14 @@ typedef struct {
     q36_tokens transcript;
     int ctx_size;
     int max_prefix_tokens;
+    q36_think_mode enabled_think_mode;
+    bool thinking_enabled;
 } repl_chat;
+
+static q36_think_mode repl_chat_think_mode(const repl_chat *chat) {
+    if (!chat->thinking_enabled) return Q36_THINK_NONE;
+    return q36_think_mode_for_context(chat->enabled_think_mode, chat->ctx_size);
+}
 
 static void tokens_insert(q36_tokens *dst, int pos, const q36_tokens *src) {
     if (!src || src->len <= 0) return;
@@ -963,9 +982,13 @@ static int repl_chat_create_session(q36_engine *engine, repl_chat *chat, int ctx
 
 static int repl_chat_init(q36_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
+    chat->enabled_think_mode = cfg->gen.think_mode == Q36_THINK_NONE ?
+        Q36_THINK_HIGH : cfg->gen.think_mode;
+    chat->thinking_enabled = q36_think_mode_enabled(cfg->gen.think_mode);
+    q36_chat_apply_thinking_control(cfg->gen.system, &chat->thinking_enabled);
     q36_chat_begin(engine, &chat->transcript);
     repl_chat_apply_max_prefix(engine, chat,
-                               cli_effective_think_mode(&cfg->gen) == Q36_THINK_MAX);
+                               repl_chat_think_mode(chat) == Q36_THINK_MAX);
     if (cfg->gen.system && cfg->gen.system[0]) {
         q36_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
@@ -977,9 +1000,13 @@ static void repl_chat_reset(q36_engine *engine, repl_chat *chat, const cli_confi
     q36_session_invalidate(chat->session);
     q36_tokens_free(&chat->transcript);
     chat->max_prefix_tokens = 0;
+    chat->enabled_think_mode = cfg->gen.think_mode == Q36_THINK_NONE ?
+        Q36_THINK_HIGH : cfg->gen.think_mode;
+    chat->thinking_enabled = q36_think_mode_enabled(cfg->gen.think_mode);
+    q36_chat_apply_thinking_control(cfg->gen.system, &chat->thinking_enabled);
     q36_chat_begin(engine, &chat->transcript);
     repl_chat_apply_max_prefix(engine, chat,
-                               cli_effective_think_mode(&cfg->gen) == Q36_THINK_MAX);
+                               repl_chat_think_mode(chat) == Q36_THINK_MAX);
     if (cfg->gen.system && cfg->gen.system[0]) {
         q36_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
@@ -1009,8 +1036,9 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
         return 1;
     }
 
-    q36_think_mode think_mode = q36_think_mode_for_context(cfg->gen.think_mode,
-                                                           chat->ctx_size);
+    bool old_thinking = chat->thinking_enabled;
+    q36_chat_apply_thinking_control(user_text, &chat->thinking_enabled);
+    q36_think_mode think_mode = repl_chat_think_mode(chat);
     repl_chat_apply_max_prefix(engine, chat, think_mode == Q36_THINK_MAX);
     const int rollback_len = chat->transcript.len;
     q36_chat_append_message(engine, &chat->transcript, "user", user_text);
@@ -1032,6 +1060,9 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
     if (q36_session_sync(chat->session, &chat->transcript, err, sizeof(err)) != 0) {
         q36_session_set_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
+        chat->thinking_enabled = old_thinking;
+        repl_chat_apply_max_prefix(engine, chat,
+                                   repl_chat_think_mode(chat) == Q36_THINK_MAX);
         fprintf(stderr, "q36: prompt processing failed: %s\n", err);
         return 1;
     }
@@ -1172,17 +1203,22 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             print_repl_help();
         } else if (!strcmp(cmd, "/think")) {
             cfg->gen.think_mode = Q36_THINK_HIGH;
+            chat.enabled_think_mode = Q36_THINK_HIGH;
+            chat.thinking_enabled = true;
             repl_chat_apply_max_prefix(engine, &chat, false);
             puts("Thinking mode: high.");
         } else if (!strcmp(cmd, "/think-max")) {
             cfg->gen.think_mode = Q36_THINK_MAX;
-            bool active = q36_think_mode_for_context(cfg->gen.think_mode,
-                                                     chat.ctx_size) == Q36_THINK_MAX;
+            chat.enabled_think_mode = Q36_THINK_MAX;
+            chat.thinking_enabled = true;
+            bool active = repl_chat_think_mode(&chat) == Q36_THINK_MAX;
             repl_chat_apply_max_prefix(engine, &chat, active);
             cli_warn_think_max_downgraded(&cfg->gen, "/think-max");
             printf("Thinking mode: %s.\n", active ? "max" : "high (ctx below 98304)");
         } else if (!strcmp(cmd, "/nothink")) {
             cfg->gen.think_mode = Q36_THINK_NONE;
+            chat.enabled_think_mode = Q36_THINK_HIGH;
+            chat.thinking_enabled = false;
             repl_chat_apply_max_prefix(engine, &chat, false);
             puts("Thinking mode: none.");
         } else if (!strcmp(cmd, "/clear")) {
@@ -1207,8 +1243,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                         linenoiseFree(line);
                         break;
                     }
-                    bool active = q36_think_mode_for_context(cfg->gen.think_mode,
-                                                             chat.ctx_size) == Q36_THINK_MAX;
+                    bool active = repl_chat_think_mode(&chat) == Q36_THINK_MAX;
                     repl_chat_apply_max_prefix(engine, &chat, active);
                     cli_warn_think_max_downgraded(&cfg->gen, "/ctx");
                 }

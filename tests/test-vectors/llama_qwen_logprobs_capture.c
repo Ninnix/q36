@@ -46,9 +46,8 @@ static char *read_file(const char *path, size_t *len) {
 static char *render_prompt(const char *user, size_t user_len, bool hf) {
     const char *prefix = hf ? "<|im_start|>user\n" :
                               "<|endoftext|><|im_start|>user\n";
-    const char *suffix = hf ?
-        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" :
-        "<|im_end|>\n<|im_start|>assistant\n</think>";
+    const char *suffix =
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     size_t prefix_len = strlen(prefix);
     size_t suffix_len = strlen(suffix);
     char *out = xmalloc(prefix_len + user_len + suffix_len + 1);
@@ -283,7 +282,7 @@ int main(int argc, char **argv) {
     fprintf(fp, "  \"ctx\": %d,\n", ctx);
     fprintf(fp, "  \"top_k\": %d,\n", top_k);
     fprintf(fp, "  \"template\": \"%s\",\n",
-            hf_template ? "hf-text-only" : "legacy-q36-nothink");
+            hf_template ? "hf-text-only" : "q36-fixed-nothink");
     fprintf(fp, "  \"steps\": [\n");
 
     {

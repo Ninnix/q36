@@ -441,6 +441,18 @@ static char *test_render_hf_chat_prompt(const char *system, const char *prompt, 
     return out;
 }
 
+static char *test_render_legacy_chat_prompt(const char *prompt) {
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+
+    test_append_cstr(&out, &len, &cap, "<|endoftext|><|im_start|>user\n");
+    test_append_cstr(&out, &len, &cap, prompt ? prompt : "");
+    test_append_cstr(&out, &len, &cap,
+                     "<|im_end|>\n<|im_start|>assistant\n</think>");
+    return out;
+}
+
 static void test_encode_prompt_mode(q36_engine *engine,
                                     const char *system,
                                     const char *prompt_text,
@@ -4000,6 +4012,7 @@ typedef struct {
     test_vec_manifest_entry *v;
     int len;
     int cap;
+    char *template;
 } test_vec_manifest;
 
 typedef struct {
@@ -4054,6 +4067,7 @@ static void test_vec_manifest_free(test_vec_manifest *manifest) {
         free(manifest->v[i].llamacpp_file);
     }
     free(manifest->v);
+    free(manifest->template);
     memset(manifest, 0, sizeof(*manifest));
 }
 
@@ -4246,7 +4260,9 @@ static bool test_parse_manifest(const char *json, test_vec_manifest *manifest) {
         bool ok = false;
         if (!json_string(&p, &key)) goto fail;
         if (!test_json_expect(&p, ':')) goto fail;
-        if (!strcmp(key, "prompts")) {
+        if (!strcmp(key, "template")) {
+            ok = json_string(&p, &manifest->template);
+        } else if (!strcmp(key, "prompts")) {
             if (!test_json_expect(&p, '[')) goto fail;
             json_ws(&p);
             if (*p != ']') {
@@ -4451,7 +4467,8 @@ static bool test_compare_vector_case(const test_vec_case *vec,
     return true;
 }
 
-static bool test_validate_reference_vector_fixture(const char *vec_path) {
+static bool test_validate_reference_vector_fixture(const char *vec_path,
+                                                   bool *legacy_template) {
     char *root = test_parent_dir(vec_path);
     char *manifest_path = test_join_path(root, "manifest.json");
     char *manifest_text = test_read_file(manifest_path);
@@ -4468,6 +4485,9 @@ static bool test_validate_reference_vector_fixture(const char *vec_path) {
         fprintf(stderr, "q36-test: failed to parse vector manifest %s\n", manifest_path);
         goto done;
     }
+    if (legacy_template)
+        *legacy_template = manifest.template &&
+                           !strcmp(manifest.template, "legacy-q36-nothink");
     if (!test_load_vector_cases(vec_path, &cases, &ncases)) {
         fprintf(stderr, "q36-test: failed to parse vector fixture %s\n", vec_path);
         goto done;
@@ -4630,13 +4650,21 @@ static bool test_fill_vector_case(FILE *fp, test_vec_case *vc) {
     return false;
 }
 
-static void test_logprob_vector_case(q36_engine *engine, const test_vec_case *vc, bool hf_template) {
+static void test_logprob_vector_case(q36_engine *engine, const test_vec_case *vc,
+                                     bool hf_template, bool legacy_template) {
     char *prompt_text = test_read_file(vc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
     q36_tokens prompt = {0};
-    test_encode_prompt_mode(engine, "", prompt_text, Q36_THINK_NONE, hf_template, &prompt);
+    if (legacy_template) {
+        char *rendered = test_render_legacy_chat_prompt(prompt_text);
+        q36_tokenize_rendered_chat(engine, rendered, &prompt);
+        free(rendered);
+    } else {
+        test_encode_prompt_mode(engine, "", prompt_text, Q36_THINK_NONE,
+                                hf_template, &prompt);
+    }
     free(prompt_text);
 
     q36_session *session = NULL;
@@ -4713,8 +4741,9 @@ static void test_logprob_vectors_one(const char *test_name,
         return;
     }
     const char *path = getenv(env_name);
+    bool legacy_template = false;
     if (!path || !path[0]) path = default_path;
-    TEST_ASSERT(test_validate_reference_vector_fixture(path));
+    TEST_ASSERT(test_validate_reference_vector_fixture(path, &legacy_template));
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
@@ -4735,7 +4764,7 @@ static void test_logprob_vectors_one(const char *test_name,
         if (!test_fill_vector_case(fp, &vc)) break;
         if (!test_vector_case_selected(vc.id)) continue;
         fprintf(stderr, "q36-test: %s %s\n", test_name, vc.id);
-        test_logprob_vector_case(engine, &vc, hf_template);
+        test_logprob_vector_case(engine, &vc, hf_template, legacy_template);
     }
     fclose(fp);
     q36_engine_close(engine);
@@ -5214,7 +5243,7 @@ done:
 static void test_vector_fixtures(void) {
     const char *path = getenv("Q36_TEST_LLAMA_VECTOR_FILE");
     if (!path || !path[0]) path = "tests/test-vectors/llama.vec";
-    TEST_ASSERT(test_validate_reference_vector_fixture(path));
+    TEST_ASSERT(test_validate_reference_vector_fixture(path, NULL));
 }
 
 static const char *test_tool_call_request_json(void) {
@@ -6288,7 +6317,7 @@ static void test_qwen_tool_call_format(void) {
     tool_calls_push(&calls, tc);
 
     buf b = {0};
-    append_qwen_tool_calls_text(&b, &calls, NULL);
+    append_qwen_tool_calls_text(&b, &calls, NULL, false);
     const char *rendered = b.ptr ? b.ptr : "";
 
     TEST_ASSERT(strstr(rendered, "<tool_call>") != NULL);
@@ -6322,7 +6351,7 @@ static void test_qwen_tool_call_format(void) {
     tool_calls_push(&multi, tc);
 
     memset(&b, 0, sizeof(b));
-    append_qwen_tool_calls_text(&b, &multi, NULL);
+    append_qwen_tool_calls_text(&b, &multi, NULL, false);
     rendered = b.ptr ? b.ptr : "";
     int count = 0;
     for (const char *p = rendered; (p = strstr(p, "<tool_call>")) != NULL; p++) count++;

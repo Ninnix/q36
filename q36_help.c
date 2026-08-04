@@ -272,6 +272,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and native tool-call debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    para(fp, c, "User and system messages accept persistent <|think_on|> and <|think_off|> controls.");
     fputc('\n', fp);
 }
 
