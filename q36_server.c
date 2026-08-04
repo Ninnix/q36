@@ -3505,6 +3505,30 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+static void unterminated_reasoning(const char *text,
+                                   char **content_out,
+                                   char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    *reasoning_out = xstrdup(body);
+    *content_out = xstrdup("");
+}
+
+static void unterminated_reasoning_before_tool(const char *text,
+                                               size_t prefix_len,
+                                               char **content_out,
+                                               char **reasoning_out) {
+    const char *body = text ? text : "";
+    size_t body_len = strlen(body);
+    if (prefix_len > body_len) prefix_len = body_len;
+    if (prefix_len >= 7 && !strncmp(body, "<think>", 7)) {
+        body += 7;
+        prefix_len -= 7;
+    }
+    *reasoning_out = xstrndup(body, prefix_len);
+    *content_out = xstrdup("");
+}
+
 static size_t raw_skip_ascii_ws(const char *raw, size_t raw_len, size_t pos) {
     while (pos < raw_len && isspace((unsigned char)raw[pos])) pos++;
     return pos;
@@ -3554,13 +3578,20 @@ static bool parse_generated_message_ex(const char *text, bool thinking,
     text = text ? text : "";
     size_t raw_len = strlen(text);
     const char *tool_search = text;
+    bool recovered_unclosed_tool = false;
     if (thinking) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
-            split_reasoning_content(text, raw_len, content_out, reasoning_out);
-            return true;
+            const char *candidate = find_any_tool_start(text);
+            if (!candidate || !find_any_tool_end(candidate)) {
+                unterminated_reasoning(text, content_out, reasoning_out);
+                return true;
+            }
+            tool_search = candidate;
+            recovered_unclosed_tool = true;
+        } else {
+            tool_search = think_end + strlen("</think>");
         }
-        tool_search = think_end + strlen("</think>");
     }
     const char *start = strstr(tool_search, Q36_TOOL_CALLS_START);
     if (!start) {
@@ -3632,7 +3663,12 @@ bad_call:
     if (calls->len == 0) return false;
     if (pos < raw_len) return false;
     calls->raw_tool_text = xstrndup(start, raw_end - (size_t)(start - text));
-    split_reasoning_content(text, content_len, content_out, reasoning_out);
+    if (recovered_unclosed_tool) {
+        unterminated_reasoning_before_tool(text, content_len,
+                                           content_out, reasoning_out);
+    } else {
+        split_reasoning_content(text, content_len, content_out, reasoning_out);
+    }
     return true;
 }
 
@@ -3969,6 +4005,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -3978,6 +4015,8 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = q36_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
+    st->guard_second_reasoning =
+        q36_think_mode_enabled(r->think_mode) && r->has_tools;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -4616,8 +4655,16 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -4635,6 +4682,14 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->emit_pos = limit;
         }
 
+        if (tool_before_close) {
+            if (complete_tool) {
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = OPENAI_STREAM_SUPPRESS;
+            }
+            return true;
+        }
+
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
             st->mode = OPENAI_STREAM_TEXT;
@@ -4647,6 +4702,26 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool || close < tool)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos &&
+                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
+                                      raw + st->emit_pos,
+                                      limit - st->emit_pos)) return false;
+                if (limit > st->emit_pos) st->sent_reasoning = true;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -5021,6 +5096,7 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
+    bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
 } anthropic_stream;
@@ -5043,6 +5119,8 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = q36_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
+    st->guard_second_reasoning =
+        q36_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
 }
 
@@ -5185,8 +5263,16 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        const char *tool = r->has_tools ?
+            find_any_tool_start(raw + st->emit_pos) : NULL;
+        const bool tool_before_close = tool && (!close || tool < close);
+        const bool complete_tool =
+            tool_before_close && find_any_tool_end(tool) != NULL;
         size_t limit;
-        if (close) {
+        if (tool_before_close) {
+            limit = trim_tool_separator_ws(raw, st->emit_pos,
+                                           (size_t)(tool - raw));
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
             limit = raw_len;
@@ -5205,6 +5291,15 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
             st->emit_pos = limit;
         }
 
+        if (tool_before_close) {
+            if (complete_tool) {
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = (size_t)(tool - raw);
+                st->mode = ANTH_STREAM_SUPPRESS;
+            }
+            return true;
+        }
+
         if (close || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
             if (close) {
@@ -5220,6 +5315,29 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
+        if (st->guard_second_reasoning) {
+            const char *close = strstr(raw + st->emit_pos, "</think>");
+            const char *tool = r->has_tools ?
+                find_any_tool_start(raw + st->emit_pos) : NULL;
+            if (close && (!tool || close < tool)) {
+                const size_t limit = (size_t)(close - raw);
+                if (limit > st->emit_pos) {
+                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
+                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
+                                                  raw + st->emit_pos,
+                                                  limit - st->emit_pos)) return false;
+                    st->sent_thinking = true;
+                }
+                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
+                st->emit_pos = limit + strlen("</think>");
+                st->guard_second_reasoning = false;
+            } else if (!tool && !final) {
+                return true;
+            } else {
+                st->guard_second_reasoning = false;
+            }
+        }
+
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -7452,71 +7570,22 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static bool complete_tool_call_inside_thinking(const char *text, size_t len,
+                                               size_t *scan_from) {
+    if (!text || !scan_from) return false;
+    if (*scan_from > len) *scan_from = len;
+    const char *start = find_any_tool_start(text + *scan_from);
+    if (!start) {
+        const size_t hold = 80;
+        *scan_from = len > hold ? len - hold : 0;
+        return false;
+    }
+    *scan_from = (size_t)(start - text);
+    return find_any_tool_end(start) != NULL;
+}
+
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen);
-
-static int chat_think_tool_recovery_slot(server *s, server_slot *slot, buf *text,
-                                    thinking_state *thinking,
-                                    size_t *scan_from,
-                                    int speculative_tail,
-                                    int *completion, int max_tokens,
-                                    char *err, size_t errlen) {
-    if (!thinking->inside || !text->ptr) return 0;
-    if (*scan_from > text->len) *scan_from = text->len;
-    if (!strstr(text->ptr + *scan_from, Q36_TOOL_CALLS_START)) {
-        const size_t hold = 80;
-        *scan_from = text->len > hold ? text->len - hold : 0;
-        return 0;
-    }
-
-    /* Qwen resumes at <function=...> after the forced close, so restart the
-     * native wrapper too. The model-backed recovery test guards this choice. */
-    const char *inject = "</think>\n\n" Q36_TOOL_CALLS_START "\n";
-    q36_tokens toks = {0};
-    q36_tokenize_rendered_chat(s->engine, inject, &toks);
-    int room = q36_session_ctx(slot->session) - q36_session_pos(slot->session) + speculative_tail;
-    if (toks.len <= 0 || toks.len >= room || *completion + toks.len >= max_tokens) {
-        q36_tokens_free(&toks);
-        *scan_from = text->len;
-        return 0;
-    }
-
-    if (speculative_tail > 0) {
-        int pos = q36_session_pos(slot->session) - speculative_tail;
-        q36_session_rewind(slot->session, pos);
-        if (q36_session_pos(slot->session) != pos) {
-            q36_tokens_free(&toks);
-            snprintf(err, errlen, "think tool recovery rewind failed");
-            return -1;
-        }
-    }
-    for (int i = 0; i < toks.len; i++) {
-        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
-            q36_tokens_free(&toks);
-            return -1;
-        }
-        (*completion)++;
-    }
-    buf_puts(text, inject);
-    thinking_state_feed(thinking, inject, strlen(inject));
-    *scan_from = text->len;
-    q36_tokens_free(&toks);
-    return 1;
-}
-
-#ifdef Q36_SERVER_TEST
-static int chat_think_tool_recovery(server *s, buf *text,
-                                    thinking_state *thinking,
-                                    size_t *scan_from,
-                                    int speculative_tail,
-                                    int *completion, int max_tokens,
-                                    char *err, size_t errlen) {
-    server_slot slot = {.srv = s, .session = s ? s->session : NULL};
-    return chat_think_tool_recovery_slot(
-            s, &slot, text, thinking, scan_from, speculative_tail,
-            completion, max_tokens, err, errlen);
-}
-#endif
 
 static bool should_canonicalize_thinking_checkpoint(const request *r,
                                                     const thinking_state *thinking,
@@ -8278,8 +8347,6 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
     size_t think_recovery_scan_from = 0;
-    const bool think_tool_recovery_enabled =
-        getenv("Q36_SERVER_DISABLE_THINK_TOOL_RECOVERY") == NULL;
     qwen_tool_decode_tracker qwen_tool_tracker;
     qwen_tool_decode_tracker_init(&qwen_tool_tracker);
 
@@ -8343,7 +8410,6 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         }
 
         bool stop_decode = false;
-        bool restart_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
             if (token == q36_token_eos(s->engine)) {
@@ -8415,33 +8481,24 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking_gates_tool_markers && thinking.inside) {
-                    int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery_slot(s, slot, &text, &thinking,
-                                                 &think_recovery_scan_from,
-                                                 ntok - ti - 1,
-                                                 &completion, max_tokens,
-                                                 err, sizeof(err)) : 0;
-                    if (recovered < 0) {
-                        finish = "error";
+                    if (complete_tool_call_inside_thinking(
+                            text.ptr, text.len, &think_recovery_scan_from)) {
+                        saw_tool_start = true;
+                        saw_tool_end = true;
+                        finish = "tool_calls";
                         stop_decode = true;
-                        break;
-                    }
-                    if (recovered) {
                         server_log(Q36_LOG_WARNING,
-                                   "q36-server: chat ctx=%s tool call inside unclosed <think>; "
-                                   "forced </think> after %d generated tokens",
+                                   "q36-server: chat ctx=%s recovered a complete tool call "
+                                   "from unclosed reasoning after %d generated tokens",
                                    ctx_span, completion);
                         trace_event(s, trace_id,
-                                    "think tool recovery after %d generated tokens",
+                                    "recovered complete tool call from unclosed reasoning "
+                                    "after %d generated tokens",
                                     completion);
-                        qwen_tool_decode_tracker_update(&qwen_tool_tracker,
-                                                        text.ptr, text.len);
-                        tool_scan_waiting_for_think_close = true;
-                        restart_decode = true;
-                    } else {
-                        tool_scan_waiting_for_think_close = true;
-                        tool_scan_from = text.len;
+                        break;
                     }
+                    tool_scan_waiting_for_think_close = true;
+                    tool_scan_from = text.len;
                 } else {
                     if (tool_scan_waiting_for_think_close) {
                         const char *think_end = find_last_substr(text.ptr, "</think>");
@@ -8505,11 +8562,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                 break;
             }
 
-            if (restart_decode) break;
-
         }
         if (stop_decode) break;
-        if (restart_decode) continue;
     }
 
     server_generation_leave(s);
@@ -10045,6 +10099,74 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     close(sv[1]);
 }
 
+static void test_openai_stream_reroutes_second_reasoning_pass(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = Q36_THINK_HIGH;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *partial = "<think>first pass</think>escaped draft";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_second_think",
+                                         &st, partial, strlen(partial), false));
+    const char *complete =
+        "<think>first pass</think>escaped draft</think>final answer";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
+                                       &st, complete, strlen(complete), NULL,
+                                       "stop", 5, 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = Q36_THINK_HIGH;
+    r.has_tools = true;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_second_think", 5, &st));
+    const char *partial = "first pass</think>escaped draft";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_second_think",
+                                            &st, partial, strlen(partial), false));
+    const char *complete = "first pass</think>escaped draft</think>final answer";
+    TEST_ASSERT(anthropic_sse_finish_live(sv[0], &r, "msg_second_think",
+                                          &st, complete, strlen(complete), NULL,
+                                          "stop", 9));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"thinking\":\"escaped draft\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"final answer\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"escaped draft") == NULL);
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_openai_tool_stream_sends_partial_arguments(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -10749,7 +10871,26 @@ static void test_thinking_tool_markers_are_not_executable(void) {
     memset(&calls, 0, sizeof(calls));
     TEST_ASSERT(parse_generated_message_ex(unclosed, true, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 0);
-    TEST_ASSERT(content && !strcmp(content, unclosed));
+    TEST_ASSERT(content && !strcmp(content, ""));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, unclosed));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    const char *recovered =
+        "<think>reasoning\n\n"
+        Q36_TOOL_CALLS_START "\n"
+        Q36_INVOKE_START "bash>\n"
+        Q36_PARAM_START "command>pwd" Q36_PARAM_END "\n"
+        Q36_INVOKE_END "\n"
+        Q36_TOOL_CALLS_END;
+    content = reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(parse_generated_message_ex(recovered, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(content && !strcmp(content, ""));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "reasoning"));
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "bash"));
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -12477,8 +12618,10 @@ static void q36_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
+    test_anthropic_stream_reroutes_second_reasoning_pass();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
+    test_openai_stream_reroutes_second_reasoning_pass();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();

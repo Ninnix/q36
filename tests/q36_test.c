@@ -6614,13 +6614,7 @@ static void test_think_tool_recovery_live(void) {
     q36_tokenize_rendered_chat(engine, forced.ptr, &toks);
     TEST_ASSERT(toks.len > 1);
 
-    server srv = {0};
-    srv.engine = engine;
-    srv.session = session;
     size_t scan_from = 0;
-    int completion = 0;
-    int recovered = 0;
-    int trigger = -1;
     for (int i = 0; i < toks.len; i++) {
         TEST_ASSERT(q36_session_eval(session, toks.v[i], err, sizeof(err)) == 0);
         size_t piece_len = 0;
@@ -6628,33 +6622,23 @@ static void test_think_tool_recovery_live(void) {
         buf_append(&text, piece, piece_len);
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
-        recovered = chat_think_tool_recovery(
-            &srv, &text, &thinking, &scan_from, 0,
-            &completion, 512, err, sizeof(err));
-        TEST_ASSERT(recovered >= 0);
-        if (recovered == 1) {
-            trigger = i;
-            break;
-        }
     }
-    TEST_ASSERT(recovered == 1);
-    TEST_ASSERT(trigger == toks.len - 1);
-    TEST_ASSERT(!thinking.inside);
+    TEST_ASSERT(!complete_tool_call_inside_thinking(text.ptr, text.len, &scan_from));
+    TEST_ASSERT(thinking.inside);
 
-    bool saw_start = false;
-    bool saw_end = false;
+    bool recovered = false;
     bool decode_ok = true;
-    for (int i = 0; i < 256 && !saw_end; i++) {
+    int generated = 0;
+    for (; generated < 256 && !recovered; generated++) {
         int token = q36_session_argmax(session);
         if (token < 0 || token == q36_token_eos(engine)) break;
         size_t piece_len = 0;
         char *piece = q36_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        const char *after_think = find_last_substr(text.ptr, "</think>");
-        observe_tool_markers(after_think ? after_think + 8 : "",
-                             &saw_start, &saw_end, NULL);
-        if (saw_end) break;
+        recovered = complete_tool_call_inside_thinking(text.ptr, text.len,
+                                                       &scan_from);
+        if (recovered) break;
         if (q36_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
@@ -6667,13 +6651,13 @@ static void test_think_tool_recovery_live(void) {
     bool parsed = parse_generated_message_ex(text.ptr, true,
                                               &content, &reasoning, &calls);
     fprintf(stderr,
-            "q36-test: think-tool-recovery trigger=%d/%d recovered=%d calls=%d name=%s\n",
-            trigger, toks.len, recovered, calls.len,
+            "q36-test: think-tool-recovery generated=%d recovered=%d calls=%d name=%s\n",
+            generated, recovered, calls.len,
             calls.len ? calls.v[0].name : "-");
-    if (!saw_end) fprintf(stderr, "q36-test: think-tool-recovery text=[%s]\n",
+    if (!recovered) fprintf(stderr, "q36-test: think-tool-recovery text=[%s]\n",
                           text.ptr ? text.ptr : "");
     TEST_ASSERT(decode_ok);
-    TEST_ASSERT(saw_end);
+    TEST_ASSERT(recovered);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
 
@@ -6791,7 +6775,7 @@ static const q36_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid tool calls", test_tool_call_quality},
     {"--qwen-tool-call-quality", "qwen-tool-call-quality", "model emits native Qwen tool calls", test_qwen_tool_call_quality},
-    {"--think-tool-recovery", "think-tool-recovery", "forced thinking close restarts a native Qwen tool call", test_think_tool_recovery_live},
+    {"--think-tool-recovery", "think-tool-recovery", "complete Qwen tool call is recovered from unclosed thinking", test_think_tool_recovery_live},
     {"--thinking-generation", "thinking-generation", "generation with thinking-mode enabled", test_thinking_generation},
     {"--session-sync-prefix-cpu", "session-sync-prefix-cpu", "CPU session sync extends matching prefixes", test_session_sync_prefix_resume_cpu},
     {"--sampling-controls", "sampling-controls", "CPU sampler honors temperature/top-k/top-p/min-p", test_sampling_controls},
