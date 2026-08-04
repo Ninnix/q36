@@ -3796,6 +3796,16 @@ static void agent_kv_session_meta_free(agent_kv_session_meta *m) {
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
 
+static bool agent_fp_remaining(FILE *fp, uint64_t *remaining) {
+    off_t pos = ftello(fp);
+    if (pos < 0 || fseeko(fp, 0, SEEK_END) != 0) return false;
+    off_t end = ftello(fp);
+    bool ok = end >= pos;
+    if (fseeko(fp, pos, SEEK_SET) != 0) ok = false;
+    if (ok) *remaining = (uint64_t)(end - pos);
+    return ok;
+}
+
 /* Agent sessions deliberately use a different policy from q36-server:
  *
  * - sysprompt.kv is a fixed bootstrap checkpoint for the current tool/system
@@ -3811,6 +3821,11 @@ static char *agent_session_title_from_text(const char *text, size_t text_len,
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
 static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || text_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated cached text");
+        return false;
+    }
     char *text = xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
@@ -3860,6 +3875,12 @@ static bool agent_kv_read_title_trailer(FILE *fp, const q36_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = q36_kvstore_le_get32(tb);
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || title_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     char *title = xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
@@ -6223,6 +6244,33 @@ static void agent_test_assert(bool cond, const char *expr,
 #define AGENT_TEST_ASSERT(expr) \
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
+static void test_agent_cache_lengths_are_bounded_by_file(void) {
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    AGENT_TEST_ASSERT(fwrite("abc", 1, 3, fp) == 3);
+    rewind(fp);
+    char *text = NULL;
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(!agent_kv_read_text(fp, UINT32_MAX, &text,
+                                         err, sizeof(err)));
+    AGENT_TEST_ASSERT(text == NULL);
+    fclose(fp);
+
+    fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    uint8_t huge[4] = {0xff, 0xff, 0xff, 0xff};
+    AGENT_TEST_ASSERT(fwrite(huge, 1, sizeof(huge), fp) == sizeof(huge));
+    rewind(fp);
+    q36_kvstore_entry hdr = {0};
+    char *title = NULL;
+    AGENT_TEST_ASSERT(!agent_kv_read_title_trailer(fp, &hdr, &title,
+                                                   err, sizeof(err)));
+    AGENT_TEST_ASSERT(title == NULL);
+    fclose(fp);
+}
+
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     const char *data =
         "CFLAGS = -Wall -Wextra -g\n"
@@ -6436,6 +6484,7 @@ static void test_agent_welcome_banner(void) {
 }
 
 static void q36_agent_unit_tests_run(void) {
+    test_agent_cache_lengths_are_bounded_by_file();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_qwen_tool_parser();

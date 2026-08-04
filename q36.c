@@ -2843,7 +2843,9 @@ static bool cursor_string(q36_cursor *c, q36_str *s) {
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
     uint64_t rem = value % alignment;
-    return rem == 0 ? value : value + alignment - rem;
+    if (rem == 0) return value;
+    if (value > UINT64_MAX - (alignment - rem)) q36_die("GGUF alignment overflow");
+    return value + alignment - rem;
 }
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -3036,6 +3038,10 @@ static void model_close(q36_model *m) {
 }
 
 static void parse_metadata(q36_model *m, q36_cursor *c) {
+    uint64_t remaining = c->size - c->pos;
+    if (m->n_kv > remaining / 12 ||
+        m->n_kv > SIZE_MAX / sizeof(m->kv[0]))
+        q36_die("GGUF metadata count exceeds file size");
     m->kv = xcalloc((size_t)m->n_kv, sizeof(m->kv[0]));
     m->alignment = 32;
     for (uint64_t i = 0; i < m->n_kv; i++) {
@@ -3053,6 +3059,10 @@ static void parse_metadata(q36_model *m, q36_cursor *c) {
 }
 
 static void parse_tensors(q36_model *m, q36_cursor *c) {
+    uint64_t remaining = c->size - c->pos;
+    if (m->n_tensors > remaining / 32 ||
+        m->n_tensors > SIZE_MAX / sizeof(m->tensors[0]))
+        q36_die("GGUF tensor count exceeds file size");
     m->tensors = xcalloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         q36_tensor *t = &m->tensors[i];
@@ -3096,6 +3106,7 @@ static void model_open(q36_model *m, const char *path, bool graph_mapping) {
     if (fd == -1) q36_die_errno("cannot open model", path);
     if (fstat(fd, &st) == -1) q36_die_errno("cannot stat model", path);
     if (st.st_size < 32) q36_die("model file is too small to be GGUF");
+    if ((uintmax_t)st.st_size > SIZE_MAX) q36_die("model file is too large to map");
     map = mmap(NULL, (size_t)st.st_size, PROT_READ, graph_mapping ? MAP_SHARED : MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) q36_die_errno("cannot mmap model", path);
     m->fd = fd;
@@ -9907,6 +9918,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (version == Q36_PAYLOAD_VERSION_TOKEN_ONLY) {
         uint32_t n_tokens = third;
+        if (n_tokens >= (uint32_t)s->ctx_size) {
+            q36_payload_set_err(err, errlen, "token-only checkpoint does not fit current context");
+            return 1;
+        }
         if (remaining != (uint64_t)n_tokens * sizeof(int32_t)) {
             if (err && errlen) snprintf(err, errlen, "mismatched token-only payload size");
             return 1;

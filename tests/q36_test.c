@@ -5595,6 +5595,24 @@ static void test_kv_cache_save_restore(void) {
     int argmax_after_sync = q36_session_argmax(session);
     TEST_ASSERT(argmax_after_sync == argmax_before);
 
+    FILE *oversized = tmpfile();
+    TEST_ASSERT(oversized != NULL);
+    if (oversized) {
+        uint32_t header[3] = {0x51563336u, 1u, 4096u};
+        int32_t zero = 0;
+        TEST_ASSERT(fwrite(header, sizeof(header), 1, oversized) == 1);
+        for (uint32_t i = 0; i < header[2]; i++)
+            TEST_ASSERT(fwrite(&zero, sizeof(zero), 1, oversized) == 1);
+        rewind(oversized);
+        err[0] = '\0';
+        TEST_ASSERT(q36_session_load_payload(
+                        session, oversized,
+                        sizeof(header) + (uint64_t)header[2] * sizeof(zero),
+                        err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "token-only checkpoint does not fit") != NULL);
+        fclose(oversized);
+    }
+
     q36_session_snapshot_free(&snap);
     q36_session_free(session);
     q36_tokens_free(&prompt);
