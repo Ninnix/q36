@@ -712,9 +712,27 @@ static int q36_quant_float_matmul(
     if (!weights || (!q36_batch && !q36_gpu_begin_commands())) return 0;
 
     if (tokens <= 5u) {
-        NSString *kernel = [NSString stringWithFormat:@"%@%llu", mv_stem,
-                            (unsigned long long)tokens];
-        const int16_t nsg = 4, nxpsg = 32;
+        const bool iq3_rows = q36_dense_model && tokens == 1u &&
+            ([mv_stem containsString:@"iq3_xxs"] ||
+             [mv_stem containsString:@"iq3_s"]);
+        const bool k_rows = q36_dense_model && tokens == 1u &&
+            ([mv_stem containsString:@"q4_K"] ||
+             [mv_stem containsString:@"q6_K"]);
+        const bool multi_rows = iq3_rows || k_rows;
+        NSString *kernel;
+        if (iq3_rows) {
+            kernel = [mv_stem containsString:@"iq3_xxs"]
+                ? @"kernel_mul_mv_rows_iq3_xxs_tg_f32"
+                : @"kernel_mul_mv_rows_iq3_s_tg_f32";
+        } else if (k_rows) {
+            kernel = [mv_stem containsString:@"q4_K"]
+                ? @"kernel_mul_mv_rows_q4_K_f32"
+                : @"kernel_mul_mv_rows_q6_K_f32";
+        } else {
+            kernel = [NSString stringWithFormat:@"%@%llu", mv_stem,
+                       (unsigned long long)tokens];
+        }
+        const int16_t nsg = multi_rows ? 2 : 4, nxpsg = 32;
         id<MTLComputePipelineState> p =
             q36_pipeline_mv_ext(kernel, nsg, nxpsg);
         if (!p) return 0;
@@ -734,7 +752,15 @@ static int q36_quant_float_matmul(
         [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
         [enc setBuffer:x->buffer offset:x->offset atIndex:2];
         [enc setBuffer:out->buffer offset:out->offset atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+        if (iq3_rows)
+            [enc setThreadgroupMemoryLength:
+                [mv_stem containsString:@"iq3_xxs"] ? 1152u : 2048u
+                                      atIndex:0];
+        const uint64_t rows_per_sg = iq3_rows ? 4u : (k_rows ? 2u : 1u);
+        const uint64_t rows_per_group = rows_per_sg * nsg;
+        [enc dispatchThreadgroups:MTLSizeMake(
+                                              (out_dim + rows_per_group - 1u) /
+                                                  rows_per_group,
                                               1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
         [enc endEncoding];
