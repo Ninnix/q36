@@ -43,18 +43,10 @@ QuarkStar has two native GPU backends:
   `int64`. Subgroup arithmetic, 16-bit storage, and native `float16` are
   detected at runtime; optimized kernels fall back when an optional feature
   is unavailable.
-* **AMD BC-250** (Cyan Skillfish, RDNA 2, 24 CUs / 1536 shaders, 16 GB
-  unified GDDR6) is the primary tested Vulkan device. Its vendor/device ID
-  selects the existing tuned fast path automatically. RADV is the tested
-  driver; other drivers and Vulkan GPUs need their own correctness and speed
-  validation.
-* **BIOS**: modded firmware with the Chipset menu unlocked. Set Integrated
-  Graphics → UMA Mode → `UMA_SPECIFIED` and VRAM allocation to `512 MB`
-  (dynamic). Counterintuitively, the small split is correct: it lets the GPU
-  grow into the unified pool on demand.
-* **Kernel boot parameters**: add `ttm.pages_limit=3959290
-  ttm.page_pool_size=3959290` to your bootloader, otherwise `amdgpu` caps
-  GPU-accessible memory below 8 GB and the model will fail to load.
+* **AMD BC-250** (Cyan Skillfish, 24 CUs, 16 GB unified GDDR6) is the primary
+  tested Vulkan device. Its vendor/device ID selects the tuned fast path
+  automatically. Follow [BC250.md](BC250.md) for the RADV, UMA, kernel-memory,
+  governor, build, and optional 40-CU setup.
 * **Apple Silicon M1 or newer** with macOS 11 or newer and Xcode or the Command
   Line Tools providing the macOS SDK and Metal framework. Build with
   `make metal` and run with `./q36 --metal`. Shader sources are compiled through
@@ -131,6 +123,8 @@ and offline tooling. For normal usage, keep reading the next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [BC250.md](BC250.md): Linux, RADV, unified-memory, governor, and build setup
+  for the primary Vulkan device.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix.
 - [MODEL_CARD.md](MODEL_CARD.md): the fixed Qwen3.6 architecture, tokenizer,
