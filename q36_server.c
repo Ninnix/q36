@@ -7083,17 +7083,10 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
         const double load_ms = (now_sec() - load_t0) * 1000.0;
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
         slot->continued_last_store_tokens = loaded;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
-            unlink(path);
-            server_log(Q36_LOG_KVCACHE,
-                       "q36-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms consumed file=%s",
-                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
-        } else {
-            kv_cache_touch_file(path, hdr.hits + 1);
-            server_log(Q36_LOG_KVCACHE,
-                       "q36-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms file=%s",
-                       loaded, text_bytes, hdr.quant_bits, load_ms, path);
-        }
+        kv_cache_touch_file(path, hdr.hits + 1);
+        server_log(Q36_LOG_KVCACHE,
+                   "q36-server: kv cache hit text tokens=%d text=%u quant=%u load=%.1f ms file=%s",
+                   loaded, text_bytes, hdr.quant_bits, load_ms, path);
     }
     free(cached_text);
     free(path);
