@@ -5555,6 +5555,7 @@ struct server {
     server_slot *slots;
     int slot_count;
     bool batched_mode;
+    int mixed_prefill_quantum;
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -7659,7 +7660,7 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static int server_prefill_quantum_for(bool generation_active) {
+static int server_prefill_quantum_default(bool generation_active) {
     int quantum = generation_active ? 128 : 2048;
     const char *env = getenv(generation_active
             ? "Q36_SERVER_MIXED_PREFILL_QUANTUM"
@@ -7672,11 +7673,17 @@ static int server_prefill_quantum_for(bool generation_active) {
     return quantum;
 }
 
+static int server_prefill_quantum_for(const server *s, bool generation_active) {
+    if (generation_active && s && s->mixed_prefill_quantum > 0)
+        return s->mixed_prefill_quantum;
+    return server_prefill_quantum_default(generation_active);
+}
+
 static int server_prefill_quantum(server *s) {
     pthread_mutex_lock(&s->model_mu);
     bool generation_active = s->active_generations > 0;
     pthread_mutex_unlock(&s->model_mu);
-    return server_prefill_quantum_for(generation_active);
+    return server_prefill_quantum_for(s, generation_active);
 }
 
 static int server_session_sync(server *s, server_slot *slot,
@@ -9216,6 +9223,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int mixed_prefill_quantum;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -9362,6 +9370,8 @@ static void usage(FILE *fp) {
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
         "  --batched-session N\n"
         "      Keep N resident sessions and batch decode-ready GPU requests.\n"
+        "  --mixed-prefill-quantum N\n"
+        "      Prefill tokens per scheduling turn while generation is active. Default: 128\n"
         "  --cors\n"
         "      Add Access-Control-Allow-* headers and answer browser preflight requests.\n"
         "\n"
@@ -9447,6 +9457,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = Q36_CONTEXT_MAX,
         .tool_memory_max_ids = Q36_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .mixed_prefill_quantum = server_prefill_quantum_default(true),
     };
     c.kv_cache = kv_cache_default_options();
 
@@ -9495,6 +9506,8 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
+            c.mixed_prefill_quantum = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
@@ -9629,6 +9642,7 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
@@ -9676,8 +9690,8 @@ int main(int argc, char **argv) {
     if (s.batched_mode) {
         server_log(Q36_LOG_DEFAULT,
                    "q36-server: batched mode resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
-                   slot_count, server_prefill_quantum_for(false),
-                   server_prefill_quantum_for(true), server_decode_coalesce_us());
+                   slot_count, server_prefill_quantum_for(&s, false),
+                   server_prefill_quantum_for(&s, true), server_decode_coalesce_us());
         if (mtp_requested) {
             server_log(Q36_LOG_DEFAULT,
                        "q36-server: MTP is disabled while multi-session batching is active");
@@ -12541,9 +12555,15 @@ static void test_server_streaming_options(void) {
     TEST_ASSERT(c.engine.cache_type_k == Q36_KV_CACHE_Q8_0);
     TEST_ASSERT(c.engine.cache_type_v == Q36_KV_CACHE_Q4_0);
 
-    char *batched_argv[] = {"q36-server", "--batched-session", "4"};
-    c = parse_options(3, batched_argv);
+    char *batched_argv[] = {
+        "q36-server", "--batched-session", "4",
+        "--mixed-prefill-quantum", "64",
+    };
+    c = parse_options(5, batched_argv);
     TEST_ASSERT(c.batched_sessions == 4);
+    TEST_ASSERT(c.mixed_prefill_quantum == 64);
+    server s = {.mixed_prefill_quantum = c.mixed_prefill_quantum};
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 64);
 }
 
 static void test_batched_prefill_round_robin(void) {

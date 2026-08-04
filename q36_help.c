@@ -162,6 +162,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (tool == Q36_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
         opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+        opt(fp, c, "--mixed-prefill-quantum N", "Prefill tokens per scheduling turn during active generation (default: 128).");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");

@@ -509,6 +509,11 @@ token zero.
 ./q36-server --ctx 32768 --batched-session 4
 ```
 
+Use `--mixed-prefill-quantum N` to tune how many prefill tokens a batched
+session runs per scheduling turn while another session is generating. The
+default is 128; smaller values favor decode latency, larger values favor
+prefill throughput.
+
 Each active request owns one slot until it finishes; excess requests wait for
 an idle slot. Assignment prefers the resident live/token prefix with the
 longest match. When disk KV caching is enabled, an unmatched idle slot is
