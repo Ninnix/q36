@@ -570,10 +570,11 @@ strip reasoning before the latest user query. System and user messages may also
 contain `<|think_on|>` or `<|think_off|>`; Q36 removes the control marker before
 rendering and applies it to subsequent turns.
 
-When omitted by the client, KAT-Coder sampling follows its model card:
-`temperature=1`, `top_p=0.95`, `top_k=20`, and `presence_penalty=1.5` while
-thinking; non-thinking uses `temperature=0.7` and `top_p=0.8`. Explicit request
-values always win.
+When omitted by the client, KAT-Coder uses `temperature=0.7`, `top_k=20`,
+`top_p=0.8`, `min_p=0.05`, and `presence_penalty=1.5` in both thinking modes.
+Qwen uses `temperature=1`, `top_p=1`, no top-k cap, and `min_p=0.05`. CLI,
+agent, and server use the loaded model's defaults. Eval stays fixed at the Qwen
+sampling defaults for comparable runs. Explicit values always win.
 
 `/v1/responses` accepts string or message-array input, instructions, direct
 tool schemas, function-call continuations, function-call outputs, sampling

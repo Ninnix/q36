@@ -203,6 +203,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max with at least 98304 context tokens.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    para(fp, c, "Qwen defaults to temp=1, top-k=0, top-p=1, min-p=0.05. KAT defaults to 0.7/20/0.8/0.05. Eval always defaults to Qwen sampling. Explicit options win.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -308,7 +309,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 98304; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or chat_template_kwargs.enable_thinking=false selects non-thinking mode.");
-    para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "Model defaults apply only to omitted sampling knobs; explicit client values win.");
     fputc('\n', fp);
 }
 

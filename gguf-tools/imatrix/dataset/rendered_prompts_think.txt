@@ -2381,7 +2381,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -8655,7 +8655,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -10827,7 +10827,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -16946,7 +16946,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -26648,7 +26648,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -34165,7 +34165,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -39608,7 +39608,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>
@@ -40898,7 +40898,7 @@ q36_server.c:1234:9: error: implicit declaration of function 'foo'
     foo(x, y);
         ^
 
-SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with corrected arguments.
+⚠️ SYSTEM WARNING: The previous tool call returned an error. Diagnose the failure and retry with completely corrected arguments.
 </tool_response><|im_end|>
 <|im_start|>assistant
 Build broke at q36_server.c:1234 on an implicit declaration of foo. Likely a missing include after a refactor.<|im_end|>

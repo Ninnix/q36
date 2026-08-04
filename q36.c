@@ -7679,8 +7679,7 @@ void q36_chat_apply_thinking_control(const char *content, bool *thinking) {
     else if (strstr(content, "<|think_on|>")) *thinking = true;
 }
 
-static void q36_tokenize_chat_content(q36_engine *e, const char *text,
-                                      bool controls, q36_tokens *out) {
+static char *q36_chat_content_text(const char *text, bool controls) {
     static const char think_off[] = "<|think_off|>";
     static const char think_on[] = "<|think_on|>";
     const char *remove = NULL;
@@ -7715,13 +7714,12 @@ static void q36_tokenize_chat_content(q36_engine *e, const char *text,
     char *trimmed = xmalloc((size_t)(end - start) + 1);
     memcpy(trimmed, start, (size_t)(end - start));
     trimmed[end - start] = '\0';
-    q36_tokenize_rendered_chat(e, trimmed, out);
     free(plain);
-    free(trimmed);
+    return trimmed;
 }
 
 void q36_chat_begin(q36_engine *e, q36_tokens *tokens) {
-    if (!e->kat_coder && e->vocab.bos_id >= 0)
+    if (e->vocab.add_bos && e->vocab.bos_id >= 0)
         q36_tokens_push(tokens, e->vocab.bos_id);
 }
 
@@ -7745,18 +7743,25 @@ void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role
     if (!content) content = "";
     if (!strcmp(role, "developer")) role = "system";
     if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        char *text = q36_chat_content_text(content, false);
         chat_append_open_role(e, tokens, "user");
         q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
-        q36_tokenize_chat_content(e, content, false, tokens);
+        q36_tokenize_rendered_chat(e, text, tokens);
         q36_tokenize_rendered_chat(e, "\n</tool_response>", tokens);
         chat_append_close_role(e, tokens);
+        free(text);
+        return;
+    }
+    bool controls = !strcmp(role, "system") || !strcmp(role, "user");
+    char *text = q36_chat_content_text(content, controls);
+    if (!strcmp(role, "system") && !text[0]) {
+        free(text);
         return;
     }
     chat_append_open_role(e, tokens, role);
-    q36_tokenize_chat_content(e, content,
-                              !strcmp(role, "system") || !strcmp(role, "user"),
-                              tokens);
+    q36_tokenize_rendered_chat(e, text, tokens);
     chat_append_close_role(e, tokens);
+    free(text);
 }
 
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode) {

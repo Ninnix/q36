@@ -33,8 +33,14 @@ class RenderTests(unittest.TestCase):
         ]
         prompt = render(messages, "think", tools=[{"type": "function"}])
         self.assertIn("</tool_call>\n\n<tool_call>", prompt)
-        self.assertIn("previous tool call returned an error", prompt)
-        self.assertIn("Multiple consecutive tool errors", prompt)
+        self.assertIn(
+            "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+            "Diagnose the failure and retry with completely corrected arguments.",
+            prompt)
+        self.assertIn(
+            "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
+            "Your previous approach is incorrect. You MUST use a fundamentally "
+            "different approach or corrected arguments.", prompt)
         self.assertTrue(prompt.endswith(
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"))
 

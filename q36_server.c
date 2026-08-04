@@ -2014,12 +2014,14 @@ static bool tool_response_is_error(const char *content) {
 
 static void append_tool_error_warning(buf *out, int failures) {
     if (failures >= 2) {
-        buf_puts(out, "\n\nSYSTEM WARNING: Multiple consecutive tool errors detected. "
-                      "The previous approach is incorrect. Use a fundamentally "
-                      "different approach or corrected arguments.");
+        buf_printf(out,
+            "\n\n⚠️ SYSTEM WARNING: %d consecutive tool errors detected. "
+            "Your previous approach is incorrect. You MUST use a fundamentally "
+            "different approach or corrected arguments.", failures);
     } else if (failures == 1) {
-        buf_puts(out, "\n\nSYSTEM WARNING: The previous tool call returned an error. "
-                      "Diagnose the failure and retry with corrected arguments.");
+        buf_puts(out,
+            "\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+            "Diagnose the failure and retry with completely corrected arguments.");
     }
 }
 
@@ -2139,7 +2141,7 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
             buf_puts(&out, first_content);
         }
         buf_puts(&out, "<|im_end|>\n");
-    } else if (first_system) {
+    } else if (first_system && text_has_trimmed_content(first_content)) {
         buf_puts(&out, "<|im_start|>system\n");
         buf_puts(&out, first_content);
         buf_puts(&out, "<|im_end|>\n");
@@ -2236,7 +2238,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
             buf_puts(&out, first_content);
         }
         buf_puts(&out, "<|im_end|>\n");
-    } else if (first_system) {
+    } else if (first_system && text_has_trimmed_content(first_content)) {
         buf_puts(&out, "<|im_start|>system\n");
         buf_puts(&out, first_content);
         buf_puts(&out, "<|im_end|>\n");
@@ -9290,8 +9292,9 @@ static void usage(FILE *fp) {
         "  Think Max requires --ctx >= 98304; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, chat_template_kwargs.enable_thinking=false, or a -nothink model alias selects non-thinking mode.\n"
         "  Qwen and KAT-Coder preserve prior thinking by default; chat_template_kwargs.preserve_thinking=false strips it.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  Thinking defaults apply only to omitted sampling knobs; explicit client values win.\n"
+        "  Qwen defaults are temperature=1, top_k=0, top_p=1, min_p=0.05.\n"
+        "  KAT defaults are temperature=0.7, top_k=20, top_p=0.8, min_p=0.05.\n"
+        "  Model defaults apply only to omitted sampling knobs; explicit client values win.\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-disk-dir DIR\n"
@@ -10366,6 +10369,14 @@ static void test_request_defaults_match_qwen_api(void) {
     TEST_ASSERT(r.min_p == Q36_DEFAULT_MIN_P);
     TEST_ASSERT(r.preserve_thinking);
     TEST_ASSERT(!r.temperature_set && !r.top_p_set && !r.top_k_set && !r.min_p_set);
+
+    float temperature, top_p, min_p;
+    int top_k;
+    q36_engine_sampling_defaults(NULL, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == Q36_DEFAULT_TEMPERATURE);
+    TEST_ASSERT(top_p == Q36_DEFAULT_TOP_P);
+    TEST_ASSERT(top_k == 0);
+    TEST_ASSERT(min_p == Q36_DEFAULT_MIN_P);
     request_free(&r);
 }
 
@@ -12052,6 +12063,25 @@ static void test_fixed_template_inline_controls(void) {
         TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
         free(prompt);
         chat_msgs_free(&msgs);
+
+        msgs = (chat_msgs){0};
+        system = (chat_msg){
+            .role = xstrdup("system"),
+            .content = xstrdup("  <|think_off|>  "),
+        };
+        user = (chat_msg){
+            .role = xstrdup("user"),
+            .content = xstrdup("hello"),
+        };
+        chat_msgs_push(&msgs, system);
+        chat_msgs_push(&msgs, user);
+        prompt = render_chat_prompt_text_profile(
+            &msgs, NULL, NULL, Q36_THINK_HIGH, kat, true);
+        TEST_ASSERT(!strncmp(prompt, "<|im_start|>user\nhello",
+                             strlen("<|im_start|>user\nhello")));
+        TEST_ASSERT(strstr(prompt, "<|im_start|>system") == NULL);
+        free(prompt);
+        chat_msgs_free(&msgs);
     }
 }
 
@@ -12096,8 +12126,13 @@ static void test_fixed_template_tool_error_recovery(void) {
 
         char *prompt = render_chat_prompt_text_profile(
             &msgs, NULL, NULL, Q36_THINK_HIGH, kat, true);
-        TEST_ASSERT(strstr(prompt, "previous tool call returned an error") != NULL);
-        TEST_ASSERT(strstr(prompt, "Multiple consecutive tool errors detected") != NULL);
+        TEST_ASSERT(strstr(prompt,
+            "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+            "Diagnose the failure and retry with completely corrected arguments.") != NULL);
+        TEST_ASSERT(strstr(prompt,
+            "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
+            "Your previous approach is incorrect. You MUST use a fundamentally "
+            "different approach or corrected arguments.") != NULL);
         TEST_ASSERT(strstr(prompt,
             "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
         TEST_ASSERT(strstr(prompt,

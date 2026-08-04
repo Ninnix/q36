@@ -43,9 +43,8 @@ static char *read_file(const char *path, size_t *len) {
     return buf;
 }
 
-static char *render_prompt(const char *user, size_t user_len, bool hf) {
-    const char *prefix = hf ? "<|im_start|>user\n" :
-                              "<|endoftext|><|im_start|>user\n";
+static char *render_prompt(const char *user, size_t user_len) {
+    const char *prefix = "<|im_start|>user\n";
     const char *suffix =
         "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
     size_t prefix_len = strlen(prefix);
@@ -257,7 +256,7 @@ int main(int argc, char **argv) {
             error = "failed to read prompt";
             goto done;
         }
-        rendered = render_prompt(user, user_len, hf_template);
+        rendered = render_prompt(user, user_len);
         prompt_tokens = tokenize_prompt(vocab, rendered, &prompt_count);
         if (!prompt_tokens) {
             error = "failed to tokenize prompt";

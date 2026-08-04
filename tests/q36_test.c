@@ -5042,7 +5042,7 @@ static void test_llama_parity_case(q36_engine *engine,
     rendered = test_render_hf_chat_prompt("", prompt_text, Q36_THINK_NONE);
     TEST_ASSERT(rendered != NULL);
     if (!rendered) goto done;
-    q36_tokenize_rendered_chat(engine, rendered, &prompt);
+    q36_encode_chat_prompt(engine, "", prompt_text, Q36_THINK_NONE, &prompt);
     TEST_ASSERT(prompt.len > 0);
     vocab = llama_model_get_vocab(llama_model);
     TEST_ASSERT(test_llama_tokenize_exact(vocab, rendered, &llama_tokens, &llama_len));
@@ -5352,6 +5352,10 @@ static void test_thinking_generation(void) {
 
     q36_tokens prompt_high = {0};
     q36_encode_chat_prompt(engine, "", thk_prompt, Q36_THINK_HIGH, &prompt_high);
+
+    char *first_text = q36_token_text(engine, prompt_none.v[0], NULL);
+    TEST_ASSERT(first_text && !strcmp(first_text, "<|im_start|>"));
+    free(first_text);
 
     fprintf(stderr, "q36-test: think=HIGH prompt=%d tokens vs think=NONE prompt=%d tokens\n",
             prompt_high.len, prompt_none.len);
@@ -6416,11 +6420,31 @@ static void test_kat_model_support(void) {
         "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
     float temperature, top_p, min_p;
     int top_k;
+    request_apply_model_sampling_defaults(engine, &request);
     request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
     TEST_ASSERT(temperature == 0.7f);
     TEST_ASSERT(top_k == 20);
     TEST_ASSERT(top_p == 0.8f);
-    TEST_ASSERT(min_p == 0.0f);
+    TEST_ASSERT(min_p == 0.05f);
+    request_free(&request);
+
+    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.7f);
+    TEST_ASSERT(top_k == 20);
+    TEST_ASSERT(top_p == 0.8f);
+    TEST_ASSERT(min_p == 0.05f);
+
+    const char *override_body =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"temperature\":0.2,\"top_k\":7,\"top_p\":0.6,\"min_p\":0.01}";
+    TEST_ASSERT(parse_chat_request(engine, NULL, override_body, 128, 4096,
+                                   &request, err, sizeof(err)));
+    request_apply_model_sampling_defaults(engine, &request);
+    request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.2f);
+    TEST_ASSERT(top_k == 7);
+    TEST_ASSERT(top_p == 0.6f);
+    TEST_ASSERT(min_p == 0.01f);
     request_free(&request);
 
     q36_tokens direct = {0};
@@ -6429,6 +6453,23 @@ static void test_kat_model_support(void) {
     char *first = q36_token_text(engine, direct.v[0], NULL);
     TEST_ASSERT(!strcmp(first, "<|im_start|>"));
     free(first);
+    q36_tokens_free(&direct);
+
+    q36_encode_chat_prompt(engine, " <|think_off|> ", "user",
+                           Q36_THINK_HIGH, &direct);
+    buf direct_text = {0};
+    for (int i = 0; i < direct.len; i++) {
+        size_t len = 0;
+        char *piece = q36_token_text(engine, direct.v[i], &len);
+        buf_append(&direct_text, piece, len);
+        free(piece);
+    }
+    TEST_ASSERT(strstr(direct_text.ptr, "<|im_start|>system") == NULL);
+    TEST_ASSERT(!strncmp(direct_text.ptr, "<|im_start|>user\nuser",
+                         strlen("<|im_start|>user\nuser")));
+    TEST_ASSERT(strstr(direct_text.ptr,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+    buf_free(&direct_text);
     q36_tokens_free(&direct);
 
     q36_tokens_free(&tokens);

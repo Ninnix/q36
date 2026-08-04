@@ -177,12 +177,12 @@ def tool_response_is_error(content: str) -> bool:
 
 def tool_error_warning(failures: int) -> str:
     if failures >= 2:
-        return ("\n\nSYSTEM WARNING: Multiple consecutive tool errors detected. "
-                "The previous approach is incorrect. Use a fundamentally "
+        return (f"\n\n⚠️ SYSTEM WARNING: {failures} consecutive tool errors detected. "
+                "Your previous approach is incorrect. You MUST use a fundamentally "
                 "different approach or corrected arguments.")
     if failures == 1:
-        return ("\n\nSYSTEM WARNING: The previous tool call returned an error. "
-                "Diagnose the failure and retry with corrected arguments.")
+        return ("\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+                "Diagnose the failure and retry with completely corrected arguments.")
     return ""
 
 

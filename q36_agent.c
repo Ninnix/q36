@@ -3687,14 +3687,19 @@ static char *agent_tool_response_add_warning(char *content, int *failures) {
     agent_buf out = {0};
     agent_buf_puts(&out, content);
     if (*failures >= 2) {
+        char count[32];
+        snprintf(count, sizeof(count), "%d", *failures);
         agent_buf_puts(&out,
-            "\n\nSYSTEM WARNING: Multiple consecutive tool errors detected. "
-            "The previous approach is incorrect. Use a fundamentally "
+            "\n\n⚠️ SYSTEM WARNING: ");
+        agent_buf_puts(&out, count);
+        agent_buf_puts(&out,
+            " consecutive tool errors detected. Your previous approach is "
+            "incorrect. You MUST use a fundamentally "
             "different approach or corrected arguments.");
     } else {
         agent_buf_puts(&out,
-            "\n\nSYSTEM WARNING: The previous tool call returned an error. "
-            "Diagnose the failure and retry with corrected arguments.");
+            "\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+            "Diagnose the failure and retry with completely corrected arguments.");
     }
     free(content);
     return agent_buf_take(&out);
@@ -6322,13 +6327,18 @@ static void test_agent_tool_error_recovery(void) {
     char *text = agent_tool_response_add_warning(
         xstrdup("Tool error: first failure"), &failures);
     AGENT_TEST_ASSERT(failures == 1);
-    AGENT_TEST_ASSERT(strstr(text, "previous tool call returned an error") != NULL);
+    AGENT_TEST_ASSERT(strstr(text,
+        "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+        "Diagnose the failure and retry with completely corrected arguments.") != NULL);
     free(text);
 
     text = agent_tool_response_add_warning(
         xstrdup("Tool error: second failure"), &failures);
     AGENT_TEST_ASSERT(failures == 2);
-    AGENT_TEST_ASSERT(strstr(text, "Multiple consecutive tool errors") != NULL);
+    AGENT_TEST_ASSERT(strstr(text,
+        "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
+        "Your previous approach is incorrect. You MUST use a fundamentally "
+        "different approach or corrected arguments.") != NULL);
     free(text);
 
     text = agent_tool_response_add_warning(xstrdup("Tool result: ok"), &failures);
