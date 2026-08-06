@@ -50,6 +50,7 @@ static int q36_model_fd = -1;
 static bool q36_quality;
 static bool q36_micro_batch;
 static bool q36_ssd_streaming;
+static bool q36_metal_mpp_enabled;
 
 static uint64_t q36_gpu_system_memory_bytes(void) {
     uint64_t bytes = 0;
@@ -67,6 +68,70 @@ static void q36_gpu_print_device_summary(void) {
     } else {
         fprintf(stderr, "q36: Metal device %s\n", name);
     }
+}
+
+static bool q36_env_enabled(const char *name, bool fallback) {
+    const char *value = getenv(name);
+    if (!value) return fallback;
+    return value[0] != '0';
+}
+
+static bool q36_metal_compile_tensor_probe(void) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+    if (!q36_device) return false;
+    if (@available(macOS 26.0, *)) {
+        const char *source =
+            "#include <metal_stdlib>\n"
+            "#include <metal_tensor>\n"
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+            "using namespace metal;\n"
+            "using namespace mpp::tensor_ops;\n"
+            "kernel void q36_tensor_probe(\n"
+            "        tensor<device half, dextents<int32_t, 2>> A [[buffer(0)]],\n"
+            "        tensor<device half, dextents<int32_t, 2>> B [[buffer(1)]],\n"
+            "        device float *C [[buffer(2)]]) {\n"
+            "    auto tA = A.slice(0, 0);\n"
+            "    auto tB = B.slice(0, 0);\n"
+            "    matmul2d<matmul2d_descriptor(16, 16, 16), execution_simdgroups<4>> mm;\n"
+            "    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();\n"
+            "    mm.run(tB, tA, cT);\n"
+            "    auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(\n"
+            "        C, dextents<int32_t, 2>(16, 16));\n"
+            "    cT.store(tC);\n"
+            "}\n";
+        NSError *error = nil;
+        id<MTLLibrary> library = [q36_device
+            newLibraryWithSource:[NSString stringWithUTF8String:source]
+                         options:[MTLCompileOptions new] error:&error];
+        id<MTLFunction> function =
+            library ? [library newFunctionWithName:@"q36_tensor_probe"] : nil;
+        id<MTLComputePipelineState> pipeline = function
+            ? [q36_device newComputePipelineStateWithFunction:function
+                                                        error:&error]
+            : nil;
+        if (!pipeline && getenv("Q36_METAL_MOE_MPP")) {
+            fprintf(stderr, "q36: Metal tensor probe failed: %s\n",
+                    error.localizedDescription.UTF8String);
+        }
+        return pipeline != nil;
+    }
+#endif
+    return false;
+}
+
+static bool q36_metal_detect_mpp(void) {
+    const char *name = q36_device.name.UTF8String;
+    const bool automatic = name &&
+        (strstr(name, "M5") || strstr(name, "M6") ||
+         strstr(name, "A19") || strstr(name, "A20"));
+    if (!q36_env_enabled("Q36_METAL_MOE_MPP", automatic)) return false;
+    return q36_metal_compile_tensor_probe();
+}
+
+static int q36_metal_moe_mpp_mask(void) {
+    if (!q36_metal_mpp_enabled || q36_quality) return 0;
+    const char *value = getenv("Q36_METAL_MOE_MPP_MASK");
+    return value ? atoi(value) & 7 : 7;
 }
 
 enum {
@@ -127,9 +192,11 @@ static id<MTLBuffer> q36_moe_gate_scratch;
 static id<MTLBuffer> q36_moe_up_scratch;
 static id<MTLBuffer> q36_moe_down_scratch;
 static id<MTLBuffer> q36_moe_id_map;
+static id<MTLBuffer> q36_moe_mid_f16_scratch;
 static NSUInteger q36_moe_pair_scratch_bytes;
 static NSUInteger q36_moe_down_scratch_bytes;
 static NSUInteger q36_moe_id_map_bytes;
+static NSUInteger q36_moe_mid_f16_scratch_bytes;
 static id<MTLBuffer> q36_shared_gate_scratch;
 static id<MTLBuffer> q36_shared_up_scratch;
 static id<MTLBuffer> q36_shared_down_scratch;
@@ -330,6 +397,32 @@ static id<MTLComputePipelineState> q36_pipeline_mm(
     p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
     if (!p) {
         fprintf(stderr, "q36: Metal MM pipeline %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    q36_pipelines[key] = p;
+    return p;
+}
+
+static id<MTLComputePipelineState> q36_pipeline_mm_id(
+        NSString *name, bool bc_inp) {
+    NSString *key = [NSString stringWithFormat:@"%@#mmid%d",
+                     name, bc_inp ? 1 : 0];
+    id<MTLComputePipelineState> p = q36_pipelines[key];
+    if (p) return p;
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&bc_inp type:MTLDataTypeBool atIndex:700];
+    NSError *error = nil;
+    id<MTLFunction> fn = [q36_library newFunctionWithName:name
+                                          constantValues:constants error:&error];
+    if (!fn) {
+        fprintf(stderr, "q36: Metal MM-ID function %s failed: %s\n",
+                name.UTF8String, error.localizedDescription.UTF8String);
+        return nil;
+    }
+    p = [q36_device newComputePipelineStateWithFunction:fn error:&error];
+    if (!p) {
+        fprintf(stderr, "q36: Metal MM-ID pipeline %s failed: %s\n",
                 name.UTF8String, error.localizedDescription.UTF8String);
         return nil;
     }
@@ -663,6 +756,9 @@ int q36_gpu_init(void) {
             return 0;
         }
         q36_gpu_print_device_summary();
+        q36_metal_mpp_enabled = q36_metal_detect_mpp();
+        if (q36_metal_mpp_enabled)
+            fprintf(stderr, "q36: Metal TensorOps routed-MoE prefill enabled\n");
         q36_queue = [q36_device newCommandQueue];
         if (!q36_queue) {
             q36_device = nil;
@@ -671,6 +767,8 @@ int q36_gpu_init(void) {
         }
         NSError *error = nil;
         MTLCompileOptions *options = [MTLCompileOptions new];
+        if (q36_metal_mpp_enabled)
+            options.preprocessorMacros = @{ @"Q36_METAL_HAS_TENSOR": @"1" };
         if (@available(macOS 15.0, *)) {
             options.mathMode = MTLMathModeFast;
         } else {
@@ -711,9 +809,12 @@ void q36_gpu_cleanup(void) {
         q36_moe_up_scratch = nil;
         q36_moe_down_scratch = nil;
         q36_moe_id_map = nil;
+        q36_moe_mid_f16_scratch = nil;
         q36_moe_pair_scratch_bytes = 0;
         q36_moe_down_scratch_bytes = 0;
         q36_moe_id_map_bytes = 0;
+        q36_moe_mid_f16_scratch_bytes = 0;
+        q36_metal_mpp_enabled = false;
         q36_shared_gate_scratch = nil;
         q36_shared_up_scratch = nil;
         q36_shared_down_scratch = nil;
@@ -2974,6 +3075,18 @@ static int q36_moe_ensure_scratch(uint64_t pair_bytes, uint64_t down_bytes) {
     return 1;
 }
 
+static int q36_moe_ensure_mid_f16_scratch(uint64_t bytes) {
+    if (bytes > NSUIntegerMax) return 0;
+    if (q36_moe_mid_f16_scratch_bytes < bytes) {
+        q36_moe_mid_f16_scratch = [q36_device
+            newBufferWithLength:(NSUInteger)bytes
+                        options:MTLResourceStorageModePrivate];
+        if (!q36_moe_mid_f16_scratch) return 0;
+        q36_moe_mid_f16_scratch_bytes = (NSUInteger)bytes;
+    }
+    return 1;
+}
+
 static const char *q36_moe_mm_map_name(uint32_t used, bool compact) {
     if (compact) {
         return used == 8u
@@ -3015,21 +3128,31 @@ static int q36_moe_ensure_id_map(
     return 1;
 }
 
-static q36_moe_mm_args q36_moe_make_mm_args(
+static q36_moe_mm_args q36_moe_make_mm_args_size(
         uint32_t cols, uint32_t rows, uint32_t experts,
         uint64_t row_bytes, uint64_t expert_bytes,
-        uint32_t rhs_rows, uint32_t used, uint32_t tokens) {
+        uint32_t rhs_rows, uint32_t used, uint32_t tokens,
+        uint64_t rhs_size) {
     return (q36_moe_mm_args) {
         .ne00 = (int32_t)cols, .ne02 = (int32_t)experts,
         .nb01 = row_bytes, .nb02 = expert_bytes,
         .nb03 = expert_bytes * experts, .ne11 = (int32_t)rhs_rows,
-        .nb10 = sizeof(float), .nb11 = (uint64_t)cols * sizeof(float),
-        .nb12 = (uint64_t)rhs_rows * cols * sizeof(float),
-        .nb13 = (uint64_t)tokens * rhs_rows * cols * sizeof(float),
+        .nb10 = rhs_size, .nb11 = (uint64_t)cols * rhs_size,
+        .nb12 = (uint64_t)rhs_rows * cols * rhs_size,
+        .nb13 = (uint64_t)tokens * rhs_rows * cols * rhs_size,
         .ne20 = (int32_t)used, .ne21 = (int32_t)tokens,
         .ne0 = (int32_t)rows, .ne1 = (int32_t)used,
         .r2 = 1, .r3 = 1, .tp_world = 1,
     };
+}
+
+static q36_moe_mm_args q36_moe_make_mm_args(
+        uint32_t cols, uint32_t rows, uint32_t experts,
+        uint64_t row_bytes, uint64_t expert_bytes,
+        uint32_t rhs_rows, uint32_t used, uint32_t tokens) {
+    return q36_moe_make_mm_args_size(
+        cols, rows, experts, row_bytes, expert_bytes,
+        rhs_rows, used, tokens, sizeof(float));
 }
 
 typedef struct {
@@ -3204,11 +3327,14 @@ static int q36_moe_gpu(
     const char *compact_env = getenv("Q36_METAL_MOE_COMPACT");
     const bool compact = iq2_q2 && used == 8u &&
         (!compact_env || compact_env[0] != '0');
+    const int mpp_mask = compact ? q36_metal_moe_mpp_mask() : 0;
     const char *map_name = q36_moe_mm_map_name(used, compact);
     bool use_mm = tokens >= 64u && !q36_micro_batch && map_name &&
         (!mm_env || mm_env[0] != '0');
+    bool mid_f16 = mpp_mask != 0 && use_mm;
     id<MTLComputePipelineState> map_pipeline = nil;
     id<MTLComputePipelineState> gate_pipeline = nil;
+    id<MTLComputePipelineState> up_pipeline = nil;
     id<MTLComputePipelineState> down_pipeline = nil;
     if (use_mm) {
         map_pipeline = q36_pipeline_mm(
@@ -3218,24 +3344,40 @@ static int q36_moe_gpu(
             (q4 ? @"kernel_mul_mm_id_q4_K_f32"
                 : @"kernel_mul_mm_id_iq2_xxs_f32"),
             false, true);
+        up_pipeline = gate_pipeline;
         down_pipeline = q36_pipeline_mm(
-            compact ? @"kernel_mul_mm_id_q2_K_f32_compact" :
+            compact ? (mid_f16
+                ? @"kernel_mul_mm_id_q2_K_f16_compact"
+                : @"kernel_mul_mm_id_q2_K_f32_compact") :
             (q4 ? @"kernel_mul_mm_id_q4_K_f32"
                 : @"kernel_mul_mm_id_q2_K_f32"),
             false, true);
+        if (mpp_mask & 1)
+            gate_pipeline = q36_pipeline_mm_id(
+                @"kernel_mul_mm_id_iq2_xxs_f32_mpp", false);
+        if (mpp_mask & 2)
+            up_pipeline = q36_pipeline_mm_id(
+                @"kernel_mul_mm_id_iq2_xxs_f32_mpp", false);
+        if (mpp_mask & 4)
+            down_pipeline = q36_pipeline_mm_id(
+                @"kernel_mul_mm_id_q2_K_f16_mpp", false);
         const uint64_t map_shmem =
             (uint64_t)weight_experts * used * sizeof(uint16_t);
-        use_mm = map_pipeline && gate_pipeline && down_pipeline &&
+        use_mm = map_pipeline && gate_pipeline && up_pipeline && down_pipeline &&
             weight_experts <= map_pipeline.maxTotalThreadsPerThreadgroup &&
             128u <= gate_pipeline.maxTotalThreadsPerThreadgroup &&
+            128u <= up_pipeline.maxTotalThreadsPerThreadgroup &&
             128u <= down_pipeline.maxTotalThreadsPerThreadgroup &&
             map_shmem <= q36_device.maxThreadgroupMemoryLength &&
             8192u <= q36_device.maxThreadgroupMemoryLength;
         if (use_mm) {
             use_mm = q36_moe_ensure_id_map(
-                weight_experts, tokens, used, compact);
+                         weight_experts, tokens, used, compact) &&
+                (!mid_f16 || q36_moe_ensure_mid_f16_scratch(
+                    pairs * mid_dim * sizeof(uint16_t)));
         }
     }
+    if (!use_mm) mid_f16 = false;
 
     q36_moe_mm_args gate_mm = {0};
     q36_moe_mm_args down_mm = {0};
@@ -3269,9 +3411,10 @@ static int q36_moe_gpu(
         gate_mm = q36_moe_make_mm_args(
             in_dim, mid_dim, weight_experts, grb, gate_stride,
             1, used, tokens);
-        down_mm = q36_moe_make_mm_args(
+        down_mm = q36_moe_make_mm_args_size(
             mid_dim, out_dim, weight_experts, drb, down_stride,
-            used, used, tokens);
+            used, used, tokens,
+            mid_f16 ? sizeof(uint16_t) : sizeof(float));
         mm_blocks = compact
             ? (NSUInteger)(((uint64_t)tokens * used + 31u) / 32u +
                            weight_experts)
@@ -3313,7 +3456,7 @@ static int q36_moe_gpu(
 
         enc = [q36_batch computeCommandEncoder];
         enc.label = @"moe.up.kernel_mul_mm_id_iq2_xxs_f32";
-        [enc setComputePipelineState:gate_pipeline];
+        [enc setComputePipelineState:up_pipeline];
         [enc setBytes:&gate_mm length:sizeof(gate_mm) atIndex:0];
         [enc setBuffer:ub offset:(NSUInteger)uo atIndex:1];
         [enc setBuffer:x->buffer offset:x->offset atIndex:2];
@@ -3350,12 +3493,15 @@ static int q36_moe_gpu(
         mid_dim, used, tokens, gate->has_scales, up->has_scales,
         down_sum && down->has_scales
     };
-    enc = q36_encoder(@"q36_moe_activation_f32");
+    enc = q36_encoder(mid_f16 ? @"q36_moe_activation_f16"
+                              : @"q36_moe_activation_f32");
     if (!enc) return 0;
     /* Activation consumes gate element i before replacing the same element
      * with SiLU(gate)*up.  Reusing the gate buffer removes one 16 MiB
      * 1024-token routed-expert scratch allocation without changing order. */
-    [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:0];
+    [enc setBuffer:(mid_f16 ? q36_moe_mid_f16_scratch
+                            : q36_moe_gate_scratch)
+            offset:0 atIndex:0];
     [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:1];
     [enc setBuffer:q36_moe_up_scratch offset:0 atIndex:2];
     [enc setBuffer:selected->buffer offset:selected->offset atIndex:3];
@@ -3391,7 +3537,9 @@ static int q36_moe_gpu(
     if (use_mm) {
         [enc setBytes:&down_mm length:sizeof(down_mm) atIndex:0];
         [enc setBuffer:db offset:(NSUInteger)doff atIndex:1];
-        [enc setBuffer:q36_moe_gate_scratch offset:0 atIndex:2];
+        [enc setBuffer:(mid_f16 ? q36_moe_mid_f16_scratch
+                                : q36_moe_gate_scratch)
+                offset:0 atIndex:2];
         [enc setBuffer:q36_moe_id_map offset:0 atIndex:3];
         [enc setBuffer:q36_moe_id_map offset:map_ids_offset atIndex:4];
         [enc setBuffer:q36_moe_down_scratch offset:0 atIndex:5];
