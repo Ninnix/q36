@@ -271,6 +271,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
+    opt(fp, c, "--edit-upto", "Enable anchored [upto] edits. Exact old/new replacement is the default.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and native tool-call debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
@@ -502,7 +503,7 @@ static void print_topic(FILE *fp, const help_colors *c, q36_help_tool tool, cons
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through browser-backed web tools.");
         para(fp, c, "Tool calls use Qwen's native function and parameter tags and render live in the terminal.");
-        para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
+        para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables unique head/tail anchored edits.");
         fputc('\n', fp);
     } else if (tool == Q36_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
     else if (tool == Q36_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);

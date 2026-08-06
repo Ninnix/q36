@@ -136,6 +136,8 @@ not evidence of parity.
   compatibility input, not the current writer format.
 - Interrupt a long prefill, restart from a disk checkpoint, and compare the
   next greedy token with an uninterrupted run.
+- Load the same disk checkpoint twice. Both restores must succeed and normal
+  hit accounting must retain the checkpoint file for later reuse.
 - Corrupt or truncate a disposable cache file and require a clean rejection,
   never a partial restore.
 
@@ -161,6 +163,10 @@ not evidence of parity.
 - Exercise non-streaming and streaming requests for:
   `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, and
   `/v1/messages`.
+- Send malformed duplicate owned-string fields and non-finite numeric fields to
+  all four endpoints. Every request must be rejected without a crash or leak.
+- Replay a 4096-call tool history with disk KV enabled. Validation and exact
+  tool restoration must complete without quadratic slowdown.
 - For `/v1/responses`, test string input, message input, function calls,
   function-call outputs, reasoning summary output, and SSE completion events.
 - With `--cors`, send an `OPTIONS` request and require all three
@@ -188,6 +194,10 @@ not evidence of parity.
   full residency in the startup log. Repeat with `--ssd-streaming` and require
   SSD streaming.
 - Run one non-interactive tool call and one interactive edit/read loop.
+- Verify exact old/new edit replacement by default, then repeat an anchored
+  edit with `--edit-upto`; the default prompt must not advertise `[upto]`.
+- Truncate a disposable agent cache and forge impossible text/title lengths;
+  listing and loading must reject it without allocating from untrusted sizes.
 - Verify generated calls use Qwen native tags and Hermes tool schemas; no
   foreign protocol parser or prompt text may be present.
 - Exercise queued input and require `+QUARKSTAR_QUEUED` and

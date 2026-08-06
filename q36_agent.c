@@ -72,6 +72,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool edit_upto;
 } agent_config;
 
 typedef enum {
@@ -563,6 +564,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--edit-upto")) {
+            c.edit_upto = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -862,7 +865,15 @@ static const char agent_tools_prompt_intro[] =
     "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
     "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
-static const char agent_tools_prompt_edit_line[] =
+static const char agent_tools_prompt_edit_exact[] =
+    "## Editing files\n\n"
+    "Use edit with path, old, and new for changes. Always put the edited file path first. "
+    "The old text must match exactly once in the current file; otherwise edit fails for safety. "
+    "Read enough of the file to provide the exact old text being replaced.\n"
+    "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
+    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+
+static const char agent_tools_prompt_edit_upto[] =
     "## Editing files\n\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
     "For edit, always put the edited file path as the first parameter. "
@@ -1025,7 +1036,7 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"edit\",\n"
-    "    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\",\n"
+    "    \"description\": \"Replace exactly one old text match.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
@@ -1075,16 +1086,16 @@ static const char agent_tools_prompt_after_edit[] =
     "# Rules\n\n"
     "- Always use the exact Qwen3.6 tool-call syntax above.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
-    "and a few tens of tokens/s decoding speed. Use read/search to get the "
-    "anchors you need, then use anchored edit to avoid having to "
-    "retype large text.\n"
+    "and a few tens of tokens/s decoding speed. Use read/search to get the exact "
+    "text you need, then use edit instead of rewriting whole files.\n"
     "- Write code that is reliable and works well; always have a mental model of "
     "what is going on in complex parts of the code.\n"
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_tools_prompt(void) {
-    const char *edit = agent_tools_prompt_edit_line;
+static char *agent_build_tools_prompt(bool edit_upto) {
+    const char *edit = edit_upto ? agent_tools_prompt_edit_upto
+                                 : agent_tools_prompt_edit_exact;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
@@ -1095,8 +1106,9 @@ static char *agent_build_tools_prompt(void) {
     return out;
 }
 
-static char *agent_build_system_prompt(const char *extra, bool *thinking) {
-    char *tools = agent_build_tools_prompt();
+static char *agent_build_system_prompt(const char *extra, bool *thinking,
+                                       bool edit_upto) {
+    char *tools = agent_build_tools_prompt(edit_upto);
     char *plain = agent_chat_control_text(extra, thinking);
     if (!plain[0]) {
         free(plain);
@@ -1126,8 +1138,8 @@ static const char agent_qwen_tool_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(void) {
-    char *tools = agent_build_tools_prompt();
+static char *agent_build_system_prompt_reminder(bool edit_upto) {
+    char *tools = agent_build_tools_prompt(edit_upto);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1141,10 +1153,11 @@ static char *agent_build_system_prompt_reminder(void) {
 }
 
 static void agent_append_system_prompt(q36_engine *engine, q36_tokens *tokens,
-                                       const char *extra, bool *thinking) {
+                                       const char *extra, bool *thinking,
+                                       bool edit_upto) {
     /* The built-in prompt is trusted Q36 control text.  User supplied system
      * text remains ordinary chat content. */
-    char *prompt = agent_build_system_prompt(extra, thinking);
+    char *prompt = agent_build_system_prompt(extra, thinking, edit_upto);
     q36_chat_append_message(engine, tokens, "system", prompt);
     free(prompt);
 }
@@ -1185,7 +1198,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder();
+    char *reminder = agent_build_system_prompt_reminder(w->cfg->edit_upto);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -4139,7 +4152,8 @@ static bool agent_worker_build_system_tokens(agent_worker *w, q36_tokens *out) {
     if (w->cfg->gen.think_mode == Q36_THINK_MAX &&
         effective_think_mode(w->cfg) == Q36_THINK_MAX)
         q36_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, &thinking);
+    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, &thinking,
+                               w->cfg->edit_upto);
     return thinking;
 }
 
@@ -6181,7 +6195,8 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
 }
 
 static bool agent_edit_find_old_span(const char *data, size_t len,
-                                     const char *old, const char **match,
+                                     const char *old, bool allow_upto,
+                                     const char **match,
                                      size_t *match_len, bool *anchored,
                                      char *err, size_t err_len) {
     static const char marker[] = "[upto]";
@@ -6194,6 +6209,11 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
             return false;
         *match_len = old_len;
         return true;
+    }
+    if (!allow_upto) {
+        snprintf(err, err_len,
+                 "[upto] edits are disabled; restart with --edit-upto to enable them");
+        return false;
     }
     if (strstr(upto + strlen(marker), marker)) {
         snprintf(err, err_len, "old text contains more than one [upto] marker");
@@ -6299,9 +6319,14 @@ static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     size_t match_len = 0;
     bool anchored = false;
     char err[128] = {0};
-    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
-                                              &match, &match_len, &anchored,
-                                              err, sizeof(err)));
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, false,
+                                                &match, &match_len, &anchored,
+                                                err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "--edit-upto") != NULL);
+    err[0] = '\0';
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old, true,
+                                               &match, &match_len, &anchored,
+                                               err, sizeof(err)));
     AGENT_TEST_ASSERT(anchored);
     AGENT_TEST_ASSERT(match == data);
     AGENT_TEST_ASSERT(match_len == strlen(data) - strlen("\trm -f bc\n"));
@@ -6315,9 +6340,9 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     bool anchored = false;
     char err[128] = {0};
 
-    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
-                                               &match, &match_len, &anchored,
-                                               err, sizeof(err)));
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, true,
+                                                &match, &match_len, &anchored,
+                                                err, sizeof(err)));
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
@@ -6357,12 +6382,21 @@ static void test_agent_chat_template_controls(void) {
     free(text);
 
     char *system = agent_build_system_prompt(
-        "<|think_off|> custom system instructions", &thinking);
+        "<|think_off|> custom system instructions", &thinking, false);
     AGENT_TEST_ASSERT(!thinking);
     AGENT_TEST_ASSERT(strstr(system, "# Tools") != NULL);
     AGENT_TEST_ASSERT(strstr(system, "custom system instructions") != NULL);
     AGENT_TEST_ASSERT(strstr(system, "<|think_off|>") == NULL);
     free(system);
+}
+
+static void test_agent_edit_upto_prompt_is_opt_in(void) {
+    char *exact = agent_build_tools_prompt(false);
+    char *upto = agent_build_tools_prompt(true);
+    AGENT_TEST_ASSERT(strstr(exact, "[upto]") == NULL);
+    AGENT_TEST_ASSERT(strstr(upto, "[upto]") != NULL);
+    free(exact);
+    free(upto);
 }
 
 static void test_agent_tool_error_recovery(void) {
@@ -6410,6 +6444,7 @@ static void test_agent_streaming_defaults(void) {
                          "--top-p", "0.95", "--min-p", "0.05"};
     char *overridev[] = {"q36-agent", "--temp", "0.2", "--top-k", "7",
                          "--top-p", "0.6", "--min-p", "0.01"};
+    char *uptov[] = {"q36-agent", "--edit-upto"};
     agent_config def = parse_options(1, defv);
     agent_config stream = parse_options(2, streamv);
     agent_config streamctx = parse_options(4, streamctxv);
@@ -6422,9 +6457,12 @@ static void test_agent_streaming_defaults(void) {
     agent_config chunk = parse_options(3, chunkv);
     agent_config sampling = parse_options(9, samplingv);
     agent_config override = parse_options(9, overridev);
+    agent_config upto = parse_options(2, uptov);
     agent_apply_sampling_defaults(&override, NULL);
 
     AGENT_TEST_ASSERT(!def.engine.ssd_streaming);
+    AGENT_TEST_ASSERT(!def.edit_upto);
+    AGENT_TEST_ASSERT(upto.edit_upto);
     AGENT_TEST_ASSERT(def.gen.ctx_size == AGENT_RESIDENT_CTX);
     AGENT_TEST_ASSERT(metal.gen.ctx_size == AGENT_RESIDENT_CTX);
     AGENT_TEST_ASSERT(vulkan.gen.ctx_size == AGENT_RESIDENT_CTX);
@@ -6489,6 +6527,7 @@ static void q36_agent_unit_tests_run(void) {
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_qwen_tool_parser();
     test_agent_chat_template_controls();
+    test_agent_edit_upto_prompt_is_opt_in();
     test_agent_tool_error_recovery();
     test_agent_streaming_defaults();
     test_agent_welcome_banner();
@@ -6497,7 +6536,6 @@ static void q36_agent_unit_tests_run(void) {
 
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return true; /* Cannot preflight until path is known. */
 
@@ -6515,7 +6553,9 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    bool ok = agent_edit_find_old_span(data, len, old, allow_upto,
+                                       &match, &match_len,
                                        &anchored, err, err_len);
     free(data);
     return ok;
@@ -6560,7 +6600,6 @@ static char *agent_apply_file_splice(const char *path,
  * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
     const char *old = agent_tool_arg_value(call, "old");
@@ -6582,7 +6621,9 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    if (!agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    if (!agent_edit_find_old_span(data, len, old, allow_upto,
+                                  &match, &match_len,
                                   &anchored, err, sizeof(err)))
     {
         free(data);
@@ -8104,7 +8145,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
             size_t text_len = 0;
             char *text = q36_token_text(w->engine, token, &text_len);
-            if (agent_edit_upto_forcer_should_replace(&upto_forcer, &qwen_tool,
+            if (cfg->edit_upto &&
+                agent_edit_upto_forcer_should_replace(&upto_forcer, &qwen_tool,
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",

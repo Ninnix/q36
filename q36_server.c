@@ -280,7 +280,7 @@ static bool json_number(const char **p, double *out) {
     json_ws(p);
     char *end = NULL;
     double v = strtod(*p, &end);
-    if (end == *p) return false;
+    if (end == *p || !isfinite(v)) return false;
     *p = end;
     *out = v;
     return true;
@@ -6171,31 +6171,37 @@ static void sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
-static bool id_list_contains(const stop_list *ids, const char *id) {
-    if (!ids || !id || !id[0]) return false;
-    for (int i = 0; i < ids->len; i++) {
-        if (ids->v[i] && !strcmp(ids->v[i], id)) return true;
-    }
-    return false;
+typedef struct {
+    rax *ids;
+} id_set;
+
+static void id_set_init(id_set *set) {
+    set->ids = raxNew();
+    if (!set->ids) die("out of memory");
 }
 
-static void id_list_push_unique(stop_list *ids, const char *id) {
-    if (!ids || !id || !id[0] || id_list_contains(ids, id)) return;
-    stop_list_push(ids, xstrdup(id));
+static bool id_set_contains(const id_set *set, const char *id) {
+    if (!set || !set->ids || !id || !id[0]) return false;
+    return raxFind(set->ids, (unsigned char *)id, strlen(id)) != raxNotFound;
 }
 
-static void id_list_free(stop_list *ids) {
-    stop_list_clear(ids);
-    free(ids->v);
-    memset(ids, 0, sizeof(*ids));
+static void id_set_add(id_set *set, const char *id) {
+    if (!set || !set->ids || !id || !id[0] || id_set_contains(set, id)) return;
+    if (!raxInsert(set->ids, (unsigned char *)id, strlen(id), (void *)1, NULL))
+        die("out of memory");
 }
 
-static void collect_tool_call_ids(const chat_msgs *msgs, stop_list *ids) {
+static void id_set_free(id_set *set) {
+    if (set && set->ids) raxFree(set->ids);
+    if (set) memset(set, 0, sizeof(*set));
+}
+
+static void collect_tool_call_ids(const chat_msgs *msgs, id_set *ids) {
     if (!msgs || !ids) return;
     for (int i = 0; i < msgs->len; i++) {
         const tool_calls *calls = &msgs->v[i].calls;
         for (int j = 0; j < calls->len; j++) {
-            id_list_push_unique(ids, calls->v[j].id);
+            id_set_add(ids, calls->v[j].id);
         }
     }
 }
@@ -6389,7 +6395,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     return ok;
 }
 
-static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wanted) {
+static int kv_tool_map_load_from_pos(server *s, FILE *fp, const id_set *wanted) {
     if (!s || s->disable_exact_tool_replay || !fp) return 0;
     uint8_t h[KV_TOOL_MAP_HEADER];
     size_t n = fread(h, 1, sizeof(h), fp);
@@ -6414,7 +6420,7 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
                   fread(qwen_tool, 1, qwen_tool_len, fp) == qwen_tool_len;
         id[id_len] = '\0';
         qwen_tool[qwen_tool_len] = '\0';
-        if (ok && (!wanted || id_list_contains(wanted, id))) {
+        if (ok && (!wanted || id_set_contains(wanted, id))) {
             tool_memory_put_source(s, id, qwen_tool, TOOL_MEMORY_DISK);
             loaded++;
         }
@@ -6526,13 +6532,17 @@ static bool kv_cache_touch_file(const char *path, uint32_t hits) {
 
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
     if (!s || s->disable_exact_tool_replay || !s->kv.enabled || !msgs) return;
-    stop_list wanted = {0};
+    id_set wanted = {0};
+    id_set_init(&wanted);
     collect_tool_call_ids(msgs, &wanted);
-    if (wanted.len == 0) return;
+    if (raxSize(wanted.ids) == 0) {
+        id_set_free(&wanted);
+        return;
+    }
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {
-        id_list_free(&wanted);
+        id_set_free(&wanted);
         return;
     }
     struct dirent *de;
@@ -6558,7 +6568,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         fclose(fp);
     }
     closedir(d);
-    id_list_free(&wanted);
+    id_set_free(&wanted);
 }
 
 static double kv_entry_eviction_score(const kv_entry *e, const q36_tokens *live) {
@@ -11441,6 +11451,50 @@ static void test_json_owned_replacement_is_atomic(void) {
     TEST_ASSERT(!json_int(&p, &integer));
     p = "Infinity";
     TEST_ASSERT(!json_int(&p, &integer));
+
+    double number = 0.0;
+    p = "NaN";
+    TEST_ASSERT(!json_number(&p, &number));
+    p = "-Infinity";
+    TEST_ASSERT(!json_number(&p, &number));
+    p = "1e9999";
+    TEST_ASSERT(!json_number(&p, &number));
+}
+
+static void test_api_parsers_reject_nonfinite_numbers(void) {
+    request r;
+    char err[160];
+
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"messages\":[],\"temperature\":NaN}", 128, 4096,
+        &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"input\":[],\"top_p\":Infinity}", 128, 4096,
+        &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+        "{\"messages\":[],\"presence_penalty\":-Infinity}", 128, 4096,
+        &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_completion_request(NULL,
+        "{\"prompt\":\"hello\",\"frequency_penalty\":1e9999}", 128, 4096,
+        &r, err, sizeof(err)));
+}
+
+static void test_api_parsers_reject_malformed_duplicate_strings(void) {
+    request r;
+    char err[160];
+
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"messages\":[],\"model\":\"first\",\"model\":\"unterminated}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"input\":[],\"instructions\":\"first\",\"instructions\":\"unterminated}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_anthropic_request(NULL, NULL,
+        "{\"messages\":[],\"system\":\"first\",\"system\":\"unterminated}",
+        128, 4096, &r, err, sizeof(err)));
+    TEST_ASSERT(!parse_completion_request(NULL,
+        "{\"prompt\":\"hello\",\"model\":\"first\",\"model\":\"unterminated}",
+        128, 4096, &r, err, sizeof(err)));
 }
 
 static void test_model_metadata_clamps_completion_to_context(void) {
@@ -11677,6 +11731,38 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
+static void test_kv_cache_entry_can_be_touched_twice(void) {
+    char tmpl[] = "/tmp/q36-kv-retain-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *sha = "1111111111111111111111111111111111111111";
+    test_kv_stub_file(dir, sha, KV_REASON_COLD, 512, 0, 100, 0);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    TEST_ASSERT(kv_cache_touch_file(path, 1));
+    TEST_ASSERT(access(path, F_OK) == 0);
+    TEST_ASSERT(kv_cache_touch_file(path, 2));
+    TEST_ASSERT(access(path, F_OK) == 0);
+
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        kv_entry e = {0};
+        uint32_t text_bytes = 0;
+        TEST_ASSERT(kv_read_header(fp, &e, &text_bytes));
+        TEST_ASSERT(e.hits == 2);
+        fclose(fp);
+    }
+
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_text_stub_file(const char *dir, const char *text,
                                    uint32_t tokens, uint64_t payload_bytes) {
     char sha[41];
@@ -11800,6 +11886,38 @@ static void test_kv_tool_map_filters_by_qwen_tool_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
+static void test_tool_id_set_handles_large_history(void) {
+    enum { CALLS = 4096 };
+    chat_msgs msgs = {0};
+    chat_msg msg = {.role = xstrdup("assistant")};
+    char id[64];
+
+    for (int i = 0; i < CALLS; i++) {
+        snprintf(id, sizeof(id), "call_%d", i);
+        tool_call call = {
+            .id = xstrdup(id),
+            .name = xstrdup("tool"),
+            .arguments = xstrdup("{}"),
+        };
+        tool_calls_push(&msg.calls, call);
+    }
+    chat_msgs_push(&msgs, msg);
+
+    id_set ids = {0};
+    id_set_init(&ids);
+    collect_tool_call_ids(&msgs, &ids);
+    TEST_ASSERT(raxSize(ids.ids) == CALLS);
+    for (int i = 0; i < CALLS; i++) {
+        snprintf(id, sizeof(id), "call_%d", i);
+        TEST_ASSERT(id_set_contains(&ids, id));
+    }
+    id_set_add(&ids, "call_0");
+    TEST_ASSERT(raxSize(ids.ids) == CALLS);
+
+    id_set_free(&ids);
+    chat_msgs_free(&msgs);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/q36-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -11852,6 +11970,9 @@ static void test_kv_tool_map_restores_before_prompt_render(void) {
     chat_msgs_push(&msgs, a);
 
     kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+    TEST_ASSERT(access(path, F_OK) == 0);
+    kv_cache_restore_tool_memory_for_messages(&dst, &msgs);
+    TEST_ASSERT(access(path, F_OK) == 0);
     tool_replay_stats stats = {0};
     tool_memory_attach_to_messages(&dst, &msgs, &stats);
     TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
@@ -12675,6 +12796,8 @@ static void q36_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_json_string_handles_surrogates();
     test_json_owned_replacement_is_atomic();
+    test_api_parsers_reject_nonfinite_numbers();
+    test_api_parsers_reject_malformed_duplicate_strings();
     test_model_metadata_clamps_completion_to_context();
     test_gguf_counts_are_rejected_before_allocation();
     test_client_socket_nonblocking_flag();
@@ -12685,7 +12808,9 @@ static void q36_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_sha1_bytes_hex_matches_known_vector();
+    test_tool_id_set_handles_large_history();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_entry_can_be_touched_twice();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }
