@@ -187,7 +187,7 @@ def main() -> None:
         + USER
         + story
         + ASSISTANT
-        + "</think>"
+        + "<think>\n\n</think>\n\n"
     )
     (root / "long_context_story_prompt.txt").write_text(rendered, encoding="utf-8")
 

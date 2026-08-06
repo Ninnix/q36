@@ -441,6 +441,18 @@ static char *test_render_hf_chat_prompt(const char *system, const char *prompt, 
     return out;
 }
 
+static char *test_render_legacy_chat_prompt(const char *prompt) {
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+
+    test_append_cstr(&out, &len, &cap, "<|endoftext|><|im_start|>user\n");
+    test_append_cstr(&out, &len, &cap, prompt ? prompt : "");
+    test_append_cstr(&out, &len, &cap,
+                     "<|im_end|>\n<|im_start|>assistant\n</think>");
+    return out;
+}
+
 static void test_encode_prompt_mode(q36_engine *engine,
                                     const char *system,
                                     const char *prompt_text,
@@ -1353,7 +1365,7 @@ static void parity_write_report(const parity_config *cfg,
         fprintf(fp, "Top-line result: **%s**.\n\n", all ? "PASS" : "FAIL");
         fprintf(fp, "Generated: %s\n\n", tbuf);
         fprintf(fp, "Model: `%s`\n\n", cfg->model_path);
-        fprintf(fp, "Corpus: `%d` prompts from `gguf-tools/quality-testing/prompts.jsonl` plus `%d` prompts from `tests/test-vectors/prompts`.\n\n",
+        fprintf(fp, "Corpus: `%d` prompts from `gguf-tools/quality-testing/prompts.jsonl` plus `%d` prompts from `tests/test-vectors/qwen3.6-35b-a3b/prompts`.\n\n",
                 prompts->len - (cfg->skip_long ? 3 : 5), cfg->skip_long ? 3 : 5);
         fprintf(fp, "Run mode: empty system prompt, no-thinking chat rendering, greedy q36-token trajectory, max `%d` generated positions per prompt, ctx `%d`.\n\n", cfg->steps, cfg->ctx_size);
         fprintf(fp, "## Pass Criteria\n\n");
@@ -1470,11 +1482,11 @@ static int test_parity_report_main(int argc, char **argv) {
         prompts.len = cfg.quality_limit;
     }
     if ((!cfg.skip_long &&
-         (!parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/long_code_audit.txt", "tv_long_code_audit", "test-vectors/long") ||
-          !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/long_memory_archive.txt", "tv_long_memory_archive", "test-vectors/long"))) ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_code_completion.txt", "tv_short_code_completion", "test-vectors/short") ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_italian_fact.txt", "tv_short_italian_fact", "test-vectors/short") ||
-        !parity_load_test_prompt(&prompts, "tests/test-vectors/prompts/short_reasoning_plain.txt", "tv_short_reasoning_plain", "test-vectors/short")) {
+         (!parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", "tv_long_code_audit", "test-vectors/long") ||
+          !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", "tv_long_memory_archive", "test-vectors/long"))) ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", "tv_short_code_completion", "test-vectors/short") ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", "tv_short_italian_fact", "test-vectors/short") ||
+        !parity_load_test_prompt(&prompts, "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", "tv_short_reasoning_plain", "test-vectors/short")) {
         fprintf(stderr, "parity: failed to load test-vector prompts\n");
         goto done;
     }
@@ -4000,6 +4012,8 @@ typedef struct {
     test_vec_manifest_entry *v;
     int len;
     int cap;
+    char *template;
+    char *checkpoint;
 } test_vec_manifest;
 
 typedef struct {
@@ -4054,6 +4068,8 @@ static void test_vec_manifest_free(test_vec_manifest *manifest) {
         free(manifest->v[i].llamacpp_file);
     }
     free(manifest->v);
+    free(manifest->template);
+    free(manifest->checkpoint);
     memset(manifest, 0, sizeof(*manifest));
 }
 
@@ -4246,7 +4262,11 @@ static bool test_parse_manifest(const char *json, test_vec_manifest *manifest) {
         bool ok = false;
         if (!json_string(&p, &key)) goto fail;
         if (!test_json_expect(&p, ':')) goto fail;
-        if (!strcmp(key, "prompts")) {
+        if (!strcmp(key, "checkpoint")) {
+            ok = json_string(&p, &manifest->checkpoint);
+        } else if (!strcmp(key, "template")) {
+            ok = json_string(&p, &manifest->template);
+        } else if (!strcmp(key, "prompts")) {
             if (!test_json_expect(&p, '[')) goto fail;
             json_ws(&p);
             if (*p != ']') {
@@ -4451,7 +4471,8 @@ static bool test_compare_vector_case(const test_vec_case *vec,
     return true;
 }
 
-static bool test_validate_reference_vector_fixture(const char *vec_path) {
+static bool test_validate_reference_vector_fixture(const char *vec_path,
+                                                   bool *legacy_template) {
     char *root = test_parent_dir(vec_path);
     char *manifest_path = test_join_path(root, "manifest.json");
     char *manifest_text = test_read_file(manifest_path);
@@ -4468,6 +4489,16 @@ static bool test_validate_reference_vector_fixture(const char *vec_path) {
         fprintf(stderr, "q36-test: failed to parse vector manifest %s\n", manifest_path);
         goto done;
     }
+    const char *checkpoint = strrchr(root, '/');
+    checkpoint = checkpoint ? checkpoint + 1 : root;
+    if (!manifest.checkpoint || strcmp(manifest.checkpoint, checkpoint)) {
+        fprintf(stderr, "q36-test: fixture checkpoint mismatch: directory=%s manifest=%s\n",
+                checkpoint, manifest.checkpoint ? manifest.checkpoint : "missing");
+        goto done;
+    }
+    if (legacy_template)
+        *legacy_template = manifest.template &&
+                           !strcmp(manifest.template, "legacy-q36-nothink");
     if (!test_load_vector_cases(vec_path, &cases, &ncases)) {
         fprintf(stderr, "q36-test: failed to parse vector fixture %s\n", vec_path);
         goto done;
@@ -4630,13 +4661,21 @@ static bool test_fill_vector_case(FILE *fp, test_vec_case *vc) {
     return false;
 }
 
-static void test_logprob_vector_case(q36_engine *engine, const test_vec_case *vc, bool hf_template) {
+static void test_logprob_vector_case(q36_engine *engine, const test_vec_case *vc,
+                                     bool hf_template, bool legacy_template) {
     char *prompt_text = test_read_file(vc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) return;
 
     q36_tokens prompt = {0};
-    test_encode_prompt_mode(engine, "", prompt_text, Q36_THINK_NONE, hf_template, &prompt);
+    if (legacy_template) {
+        char *rendered = test_render_legacy_chat_prompt(prompt_text);
+        q36_tokenize_rendered_chat(engine, rendered, &prompt);
+        free(rendered);
+    } else {
+        test_encode_prompt_mode(engine, "", prompt_text, Q36_THINK_NONE,
+                                hf_template, &prompt);
+    }
     free(prompt_text);
 
     q36_session *session = NULL;
@@ -4713,8 +4752,9 @@ static void test_logprob_vectors_one(const char *test_name,
         return;
     }
     const char *path = getenv(env_name);
+    bool legacy_template = false;
     if (!path || !path[0]) path = default_path;
-    TEST_ASSERT(test_validate_reference_vector_fixture(path));
+    TEST_ASSERT(test_validate_reference_vector_fixture(path, &legacy_template));
     FILE *fp = fopen(path, "rb");
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
@@ -4735,7 +4775,7 @@ static void test_logprob_vectors_one(const char *test_name,
         if (!test_fill_vector_case(fp, &vc)) break;
         if (!test_vector_case_selected(vc.id)) continue;
         fprintf(stderr, "q36-test: %s %s\n", test_name, vc.id);
-        test_logprob_vector_case(engine, &vc, hf_template);
+        test_logprob_vector_case(engine, &vc, hf_template, legacy_template);
     }
     fclose(fp);
     q36_engine_close(engine);
@@ -4744,7 +4784,7 @@ static void test_logprob_vectors_one(const char *test_name,
 static void test_logprob_vectors(void) {
     test_logprob_vectors_one("logprob-vectors",
                              "Q36_TEST_VECTOR_FILE",
-                             "tests/test-vectors/llama.vec",
+                             "tests/test-vectors/qwen3.6-35b-a3b/llama.vec",
                              false);
 }
 
@@ -5019,7 +5059,7 @@ static void test_llama_parity_case(q36_engine *engine,
     rendered = test_render_hf_chat_prompt("", prompt_text, Q36_THINK_NONE);
     TEST_ASSERT(rendered != NULL);
     if (!rendered) goto done;
-    q36_tokenize_rendered_chat(engine, rendered, &prompt);
+    q36_encode_chat_prompt(engine, "", prompt_text, Q36_THINK_NONE, &prompt);
     TEST_ASSERT(prompt.len > 0);
     vocab = llama_model_get_vocab(llama_model);
     TEST_ASSERT(test_llama_tokenize_exact(vocab, rendered, &llama_tokens, &llama_len));
@@ -5099,9 +5139,9 @@ done:
 
 static void test_llama_parity_seq(void) {
     static const test_llama_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", 3, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", 3, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5139,8 +5179,8 @@ done:
 
 static void test_llama_parity_seq_long(void) {
     static const test_llama_case cases[] = {
-        {"long_memory_archive", "tests/test-vectors/prompts/long_memory_archive.txt", 4, 4096},
-        {"long_code_audit", "tests/test-vectors/prompts/long_code_audit.txt", 4, 4096},
+        {"long_memory_archive", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", 4, 4096},
+        {"long_code_audit", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", 4, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5178,9 +5218,9 @@ done:
 
 static void test_llama_parity_batch_loose(void) {
     static const test_llama_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", 3, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", 3, 4096},
     };
     q36_engine *engine = NULL;
     struct llama_model *llama_model = NULL;
@@ -5219,8 +5259,8 @@ done:
 
 static void test_vector_fixtures(void) {
     const char *path = getenv("Q36_TEST_LLAMA_VECTOR_FILE");
-    if (!path || !path[0]) path = "tests/test-vectors/llama.vec";
-    TEST_ASSERT(test_validate_reference_vector_fixture(path));
+    if (!path || !path[0]) path = "tests/test-vectors/qwen3.6-35b-a3b/llama.vec";
+    TEST_ASSERT(test_validate_reference_vector_fixture(path, NULL));
 }
 
 static const char *test_tool_call_request_json(void) {
@@ -5329,6 +5369,10 @@ static void test_thinking_generation(void) {
 
     q36_tokens prompt_high = {0};
     q36_encode_chat_prompt(engine, "", thk_prompt, Q36_THINK_HIGH, &prompt_high);
+
+    char *first_text = q36_token_text(engine, prompt_none.v[0], NULL);
+    TEST_ASSERT(first_text && !strcmp(first_text, "<|im_start|>"));
+    free(first_text);
 
     fprintf(stderr, "q36-test: think=HIGH prompt=%d tokens vs think=NONE prompt=%d tokens\n",
             prompt_high.len, prompt_none.len);
@@ -5567,6 +5611,24 @@ static void test_kv_cache_save_restore(void) {
     TEST_ASSERT(q36_session_sync(session, &prompt, err, sizeof(err)) == 0);
     int argmax_after_sync = q36_session_argmax(session);
     TEST_ASSERT(argmax_after_sync == argmax_before);
+
+    FILE *oversized = tmpfile();
+    TEST_ASSERT(oversized != NULL);
+    if (oversized) {
+        uint32_t header[3] = {0x51563336u, 1u, 4096u};
+        int32_t zero = 0;
+        TEST_ASSERT(fwrite(header, sizeof(header), 1, oversized) == 1);
+        for (uint32_t i = 0; i < header[2]; i++)
+            TEST_ASSERT(fwrite(&zero, sizeof(zero), 1, oversized) == 1);
+        rewind(oversized);
+        err[0] = '\0';
+        TEST_ASSERT(q36_session_load_payload(
+                        session, oversized,
+                        sizeof(header) + (uint64_t)header[2] * sizeof(zero),
+                        err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "token-only checkpoint does not fit") != NULL);
+        fclose(oversized);
+    }
 
     q36_session_snapshot_free(&snap);
     q36_session_free(session);
@@ -6004,11 +6066,11 @@ static void test_parity_cache_env(const char *k, const char *v) {
 
 static void test_gpu_cpu_parity(void) {
     static const test_backend_parity_case cases[] = {
-        {"short_italian_fact", "tests/test-vectors/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
-        {"short_code_completion", "tests/test-vectors/prompts/short_code_completion.txt", NULL, Q36_THINK_NONE, true, 2, 4096},
-        {"short_reasoning_plain", "tests/test-vectors/prompts/short_reasoning_plain.txt", NULL, Q36_THINK_NONE, true, 3, 4096},
-        {"long_memory_archive", "tests/test-vectors/prompts/long_memory_archive.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
-        {"long_code_audit", "tests/test-vectors/prompts/long_code_audit.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"short_italian_fact", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"short_code_completion", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt", NULL, Q36_THINK_NONE, true, 2, 4096},
+        {"short_reasoning_plain", "tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt", NULL, Q36_THINK_NONE, true, 3, 4096},
+        {"long_memory_archive", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
+        {"long_code_audit", "tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt", NULL, Q36_THINK_NONE, true, 4, 4096},
     };
     enum { N_CASES = sizeof(cases) / sizeof(cases[0]) };
     test_backend_parity_capture captures[N_CASES];
@@ -6294,7 +6356,7 @@ static void test_qwen_tool_call_format(void) {
     tool_calls_push(&calls, tc);
 
     buf b = {0};
-    append_qwen_tool_calls_text(&b, &calls, NULL);
+    append_qwen_tool_calls_text(&b, &calls, NULL, false);
     const char *rendered = b.ptr ? b.ptr : "";
 
     TEST_ASSERT(strstr(rendered, "<tool_call>") != NULL);
@@ -6328,7 +6390,7 @@ static void test_qwen_tool_call_format(void) {
     tool_calls_push(&multi, tc);
 
     memset(&b, 0, sizeof(b));
-    append_qwen_tool_calls_text(&b, &multi, NULL);
+    append_qwen_tool_calls_text(&b, &multi, NULL, false);
     rendered = b.ptr ? b.ptr : "";
     int count = 0;
     for (const char *p = rendered; (p = strstr(p, "<tool_call>")) != NULL; p++) count++;
@@ -6393,11 +6455,31 @@ static void test_kat_model_support(void) {
         "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
     float temperature, top_p, min_p;
     int top_k;
+    request_apply_model_sampling_defaults(engine, &request);
     request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
     TEST_ASSERT(temperature == 0.7f);
     TEST_ASSERT(top_k == 20);
     TEST_ASSERT(top_p == 0.8f);
-    TEST_ASSERT(min_p == 0.0f);
+    TEST_ASSERT(min_p == 0.05f);
+    request_free(&request);
+
+    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.7f);
+    TEST_ASSERT(top_k == 20);
+    TEST_ASSERT(top_p == 0.8f);
+    TEST_ASSERT(min_p == 0.05f);
+
+    const char *override_body =
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"temperature\":0.2,\"top_k\":7,\"top_p\":0.6,\"min_p\":0.01}";
+    TEST_ASSERT(parse_chat_request(engine, NULL, override_body, 128, 4096,
+                                   &request, err, sizeof(err)));
+    request_apply_model_sampling_defaults(engine, &request);
+    request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.2f);
+    TEST_ASSERT(top_k == 7);
+    TEST_ASSERT(top_p == 0.6f);
+    TEST_ASSERT(min_p == 0.01f);
     request_free(&request);
 
     q36_tokens direct = {0};
@@ -6406,6 +6488,23 @@ static void test_kat_model_support(void) {
     char *first = q36_token_text(engine, direct.v[0], NULL);
     TEST_ASSERT(!strcmp(first, "<|im_start|>"));
     free(first);
+    q36_tokens_free(&direct);
+
+    q36_encode_chat_prompt(engine, " <|think_off|> ", "user",
+                           Q36_THINK_HIGH, &direct);
+    buf direct_text = {0};
+    for (int i = 0; i < direct.len; i++) {
+        size_t len = 0;
+        char *piece = q36_token_text(engine, direct.v[i], &len);
+        buf_append(&direct_text, piece, len);
+        free(piece);
+    }
+    TEST_ASSERT(strstr(direct_text.ptr, "<|im_start|>system") == NULL);
+    TEST_ASSERT(!strncmp(direct_text.ptr, "<|im_start|>user\nuser",
+                         strlen("<|im_start|>user\nuser")));
+    TEST_ASSERT(strstr(direct_text.ptr,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+    buf_free(&direct_text);
     q36_tokens_free(&direct);
 
     q36_tokens_free(&tokens);
@@ -6532,13 +6631,7 @@ static void test_think_tool_recovery_live(void) {
     q36_tokenize_rendered_chat(engine, forced.ptr, &toks);
     TEST_ASSERT(toks.len > 1);
 
-    server srv = {0};
-    srv.engine = engine;
-    srv.session = session;
     size_t scan_from = 0;
-    int completion = 0;
-    int recovered = 0;
-    int trigger = -1;
     for (int i = 0; i < toks.len; i++) {
         TEST_ASSERT(q36_session_eval(session, toks.v[i], err, sizeof(err)) == 0);
         size_t piece_len = 0;
@@ -6546,33 +6639,23 @@ static void test_think_tool_recovery_live(void) {
         buf_append(&text, piece, piece_len);
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
-        recovered = chat_think_tool_recovery(
-            &srv, &text, &thinking, &scan_from, 0,
-            &completion, 512, err, sizeof(err));
-        TEST_ASSERT(recovered >= 0);
-        if (recovered == 1) {
-            trigger = i;
-            break;
-        }
     }
-    TEST_ASSERT(recovered == 1);
-    TEST_ASSERT(trigger == toks.len - 1);
-    TEST_ASSERT(!thinking.inside);
+    TEST_ASSERT(!complete_tool_call_inside_thinking(text.ptr, text.len, &scan_from));
+    TEST_ASSERT(thinking.inside);
 
-    bool saw_start = false;
-    bool saw_end = false;
+    bool recovered = false;
     bool decode_ok = true;
-    for (int i = 0; i < 256 && !saw_end; i++) {
+    int generated = 0;
+    for (; generated < 256 && !recovered; generated++) {
         int token = q36_session_argmax(session);
         if (token < 0 || token == q36_token_eos(engine)) break;
         size_t piece_len = 0;
         char *piece = q36_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        const char *after_think = find_last_substr(text.ptr, "</think>");
-        observe_tool_markers(after_think ? after_think + 8 : "",
-                             &saw_start, &saw_end, NULL);
-        if (saw_end) break;
+        recovered = complete_tool_call_inside_thinking(text.ptr, text.len,
+                                                       &scan_from);
+        if (recovered) break;
         if (q36_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
             break;
@@ -6585,13 +6668,13 @@ static void test_think_tool_recovery_live(void) {
     bool parsed = parse_generated_message_ex(text.ptr, true,
                                               &content, &reasoning, &calls);
     fprintf(stderr,
-            "q36-test: think-tool-recovery trigger=%d/%d recovered=%d calls=%d name=%s\n",
-            trigger, toks.len, recovered, calls.len,
+            "q36-test: think-tool-recovery generated=%d recovered=%d calls=%d name=%s\n",
+            generated, recovered, calls.len,
             calls.len ? calls.v[0].name : "-");
-    if (!saw_end) fprintf(stderr, "q36-test: think-tool-recovery text=[%s]\n",
+    if (!recovered) fprintf(stderr, "q36-test: think-tool-recovery text=[%s]\n",
                           text.ptr ? text.ptr : "");
     TEST_ASSERT(decode_ok);
-    TEST_ASSERT(saw_end);
+    TEST_ASSERT(recovered);
     TEST_ASSERT(parsed);
     TEST_ASSERT(calls.len > 0 && !strcmp(calls.v[0].name, "list_files"));
 
@@ -6709,7 +6792,7 @@ static const q36_test_entry test_entries[] = {
     {"--long-context", "long-context", "long-context continuation regression", test_long_security_continuation},
     {"--tool-call-quality", "tool-call-quality", "model emits valid tool calls", test_tool_call_quality},
     {"--qwen-tool-call-quality", "qwen-tool-call-quality", "model emits native Qwen tool calls", test_qwen_tool_call_quality},
-    {"--think-tool-recovery", "think-tool-recovery", "forced thinking close restarts a native Qwen tool call", test_think_tool_recovery_live},
+    {"--think-tool-recovery", "think-tool-recovery", "complete Qwen tool call is recovered from unclosed thinking", test_think_tool_recovery_live},
     {"--thinking-generation", "thinking-generation", "generation with thinking-mode enabled", test_thinking_generation},
     {"--session-sync-prefix-cpu", "session-sync-prefix-cpu", "CPU session sync extends matching prefixes", test_session_sync_prefix_resume_cpu},
     {"--sampling-controls", "sampling-controls", "CPU sampler honors temperature/top-k/top-p/min-p", test_sampling_controls},

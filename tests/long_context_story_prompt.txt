@@ -2568,4 +2568,7 @@ People to list: Bob, Alice, Clara, Diego, Elena, Felix, Greta, Hugo, Iris, Jonas
 No bullets, no prose, no explanation.
 <|im_end|>
 <|im_start|>assistant
+<think>
+
 </think>
+

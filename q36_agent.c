@@ -72,6 +72,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     bool non_interactive;
+    bool edit_upto;
 } agent_config;
 
 typedef enum {
@@ -145,6 +146,7 @@ typedef struct {
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
     bool datetime_context_injected;
+    bool thinking_enabled;
     char more_path[PATH_MAX];
     int more_next_line;
     bool more_bare;
@@ -562,6 +564,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--edit-upto")) {
+            c.edit_upto = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -764,6 +768,76 @@ static q36_think_mode effective_think_mode(const agent_config *cfg) {
     return q36_think_mode_for_context(cfg->gen.think_mode, cfg->gen.ctx_size);
 }
 
+static q36_think_mode enabled_think_mode(const agent_config *cfg) {
+    q36_think_mode mode = cfg->gen.think_mode;
+    if (mode == Q36_THINK_NONE) mode = Q36_THINK_HIGH;
+    return q36_think_mode_for_context(mode, cfg->gen.ctx_size);
+}
+
+static char *agent_chat_control_text(const char *text, bool *thinking) {
+    static const char think_off[] = "<|think_off|>";
+    static const char think_on[] = "<|think_on|>";
+    const char *remove = NULL;
+    size_t remove_len = 0;
+
+    text = text ? text : "";
+    if (strstr(text, think_off)) {
+        if (thinking) *thinking = false;
+        remove = think_off;
+        remove_len = sizeof(think_off) - 1;
+    } else if (strstr(text, think_on)) {
+        if (thinking) *thinking = true;
+        remove = think_on;
+        remove_len = sizeof(think_on) - 1;
+    }
+
+    size_t len = strlen(text);
+    char *out = xmalloc(len + 1);
+    size_t used = 0;
+    while (remove) {
+        const char *p = strstr(text, remove);
+        if (!p) break;
+        size_t n = (size_t)(p - text);
+        memcpy(out + used, text, n);
+        used += n;
+        text = p + remove_len;
+    }
+    strcpy(out + used, text);
+    used += strlen(text);
+
+    char *start = out;
+    char *end = out + used;
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    char *trimmed = xstrndup(start, (size_t)(end - start));
+    free(out);
+    return trimmed;
+}
+
+static bool agent_initial_thinking_enabled(const agent_config *cfg) {
+    bool thinking = q36_think_mode_enabled(effective_think_mode(cfg));
+    char *plain = agent_chat_control_text(cfg->gen.system, &thinking);
+    free(plain);
+    return thinking;
+}
+
+static bool agent_tool_response_is_error(const char *content) {
+    char lower[500];
+    content = content ? content : "";
+    size_t len = strlen(content);
+    if (len >= sizeof(lower) || strstr(content, "$ ")) return false;
+    for (size_t i = 0; i < len; i++)
+        lower[i] = (char)tolower((unsigned char)content[i]);
+    lower[len] = '\0';
+    if (strstr(lower, "took ")) return false;
+    if (len > 80) lower[80] = '\0';
+    return strstr(lower, "\"error\":") || strstr(lower, "error:") ||
+           strstr(lower, "err!") || strstr(lower, "fatal:") ||
+           strstr(lower, "exception:") || strstr(lower, "traceback") ||
+           strstr(lower, "command not found") || strstr(lower, "invalid syntax") ||
+           strstr(lower, "failed to");
+}
+
 /* ============================================================================
  * System Prompt Rendering And Worker Output Queues
  * ============================================================================
@@ -791,7 +865,15 @@ static const char agent_tools_prompt_intro[] =
     "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
     "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
-static const char agent_tools_prompt_edit_line[] =
+static const char agent_tools_prompt_edit_exact[] =
+    "## Editing files\n\n"
+    "Use edit with path, old, and new for changes. Always put the edited file path first. "
+    "The old text must match exactly once in the current file; otherwise edit fails for safety. "
+    "Read enough of the file to provide the exact old text being replaced.\n"
+    "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
+    "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
+
+static const char agent_tools_prompt_edit_upto[] =
     "## Editing files\n\n"
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
     "For edit, always put the edited file path as the first parameter. "
@@ -954,7 +1036,7 @@ static const char agent_tools_prompt_after_edit[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"edit\",\n"
-    "    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\",\n"
+    "    \"description\": \"Replace exactly one old text match.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
@@ -1004,16 +1086,16 @@ static const char agent_tools_prompt_after_edit[] =
     "# Rules\n\n"
     "- Always use the exact Qwen3.6 tool-call syntax above.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
-    "and a few tens of tokens/s decoding speed. Use read/search to get the "
-    "anchors you need, then use anchored edit to avoid having to "
-    "retype large text.\n"
+    "and a few tens of tokens/s decoding speed. Use read/search to get the exact "
+    "text you need, then use edit instead of rewriting whole files.\n"
     "- Write code that is reliable and works well; always have a mental model of "
     "what is going on in complex parts of the code.\n"
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_tools_prompt(void) {
-    const char *edit = agent_tools_prompt_edit_line;
+static char *agent_build_tools_prompt(bool edit_upto) {
+    const char *edit = edit_upto ? agent_tools_prompt_edit_upto
+                                 : agent_tools_prompt_edit_exact;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
@@ -1021,6 +1103,26 @@ static char *agent_build_tools_prompt(void) {
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
     memcpy(out + a + b, agent_tools_prompt_after_edit, c + 1);
+    return out;
+}
+
+static char *agent_build_system_prompt(const char *extra, bool *thinking,
+                                       bool edit_upto) {
+    char *tools = agent_build_tools_prompt(edit_upto);
+    char *plain = agent_chat_control_text(extra, thinking);
+    if (!plain[0]) {
+        free(plain);
+        return tools;
+    }
+
+    size_t a = strlen(tools);
+    size_t b = strlen(plain);
+    char *out = xmalloc(a + b + 3);
+    memcpy(out, tools, a);
+    memcpy(out + a, "\n\n", 2);
+    memcpy(out + a + 2, plain, b + 1);
+    free(tools);
+    free(plain);
     return out;
 }
 
@@ -1036,8 +1138,8 @@ static const char agent_qwen_tool_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(void) {
-    char *tools = agent_build_tools_prompt();
+static char *agent_build_system_prompt_reminder(bool edit_upto) {
+    char *tools = agent_build_tools_prompt(edit_upto);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1051,23 +1153,13 @@ static char *agent_build_system_prompt_reminder(void) {
 }
 
 static void agent_append_system_prompt(q36_engine *engine, q36_tokens *tokens,
-                                       const char *extra) {
+                                       const char *extra, bool *thinking,
+                                       bool edit_upto) {
     /* The built-in prompt is trusted Q36 control text.  User supplied system
      * text remains ordinary chat content. */
-    char *tools_prompt = agent_build_tools_prompt();
-    if (q36_engine_is_kat_coder(engine))
-        q36_chat_append_message(engine, tokens, "system", tools_prompt);
-    else
-        q36_tokenize_rendered_chat(engine, tools_prompt, tokens);
-    free(tools_prompt);
-
-    if (!extra || !extra[0]) return;
-    size_t n = strlen(extra);
-    char *plain = xmalloc(n + 3);
-    memcpy(plain, "\n\n", 2);
-    memcpy(plain + 2, extra, n + 1);
-    q36_chat_append_message(engine, tokens, "system", plain);
-    free(plain);
+    char *prompt = agent_build_system_prompt(extra, thinking, edit_upto);
+    q36_chat_append_message(engine, tokens, "system", prompt);
+    free(prompt);
 }
 
 static void agent_worker_note_system_prompt_seen(agent_worker *w) {
@@ -1106,28 +1198,20 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder();
+    char *reminder = agent_build_system_prompt_reminder(w->cfg->edit_upto);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
-    if (q36_engine_is_kat_coder(w->engine))
-        q36_chat_append_message(w->engine, &w->transcript, "system", reminder);
-    else
-        q36_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    q36_chat_append_message(w->engine, &w->transcript, "system", reminder);
     free(reminder);
 
     const char *extra = w->cfg->gen.system;
     if (extra && extra[0]) {
-        if (q36_engine_is_kat_coder(w->engine)) {
-            q36_chat_append_message(w->engine, &w->transcript, "system", extra);
-        } else {
-            q36_tokenize_text(w->engine,
-                "\nAdditional system instructions reminder:\n", &w->transcript);
-            q36_tokenize_text(w->engine, extra, &w->transcript);
-            q36_tokenize_text(w->engine,
-                "\n[End additional system instructions reminder.]\n\n",
-                &w->transcript);
-        }
+        bool thinking = w->thinking_enabled;
+        char *plain = agent_chat_control_text(extra, &thinking);
+        if (plain[0])
+            q36_chat_append_message(w->engine, &w->transcript, "system", plain);
+        free(plain);
     }
     agent_worker_note_system_prompt_seen(w);
 }
@@ -3608,6 +3692,32 @@ static char *agent_buf_take(agent_buf *b) {
     return p;
 }
 
+static char *agent_tool_response_add_warning(char *content, int *failures) {
+    if (agent_tool_response_is_error(content)) (*failures)++;
+    else *failures = 0;
+    if (*failures == 0) return content;
+
+    agent_buf out = {0};
+    agent_buf_puts(&out, content);
+    if (*failures >= 2) {
+        char count[32];
+        snprintf(count, sizeof(count), "%d", *failures);
+        agent_buf_puts(&out,
+            "\n\n⚠️ SYSTEM WARNING: ");
+        agent_buf_puts(&out, count);
+        agent_buf_puts(&out,
+            " consecutive tool errors detected. Your previous approach is "
+            "incorrect. You MUST use a fundamentally "
+            "different approach or corrected arguments.");
+    } else {
+        agent_buf_puts(&out,
+            "\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+            "Diagnose the failure and retry with completely corrected arguments.");
+    }
+    free(content);
+    return agent_buf_take(&out);
+}
+
 static bool agent_tokens_equal(const q36_tokens *a, const q36_tokens *b) {
     if (!a || !b || a->len != b->len) return false;
     for (int i = 0; i < a->len; i++) {
@@ -3699,6 +3809,16 @@ static void agent_kv_session_meta_free(agent_kv_session_meta *m) {
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes);
 
+static bool agent_fp_remaining(FILE *fp, uint64_t *remaining) {
+    off_t pos = ftello(fp);
+    if (pos < 0 || fseeko(fp, 0, SEEK_END) != 0) return false;
+    off_t end = ftello(fp);
+    bool ok = end >= pos;
+    if (fseeko(fp, pos, SEEK_SET) != 0) ok = false;
+    if (ok) *remaining = (uint64_t)(end - pos);
+    return ok;
+}
+
 /* Agent sessions deliberately use a different policy from q36-server:
  *
  * - sysprompt.kv is a fixed bootstrap checkpoint for the current tool/system
@@ -3714,6 +3834,11 @@ static char *agent_session_title_from_text(const char *text, size_t text_len,
  * text is retained for listing, history rendering, and stripped-session rebuilds. */
 static bool agent_kv_read_text(FILE *fp, uint32_t text_bytes,
                                char **text_out, char *err, size_t err_len) {
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || text_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated cached text");
+        return false;
+    }
     char *text = xmalloc((size_t)text_bytes + 1);
     if (fread(text, 1, text_bytes, fp) != text_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated cached text");
@@ -3763,6 +3888,12 @@ static bool agent_kv_read_title_trailer(FILE *fp, const q36_kvstore_entry *hdr,
         return false;
     }
     uint32_t title_bytes = q36_kvstore_le_get32(tb);
+    uint64_t remaining = 0;
+    if (!agent_fp_remaining(fp, &remaining) || title_bytes > remaining) {
+        if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
+        fseeko(fp, payload_pos, SEEK_SET);
+        return false;
+    }
     char *title = xmalloc((size_t)title_bytes + 1);
     if (fread(title, 1, title_bytes, fp) != title_bytes) {
         if (err && err_len) snprintf(err, err_len, "truncated agent session title trailer");
@@ -4015,12 +4146,15 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     return ok;
 }
 
-static void agent_worker_build_system_tokens(agent_worker *w, q36_tokens *out) {
+static bool agent_worker_build_system_tokens(agent_worker *w, q36_tokens *out) {
+    bool thinking = q36_think_mode_enabled(effective_think_mode(w->cfg));
     q36_chat_begin(w->engine, out);
     if (w->cfg->gen.think_mode == Q36_THINK_MAX &&
         effective_think_mode(w->cfg) == Q36_THINK_MAX)
         q36_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, &thinking,
+                               w->cfg->edit_upto);
+    return thinking;
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -4218,7 +4352,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const q36_tokens *tokens,
  * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     q36_tokens sys = {0};
-    agent_worker_build_system_tokens(w, &sys);
+    bool thinking = agent_worker_build_system_tokens(w, &sys);
 
     size_t text_len = 0;
     char *text = q36_kvstore_render_tokens_text(w->engine, &sys, &text_len);
@@ -4293,6 +4427,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
+    w->thinking_enabled = thinking;
     agent_worker_clear_session_identity(w);
     free(text);
     q36_tokens_free(&sys);
@@ -5377,6 +5512,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         agent_worker_note_system_prompt_seen(w);
         w->datetime_context_injected = true;
+        w->thinking_enabled = agent_initial_thinking_enabled(w->cfg);
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -6059,7 +6195,8 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
 }
 
 static bool agent_edit_find_old_span(const char *data, size_t len,
-                                     const char *old, const char **match,
+                                     const char *old, bool allow_upto,
+                                     const char **match,
                                      size_t *match_len, bool *anchored,
                                      char *err, size_t err_len) {
     static const char marker[] = "[upto]";
@@ -6072,6 +6209,11 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
             return false;
         *match_len = old_len;
         return true;
+    }
+    if (!allow_upto) {
+        snprintf(err, err_len,
+                 "[upto] edits are disabled; restart with --edit-upto to enable them");
+        return false;
     }
     if (strstr(upto + strlen(marker), marker)) {
         snprintf(err, err_len, "old text contains more than one [upto] marker");
@@ -6122,6 +6264,33 @@ static void agent_test_assert(bool cond, const char *expr,
 #define AGENT_TEST_ASSERT(expr) \
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
+static void test_agent_cache_lengths_are_bounded_by_file(void) {
+    FILE *fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    AGENT_TEST_ASSERT(fwrite("abc", 1, 3, fp) == 3);
+    rewind(fp);
+    char *text = NULL;
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(!agent_kv_read_text(fp, UINT32_MAX, &text,
+                                         err, sizeof(err)));
+    AGENT_TEST_ASSERT(text == NULL);
+    fclose(fp);
+
+    fp = tmpfile();
+    AGENT_TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    uint8_t huge[4] = {0xff, 0xff, 0xff, 0xff};
+    AGENT_TEST_ASSERT(fwrite(huge, 1, sizeof(huge), fp) == sizeof(huge));
+    rewind(fp);
+    q36_kvstore_entry hdr = {0};
+    char *title = NULL;
+    AGENT_TEST_ASSERT(!agent_kv_read_title_trailer(fp, &hdr, &title,
+                                                   err, sizeof(err)));
+    AGENT_TEST_ASSERT(title == NULL);
+    fclose(fp);
+}
+
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     const char *data =
         "CFLAGS = -Wall -Wextra -g\n"
@@ -6150,9 +6319,14 @@ static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     size_t match_len = 0;
     bool anchored = false;
     char err[128] = {0};
-    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
-                                              &match, &match_len, &anchored,
-                                              err, sizeof(err)));
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, false,
+                                                &match, &match_len, &anchored,
+                                                err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "--edit-upto") != NULL);
+    err[0] = '\0';
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old, true,
+                                               &match, &match_len, &anchored,
+                                               err, sizeof(err)));
     AGENT_TEST_ASSERT(anchored);
     AGENT_TEST_ASSERT(match == data);
     AGENT_TEST_ASSERT(match_len == strlen(data) - strlen("\trm -f bc\n"));
@@ -6166,9 +6340,9 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     bool anchored = false;
     char err[128] = {0};
 
-    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
-                                               &match, &match_len, &anchored,
-                                               err, sizeof(err)));
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old, true,
+                                                &match, &match_len, &anchored,
+                                                err, sizeof(err)));
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
@@ -6194,6 +6368,67 @@ static void test_agent_qwen_tool_parser(void) {
     agent_qwen_tool_parser_free(&p);
 }
 
+static void test_agent_chat_template_controls(void) {
+    bool thinking = true;
+    char *text = agent_chat_control_text(
+        "  inspect this <|think_off|> carefully  ", &thinking);
+    AGENT_TEST_ASSERT(!thinking);
+    AGENT_TEST_ASSERT(!strcmp(text, "inspect this  carefully"));
+    free(text);
+
+    text = agent_chat_control_text("<|think_on|> continue", &thinking);
+    AGENT_TEST_ASSERT(thinking);
+    AGENT_TEST_ASSERT(!strcmp(text, "continue"));
+    free(text);
+
+    char *system = agent_build_system_prompt(
+        "<|think_off|> custom system instructions", &thinking, false);
+    AGENT_TEST_ASSERT(!thinking);
+    AGENT_TEST_ASSERT(strstr(system, "# Tools") != NULL);
+    AGENT_TEST_ASSERT(strstr(system, "custom system instructions") != NULL);
+    AGENT_TEST_ASSERT(strstr(system, "<|think_off|>") == NULL);
+    free(system);
+}
+
+static void test_agent_edit_upto_prompt_is_opt_in(void) {
+    char *exact = agent_build_tools_prompt(false);
+    char *upto = agent_build_tools_prompt(true);
+    AGENT_TEST_ASSERT(strstr(exact, "[upto]") == NULL);
+    AGENT_TEST_ASSERT(strstr(upto, "[upto]") != NULL);
+    free(exact);
+    free(upto);
+}
+
+static void test_agent_tool_error_recovery(void) {
+    AGENT_TEST_ASSERT(agent_tool_response_is_error(
+        "Tool result 1 (edit):\nTool error: old text did not match\n"));
+    AGENT_TEST_ASSERT(!agent_tool_response_is_error(
+        "command took 2.0s\nerror: appears in captured output\n"));
+
+    int failures = 0;
+    char *text = agent_tool_response_add_warning(
+        xstrdup("Tool error: first failure"), &failures);
+    AGENT_TEST_ASSERT(failures == 1);
+    AGENT_TEST_ASSERT(strstr(text,
+        "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+        "Diagnose the failure and retry with completely corrected arguments.") != NULL);
+    free(text);
+
+    text = agent_tool_response_add_warning(
+        xstrdup("Tool error: second failure"), &failures);
+    AGENT_TEST_ASSERT(failures == 2);
+    AGENT_TEST_ASSERT(strstr(text,
+        "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
+        "Your previous approach is incorrect. You MUST use a fundamentally "
+        "different approach or corrected arguments.") != NULL);
+    free(text);
+
+    text = agent_tool_response_add_warning(xstrdup("Tool result: ok"), &failures);
+    AGENT_TEST_ASSERT(failures == 0);
+    AGENT_TEST_ASSERT(!strcmp(text, "Tool result: ok"));
+    free(text);
+}
+
 static void test_agent_streaming_defaults(void) {
     char *defv[] = {"q36-agent"};
     char *streamv[] = {"q36-agent", "--ssd-streaming"};
@@ -6209,6 +6444,7 @@ static void test_agent_streaming_defaults(void) {
                          "--top-p", "0.95", "--min-p", "0.05"};
     char *overridev[] = {"q36-agent", "--temp", "0.2", "--top-k", "7",
                          "--top-p", "0.6", "--min-p", "0.01"};
+    char *uptov[] = {"q36-agent", "--edit-upto"};
     agent_config def = parse_options(1, defv);
     agent_config stream = parse_options(2, streamv);
     agent_config streamctx = parse_options(4, streamctxv);
@@ -6221,9 +6457,12 @@ static void test_agent_streaming_defaults(void) {
     agent_config chunk = parse_options(3, chunkv);
     agent_config sampling = parse_options(9, samplingv);
     agent_config override = parse_options(9, overridev);
+    agent_config upto = parse_options(2, uptov);
     agent_apply_sampling_defaults(&override, NULL);
 
     AGENT_TEST_ASSERT(!def.engine.ssd_streaming);
+    AGENT_TEST_ASSERT(!def.edit_upto);
+    AGENT_TEST_ASSERT(upto.edit_upto);
     AGENT_TEST_ASSERT(def.gen.ctx_size == AGENT_RESIDENT_CTX);
     AGENT_TEST_ASSERT(metal.gen.ctx_size == AGENT_RESIDENT_CTX);
     AGENT_TEST_ASSERT(vulkan.gen.ctx_size == AGENT_RESIDENT_CTX);
@@ -6283,9 +6522,13 @@ static void test_agent_welcome_banner(void) {
 }
 
 static void q36_agent_unit_tests_run(void) {
+    test_agent_cache_lengths_are_bounded_by_file();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_qwen_tool_parser();
+    test_agent_chat_template_controls();
+    test_agent_edit_upto_prompt_is_opt_in();
+    test_agent_tool_error_recovery();
     test_agent_streaming_defaults();
     test_agent_welcome_banner();
 }
@@ -6293,7 +6536,6 @@ static void q36_agent_unit_tests_run(void) {
 
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return true; /* Cannot preflight until path is known. */
 
@@ -6311,7 +6553,9 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    bool ok = agent_edit_find_old_span(data, len, old, allow_upto,
+                                       &match, &match_len,
                                        &anchored, err, err_len);
     free(data);
     return ok;
@@ -6356,7 +6600,6 @@ static char *agent_apply_file_splice(const char *path,
  * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
     const char *old = agent_tool_arg_value(call, "old");
@@ -6378,7 +6621,9 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
-    if (!agent_edit_find_old_span(data, len, old, &match, &match_len,
+    bool allow_upto = w && w->cfg && w->cfg->edit_upto;
+    if (!agent_edit_find_old_span(data, len, old, allow_upto,
+                                  &match, &match_len,
                                   &anchored, err, sizeof(err)))
     {
         free(data);
@@ -7433,7 +7678,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     if (bottom <= 0) return true;
 
     q36_tokens sys = {0};
-    agent_worker_build_system_tokens(w, &sys);
+    (void)agent_worker_build_system_tokens(w, &sys);
     if (bottom <= sys.len) {
         q36_tokens_free(&sys);
         return true;
@@ -7738,7 +7983,6 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
  * the model-native Qwen tool iteration without a client/server protocol. */
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
-    q36_think_mode think_mode = effective_think_mode(cfg);
     pthread_mutex_lock(&w->mu);
     w->interrupt = false;
     w->status.error[0] = '\0';
@@ -7758,15 +8002,16 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
-    agent_trace_text(w, "user", user_text ? user_text : "",
-                     user_text ? strlen(user_text) : 0);
+    char *user_content = agent_chat_control_text(user_text, &w->thinking_enabled);
+    agent_trace_text(w, "user", user_content, strlen(user_content));
     if (!w->session_title) {
-        w->session_title = agent_session_title_from_prompt(user_text, 0);
+        w->session_title = agent_session_title_from_prompt(user_content, 0);
         w->session_created_at = (uint64_t)time(NULL);
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
-    q36_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    q36_chat_append_message(w->engine, &w->transcript, "user", user_content);
+    free(user_content);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -7783,6 +8028,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * real stopping conditions.  The transcript is the single source of truth:
      * after a Qwen tool stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
+    int consecutive_failures = 0;
     for (int tool_round = 0; ; tool_round++) {
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
@@ -7797,6 +8043,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 1;
         }
         agent_worker_maybe_append_system_prompt_reminder(w);
+        q36_think_mode think_mode = w->thinking_enabled ?
+            enabled_think_mode(cfg) : Q36_THINK_NONE;
+        if (consecutive_failures >= 2) think_mode = Q36_THINK_NONE;
         q36_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
 
         const q36_tokens *prompt_for_sync = &w->transcript;
@@ -7896,7 +8145,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
             size_t text_len = 0;
             char *text = q36_token_text(w->engine, token, &text_len);
-            if (agent_edit_upto_forcer_should_replace(&upto_forcer, &qwen_tool,
+            if (cfg->edit_upto &&
+                agent_edit_upto_forcer_should_replace(&upto_forcer, &qwen_tool,
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
@@ -8000,6 +8250,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         } else {
             tool_result = agent_execute_tool_calls(w, &qwen_tool.calls);
         }
+        int failures_before_result = consecutive_failures;
+        tool_result = agent_tool_response_add_warning(tool_result,
+                                                      &consecutive_failures);
         int projected_tokens = 0;
         if (!agent_tool_result_fits_context(w, tool_result,
                                             AGENT_TOOL_RESULT_RESERVE_TOKENS,
@@ -8033,6 +8286,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          AGENT_TOOL_RESULT_RESERVE_TOKENS);
                 agent_buf_puts(&b, msg);
                 tool_result = agent_buf_take(&b);
+                consecutive_failures = failures_before_result;
+                tool_result = agent_tool_response_add_warning(
+                    tool_result, &consecutive_failures);
                 if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
                     free(tool_result);
                     agent_qwen_tool_parser_free(&qwen_tool);
@@ -8047,8 +8303,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
-            agent_trace_text(w, "queued_user", queued_user, strlen(queued_user));
-            q36_chat_append_message(w->engine, &w->transcript, "user", queued_user);
+            char *content = agent_chat_control_text(queued_user,
+                                                    &w->thinking_enabled);
+            agent_trace_text(w, "queued_user", content, strlen(content));
+            q36_chat_append_message(w->engine, &w->transcript, "user", content);
+            free(content);
+            consecutive_failures = 0;
             pthread_mutex_lock(&w->mu);
             w->user_activity = true;
             w->session_dirty = true;

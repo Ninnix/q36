@@ -3,7 +3,7 @@
 # step <index> <selected-hex> <top-count>
 # top <token-hex> <llamacpp-logprob>
 
-case short_italian_fact 16384 4 tests/test-vectors/prompts/short_italian_fact.txt
+case short_italian_fact 16384 4 tests/test-vectors/qwen3.6-35b-a3b/prompts/short_italian_fact.txt
 step 0 0a0a 20
 top 0a0a -0.500208676
 top 0a -1.00758445
@@ -90,7 +90,7 @@ top 222222 -20.7812004
 top 204c61 -20.9021358
 end
 
-case short_code_completion 4096 3 tests/test-vectors/prompts/short_code_completion.txt
+case short_code_completion 4096 3 tests/test-vectors/qwen3.6-35b-a3b/prompts/short_code_completion.txt
 step 0 0a 20
 top 0a -0.0988941938
 top 0a0a -2.39550018
@@ -156,7 +156,7 @@ top 3b -13.6885891
 top 202f2a -13.7031431
 end
 
-case short_reasoning_plain 4096 4 tests/test-vectors/prompts/short_reasoning_plain.txt
+case short_reasoning_plain 4096 4 tests/test-vectors/qwen3.6-35b-a3b/prompts/short_reasoning_plain.txt
 step 0 0a 20
 top 0a -0.636039197
 top 0a0a -0.774810255
@@ -243,7 +243,7 @@ top 3c2f7468696e6b3e -12.9010992
 top 20200a -12.9113989
 end
 
-case long_memory_archive 16384 4 tests/test-vectors/prompts/long_memory_archive.txt
+case long_memory_archive 16384 4 tests/test-vectors/qwen3.6-35b-a3b/prompts/long_memory_archive.txt
 step 0 0a0a 20
 top 0a0a -0.000185397919
 top 0a -8.77192116
@@ -330,7 +330,7 @@ top 20616e7377657273 -13.0054026
 top 2061707065617273 -13.0775223
 end
 
-case long_code_audit 16384 4 tests/test-vectors/prompts/long_code_audit.txt
+case long_code_audit 16384 4 tests/test-vectors/qwen3.6-35b-a3b/prompts/long_code_audit.txt
 step 0 0a0a 20
 top 0a0a -0.000214852626
 top 0a -8.82813358

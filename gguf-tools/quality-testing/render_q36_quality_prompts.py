@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parent
 
 def qwen_prompt(text, mode):
     assistant_prefix = {
-        "think": "<think>",
-        "nothink": "</think>",
+        "think": "<think>\n",
+        "nothink": "<think>\n\n</think>\n\n",
         "none": "",
     }[mode]
     return (

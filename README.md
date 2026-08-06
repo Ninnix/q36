@@ -43,18 +43,10 @@ QuarkStar has two native GPU backends:
   `int64`. Subgroup arithmetic, 16-bit storage, and native `float16` are
   detected at runtime; optimized kernels fall back when an optional feature
   is unavailable.
-* **AMD BC-250** (Cyan Skillfish, RDNA 2, 24 CUs / 1536 shaders, 16 GB
-  unified GDDR6) is the primary tested Vulkan device. Its vendor/device ID
-  selects the existing tuned fast path automatically. RADV is the tested
-  driver; other drivers and Vulkan GPUs need their own correctness and speed
-  validation.
-* **BIOS**: modded firmware with the Chipset menu unlocked. Set Integrated
-  Graphics → UMA Mode → `UMA_SPECIFIED` and VRAM allocation to `512 MB`
-  (dynamic). Counterintuitively, the small split is correct: it lets the GPU
-  grow into the unified pool on demand.
-* **Kernel boot parameters**: add `ttm.pages_limit=3959290
-  ttm.page_pool_size=3959290` to your bootloader, otherwise `amdgpu` caps
-  GPU-accessible memory below 8 GB and the model will fail to load.
+* **AMD BC-250** (Cyan Skillfish, 24 CUs, 16 GB unified GDDR6) is the primary
+  tested Vulkan device. Its vendor/device ID selects the tuned fast path
+  automatically. Follow [BC250.md](BC250.md) for the RADV, UMA, kernel-memory,
+  governor, build, and optional 40-CU setup.
 * **Apple Silicon M1 or newer** with macOS 11 or newer and Xcode or the Command
   Line Tools providing the macOS SDK and Metal framework. Build with
   `make metal` and run with `./q36 --metal`. Shader sources are compiled through
@@ -131,6 +123,8 @@ and offline tooling. For normal usage, keep reading the next sections.
 
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
+- [BC250.md](BC250.md): Linux, RADV, unified-memory, governor, and build setup
+  for the primary Vulkan device.
 - [QA_BEFORE_RELEASES.md](QA_BEFORE_RELEASES.md): the complete release test
   matrix.
 - [MODEL_CARD.md](MODEL_CARD.md): the fixed Qwen3.6 architecture, tokenizer,
@@ -387,6 +381,10 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
+Agent user and system messages accept `<|think_on|>` and `<|think_off|>`.
+The marker is removed before rendering and remains in effect for later turns.
+Historical thinking stays in the append-only transcript until compaction.
+
 Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values and default to a
 100000-token agent context. The backend's automatic resident GPU prefill width
 resolves to 1024 tokens. Compact Metal attention scratch keeps this faster
@@ -511,6 +509,11 @@ token zero.
 ./q36-server --ctx 32768 --batched-session 4
 ```
 
+Use `--mixed-prefill-quantum N` to tune how many prefill tokens a batched
+session runs per scheduling turn while another session is generating. The
+default is 128; smaller values favor decode latency, larger values favor
+prefill throughput.
+
 Each active request owns one slot until it finishes; excess requests wait for
 an idle slot. Assignment prefers the resident live/token prefix with the
 longest match. When disk KV caching is enabled, an unmatched idle slot is
@@ -557,7 +560,7 @@ Supported endpoints:
 calls use the native Qwen3 Coder tagged format, and generated calls are mapped
 back to OpenAI tool calls.
 
-KAT-Coder also accepts its documented template controls:
+Both Qwen3.6 and KAT-Coder accept the fixed-template controls:
 
 ```json
 "chat_template_kwargs": {
@@ -566,14 +569,17 @@ KAT-Coder also accepts its documented template controls:
 }
 ```
 
-`preserve_thinking` retains earlier assistant reasoning verbatim. Without it,
-only reasoning inside the current multi-step tool round is retained, matching
-the model's official template.
+`preserve_thinking` defaults to `true`, retaining earlier assistant reasoning
+verbatim so later prompts remain a prefix-cache match. Set it to `false` to
+strip reasoning before the latest user query. System and user messages may also
+contain `<|think_on|>` or `<|think_off|>`; Q36 removes the control marker before
+rendering and applies it to subsequent turns.
 
-When omitted by the client, KAT-Coder sampling follows its model card:
-`temperature=1`, `top_p=0.95`, `top_k=20`, and `presence_penalty=1.5` while
-thinking; non-thinking uses `temperature=0.7` and `top_p=0.8`. Explicit request
-values always win.
+When omitted by the client, KAT-Coder uses `temperature=0.7`, `top_k=20`,
+`top_p=0.8`, `min_p=0.05`, and `presence_penalty=1.5` in both thinking modes.
+Qwen uses `temperature=1`, `top_p=1`, no top-k cap, and `min_p=0.05`. CLI,
+agent, and server use the loaded model's defaults. Eval stays fixed at the Qwen
+sampling defaults for comparable runs. Explicit values always win.
 
 `/v1/responses` accepts string or message-array input, instructions, direct
 tool schemas, function-call continuations, function-call outputs, sampling
@@ -832,7 +838,7 @@ Mapping of API thinking controls to prompt rendering:
   feeding thinking tokens, not how the model decides to reason.
 - `reasoning_effort=minimal` or omitted with no thinking flag → thinking on.
 - Explicit non-thinking: `thinking:{"type":"disabled"}`, `think:false`, or
-  `chat_template_kwargs:{"enable_thinking":false}`. KAT uses its trained
+  `chat_template_kwargs:{"enable_thinking":false}`. Both profiles use the
   `<think>\n\n</think>\n\n` non-thinking prefix.
 
 ## KV Cache Quantization
@@ -1172,10 +1178,11 @@ is outside Q36's release scope.
 
 ## Test Vectors
 
-`tests/test-vectors` contains committed short and long-context continuation
-vectors captured from llama.cpp with the Qwen3.6 Q8_0 reference GGUF. They are
-the default offline reference, so building and testing Q36 does not require
-llama.cpp or GGML libraries.
+`tests/test-vectors/qwen3.6-35b-a3b` contains committed short and long-context
+continuation vectors captured from llama.cpp with the Qwen3.6 Q8_0 reference
+GGUF. Checkpoint-scoped directories keep fixtures from different model
+revisions separate. They are the default offline reference, so building and
+testing Q36 does not require llama.cpp or GGML libraries.
 
 The fixtures use greedy decoding, thinking disabled, and `top_logprobs=20`.
 Private vectors are generated by the optional local llama.cpp capture tool and

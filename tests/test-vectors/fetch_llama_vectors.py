@@ -13,6 +13,7 @@ MODEL_PATH = "gguf/Qwen3.6-35B-A3B-Q8_0.gguf"
 MODEL_NAME = "Qwen3.6-35B-A3B-Q8_0.gguf"
 CAPTURE_BIN = ".opencode-tmp/llama_qwen_logprobs_capture"
 DEFAULT_OUT = "tests/test-vectors"
+DEFAULT_CHECKPOINT = "qwen3.6-35b-a3b"
 TOP_LOGPROBS = 20
 MAX_TOKENS = 4
 CTX_BY_ID = {
@@ -166,12 +167,12 @@ def capture_record(spec: dict, capture_bin: Path, model: Path, prompt_path: Path
             "top_logprobs": TOP_LOGPROBS,
             "threads": threads,
             "think": False,
-            "template": "hf-text-only" if hf_template else "legacy-q36-nothink",
+            "template": "hf-text-only" if hf_template else "q36-fixed-nothink",
         },
         "prompt_tokens": raw.get("prompt_tokens"),
         "ctx": raw.get("ctx"),
         "top_k": raw.get("top_k"),
-        "template": raw.get("template", "hf-text-only" if hf_template else "legacy-q36-nothink"),
+        "template": raw.get("template", "hf-text-only" if hf_template else "q36-fixed-nothink"),
         "steps": steps,
     }
 
@@ -209,6 +210,7 @@ def write_compact_fixture(root: Path, manifest: dict) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", help="output directory")
+    parser.add_argument("--checkpoint", help="checkpoint name recorded in the manifest")
     parser.add_argument("--model", default=MODEL_PATH, help="Qwen GGUF path")
     parser.add_argument("--capture-bin", default=CAPTURE_BIN, help="direct logits capture binary")
     parser.add_argument("--threads", type=int, default=1, help="kept for compatibility")
@@ -221,8 +223,9 @@ def main() -> int:
 
     if args.hf_template and not args.out:
         raise SystemExit("--hf-template requires --out; the tracked corpus in "
-                         f"{DEFAULT_OUT} is the legacy --nothink render")
-    root = Path(args.out or DEFAULT_OUT)
+                         f"{DEFAULT_OUT} uses the Q36 chat render")
+    root = Path(args.out or Path(DEFAULT_OUT) / DEFAULT_CHECKPOINT)
+    checkpoint = args.checkpoint or root.name
     model = Path(args.model)
     capture_bin = Path(args.capture_bin)
     prompt_dir = root / "prompts"
@@ -237,10 +240,12 @@ def main() -> int:
 
     wanted = set(args.only or [])
     selected = [spec for spec in PROMPTS if not wanted or spec["id"] in wanted]
+    template = "hf-text-only" if args.hf_template else "q36-fixed-nothink"
     manifest = {
         "schema": "q36-test-vector-manifest-v1",
+        "checkpoint": checkpoint,
         "source": "llama.cpp-direct-logits",
-        "template": "hf-text-only" if args.hf_template else "legacy-q36-nothink",
+        "template": template,
         "model": model.name,
         "top_logprobs": TOP_LOGPROBS,
         "max_tokens": MAX_TOKENS,
@@ -257,6 +262,8 @@ def main() -> int:
         else:
             record = capture_record(spec, capture_bin, model, prompt_path, args.hf_template, args.threads)
             out_path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if record.get("template") != template:
+            raise SystemExit(f"{out_path}: template is {record.get('template')!r}, expected {template!r}")
         manifest["prompts"].append(
             {
                 "id": spec["id"],

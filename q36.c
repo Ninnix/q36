@@ -2995,7 +2995,9 @@ static bool cursor_string(q36_cursor *c, q36_str *s) {
 
 static uint64_t align_up(uint64_t value, uint64_t alignment) {
     uint64_t rem = value % alignment;
-    return rem == 0 ? value : value + alignment - rem;
+    if (rem == 0) return value;
+    if (value > UINT64_MAX - (alignment - rem)) q36_die("GGUF alignment overflow");
+    return value + alignment - rem;
 }
 
 static uint64_t scalar_value_size(uint32_t type) {
@@ -3188,6 +3190,10 @@ static void model_close(q36_model *m) {
 }
 
 static void parse_metadata(q36_model *m, q36_cursor *c) {
+    uint64_t remaining = c->size - c->pos;
+    if (m->n_kv > remaining / 12 ||
+        m->n_kv > SIZE_MAX / sizeof(m->kv[0]))
+        q36_die("GGUF metadata count exceeds file size");
     m->kv = xcalloc((size_t)m->n_kv, sizeof(m->kv[0]));
     m->alignment = 32;
     for (uint64_t i = 0; i < m->n_kv; i++) {
@@ -3205,6 +3211,10 @@ static void parse_metadata(q36_model *m, q36_cursor *c) {
 }
 
 static void parse_tensors(q36_model *m, q36_cursor *c) {
+    uint64_t remaining = c->size - c->pos;
+    if (m->n_tensors > remaining / 32 ||
+        m->n_tensors > SIZE_MAX / sizeof(m->tensors[0]))
+        q36_die("GGUF tensor count exceeds file size");
     m->tensors = xcalloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         q36_tensor *t = &m->tensors[i];
@@ -3248,6 +3258,7 @@ static void model_open(q36_model *m, const char *path, bool graph_mapping) {
     if (fd == -1) q36_die_errno("cannot open model", path);
     if (fstat(fd, &st) == -1) q36_die_errno("cannot stat model", path);
     if (st.st_size < 32) q36_die("model file is too small to be GGUF");
+    if ((uintmax_t)st.st_size > SIZE_MAX) q36_die("model file is too large to map");
     map = mmap(NULL, (size_t)st.st_size, PROT_READ, graph_mapping ? MAP_SHARED : MAP_PRIVATE, fd, 0);
     if (map == MAP_FAILED) q36_die_errno("cannot mmap model", path);
     m->fd = fd;
@@ -8053,25 +8064,53 @@ void q36_tokenize_rendered_chat(q36_engine *e, const char *text, q36_tokens *out
     tokenize_rendered_chat_vocab(&e->vocab, text, out);
 }
 
-static void q36_tokenize_chat_content(q36_engine *e, const char *text,
-                                      q36_tokens *out) {
-    if (!e->kat_coder) {
-        q36_tokenize_rendered_chat(e, text, out);
-        return;
-    }
+void q36_chat_apply_thinking_control(const char *content, bool *thinking) {
+    if (!content || !thinking) return;
+    if (strstr(content, "<|think_off|>")) *thinking = false;
+    else if (strstr(content, "<|think_on|>")) *thinking = true;
+}
+
+static char *q36_chat_content_text(const char *text, bool controls) {
+    static const char think_off[] = "<|think_off|>";
+    static const char think_on[] = "<|think_on|>";
+    const char *remove = NULL;
+    size_t remove_len = 0;
     const char *start = text ? text : "";
     const char *end = start + strlen(start);
+
+    if (controls && strstr(start, think_off)) {
+        remove = think_off;
+        remove_len = sizeof(think_off) - 1;
+    } else if (controls && strstr(start, think_on)) {
+        remove = think_on;
+        remove_len = sizeof(think_on) - 1;
+    }
+
+    char *plain = xmalloc((size_t)(end - start) + 1);
+    size_t used = 0;
+    while (remove) {
+        const char *p = strstr(start, remove);
+        if (!p) break;
+        size_t n = (size_t)(p - start);
+        memcpy(plain + used, start, n);
+        used += n;
+        start = p + remove_len;
+    }
+    size_t tail = (size_t)(end - start);
+    memcpy(plain + used, start, tail + 1);
+    start = plain;
+    end = plain + used + tail;
     while (start < end && isspace((unsigned char)*start)) start++;
     while (end > start && isspace((unsigned char)end[-1])) end--;
     char *trimmed = xmalloc((size_t)(end - start) + 1);
     memcpy(trimmed, start, (size_t)(end - start));
     trimmed[end - start] = '\0';
-    q36_tokenize_rendered_chat(e, trimmed, out);
-    free(trimmed);
+    free(plain);
+    return trimmed;
 }
 
 void q36_chat_begin(q36_engine *e, q36_tokens *tokens) {
-    if (!e->kat_coder && e->vocab.bos_id >= 0)
+    if (e->vocab.add_bos && e->vocab.bos_id >= 0)
         q36_tokens_push(tokens, e->vocab.bos_id);
 }
 
@@ -8095,38 +8134,43 @@ void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role
     if (!content) content = "";
     if (!strcmp(role, "developer")) role = "system";
     if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+        char *text = q36_chat_content_text(content, false);
         chat_append_open_role(e, tokens, "user");
         q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
-        q36_tokenize_chat_content(e, content, tokens);
+        q36_tokenize_rendered_chat(e, text, tokens);
         q36_tokenize_rendered_chat(e, "\n</tool_response>", tokens);
         chat_append_close_role(e, tokens);
+        free(text);
+        return;
+    }
+    bool controls = !strcmp(role, "system") || !strcmp(role, "user");
+    char *text = q36_chat_content_text(content, controls);
+    if (!strcmp(role, "system") && !text[0]) {
+        free(text);
         return;
     }
     chat_append_open_role(e, tokens, role);
-    q36_tokenize_chat_content(e, content, tokens);
+    q36_tokenize_rendered_chat(e, text, tokens);
     chat_append_close_role(e, tokens);
+    free(text);
 }
 
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode) {
     chat_append_open_role(e, tokens, "assistant");
-    if (e->kat_coder) {
-        q36_tokenize_rendered_chat(e, think_mode == Q36_THINK_NONE ?
-            "<think>\n\n</think>\n\n" : "<think>\n", tokens);
-        if (think_mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(e, tokens);
-        return;
-    }
     if (think_mode == Q36_THINK_NONE) {
-        q36_tokenize_rendered_chat(e, "</think>", tokens);
+        q36_tokenize_rendered_chat(e, "<think>\n\n</think>\n\n", tokens);
         return;
     }
-    q36_tokenize_rendered_chat(e, "<think>", tokens);
-    if (think_mode == Q36_THINK_MAX) {
-        bpe_tokenize_text(&e->vocab, "\n", tokens);
-        q36_chat_append_max_effort_prefix(e, tokens);
-    }
+    q36_tokenize_rendered_chat(e, "<think>\n", tokens);
+    if (think_mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(e, tokens);
 }
 
 void q36_encode_chat_prompt(q36_engine *e, const char *system, const char *prompt, q36_think_mode think_mode, q36_tokens *out) {
+    bool thinking = q36_think_mode_enabled(think_mode);
+    q36_chat_apply_thinking_control(system, &thinking);
+    q36_chat_apply_thinking_control(prompt, &thinking);
+    if (!thinking) think_mode = Q36_THINK_NONE;
+    else if (think_mode == Q36_THINK_NONE) think_mode = Q36_THINK_HIGH;
     q36_chat_begin(e, out);
     if (system && system[0]) q36_chat_append_message(e, out, "system", system);
     q36_chat_append_message(e, out, "user", prompt ? prompt : "");
@@ -10271,6 +10315,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (version == Q36_PAYLOAD_VERSION_TOKEN_ONLY) {
         uint32_t n_tokens = third;
+        if (n_tokens >= (uint32_t)s->ctx_size) {
+            q36_payload_set_err(err, errlen, "token-only checkpoint does not fit current context");
+            return 1;
+        }
         if (remaining != (uint64_t)n_tokens * sizeof(int32_t)) {
             if (err && errlen) snprintf(err, errlen, "mismatched token-only payload size");
             return 1;

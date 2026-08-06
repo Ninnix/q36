@@ -30,10 +30,13 @@ TOOL_INSTRUCTIONS = (
     "</tool_call>\n\n"
     "<IMPORTANT>\n"
     "Reminder:\n"
-    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
-    "- Required parameters MUST be specified\n"
-    "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
-    "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+    "- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n"
+    "- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n"
+    "- If you choose to call a tool, output the <tool_call> block immediately after thinking, with no conversational text before it.\n"
+    "- The <tool_call> and <function> tags must begin a new line with no indentation.\n"
+    "- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for each function.\n"
+    "- If you have all necessary data, provide your final answer directly to the user without any tool call.\n"
     "</IMPORTANT>"
 )
 
@@ -60,23 +63,37 @@ def render_content(content: object) -> str:
     raise ValueError("unexpected content type")
 
 
-def system_text(messages: list[dict], tools: list[dict]) -> str:
-    first_system = messages and messages[0].get("role") == "system"
+def apply_thinking_control(content: str, thinking: bool) -> tuple[str, bool]:
+    if "<|think_off|>" in content:
+        return content.replace("<|think_off|>", "").strip(), False
+    if "<|think_on|>" in content:
+        return content.replace("<|think_on|>", "").strip(), True
+    return content.strip(), thinking
+
+
+def is_system(role: object) -> bool:
+    return role in ("system", "developer")
+
+
+def system_text(messages: list[dict], tools: list[dict], thinking: bool) -> tuple[str, int, bool]:
+    first_system = bool(messages and is_system(messages[0].get("role")))
+    skip = 1 if first_system else 0
+    extra = render_content(messages[0].get("content")) if first_system else ""
+    extra, thinking = apply_thinking_control(extra, thinking)
     if tools:
         tool_lines = "".join(
             "\n" + json.dumps(t, ensure_ascii=False, separators=(",", ":"))
             for t in tools
         )
         content = TOOL_INSTRUCTIONS.format(tools=tool_lines)
-        if first_system:
-            extra = render_content(messages[0].get("content")).strip()
-            if extra:
-                content += "\n\n" + extra
-        return f"{IM_START}system\n{content}{IM_END}\n"
+        if extra:
+            content += "\n\n" + extra
+        return f"{IM_START}system\n{content}{IM_END}\n", skip, thinking
     if first_system:
-        content = render_content(messages[0].get("content")).strip()
-        return f"{IM_START}system\n{content}{IM_END}\n"
-    return ""
+        if extra:
+            return f"{IM_START}system\n{extra}{IM_END}\n", skip, thinking
+        return "", skip, thinking
+    return "", skip, thinking
 
 
 def last_query_index(messages: list[dict]) -> int:
@@ -87,7 +104,34 @@ def last_query_index(messages: list[dict]) -> int:
         content = render_content(msg.get("content")).strip()
         if not (content.startswith("<tool_response>") and content.endswith("</tool_response>")):
             return i
-    raise ValueError("no user query found")
+    if len(messages) > 50:
+        return len(messages) - 1
+    return 0
+
+
+def assistant_parts(msg: dict, content: str) -> tuple[str, str]:
+    reasoning = msg.get("reasoning_content")
+    if reasoning is None:
+        reasoning = msg.get("thinking")
+    if reasoning is not None:
+        return str(reasoning).strip(), content
+
+    found = []
+    for tag in ("</think>", "</thinking>"):
+        if content.startswith(tag):
+            found.append((0, tag))
+    for tag in ("\n</think>", "\n</thinking>", "\n</ think>", "\n</think >"):
+        pos = content.find(tag)
+        if pos >= 0:
+            found.append((pos, tag))
+    if not found:
+        return "", content
+    pos, tag = min(found)
+    reasoning = content[:pos]
+    opening = "<thinking>" if "thinking" in tag else "<think>"
+    if opening in reasoning:
+        reasoning = reasoning.rsplit(opening, 1)[-1]
+    return reasoning.strip(), content[pos + len(tag):].strip()
 
 
 def render_tool_calls(content: str, calls: list[dict]) -> str:
@@ -102,7 +146,7 @@ def render_tool_calls(content: str, calls: list[dict]) -> str:
         elif i == 0:
             out.append(f"<tool_call>\n<function={name}>\n")
         else:
-            out.append(f"\n<tool_call>\n<function={name}>\n")
+            out.append(f"\n\n<tool_call>\n<function={name}>\n")
         args = fn.get("arguments") or {}
         if isinstance(args, str):
             try:
@@ -120,24 +164,51 @@ def render_tool_calls(content: str, calls: list[dict]) -> str:
     return "".join(out)
 
 
-def render(messages: list[dict], mode: str, tools: list[dict] | None = None,
-           add_generation_prompt: bool = True, preserve_thinking: bool = False) -> str:
-    tools = tools or []
-    out = [system_text(messages, tools)]
-    last_query = last_query_index(messages)
+def tool_response_is_error(content: str) -> bool:
+    lower = content.lower()
+    if len(content) >= 500 or "$ " in content or "took " in lower:
+        return False
+    head = lower[:80]
+    return any(mark in head for mark in (
+        '"error":', "error:", "err!", "fatal:", "exception:",
+        "traceback", "command not found", "invalid syntax", "failed to",
+    ))
 
-    for i, msg in enumerate(messages):
+
+def tool_error_warning(failures: int) -> str:
+    if failures >= 2:
+        return (f"\n\n⚠️ SYSTEM WARNING: {failures} consecutive tool errors detected. "
+                "Your previous approach is incorrect. You MUST use a fundamentally "
+                "different approach or corrected arguments.")
+    if failures == 1:
+        return ("\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+                "Diagnose the failure and retry with completely corrected arguments.")
+    return ""
+
+
+def render(messages: list[dict], mode: str, tools: list[dict] | None = None,
+           add_generation_prompt: bool = True, preserve_thinking: bool = True) -> str:
+    tools = tools or []
+    thinking = mode != "nothink"
+    system, skip, thinking = system_text(messages, tools, thinking)
+    out = [system]
+    body_messages = messages[skip:]
+    last_query = last_query_index(body_messages)
+    failures = 0
+
+    for i, msg in enumerate(body_messages):
         role = msg.get("role")
         content = render_content(msg.get("content")).strip()
-        if role == "system":
-            if i != 0:
-                raise ValueError("system message must be first")
-            continue
-        if role == "user":
+        if is_system(role):
+            content, thinking = apply_thinking_control(content, thinking)
+            out.append(f"{IM_START}system\n{content}{IM_END}\n")
+        elif role == "user":
+            content, thinking = apply_thinking_control(content, thinking)
+            failures = 0
             out.append(f"{IM_START}user\n{content}{IM_END}\n")
         elif role == "assistant":
-            reasoning = str(msg.get("reasoning_content") or "").strip()
-            if preserve_thinking or i > last_query:
+            reasoning, content = assistant_parts(msg, content)
+            if reasoning and (preserve_thinking or i > last_query):
                 body = f"<think>\n{reasoning}\n</think>\n\n{content}"
             else:
                 body = content
@@ -146,17 +217,18 @@ def render(messages: list[dict], mode: str, tools: list[dict] | None = None,
                 body += render_tool_calls(content, calls)
             out.append(f"{IM_START}assistant\n{body}{IM_END}\n")
         elif role == "tool":
-            if i > 0 and messages[i - 1].get("role") != "tool":
+            failures = failures + 1 if tool_response_is_error(content) else 0
+            if i == 0 or body_messages[i - 1].get("role") != "tool":
                 out.append(f"{IM_START}user")
-            out.append(f"\n<tool_response>\n{content}\n</tool_response>")
-            if i == len(messages) - 1 or messages[i + 1].get("role") != "tool":
+            out.append(f"\n<tool_response>\n{content}{tool_error_warning(failures)}\n</tool_response>")
+            if i == len(body_messages) - 1 or body_messages[i + 1].get("role") != "tool":
                 out.append(f"{IM_END}\n")
         else:
-            raise ValueError(f"unexpected message role: {role}")
+            out.append(f"{IM_START}user\n[{role}]: {content}{IM_END}\n")
 
     if add_generation_prompt and (not messages or messages[-1].get("role") != "assistant"):
         out.append(f"{IM_START}assistant\n")
-        if mode == "nothink":
+        if not thinking or failures >= 2:
             out.append("<think>\n\n</think>\n\n")
         else:
             out.append("<think>\n")

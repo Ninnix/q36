@@ -103,7 +103,6 @@ typedef struct {
     uint8_t quant_bits;
     uint8_t ext_flags;
     double load_ms;
-    bool consumed;
     char *path;
 } q36_kvstore_load_result;
 

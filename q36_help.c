@@ -162,6 +162,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (tool == Q36_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
         opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+        opt(fp, c, "--mixed-prefill-quantum N", "Prefill tokens per scheduling turn during active generation (default: 128).");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");
@@ -203,6 +204,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max with at least 98304 context tokens.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
+    para(fp, c, "Qwen defaults to temp=1, top-k=0, top-p=1, min-p=0.05. KAT defaults to 0.7/20/0.8/0.05. Eval always defaults to Qwen sampling. Explicit options win.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -269,9 +271,11 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
+    opt(fp, c, "--edit-upto", "Enable anchored [upto] edits. Exact old/new replacement is the default.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and native tool-call debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    para(fp, c, "User and system messages accept persistent <|think_on|> and <|think_off|> controls.");
     fputc('\n', fp);
 }
 
@@ -307,7 +311,7 @@ static void print_server_thinking(FILE *fp, const help_colors *c) {
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 98304; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or chat_template_kwargs.enable_thinking=false selects non-thinking mode.");
-    para(fp, c, "In thinking mode, client sampling knobs are ignored like the official API.");
+    para(fp, c, "Model defaults apply only to omitted sampling knobs; explicit client values win.");
     fputc('\n', fp);
 }
 
@@ -499,7 +503,7 @@ static void print_topic(FILE *fp, const help_colors *c, q36_help_tool tool, cons
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through browser-backed web tools.");
         para(fp, c, "Tool calls use Qwen's native function and parameter tags and render live in the terminal.");
-        para(fp, c, "Edit uses exact old/new replacement; [upto] can bridge a unique head and tail for large anchored edits.");
+        para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables unique head/tail anchored edits.");
         fputc('\n', fp);
     } else if (tool == Q36_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);
     else if (tool == Q36_HELP_EVAL && streq(topic, "evaluation")) print_eval_specific(fp, c);

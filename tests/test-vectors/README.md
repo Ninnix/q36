@@ -8,14 +8,17 @@ defaults to
 regenerate the fixtures before treating this directory as a refreshed Q8_0
 parity corpus.
 
-This directory is the tracked parity corpus, captured with q36's `--nothink`
-render. Normal builds and tests do not need a llama.cpp checkout.
+`qwen3.6-35b-a3b/` is the tracked parity corpus. Checkpoint-scoped directories
+keep fixtures from different model revisions from being mixed. Each manifest records the exact
+template used for each capture; the current fixture predates the fixed
+`--nothink` render, while new captures use it. Normal builds and tests do not
+need a llama.cpp checkout.
 
 Files:
 
-- `prompts/*.txt`: exact user prompts.
-- `llamacpp/*.llamacpp.json`: raw llama.cpp continuations and top-logprobs.
-- `llama.vec`: compact C-test fixture generated from the llama.cpp JSON.
+- `<checkpoint>/prompts/*.txt`: exact user prompts.
+- `<checkpoint>/llamacpp/*.llamacpp.json`: raw llama.cpp continuations and top-logprobs.
+- `<checkpoint>/llama.vec`: compact C-test fixture generated from the llama.cpp JSON.
 
 Check the tracked raw JSON against its compact form without a model:
 

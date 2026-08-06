@@ -1,5 +1,6 @@
 {
   "schema": "q36-test-vector-manifest-v1",
+  "checkpoint": "qwen3.6-35b-a3b",
   "source": "llama.cpp-direct-logits",
   "template": "legacy-q36-nothink",
   "model": "Qwen3.6-35B-A3B-Q8_0.gguf",

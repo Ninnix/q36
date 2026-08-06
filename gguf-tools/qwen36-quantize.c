@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -160,6 +161,7 @@ static void *xmalloc(size_t n) {
 }
 
 static void *xcalloc(size_t n, size_t sz) {
+    if (sz && n > SIZE_MAX / sz) die("allocation size overflow");
     void *p = calloc(n ? n : 1, sz ? sz : 1);
     if (!p) die("out of memory");
     return p;
@@ -178,6 +180,16 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
+static size_t size_add(size_t a, size_t b) {
+    if (a > SIZE_MAX - b) die("size overflow");
+    return a + b;
+}
+
+static size_t size_mul(size_t a, size_t b) {
+    if (a && b > SIZE_MAX / a) die("size overflow");
+    return a * b;
+}
+
 static uint64_t fnv1a(const char *s) {
     uint64_t h = 1469598103934665603ull;
     while (*s) {
@@ -188,6 +200,7 @@ static uint64_t fnv1a(const char *s) {
 }
 
 static void hmap_build(hmap *m, char **keys, int n) {
+    if (n < 0 || n > INT_MAX / 2) die("too many tensor names");
     int cap = 1;
     while (cap < n * 2) cap <<= 1;
     m->cap = cap;
@@ -225,7 +238,9 @@ static bool ends(const char *s, const char *p) {
 }
 
 static size_t pad(size_t x, size_t n) {
-    return ((x + n - 1) / n) * n;
+    if (!n) die("zero GGUF alignment");
+    size_t rem = x % n;
+    return rem ? size_add(x, n - rem) : x;
 }
 
 static uint16_t get_u16(const uint8_t *p) {
@@ -270,6 +285,15 @@ static int32_t read_i32(FILE *fp, const char *what) {
     return (int32_t)read_u32(fp, what);
 }
 
+static size_t file_remaining(FILE *fp) {
+    off_t pos = ftello(fp);
+    if (pos < 0 || fseeko(fp, 0, SEEK_END) != 0) die("cannot inspect input size");
+    off_t end = ftello(fp);
+    if (fseeko(fp, pos, SEEK_SET) != 0 || end < pos) die("cannot inspect input size");
+    if ((uintmax_t)(end - pos) > SIZE_MAX) die("input file is too large");
+    return (size_t)(end - pos);
+}
+
 static size_t scalar_size(uint32_t type) {
     switch (type) {
         case GGUF_TYPE_UINT8:
@@ -288,21 +312,21 @@ static size_t scalar_size(uint32_t type) {
 }
 
 static uint64_t pull_u64(const uint8_t *base, size_t size, size_t *p) {
-    if (*p + 8 > size) die("bad GGUF: short u64");
+    if (*p > size || size - *p < 8) die("bad GGUF: short u64");
     uint64_t v = get_u64(base + *p);
     *p += 8;
     return v;
 }
 
 static uint16_t pull_u16(const uint8_t *base, size_t size, size_t *p) {
-    if (*p + 2 > size) die("bad GGUF: short u16");
+    if (*p > size || size - *p < 2) die("bad GGUF: short u16");
     uint16_t v = get_u16(base + *p);
     *p += 2;
     return v;
 }
 
 static uint32_t pull_u32(const uint8_t *base, size_t size, size_t *p) {
-    if (*p + 4 > size) die("bad GGUF: short u32");
+    if (*p > size || size - *p < 4) die("bad GGUF: short u32");
     uint32_t v = get_u32(base + *p);
     *p += 4;
     return v;
@@ -310,7 +334,8 @@ static uint32_t pull_u32(const uint8_t *base, size_t size, size_t *p) {
 
 static char *pull_str(const uint8_t *base, size_t size, size_t *p) {
     uint64_t n = pull_u64(base, size, p);
-    if (n > SIZE_MAX - 1 || *p + (size_t)n > size) die("bad GGUF: short string");
+    if (n > SIZE_MAX - 1 || *p > size || n > size - *p)
+        die("bad GGUF: short string");
     char *s = xmalloc((size_t)n + 1);
     memcpy(s, base + *p, (size_t)n);
     s[n] = 0;
@@ -321,7 +346,7 @@ static char *pull_str(const uint8_t *base, size_t size, size_t *p) {
 static void skip_value(const uint8_t *base, size_t size, size_t *p, uint32_t type) {
     if (type == GGUF_TYPE_STRING) {
         uint64_t n = pull_u64(base, size, p);
-        if (*p + (size_t)n > size) die("bad GGUF: short string value");
+        if (*p > size || n > size - *p) die("bad GGUF: short string value");
         *p += (size_t)n;
         return;
     }
@@ -331,25 +356,26 @@ static void skip_value(const uint8_t *base, size_t size, size_t *p, uint32_t typ
         if (et == GGUF_TYPE_STRING) {
             for (uint64_t i = 0; i < n; i++) {
                 uint64_t len = pull_u64(base, size, p);
-                if (*p + (size_t)len > size) die("bad GGUF: short string array");
+                if (*p > size || len > size - *p) die("bad GGUF: short string array");
                 *p += (size_t)len;
             }
             return;
         }
         size_t sz = scalar_size(et);
         if (!sz) die("bad GGUF: unsupported array type");
-        if (n > SIZE_MAX / sz || *p + (size_t)n * sz > size) die("bad GGUF: short array");
+        if (n > SIZE_MAX / sz || *p > size || (size_t)n * sz > size - *p)
+            die("bad GGUF: short array");
         *p += (size_t)n * sz;
         return;
     }
     size_t sz = scalar_size(type);
     if (!sz) die("bad GGUF: unsupported value type");
-    if (*p + sz > size) die("bad GGUF: short scalar");
+    if (*p > size || sz > size - *p) die("bad GGUF: short scalar");
     *p += sz;
 }
 
 static size_t str_size(const char *s) {
-    return 8 + strlen(s);
+    return size_add(8, strlen(s));
 }
 
 static bool imatrix_kv(const char *key) {
@@ -362,23 +388,35 @@ static bool split_kv(const char *key) {
 
 static size_t tensor_elems(const tensor *t) {
     size_t n = 1;
-    for (int i = 0; i < t->n_dims; i++) n *= (size_t)t->ne[i];
+    for (int i = 0; i < t->n_dims; i++) {
+        if (t->ne[i] <= 0 || (uint64_t)t->ne[i] > SIZE_MAX) die("bad tensor shape");
+        n = size_mul(n, (size_t)t->ne[i]);
+    }
     return n;
 }
 
 static size_t tensor_size(q36q_type type, const int64_t *ne, int n_dims) {
+    if (n_dims < 1 || ne[0] <= 0) return 0;
     size_t row = q36q_row_size(type, ne[0]);
-    for (int i = 1; i < n_dims; i++) row *= (size_t)ne[i];
+    for (int i = 1; i < n_dims; i++) {
+        if (ne[i] <= 0 || (uint64_t)ne[i] > SIZE_MAX) return 0;
+        row = size_mul(row, (size_t)ne[i]);
+    }
     return row;
 }
 
 static int tensor_rows(const tensor *t) {
-    return (int)(tensor_elems(t) / (size_t)t->ne[0]);
+    size_t rows = tensor_elems(t) / (size_t)t->ne[0];
+    if (rows > INT_MAX) die("tensor has too many rows");
+    return (int)rows;
 }
 
 static int64_t tensor_nelems_i64(const tensor *t) {
     int64_t n = 1;
-    for (int i = 0; i < t->n_dims; i++) n *= t->ne[i];
+    for (int i = 0; i < t->n_dims; i++) {
+        if (t->ne[i] <= 0 || n > INT64_MAX / t->ne[i]) die("tensor element count overflow");
+        n *= t->ne[i];
+    }
     return n;
 }
 
@@ -390,6 +428,7 @@ static gguf gguf_open(const char *path) {
     struct stat st;
     if (fstat(g.fd, &st) != 0) die_errno("stat", path);
     if (st.st_size <= 0) die("empty GGUF");
+    if ((uintmax_t)st.st_size > SIZE_MAX) die("GGUF is too large to map");
     g.size = (size_t)st.st_size;
     g.map = mmap(NULL, g.size, PROT_READ, MAP_PRIVATE, g.fd, 0);
     if (g.map == MAP_FAILED) die_errno("mmap", path);
@@ -400,9 +439,11 @@ static gguf gguf_open(const char *path) {
     g.n_tensors = pull_u64(g.map, g.size, &p);
     g.n_kv = pull_u64(g.map, g.size, &p);
     g.alignment = Q36_GGUF_ALIGNMENT;
+    if (g.n_kv > (g.size - p) / 12 || g.n_kv > (SIZE_MAX - 1) / 2)
+        die("bad GGUF: metadata count exceeds file size");
 
     size_t kv_start = p;
-    size_t keep_cap = (size_t)g.n_kv * 2 + 1;
+    size_t keep_cap = size_add(size_mul((size_t)g.n_kv, 2), 1);
     size_t *spans = xcalloc(keep_cap, sizeof(spans[0]));
     size_t keep_n = 0;
     for (uint64_t i = 0; i < g.n_kv; i++) {
@@ -428,25 +469,34 @@ static gguf gguf_open(const char *path) {
     }
 
     size_t kv_len = p - kv_start;
-    for (size_t i = 0; i < keep_n; i += 2) g.kv.size += spans[i + 1] - spans[i];
+    for (size_t i = 0; i < keep_n; i += 2)
+        g.kv.size = size_add(g.kv.size, spans[i + 1] - spans[i]);
     g.kv.data = xmalloc(g.kv.size);
     size_t q = 0;
     for (size_t i = 0; i < keep_n; i += 2) {
         size_t n = spans[i + 1] - spans[i];
         memcpy(g.kv.data + q, g.map + kv_start + spans[i], n);
-        q += n;
+        q = size_add(q, n);
     }
     g.n_kv = keep_n / 2;
     free(spans);
     (void)kv_len;
 
+    if (g.alignment == 0) die("bad GGUF: zero alignment");
+    if (g.n_tensors > (g.size - p) / 32 || g.n_tensors > INT_MAX ||
+        g.n_tensors > SIZE_MAX / sizeof(g.tensors[0]))
+        die("bad GGUF: tensor count exceeds file size");
     g.tensors = xcalloc((size_t)g.n_tensors, sizeof(g.tensors[0]));
     for (uint64_t i = 0; i < g.n_tensors; i++) {
         tensor *t = &g.tensors[i];
         t->name = pull_str(g.map, g.size, &p);
         t->n_dims = (int)pull_u32(g.map, g.size, &p);
         if (t->n_dims < 1 || t->n_dims > Q36Q_MAX_DIMS) die("bad tensor rank");
-        for (int j = 0; j < t->n_dims; j++) t->ne[j] = (int64_t)pull_u64(g.map, g.size, &p);
+        for (int j = 0; j < t->n_dims; j++) {
+            uint64_t dim = pull_u64(g.map, g.size, &p);
+            if (dim == 0 || dim > INT64_MAX) die("bad tensor shape");
+            t->ne[j] = (int64_t)dim;
+        }
         t->type = (q36q_type)pull_u32(g.map, g.size, &p);
         t->old_offset = pull_u64(g.map, g.size, &p);
         t->size = tensor_size(t->type, t->ne, t->n_dims);
@@ -467,7 +517,7 @@ static gguf gguf_open(const char *path) {
         }
         t->data = g.map + g.data_offset + t->old_offset;
     }
-    char **keys = xmalloc((size_t)g.n_tensors * sizeof(keys[0]));
+    char **keys = xmalloc(size_mul((size_t)g.n_tensors, sizeof(keys[0])));
     for (uint64_t i = 0; i < g.n_tensors; i++) keys[i] = g.tensors[i].name;
     hmap_build(&g.tmap, keys, (int)g.n_tensors);
     free(keys);
@@ -500,9 +550,12 @@ static gguf gguf_open_many(char **paths, int n) {
         if (s->split_no != i || s->split_count != n || s->split_tensors < 0) {
             die("GGUF shards are missing, duplicated, or out of order");
         }
+        if (g.n_tensors > UINT64_MAX - s->n_tensors) die("GGUF shard tensor count overflow");
         g.n_tensors += s->n_tensors;
     }
     if ((uint64_t)first->split_tensors != g.n_tensors) die("GGUF shard tensor count mismatch");
+    if (g.n_tensors > INT_MAX || g.n_tensors > SIZE_MAX / sizeof(g.tensors[0]))
+        die("too many tensors across GGUF shards");
 
     g.tensors = xcalloc((size_t)g.n_tensors, sizeof(g.tensors[0]));
     uint64_t k = 0;
@@ -514,7 +567,7 @@ static gguf gguf_open_many(char **paths, int n) {
             dst->name = xstrdup(s->tensors[j].name);
         }
     }
-    char **keys = xmalloc((size_t)g.n_tensors * sizeof(keys[0]));
+    char **keys = xmalloc(size_mul((size_t)g.n_tensors, sizeof(keys[0])));
     for (uint64_t i = 0; i < g.n_tensors; i++) {
         keys[i] = g.tensors[i].name;
         for (uint64_t j = 0; j < i; j++) {
@@ -578,11 +631,13 @@ static void imatrix_load_gguf(imatrix *im, const char *path) {
         }
         if (nval > INT32_MAX) die("GGUF imatrix entry too large");
         if (im->n_entries == cap) {
+            if (cap > INT_MAX / 2) die("too many imatrix entries");
             cap *= 2;
-            im->entries = xrealloc(im->entries, (size_t)cap * sizeof(im->entries[0]));
+            im->entries = xrealloc(im->entries,
+                                   size_mul((size_t)cap, sizeof(im->entries[0])));
         }
 
-        float *v = xmalloc((size_t)nval * sizeof(float));
+        float *v = xmalloc(size_mul((size_t)nval, sizeof(float)));
         const float *sdata = (const float *)sum->data;
         const float *cdata = (const float *)counts->data;
         int64_t ne0 = nval / ncounts;
@@ -622,6 +677,7 @@ static void imatrix_load(imatrix *im, const char *path, bool strict) {
     if (fseek(fp, 0, SEEK_SET) != 0) die_errno("seek imatrix", path);
     int32_t n = read_i32(fp, "imatrix entry count");
     if (n < 1) die("imatrix has no entries");
+    if ((size_t)n > file_remaining(fp) / 17) die("imatrix entry count exceeds file size");
     im->entries = xcalloc((size_t)n, sizeof(im->entries[0]));
     im->n_entries = n;
     for (int i = 0; i < n; i++) {
@@ -633,7 +689,9 @@ static void imatrix_load(imatrix *im, const char *path, bool strict) {
         int32_t ncall = read_i32(fp, "imatrix calls");
         int32_t nval = read_i32(fp, "imatrix values");
         if (nval < 1) die("bad imatrix value count");
-        float *v = xmalloc((size_t)nval * sizeof(float));
+        if ((size_t)nval > file_remaining(fp) / sizeof(float))
+            die("imatrix value count exceeds file size");
+        float *v = xmalloc(size_mul((size_t)nval, sizeof(float)));
         if (fread(v, sizeof(float), (size_t)nval, fp) != (size_t)nval) die("short imatrix value read");
         if (ncall > 0) {
             for (int j = 0; j < nval; j++) v[j] /= (float)ncall;
@@ -646,7 +704,7 @@ static void imatrix_load(imatrix *im, const char *path, bool strict) {
     if (fgetc(fp) != EOF && fseeko(fp, -1, SEEK_CUR) == 0) {
         im->chunks = read_i32(fp, "imatrix chunks");
         int32_t len = read_i32(fp, "imatrix dataset length");
-        if (len > 0 && len < (1 << 20)) {
+        if (len > 0 && len < (1 << 20) && (size_t)len <= file_remaining(fp)) {
             im->dataset = xmalloc((size_t)len + 1);
             if (fread(im->dataset, 1, (size_t)len, fp) == (size_t)len) im->dataset[len] = 0;
             else {
@@ -787,10 +845,11 @@ static int max_routed_layer(const gguf *in) {
 static size_t extra_imatrix_kv_size(const imatrix *im) {
     if (!im || !im->n_entries) return 0;
     size_t n = 0;
-    n += str_size(Q36_KV_IMATRIX_FILE) + 4 + str_size(im->file);
-    n += str_size(Q36_KV_IMATRIX_ENTRIES) + 4 + 8;
-    if (im->dataset) n += str_size(Q36_KV_IMATRIX_DATASET) + 4 + str_size(im->dataset);
-    if (im->chunks > 0) n += str_size(Q36_KV_IMATRIX_CHUNKS) + 4 + 8;
+    n = size_add(n, size_add(size_add(str_size(Q36_KV_IMATRIX_FILE), 4), str_size(im->file)));
+    n = size_add(n, size_add(str_size(Q36_KV_IMATRIX_ENTRIES), 12));
+    if (im->dataset)
+        n = size_add(n, size_add(size_add(str_size(Q36_KV_IMATRIX_DATASET), 4), str_size(im->dataset)));
+    if (im->chunks > 0) n = size_add(n, size_add(str_size(Q36_KV_IMATRIX_CHUNKS), 12));
     return n;
 }
 
@@ -854,11 +913,14 @@ static plan make_plan(const gguf *in, const imatrix *im, const params *pa) {
         dst->type = target;
         dst->size = tensor_size(target, dst->ne, dst->n_dims);
         dst->new_offset = off;
-        off += pad(dst->size, p.alignment);
-        info += str_size(dst->name) + 4 + (size_t)dst->n_dims * 8 + 4 + 8;
+        off = size_add(off, pad(dst->size, p.alignment));
+        size_t shape = size_mul((size_t)dst->n_dims, 8);
+        info = size_add(info, size_add(str_size(dst->name), size_add(shape, 16)));
     }
     p.tensor_bytes = off;
-    p.meta_size = 4 + 4 + 8 + 8 + in->kv.size + extra_imatrix_kv_size(im) + info;
+    p.meta_size = size_add(24, in->kv.size);
+    p.meta_size = size_add(p.meta_size, extra_imatrix_kv_size(im));
+    p.meta_size = size_add(p.meta_size, info);
     p.data_offset = pad(p.meta_size, p.alignment);
     return p;
 }
@@ -907,9 +969,9 @@ static void decode_rows(q36q_type type, const uint8_t *src,
         decode_q8_rows(src, ncols, rows, dst);
         return;
     }
-    size_t n = (size_t)rows * (size_t)ncols;
+    size_t n = size_mul((size_t)rows, (size_t)ncols);
     if (type == Q36Q_TYPE_F32) {
-        memcpy(dst, src, n * sizeof(float));
+        memcpy(dst, src, size_mul(n, sizeof(float)));
         return;
     }
     if (type == Q36Q_TYPE_F16 || type == Q36Q_TYPE_BF16) {
@@ -927,9 +989,10 @@ static float *synthetic_imatrix(const tensor *t) {
     const int rows = tensor_rows(t);
     const size_t src_row = q36q_row_size(t->type, ncols);
     float *acc = xcalloc((size_t)ncols, sizeof(float));
-    int chunk = (int)((16u << 20) / ((size_t)ncols * sizeof(float)));
+    size_t row_bytes = size_mul((size_t)ncols, sizeof(float));
+    int chunk = (int)((16u << 20) / row_bytes);
     if (chunk < 1) chunk = 1;
-    float *f32 = xmalloc((size_t)chunk * (size_t)ncols * sizeof(float));
+    float *f32 = xmalloc(size_mul((size_t)chunk, row_bytes));
     const uint8_t *base = t->data;
     for (int r = 0; r < rows; r += chunk) {
         int nr = rows - r < chunk ? rows - r : chunk;
@@ -962,7 +1025,8 @@ typedef struct {
 
 static void *quant_worker(void *arg) {
     quant_job *j = arg;
-    float *f32 = xmalloc((size_t)j->chunk * (size_t)j->ncols * sizeof(float));
+    size_t row_bytes = size_mul((size_t)j->ncols, sizeof(float));
+    float *f32 = xmalloc(size_mul((size_t)j->chunk, row_bytes));
     q36q_quantize_init(j->dst->type);
     for (;;) {
         pthread_mutex_lock(&j->lock);
@@ -1013,12 +1077,14 @@ static void convert_tensor(FILE *fp, const tensor *src, const tensor *dst,
         synthetic = synthetic_imatrix(src);
         imat = synthetic;
     }
-    int chunk = (int)((16u << 20) / ((size_t)ncols * sizeof(float)));
+    size_t row_bytes = size_mul((size_t)ncols, sizeof(float));
+    int chunk = (int)((16u << 20) / row_bytes);
     if (chunk < 1) chunk = 1;
     if (threads < 1) threads = 1;
     if (threads > rows) threads = rows;
 
-    uint8_t *out = xmalloc((size_t)rows * dst_row);
+    size_t out_bytes = size_mul((size_t)rows, dst_row);
+    uint8_t *out = xmalloc(out_bytes);
     quant_job job = {
         .src = src, .dst = dst, .im = im, .imat = imat, .out = out,
         .rows = rows, .chunk = chunk, .ncols = ncols,
@@ -1038,7 +1104,7 @@ static void convert_tensor(FILE *fp, const tensor *src, const tensor *dst,
     }
     pthread_mutex_destroy(&job.lock);
     free(tid);
-    if (fwrite(out, 1, (size_t)rows * dst_row, fp) != (size_t)rows * dst_row) {
+    if (fwrite(out, 1, out_bytes, fp) != out_bytes) {
         die("write quantized tensor failed");
     }
     free(out);
@@ -1079,7 +1145,8 @@ static void write_gguf(const gguf *in, const plan *p, const imatrix *im, const p
         write_padding(fp, pad(dst->size, p->alignment) - dst->size);
     }
     long end = ftell(fp);
-    if (end < 0 || (size_t)end != p->data_offset + p->tensor_bytes) die("output size mismatch");
+    if (end < 0 || (size_t)end != size_add(p->data_offset, p->tensor_bytes))
+        die("output size mismatch");
     fclose(fp);
 }
 
@@ -1120,7 +1187,7 @@ static void print_plan(const gguf *in, const plan *p, const params *pa) {
     printf("type_changes: %zu\n", changed);
     printf("meta_bytes: %zu\n", p->data_offset);
     printf("tensor_bytes_unpadded: %zu\n", p->tensor_bytes);
-    printf("approx_file_bytes: %zu\n", p->data_offset + p->tensor_bytes);
+    printf("approx_file_bytes: %zu\n", size_add(p->data_offset, p->tensor_bytes));
 }
 
 static bool parse_range(const char *s, int *start, int *end) {

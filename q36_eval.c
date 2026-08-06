@@ -4153,7 +4153,6 @@ int main(int argc, char **argv) {
         free(case_sequence);
         return 1;
     }
-
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
     const bool auto_ctx = cfg.ctx_size <= 0;

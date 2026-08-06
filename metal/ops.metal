@@ -148,6 +148,32 @@ kernel void q36_moe_activation_f32(
         (g / (1.0f + exp(-g))) * u * route_weights[pair] * d;
 }
 
+// The routed grouped matmul converts its dense RHS tile to half before the
+// multiply. Storing the SwiGLU intermediate in that precision avoids the F32
+// write/read without changing the values consumed by the down projection.
+kernel void q36_moe_activation_f16(
+        device half *mid [[buffer(0)]],
+        device const float *gate [[buffer(1)]],
+        device const float *up [[buffer(2)]],
+        device const int *selected [[buffer(3)]],
+        device const float *route_weights [[buffer(4)]],
+        device const float *gate_scales [[buffer(5)]],
+        device const float *up_scales [[buffer(6)]],
+        constant q36_moe_activation_args &args [[buffer(7)]],
+        device const float *down_scales [[buffer(8)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    ulong pair = gid.y;
+    if (gid.x >= args.width || pair >= (ulong)args.tokens * args.used) return;
+    int expert = selected[pair];
+    float g = gate[pair * args.width + gid.x] *
+              (args.has_gate_scale ? gate_scales[expert] : 1.0f);
+    float u = up[pair * args.width + gid.x] *
+              (args.has_up_scale ? up_scales[expert] : 1.0f);
+    float d = args.has_down_scale ? down_scales[expert] : 1.0f;
+    mid[pair * args.width + gid.x] =
+        (half)((g / (1.0f + exp(-g))) * u * route_weights[pair] * d);
+}
+
 kernel void q36_moe_reduce_f32(
         device float *out [[buffer(0)]],
         device const float *expert_out [[buffer(1)]],
