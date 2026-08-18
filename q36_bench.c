@@ -407,7 +407,6 @@ static void log_context_memory(const bench_config *c) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    log_context_memory(&cfg);
 
     q36_engine_options opt = {
         .model_path = cfg.model_path,
@@ -431,6 +430,7 @@ int main(int argc, char **argv) {
     };
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &opt) != 0) return 1;
+    log_context_memory(&cfg);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     q36_tokens prompt = {0};
