@@ -28,6 +28,8 @@ void q36_gpu_parallel_for_rows(uint64_t n_rows,
                                void *ctx);
 
 q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes);
+/* Persistent storage whose rows are written before use. */
+q36_gpu_tensor *q36_gpu_tensor_alloc_uninitialized(uint64_t bytes);
 /* Output-only scratch. Contents are undefined until a GPU command writes it. */
 q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes);
 q36_gpu_tensor *q36_gpu_tensor_view(const q36_gpu_tensor *base, uint64_t offset, uint64_t bytes);

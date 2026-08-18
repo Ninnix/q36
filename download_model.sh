@@ -3,12 +3,12 @@ set -e
 
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
 KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
-DENSE_REPO="mradermacher/Qwen3.6-27B-i1-GGUF"
+DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 Q2_Q4_FILE="Qwen3.6-35B-A3B-Layers34-39Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-Q8Rest-imatrix.gguf"
 MTP_FILE="Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf"
 KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
-DENSE_FILE="Qwen3.6-27B.i1-IQ3_XS.gguf"
+DENSE_FILE="Qwen3.8-27B-UD-IQ3_XXS.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${Q36_GGUF_DIR:-"$ROOT/gguf"}
@@ -46,7 +46,7 @@ Targets:
        about 11 GB on disk.
 
   27b
-       Dense Qwen3.6 27B IQ3_XS quant from $DENSE_REPO.
+       Dense Qwen3.8 27B IQ3_XXS quant from $DENSE_REPO.
 
   mtp  Optional speculative decoding component for either main-model target.
        It must be enabled explicitly with --mtp when starting a runtime.

@@ -14,11 +14,13 @@ enum {
     Q36_VK_TAB_IQ2S_BYTES = 8192,   /* 1024 entries x 8 bytes */
     Q36_VK_TAB_IQ3S_BYTES = 2048,   /* 512 entries x 4 bytes */
     Q36_VK_TAB_IQ3XXS_BYTES = 1024, /* 256 entries x 4 bytes */
+    Q36_VK_TAB_IQ1S_BYTES = 16384,  /* 2048 entries x 8 bytes */
     Q36_VK_TAB_TOTAL_BYTES = Q36_VK_TAB_XXS_BYTES +
                              Q36_VK_TAB_KSIGNS_BYTES +
                              Q36_VK_TAB_IQ2S_BYTES +
                              Q36_VK_TAB_IQ3S_BYTES +
-                             Q36_VK_TAB_IQ3XXS_BYTES,
+                             Q36_VK_TAB_IQ3XXS_BYTES +
+                             Q36_VK_TAB_IQ1S_BYTES,
 };
 
 /* q36_iq2xxs_grid is a string literal, so sizeof carries one trailing NUL. */
@@ -41,6 +43,8 @@ static void q36_vk_pack_iq_tables(unsigned char *p) {
     memcpy(p, q36_iq3s_grid, Q36_VK_TAB_IQ3S_BYTES);
     p += Q36_VK_TAB_IQ3S_BYTES;
     memcpy(p, q36_iq3xxs_grid, Q36_VK_TAB_IQ3XXS_BYTES);
+    p += Q36_VK_TAB_IQ3XXS_BYTES;
+    q36_quant_pack_iq1_grid(p);
 }
 
 #endif

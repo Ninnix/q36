@@ -147,7 +147,7 @@ void main(void) {
         for (uint i = 0u; i < 4u; i++)
             qvec[i] = unpack_i8(q8[b * Q8K_WORDS + 2u + 4u * itid + i]);
         float qsum = 0.0;
-        if (pc.type == Q4_K || pc.type == Q6_K) {
+        if (pc.type == Q4_K || pc.type == Q5_K || pc.type == Q6_K) {
             for (uint i = 0u; i < 4u; i++)
                 qsum += qvec[i].x + qvec[i].y + qvec[i].z + qvec[i].w;
         }
@@ -170,6 +170,28 @@ void main(void) {
                         ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
                     vec4 xv = qvec[i];
                     qdot += dot(unpack_i8(packed), xv);
+                }
+                float part = load_f16(base) * float(sc) * qdot -
+                             load_f16(base + 2u) * float(mn) * qsum;
+                acc[r] = fma(yd, part, acc[r]);
+                continue;
+            }
+            if (pc.type == Q5_K) {
+                uint base = row * pc.row_bytes + 176u * b;
+                uint group = itid >> 1u;
+                uint sc;
+                uint mn;
+                k4_scale_min(base, group, sc, mn);
+                float qdot = 0.0;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * itid + 4u * i;
+                    uint ql = load_u32(base + 48u + (group >> 1u) * 32u +
+                                       (idx & 31u));
+                    uint low = (group & 1u) == 0u ?
+                        ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+                    uint qh = load_u32(base + 16u + (idx & 31u));
+                    uint packed = low | (((qh >> group) & 0x01010101u) << 4u);
+                    qdot += dot(unpack_i8(packed), qvec[i]);
                 }
                 float part = load_f16(base) * float(sc) * qdot -
                              load_f16(base + 2u) * float(mn) * qsum;

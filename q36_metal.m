@@ -1025,6 +1025,10 @@ q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
     return tensor;
 }
 
+q36_gpu_tensor *q36_gpu_tensor_alloc_uninitialized(uint64_t bytes) {
+    return q36_gpu_tensor_alloc(bytes);
+}
+
 q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes) {
     /* Apple silicon uses unified memory, so Metal scratch has the same
      * storage mode as other tensors. Keep the backend-neutral scratch API

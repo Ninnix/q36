@@ -1,0 +1,66 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+const uint Q8K_WORDS = 74u;
+const int values[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113);
+
+uint load_u8(uint off) {
+    return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
+}
+
+uint load_u16(uint off) {
+    return uint(wh[off >> 1u]);
+}
+
+int q8_at(uint base, uint i) {
+    return bitfieldExtract(int(q8[base + 2u + i / 4u]), int(8u * (i & 3u)), 8);
+}
+
+void main(void) {
+    uint lane = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    if (row >= pc.out_dim || tok >= pc.n_tok) return;
+    float acc = 0.0;
+    for (uint b = 0u; b < pc.blocks; b++) {
+        uint wbase = row * pc.row_bytes + b * 136u;
+        uint qbase = (tok * pc.blocks + b) * Q8K_WORDS;
+        uint ib = lane >> 2u;
+        uint within = (lane & 3u) * 8u;
+        uint sl = load_u8(wbase + 4u + ib / 2u);
+        uint sh = load_u16(wbase + 2u);
+        int ls = int((sl >> (4u * (ib & 1u))) & 15u) |
+                 int(((sh >> (2u * ib)) & 3u) << 4u);
+        float wd = unpackHalf2x16(load_u16(wbase)).x * float(ls - 32);
+        float yd = uintBitsToFloat(q8[qbase]);
+        float sum = 0.0;
+        for (uint j = 0u; j < 8u; j++) {
+            uint i = ib * 32u + within + j;
+            uint packed = load_u8(wbase + 8u + ib * 16u + (i & 15u));
+            uint code = (i & 31u) < 16u ? packed & 15u : packed >> 4u;
+            sum += float(q8_at(qbase, i) * values[code]);
+        }
+        acc = fma(wd * yd, sum, acc);
+    }
+    float total = subgroupAdd(acc);
+    if (lane == 0u) y[tok * pc.out_dim + row] = total * pc.scale;
+}

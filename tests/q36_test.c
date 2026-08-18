@@ -33,6 +33,8 @@ static bool test_is_cpu_only_build(void) {
 
 static q36_engine *test_engine_fast;
 static q36_engine *test_engine_quality;
+static const char *test_model_override;
+static const char *test_case_override;
 
 static void test_skip(const char *name, const char *reason) {
     fprintf(stderr, "%s: SKIP (%s)\n", name, reason);
@@ -52,6 +54,7 @@ static q36_backend test_default_backend(void) {
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("Q36_TEST_MODEL");
+    if (test_model_override) return test_model_override;
     return (model_path && model_path[0]) ? model_path : Q36_DEFAULT_MODEL_PATH;
 }
 
@@ -634,7 +637,7 @@ done:
 }
 
 static bool test_vector_case_selected(const char *id) {
-    const char *filter = getenv("Q36_TEST_VECTOR_CASE");
+    const char *filter = test_case_override ? test_case_override : getenv("Q36_TEST_VECTOR_CASE");
     char buf[256];
     if (!filter || !filter[0]) return true;
     snprintf(buf, sizeof(buf), "%s", filter);
@@ -6830,6 +6833,10 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
+    puts("  --model FILE");
+    puts("      Override the model path for selected tests.");
+    puts("  --case FILTER");
+    puts("      Run vector cases whose names contain FILTER.");
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
@@ -6877,6 +6884,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
             run_all = true;
+        } else if (!strcmp(argv[i], "--model") && i + 1 < argc) {
+            test_model_override = argv[++i];
+        } else if (!strcmp(argv[i], "--case") && i + 1 < argc) {
+            test_case_override = argv[++i];
         } else if (!strcmp(argv[i], "--list")) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);

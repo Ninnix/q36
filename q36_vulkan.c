@@ -1,6 +1,6 @@
 #include "q36_gpu.h"
-#include "q36_iq2_tables_vulkan.inc"
 #include "q36_quant.h"
+#include "q36_iq2_tables_vulkan.inc"
 #include "q36_ssd.h"
 
 #include <errno.h>
@@ -30,6 +30,8 @@ enum {
     Q36_VK_TENSOR_IQ3_XXS = 18,
     Q36_VK_TENSOR_IQ3_S   = 21,
     Q36_VK_TENSOR_IQ2_S   = 22,
+    Q36_VK_TENSOR_IQ4_XS  = 23,
+    Q36_VK_TENSOR_IQ1_M   = 29,
 };
 
 typedef struct q36_gpu_tensor {
@@ -198,6 +200,10 @@ typedef struct {
     q36_vk_kernel dense_iq3_xxs_mmq;
     q36_vk_kernel dense_iq3_s_decode;
     q36_vk_kernel dense_iq3_s_mmq;
+    q36_vk_kernel dense_iq4_xs;
+    q36_vk_kernel dense_iq4_xs_decode;
+    q36_vk_kernel dense_iq4_xs_mmq;
+    q36_vk_kernel dense_iq1_m;
     q36_vk_kernel dense_kquant_mmq;
     q36_vk_kernel dense_kquant_decode;
     q36_vk_kernel moe_reduce;
@@ -1451,7 +1457,8 @@ static q36_gpu_tensor *q36_vk_tensor_alloc_dl_unlocked(uint64_t bytes) {
     return tensor;
 }
 
-static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool device_pref) {
+static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool device_pref,
+                                                         bool clear) {
     q36_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
     if (!tensor) return NULL;
     tensor->bytes = bytes;
@@ -1519,7 +1526,7 @@ static q36_gpu_tensor *q36_vk_tensor_alloc_kind_unlocked(uint64_t bytes, bool de
         free(tensor);
         return NULL;
     }
-    memset(tensor->data, 0, (size_t)tensor->alloc_bytes);
+    if (clear) memset(tensor->data, 0, (size_t)tensor->alloc_bytes);
 
     q36_gpu_live_bytes += bytes;
     if (q36_gpu_live_bytes > q36_gpu_peak_bytes) q36_gpu_peak_bytes = q36_gpu_live_bytes;
@@ -1530,7 +1537,7 @@ static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor);
 
 static q36_gpu_tensor *q36_vk_tensor_alloc_scratch_unlocked(uint64_t bytes) {
     const uint64_t alloc_bytes = bytes ? q36_round_up_u64(bytes, 4) : 4;
-    if (q36_gpu_quality) return q36_vk_tensor_alloc_kind_unlocked(bytes, false);
+    if (q36_gpu_quality) return q36_vk_tensor_alloc_kind_unlocked(bytes, false, true);
     for (uint32_t i = 0; i < q36_vk_private_pool_n; i++) {
         q36_gpu_tensor *tensor = q36_vk_private_pool[i];
         if (tensor->alloc_bytes != alloc_bytes) continue;
@@ -1555,7 +1562,7 @@ static q36_gpu_tensor *q36_vk_tensor_alloc_scratch_unlocked(uint64_t bytes) {
         }
         q36_vk_tensor_free_unlocked(tensor);
     }
-    return q36_vk_tensor_alloc_kind_unlocked(bytes, false);
+    return q36_vk_tensor_alloc_kind_unlocked(bytes, false, true);
 }
 
 static void q36_vk_tensor_free_unlocked(q36_gpu_tensor *tensor) {
@@ -1902,9 +1909,9 @@ static q36_gpu_tensor *q36_vk_arena_alloc_unlocked(uint64_t bytes) {
     }
     if (!block) {
         uint64_t block_bytes = need > Q36_VK_ARENA_BLOCK_BYTES ? need : Q36_VK_ARENA_BLOCK_BYTES;
-        q36_gpu_tensor *base = q36_vk_tensor_alloc_kind_unlocked(block_bytes, true);
-        if (!base && block_bytes > need) base = q36_vk_tensor_alloc_kind_unlocked(need, true);
-        if (!base) base = q36_vk_tensor_alloc_kind_unlocked(need, false);
+        q36_gpu_tensor *base = q36_vk_tensor_alloc_kind_unlocked(block_bytes, true, true);
+        if (!base && block_bytes > need) base = q36_vk_tensor_alloc_kind_unlocked(need, true, true);
+        if (!base) base = q36_vk_tensor_alloc_kind_unlocked(need, false, true);
         if (!base) return NULL;
         block = calloc(1, sizeof(*block));
         if (!block) {
@@ -2039,18 +2046,18 @@ static bool q36_vk_stream_cache_init_unlocked(const q36_gpu_stream_expert_table 
         if (sizes_ok) {
             q36_vk_stream.entry = calloc(cap, sizeof(q36_vk_stream.entry[0]));
             if (q36_vk_stream.entry)
-                q36_vk_stream.gate = q36_vk_tensor_alloc_kind_unlocked(gate_bytes, true);
+                q36_vk_stream.gate = q36_vk_tensor_alloc_kind_unlocked(gate_bytes, true, true);
             if (q36_vk_stream.gate)
-                q36_vk_stream.up = q36_vk_tensor_alloc_kind_unlocked(up_bytes, true);
+                q36_vk_stream.up = q36_vk_tensor_alloc_kind_unlocked(up_bytes, true, true);
             if (q36_vk_stream.up)
-                q36_vk_stream.down = q36_vk_tensor_alloc_kind_unlocked(down_bytes, true);
+                q36_vk_stream.down = q36_vk_tensor_alloc_kind_unlocked(down_bytes, true, true);
             if (q36_vk_stream.down && t->has_gate_scales)
-                q36_vk_stream.gate_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true);
+                q36_vk_stream.gate_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true, true);
             if (q36_vk_stream.down && (!t->has_gate_scales || q36_vk_stream.gate_scales) && t->has_up_scales)
-                q36_vk_stream.up_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true);
+                q36_vk_stream.up_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true, true);
             if (q36_vk_stream.down && (!t->has_gate_scales || q36_vk_stream.gate_scales) &&
                 (!t->has_up_scales || q36_vk_stream.up_scales) && t->has_down_scales)
-                q36_vk_stream.down_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true);
+                q36_vk_stream.down_scales = q36_vk_tensor_alloc_kind_unlocked(scale_bytes, true, true);
         }
         if (sizes_ok && q36_vk_stream.entry && q36_vk_stream.gate &&
             q36_vk_stream.up && q36_vk_stream.down &&
@@ -2690,6 +2697,10 @@ int q36_gpu_init(void) {
     q36_vk.dense_iq3_xxs_mmq = Q36_VK_KERNEL("vulkan/dense_iq3_xxs_mmq.spv", 4, 20, 1u << 2);
     q36_vk.dense_iq3_s_decode = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode.spv", 4, 16, 1u << 2);
     q36_vk.dense_iq3_s_mmq = Q36_VK_KERNEL("vulkan/dense_iq3_s_mmq.spv", 4, 20, 1u << 2);
+    q36_vk.dense_iq4_xs = Q36_VK_KERNEL("vulkan/dense_iq4_xs.spv", 3, 20, 1u << 2);
+    q36_vk.dense_iq4_xs_decode = Q36_VK_KERNEL("vulkan/dense_iq4_xs_decode.spv", 3, 16, 1u << 2);
+    q36_vk.dense_iq4_xs_mmq = Q36_VK_KERNEL("vulkan/dense_iq4_xs_mmq.spv", 3, 20, 1u << 2);
+    q36_vk.dense_iq1_m = Q36_VK_KERNEL("vulkan/dense_iq1_m.spv", 4, 20, 1u << 2);
     q36_vk.dense_kquant_mmq = Q36_VK_KERNEL("vulkan/dense_kquant_mmq.spv", 3, 28, 1u << 2);
     q36_vk.dense_kquant_decode = Q36_VK_KERNEL("vulkan/dense_kquant_decode.spv", 3, 28, 1u << 2);
     q36_vk.moe_reduce = Q36_VK_KERNEL("vulkan/moe_reduce.spv", 3, 8, 1u << 2);
@@ -3026,6 +3037,10 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.ffn_tail);
     q36_vk_kernel_destroy(&q36_vk.moe_reduce);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_mmq);
+    q36_vk_kernel_destroy(&q36_vk.dense_iq1_m);
+    q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_mmq);
+    q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_decode);
+    q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs);
     q36_vk_kernel_destroy(&q36_vk.dense_kquant_mmq);
     q36_vk_kernel_destroy(&q36_vk.dense_kquant_decode);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode);
@@ -3120,7 +3135,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_host_threads_shutdown();
 }
 
-q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
+static q36_gpu_tensor *q36_gpu_tensor_alloc_persistent(uint64_t bytes, bool clear) {
     if (!q36_gpu_init()) return NULL;
     pthread_mutex_lock(&q36_vk_mu);
     q36_gpu_tensor *tensor = NULL;
@@ -3132,14 +3147,22 @@ q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
         tensor->bytes = bytes;
         tensor->gpu_written = false;
         tensor->last_use_seq = 0;
-        memset(tensor->data, 0, (size_t)alloc_bytes);
+        if (clear) memset(tensor->data, 0, (size_t)alloc_bytes);
         q36_gpu_live_bytes += bytes;
         if (q36_gpu_live_bytes > q36_gpu_peak_bytes) q36_gpu_peak_bytes = q36_gpu_live_bytes;
         break;
     }
-    if (!tensor) tensor = q36_vk_tensor_alloc_kind_unlocked(bytes, false);
+    if (!tensor) tensor = q36_vk_tensor_alloc_kind_unlocked(bytes, false, clear);
     pthread_mutex_unlock(&q36_vk_mu);
     return tensor;
+}
+
+q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes) {
+    return q36_gpu_tensor_alloc_persistent(bytes, true);
+}
+
+q36_gpu_tensor *q36_gpu_tensor_alloc_uninitialized(uint64_t bytes) {
+    return q36_gpu_tensor_alloc_persistent(bytes, false);
 }
 
 q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes) {
@@ -4996,7 +5019,7 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
  * moe_matvec kernel.  Layout must match the TAB_* offsets in the shader. */
 static q36_gpu_tensor *q36_vk_iq_tables_unlocked(void) {
     if (q36_vk.iq_tables) return q36_vk.iq_tables;
-    q36_gpu_tensor *t = q36_vk_tensor_alloc_kind_unlocked(Q36_VK_TAB_TOTAL_BYTES, true);
+    q36_gpu_tensor *t = q36_vk_tensor_alloc_kind_unlocked(Q36_VK_TAB_TOTAL_BYTES, true, true);
     if (!t) return NULL;
     q36_vk_pack_iq_tables(t->data);
     q36_vk.iq_tables = t;
@@ -6464,6 +6487,8 @@ static uint64_t q36_vk_iq_block_bytes(uint32_t type) {
     case Q36_VK_TENSOR_IQ3_XXS: return 98;
     case Q36_VK_TENSOR_IQ3_S: return 110;
     case Q36_VK_TENSOR_IQ2_S: return 82;
+    case Q36_VK_TENSOR_IQ4_XS: return 136;
+    case Q36_VK_TENSOR_IQ1_M: return 56;
     default: return 0;
     }
 }
@@ -6875,7 +6900,9 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
     int ok;
 
     if ((weight_type != Q36_VK_TENSOR_IQ3_XXS &&
-         weight_type != Q36_VK_TENSOR_IQ3_S) ||
+         weight_type != Q36_VK_TENSOR_IQ3_S &&
+         weight_type != Q36_VK_TENSOR_IQ4_XS &&
+         weight_type != Q36_VK_TENSOR_IQ1_M) ||
         in_dim == 0 || (in_dim % Q36_VK_QK_K) != 0 ||
         out_dim == 0 || n_tok == 0 || in_dim > UINT32_MAX ||
         out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
@@ -6892,6 +6919,80 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
         !q36_gpu_tensor_range_ok(q8, 0, q8_bytes)) return 0;
     source = q36_gpu_weight_bytes(model_map, model_size, weight_offset, weight_bytes);
     if (!source) return 0;
+
+    if (weight_type == Q36_VK_TENSOR_IQ4_XS && !q36_gpu_quality &&
+        q36_vk_use_dense_iq3_fast()) {
+        pthread_mutex_lock(&q36_vk_mu);
+        q36_gpu_tensor *weights = q36_vk_weight_get_unlocked(source, weight_bytes);
+        ok = weights != NULL;
+        if (ok) {
+            const q36_gpu_tensor *bindings[3] = { weights, q8, out };
+            if (n_tok == 1u) {
+                struct {
+                    uint32_t out_dim;
+                    uint32_t blocks;
+                    uint32_t row_bytes;
+                    float scale;
+                } push = {
+                    (uint32_t)out_dim, (uint32_t)blocks,
+                    (uint32_t)row_bytes, scale,
+                };
+                ok = q36_vk_run_unlocked(
+                    "dense_iq4_xs_decode", &q36_vk.dense_iq4_xs_decode,
+                    bindings, &push, sizeof(push),
+                    ((uint32_t)out_dim + 3u) / 4u, 1, 1);
+            } else {
+                struct {
+                    uint32_t out_dim;
+                    uint32_t n_tok;
+                    uint32_t blocks;
+                    uint32_t row_bytes;
+                    float scale;
+                } push = {
+                    (uint32_t)out_dim, (uint32_t)n_tok,
+                    (uint32_t)blocks, (uint32_t)row_bytes, scale,
+                };
+                ok = q36_vk_run_unlocked(
+                    "dense_iq4_xs_mmq", &q36_vk.dense_iq4_xs_mmq,
+                    bindings, &push, sizeof(push),
+                    ((uint32_t)out_dim + 63u) / 64u,
+                    ((uint32_t)n_tok + 63u) / 64u, 1);
+            }
+        }
+        pthread_mutex_unlock(&q36_vk_mu);
+        return ok;
+    }
+
+    if (weight_type == Q36_VK_TENSOR_IQ4_XS ||
+        weight_type == Q36_VK_TENSOR_IQ1_M) {
+        struct {
+            uint32_t out_dim;
+            uint32_t n_tok;
+            uint32_t blocks;
+            uint32_t row_bytes;
+            float scale;
+        } push = {
+            (uint32_t)out_dim, (uint32_t)n_tok,
+            (uint32_t)blocks, (uint32_t)row_bytes, scale,
+        };
+        pthread_mutex_lock(&q36_vk_mu);
+        q36_gpu_tensor *tables = weight_type == Q36_VK_TENSOR_IQ1_M ?
+            q36_vk_iq_tables_unlocked() : NULL;
+        q36_gpu_tensor *weights = q36_vk_weight_get_unlocked(source, weight_bytes);
+        ok = weights != NULL &&
+             (weight_type != Q36_VK_TENSOR_IQ1_M || tables != NULL);
+        if (ok) {
+            const q36_gpu_tensor *bindings[4] = { weights, q8, out, tables };
+            q36_vk_kernel *kernel = weight_type == Q36_VK_TENSOR_IQ4_XS ?
+                &q36_vk.dense_iq4_xs : &q36_vk.dense_iq1_m;
+            ok = q36_vk_run_unlocked(
+                weight_type == Q36_VK_TENSOR_IQ4_XS ? "dense_iq4_xs" : "dense_iq1_m",
+                kernel, bindings, &push, sizeof(push),
+                (uint32_t)out_dim, (uint32_t)n_tok, 1);
+        }
+        pthread_mutex_unlock(&q36_vk_mu);
+        return ok;
+    }
 
     if ((weight_type == Q36_VK_TENSOR_IQ3_XXS ||
          weight_type == Q36_VK_TENSOR_IQ3_S) && !q36_gpu_quality &&
