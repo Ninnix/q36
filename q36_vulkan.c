@@ -1901,10 +1901,12 @@ enum { Q36_VK_ARENA_BLOCK_BYTES = 512u << 20 };
 static q36_gpu_tensor *q36_vk_arena_alloc_unlocked(uint64_t bytes) {
     const uint64_t need = q36_round_up_u64(bytes ? bytes : 4, 256);
     q36_vk_arena_block *block = NULL;
+    uint64_t best_left = UINT64_MAX;
     for (q36_vk_arena_block *b = q36_vk.arena; b; b = b->next) {
-        if (b->base->alloc_bytes - b->used >= need) {
+        uint64_t free_bytes = b->base->alloc_bytes - b->used;
+        if (free_bytes >= need && free_bytes - need < best_left) {
             block = b;
-            break;
+            best_left = free_bytes - need;
         }
     }
     if (!block) {
@@ -3594,8 +3596,18 @@ int q36_gpu_stream_expert_cache_bias_experts(const q36_gpu_stream_expert_table *
 }
 
 void q36_gpu_print_memory_report(const char *label) {
+    uint64_t arena_reserved = 0, arena_used = 0, arena_max_slack = 0;
+    uint32_t arena_blocks = 0;
+    for (q36_vk_arena_block *b = q36_vk.arena; b; b = b->next) {
+        arena_reserved += b->base->alloc_bytes;
+        arena_used += b->used;
+        if (b->base->alloc_bytes - b->used > arena_max_slack)
+            arena_max_slack = b->base->alloc_bytes - b->used;
+        arena_blocks++;
+    }
     fprintf(stderr,
             "q36: Vulkan memory%s%s live=%" PRIu64 " peak=%" PRIu64
+            " arena=%" PRIu64 "/%" PRIu64 " arena_blocks=%u arena_max_slack=%" PRIu64
             " scratch_private=%" PRIu64 " scratch_private_peak=%" PRIu64
             " scratch_private_limit=%" PRIu64
             " fd=%d quality=%s ssd_streaming=%s cache=%u/%u requested=%u allocation_failures=%u lookup=%s lookup_steps=%" PRIu64 " hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64 " evictions=%" PRIu64 " device=%s api=%u.%u.%u\n",
@@ -3603,6 +3615,10 @@ void q36_gpu_print_memory_report(const char *label) {
             label ? label : "",
             q36_gpu_live_bytes,
             q36_gpu_peak_bytes,
+            arena_used,
+            arena_reserved,
+            arena_blocks,
+            arena_max_slack,
             q36_vk_private_bytes,
             q36_vk_private_peak,
             (uint64_t)Q36_VK_PRIVATE_LIMIT,
@@ -4541,7 +4557,7 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                                                                  "dense_q6k_decode"));
             ok = q36_vk_run_unlocked(op, &q36_vk.dense_kquant_decode,
                                      bindings, &push, sizeof(push),
-                                     ((uint32_t)out_dim + 1u) / 2u, 1, 1);
+                                     ((uint32_t)out_dim + 3u) / 4u, 1, 1);
         }
         pthread_mutex_unlock(&q36_vk_mu);
         return ok;

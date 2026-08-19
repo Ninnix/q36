@@ -396,8 +396,11 @@ static void log_context_memory(const bench_config *c) {
             c->backend, c->ctx_alloc, c->prefill_chunk,
             c->cache_type_k, c->cache_type_v);
     fprintf(stderr,
-            "q36-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
+            "q36-bench: context buffers %.2f MiB (scratch=%.2f MiB, raw=%.2f MiB, compressed=%.2f MiB, ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
+            (double)m.scratch_bytes / (1024.0 * 1024.0),
+            (double)m.raw_bytes / (1024.0 * 1024.0),
+            (double)m.compressed_bytes / (1024.0 * 1024.0),
             c->ctx_alloc,
             q36_backend_name(c->backend),
             m.prefill_cap,

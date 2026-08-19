@@ -23,6 +23,8 @@ const uint ROWS = 5u;
 const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 
+shared uint grid_lut[512];
+
 uint load_u8(uint off) {
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
 }
@@ -53,6 +55,9 @@ void main(void) {
     uint first_row = gl_WorkGroupID.x * ROWS;
     float acc[ROWS];
     for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+    for (uint i = lid; i < 512u; i += 64u)
+        grid_lut[i] = tables[TAB_IQ3S_GRID + i];
+    barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
@@ -75,7 +80,7 @@ void main(void) {
                              ((qh << (8u - l)) & 256u);
                 uint signs = (signs4 >> (8u * (l >> 1u))) & 255u;
                 uint mask = sign_mask(signs >> ((l & 1u) * 4u));
-                uint grid = tables[TAB_IQ3S_GRID + entry];
+                uint grid = grid_lut[entry];
                 uint weight = (grid ^ mask) + (mask & 0x01010101u);
                 sum += dot(unpack_i8(weight), qv[l]);
             }

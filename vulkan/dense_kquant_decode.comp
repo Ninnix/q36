@@ -24,7 +24,7 @@ const uint Q2_K = 10u;
 const uint Q4_K = 12u;
 const uint Q5_K = 13u;
 const uint Q6_K = 14u;
-const uint ROWS = 2u;
+const uint ROWS = 4u;
 const uint Q8K_WORDS = 74u;
 
 uint load_u8(uint off) {
