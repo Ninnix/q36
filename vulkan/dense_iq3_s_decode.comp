@@ -19,7 +19,7 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
-const uint ROWS = 4u;
+const uint ROWS = 5u;
 const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 

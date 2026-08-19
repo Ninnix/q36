@@ -4953,8 +4953,7 @@ int q36_gpu_directional_steering_project_tensor(
  * and out_norm = rmsnorm(out_sum) * w in one dispatch.  Bit-identical to
  * q36_gpu_add_tensor() + q36_gpu_rms_norm_weight_rows_tensor(), which stays
  * the fallback for quality mode and Q36_VK_ADD_RMS=0.  out_sum may alias a
- * or b.  The shader keeps each thread's row slice in registers, so n is
- * capped at 16*256 lanes. */
+ * or b. */
 int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
                                 q36_gpu_tensor *out_sum,
                                 const q36_gpu_tensor *a,
@@ -4966,7 +4965,7 @@ int q36_gpu_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
                                 uint32_t rows,
                                 float eps) {
     if (n == 0 || rows == 0) return 0;
-    if (q36_gpu_quality || !q36_vk_use_add_rms() || !q36_vk_use_gpu_rms() || n > 4096u) {
+    if (q36_gpu_quality || !q36_vk_use_add_rms() || !q36_vk_use_gpu_rms() || n > 5120u) {
         return q36_gpu_add_tensor(out_sum, a, b, n * rows) &&
                q36_gpu_rms_norm_weight_rows_tensor(out_norm, out_sum,
                                                    model_map, model_size, weight_offset,
@@ -7020,7 +7019,7 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                     weight_type == Q36_VK_TENSOR_IQ3_XXS ?
                         "dense_iq3_xxs_decode" : "dense_iq3_s_decode",
                     kernel, bindings, &push, sizeof(push),
-                    ((uint32_t)out_dim + 3u) / 4u, 1, 1);
+                    ((uint32_t)out_dim + 4u) / 5u, 1, 1);
             } else {
                 struct {
                     uint32_t out_dim;
