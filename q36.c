@@ -4654,8 +4654,21 @@ static int q36_weights_tensor_routed_layer(const q36_weights *w, const q36_tenso
     return -1;
 }
 
+static bool q36_tensor_is_disabled_embedded_mtp(const q36_engine *e,
+                                                const q36_tensor *t) {
+    char prefix[32];
+    int len;
+    if (!e || !Q36_MODEL_DENSE || e->mtp_ready || !t) return false;
+    len = snprintf(prefix, sizeof(prefix), "blk.%u.", Q36_N_LAYER);
+    return len > 0 && (uint64_t)len <= t->name.len &&
+           memcmp(t->name.ptr, prefix, (size_t)len) == 0;
+}
+
 static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor *t) {
-    if (t == e->weights.token_embd || t->bytes == 0) return true;
+    /* The dense runtime executes only the trunk; its appended MTP block must
+     * not consume the resident model arena. */
+    if (t == e->weights.token_embd || t->bytes == 0 ||
+        q36_tensor_is_disabled_embedded_mtp(e, t)) return true;
     int il = q36_weights_tensor_routed_layer(&e->weights, t);
     return e->ssd_streaming && il >= 0 && (uint32_t)il >= e->ssd_streaming_full_layers;
 }
