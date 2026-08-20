@@ -1,0 +1,39 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer State { float state[]; };
+layout(set = 0, binding = 1) readonly buffer Gate { float gatev[]; };
+layout(set = 0, binding = 2) readonly buffer Weight { float weight[]; };
+
+layout(push_constant) uniform Push {
+    uint width;
+    uint rows;
+    float eps;
+} pc;
+
+shared double sh_sum[256];
+
+void main(void) {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint base = row * pc.width;
+    double ss = 0.0;
+    for (uint i = lid; i < pc.width; i += 256u) {
+        float v = state[base + i];
+        ss += double(v) * double(v);
+    }
+    sh_sum[lid] = ss;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_sum[lid] += sh_sum[lid + s];
+        barrier();
+    }
+    float scale = inversesqrt(float(sh_sum[0] / double(pc.width)) + pc.eps);
+    for (uint i = lid; i < pc.width; i += 256u) {
+        uint off = base + i;
+        float u = (state[off] * scale) * weight[i];
+        float g = gatev[off];
+        state[off] = (g / (1.0f + exp(-g))) * u;
+    }
+}

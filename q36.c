@@ -6789,12 +6789,21 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
             !q36_gpu_tensor_matmul_q8_or_float_scaled(
                 m, l->ffn_up_shexp, inp, rt->inp_q8,
                 rt->ffn_shared_up, Q36_N_EMBD, Q36_N_FF_SHARED,
-                n_tok, 1.0f) ||
-            !q36_gpu_swiglu_tensor(
-                rt->ffn_shared_mid, rt->ffn_shared_gate,
-                rt->ffn_shared_up, n_tok * Q36_N_FF_SHARED, 0.0f, 1.0f) ||
-            !q36_gpu_quantize_q8_k_tensor(
-                rt->inp_q8, rt->ffn_shared_mid, Q36_N_FF_SHARED, n_tok) ||
+                n_tok, 1.0f)) {
+            return false;
+        }
+        bool fused_swiglu_q8 = false;
+#ifndef Q36_METAL
+        fused_swiglu_q8 = q36_gpu_swiglu_q8_k_tensor(
+            rt->ffn_shared_mid, rt->inp_q8, rt->ffn_shared_gate,
+            rt->ffn_shared_up, Q36_N_FF_SHARED, n_tok, 0.0f, 1.0f);
+#endif
+        if ((!fused_swiglu_q8 &&
+             (!q36_gpu_swiglu_tensor(
+                  rt->ffn_shared_mid, rt->ffn_shared_gate,
+                  rt->ffn_shared_up, n_tok * Q36_N_FF_SHARED, 0.0f, 1.0f) ||
+              !q36_gpu_quantize_q8_k_tensor(
+                  rt->inp_q8, rt->ffn_shared_mid, Q36_N_FF_SHARED, n_tok))) ||
             !q36_gpu_tensor_matmul_q8_or_float_scaled(
                 m, l->ffn_down_shexp, rt->ffn_shared_mid, rt->inp_q8,
                 out, Q36_N_FF_SHARED, Q36_N_EMBD, n_tok, 1.0f)) {
@@ -7280,11 +7289,19 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         fprintf(stderr, "q36: recurrent delta decode non-finite at layer=%u\n", il);
         return false;
     }
-    bool norm_gate_fused = !e->quality &&
+    bool norm_gate_q8 = false;
+#ifndef Q36_METAL
+    norm_gate_q8 = !e->quality &&
+        q36_gpu_recurrent_norm_gate_q8_k_tensor(
+            rt->recur_proj, rt->inp_q8, rt->recur_z,
+            e->model.map, e->model.size, l->ssm_norm->abs_offset,
+            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
+#endif
+    bool norm_gate_fused = norm_gate_q8 || (!e->quality &&
         q36_gpu_recurrent_norm_gate_tensor(
             rt->recur_proj, rt->recur_z, e->model.map, e->model.size,
             l->ssm_norm->abs_offset, Q36_N_SSM_STATE,
-            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
+            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS));
     if (!norm_gate_fused &&
         (!q36_gpu_rms_norm_weight_rows_tensor(
              rt->recur_proj, rt->recur_proj,
@@ -7299,9 +7316,15 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         fprintf(stderr, "q36: recurrent gated proj non-finite at layer=%u\n", il);
         return false;
     }
-    if (!q36_gpu_tensor_matmul_scaled(&e->model, l->ssm_out, rt->recur_proj, out,
-                                      Q36_N_SSM_INNER, Q36_N_EMBD, n_tok,
-                                      q36_tensor_scalar_or(&e->model, l->ssm_out_scale, 1.0f))) {
+    float out_scale = q36_tensor_scalar_or(&e->model, l->ssm_out_scale, 1.0f);
+    bool out_ok = norm_gate_q8 ?
+        q36_gpu_tensor_matmul_q8_or_float_scaled(
+            &e->model, l->ssm_out, rt->recur_proj, rt->inp_q8, out,
+            Q36_N_SSM_INNER, Q36_N_EMBD, n_tok, out_scale) :
+        q36_gpu_tensor_matmul_scaled(
+            &e->model, l->ssm_out, rt->recur_proj, out,
+            Q36_N_SSM_INNER, Q36_N_EMBD, n_tok, out_scale);
+    if (!out_ok) {
         fprintf(stderr, "q36: recurrent ssm_out failed at layer=%u\n", il);
         return false;
     }

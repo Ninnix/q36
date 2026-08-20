@@ -1,0 +1,115 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Gate { float gatev[]; };
+layout(set = 0, binding = 1) readonly buffer Up { float upv[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float outv[]; };
+layout(set = 0, binding = 3) writeonly buffer Q8K { uint q8[]; };
+
+layout(push_constant) uniform Push {
+    uint in_dim;
+    uint blocks;
+    uint n_tok;
+    float clampv;
+    float weight;
+} pc;
+
+const uint Q8K_WORDS = 74u;
+
+shared float sh_abs[64];
+shared float sh_val[64];
+shared uint sh_idx[64];
+shared int sh_sum4[64];
+shared int sh_bsum[16];
+
+int nearest_int(float fval) {
+    precise float val = fval + 12582912.0f;
+    uint bits = floatBitsToUint(val);
+    return int(bits & 0x007fffffu) - 0x00400000;
+}
+
+uint pack_i8x4(int a0, int a1, int a2, int a3) {
+    return (uint(a0) & 255u)
+         | ((uint(a1) & 255u) << 8u)
+         | ((uint(a2) & 255u) << 16u)
+         | ((uint(a3) & 255u) << 24u);
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint elem0 = lid * 4u;
+    uint base = tok * pc.in_dim + block * 256u + elem0;
+    uint out_base = (tok * pc.blocks + block) * Q8K_WORDS;
+    float v[4];
+    float best_abs = 0.0;
+    float best_val = 0.0;
+    uint best_idx = elem0;
+
+    for (uint j = 0u; j < 4u; j++) {
+        float g = gatev[base + j];
+        float u = upv[base + j];
+        if (pc.clampv > 1.0e-6f) {
+            if (g > pc.clampv) g = pc.clampv;
+            u = clamp(u, -pc.clampv, pc.clampv);
+        }
+        v[j] = (g / (1.0 + exp(-g))) * u * pc.weight;
+        outv[base + j] = v[j];
+        float av = abs(v[j]);
+        if (av > best_abs) {
+            best_abs = av;
+            best_val = v[j];
+            best_idx = elem0 + j;
+        }
+    }
+
+    sh_abs[lid] = best_abs;
+    sh_val[lid] = best_val;
+    sh_idx[lid] = best_idx;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            float other_abs = sh_abs[lid + s];
+            uint other_idx = sh_idx[lid + s];
+            if (other_abs > sh_abs[lid] ||
+                (other_abs == sh_abs[lid] && other_idx < sh_idx[lid])) {
+                sh_abs[lid] = other_abs;
+                sh_val[lid] = sh_val[lid + s];
+                sh_idx[lid] = other_idx;
+            }
+        }
+        barrier();
+    }
+
+    float maxv = sh_val[0];
+    float iscale = maxv != 0.0 ? float(-127.0 / double(maxv)) : 0.0;
+    float d = iscale != 0.0 ? float(1.0 / double(iscale)) : 0.0;
+    int qv[4];
+    int sum4 = 0;
+    for (uint j = 0u; j < 4u; j++) {
+        int q = iscale != 0.0 ? nearest_int(iscale * v[j]) : 0;
+        if (q > 127) q = 127;
+        qv[j] = q;
+        sum4 += q;
+    }
+    if (lid == 0u) {
+        q8[out_base] = floatBitsToUint(d);
+        q8[out_base + 1u] = 0u;
+    }
+    q8[out_base + 2u + lid] = pack_i8x4(qv[0], qv[1], qv[2], qv[3]);
+    sh_sum4[lid] = sum4;
+    barrier();
+    if ((lid & 3u) == 0u) {
+        sh_bsum[lid >> 2u] = sh_sum4[lid] + sh_sum4[lid + 1u] +
+                             sh_sum4[lid + 2u] + sh_sum4[lid + 3u];
+    }
+    barrier();
+    if (lid < 8u) {
+        int s0 = sh_bsum[2u * lid];
+        int s1 = sh_bsum[2u * lid + 1u];
+        q8[out_base + 66u + lid] =
+            (uint(s0) & 0xffffu) | ((uint(s1) & 0xffffu) << 16u);
+    }
+}

@@ -129,6 +129,16 @@ int q36_gpu_quantize_q8_k_tensor(
         uint64_t                in_dim,
         uint64_t                n_tok);
 
+int q36_gpu_swiglu_q8_k_tensor(
+        q36_gpu_tensor       *out,
+        q36_gpu_tensor       *q8,
+        const q36_gpu_tensor *gate,
+        const q36_gpu_tensor *up,
+        uint32_t                in_dim,
+        uint32_t                n_tok,
+        float                   clamp,
+        float                   weight);
+
 int q36_gpu_matmul_f16_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,
@@ -268,6 +278,16 @@ int q36_gpu_recurrent_norm_gate_tensor(
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                width,
+        uint32_t                rows,
+        float                   eps);
+
+int q36_gpu_recurrent_norm_gate_q8_k_tensor(
+        q36_gpu_tensor       *state,
+        q36_gpu_tensor       *q8,
+        const q36_gpu_tensor *gate,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
         uint32_t                rows,
         float                   eps);
 

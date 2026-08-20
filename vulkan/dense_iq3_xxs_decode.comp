@@ -27,11 +27,9 @@ layout(push_constant) uniform Push {
 #endif
 const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
-const uint TAB_KSIGNS = 512u;
 const uint TAB_IQ3XXS_GRID = 3104u;
 
 shared uint grid_lut[256];
-shared uint signs_lut[128];
 
 uint load_u8(uint off) {
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -61,10 +59,6 @@ void main(void) {
     for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
     for (uint i = lid; i < 256u; i += 64u)
         grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
-    for (uint i = lid; i < 128u; i += 64u) {
-        uint packed = tables[TAB_KSIGNS + (i >> 2u)];
-        signs_lut[i] = (packed >> ((i & 3u) * 8u)) & 255u;
-    }
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
@@ -86,8 +80,9 @@ void main(void) {
             for (uint part = 0u; part < 2u; part++) {
                 uint qs = load_u32(base + 2u + 8u * ib + 4u * part);
                 for (uint l = 0u; l < 2u; l++) {
-                    uint signs = signs_lut[
-                        (aux >> (7u * (2u * part + l))) & 127u];
+                    uint signs =
+                        (aux >> (7u * (2u * part + l))) & 127u;
+                    uint parity = bitCount(signs) & 1u;
                     uint grid0 = grid_lut[(qs >> (16u * l)) & 255u];
                     uint grid1 = grid_lut[(qs >> (16u * l + 8u)) & 255u];
                     vec4 w0 = unpack_i8(grid0) * vec4(
@@ -100,7 +95,7 @@ void main(void) {
                         (signs & 1u) != 0u ? -1.0 : 1.0,
                         (signs & 2u) != 0u ? -1.0 : 1.0,
                         (signs & 4u) != 0u ? -1.0 : 1.0,
-                        (signs & 8u) != 0u ? -1.0 : 1.0);
+                        parity != 0u ? -1.0 : 1.0);
                     uint q = 4u * part + 2u * l;
                     vec4 q0 = qv[q];
                     vec4 q1 = qv[q + 1u];

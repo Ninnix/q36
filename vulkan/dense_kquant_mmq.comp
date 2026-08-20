@@ -25,8 +25,8 @@ const uint Q3_K = 11u;
 const uint Q4_K = 12u;
 const uint Q5_K = 13u;
 const uint Q6_K = 14u;
-const uint BM = 64u;
-const uint BN = 64u;
+const uint BM = 32u;
+const uint BN = 128u;
 const uint BK = 32u;
 const uint STRIDE = BK / 2u + 1u;
 const uint Q8K_WORDS = 74u;
@@ -131,7 +131,8 @@ vec4 dequant_word(uint row, uint qb, uint word) {
         uint group = idx >> 4u;
         float sc = float(load_u8(base + group) & 15u);
         float mn = float(load_u8(base + group) >> 4u);
-        v = weight_d[row & 63u] * sc * qv - weight_dm[row & 63u] * mn;
+        v = weight_d[row & (BM - 1u)] * sc * qv -
+            weight_dm[row & (BM - 1u)] * mn;
     } else if (pc.type == Q3_K) {
         base += 110u * qb;
         uint half_id = idx >> 7u;
@@ -147,7 +148,8 @@ vec4 dequant_word(uint row, uint qb, uint word) {
                         (hm & (m << 8u)) != 0u ? 0.0 : 1.0,
                         (hm & (m << 16u)) != 0u ? 0.0 : 1.0,
                         (hm & (m << 24u)) != 0u ? 0.0 : 1.0);
-        v = weight_d[row & 63u] * float(q3_scale(base, idx >> 4u)) * qv;
+        v = weight_d[row & (BM - 1u)] *
+            float(q3_scale(base, idx >> 4u)) * qv;
     } else if (pc.type == Q4_K || pc.type == Q5_K) {
         uint bytes = pc.type == Q4_K ? 144u : 176u;
         base += bytes * qb;
@@ -159,8 +161,8 @@ vec4 dequant_word(uint row, uint qb, uint word) {
         uint sc;
         uint mn;
         k4_scale_min(base, idx >> 5u, sc, mn);
-        v = weight_d[row & 63u] * float(sc) * qv -
-            weight_dm[row & 63u] * float(mn);
+        v = weight_d[row & (BM - 1u)] * float(sc) * qv -
+            weight_dm[row & (BM - 1u)] * float(mn);
     } else {
         base += 210u * qb;
         uint half_block = idx >> 7u;
@@ -175,7 +177,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
         qv = vec4(float(packed & 255u), float((packed >> 8u) & 255u),
                   float((packed >> 16u) & 255u), float(packed >> 24u)) - 32.0;
         int sc = load_i8(base + 192u + (idx >> 4u));
-        v = weight_d[row & 63u] * float(sc) * qv;
+        v = weight_d[row & (BM - 1u)] * float(sc) * qv;
     }
     return v * pc.scale;
 }
@@ -195,8 +197,8 @@ void main(void) {
     uint lane = gl_SubgroupInvocationID;
     uint lane_row = lane & 7u;
     uint lane_tok = lane >> 3u;
-    uint out_row0 = row0 + (wave & 1u) * 32u + lane_row * 4u;
-    uint out_tok0 = tok0 + (wave >> 1u) * 32u + lane_tok * 8u;
+    uint out_row0 = row0 + lane_row * 4u;
+    uint out_tok0 = tok0 + wave * 32u + lane_tok * 8u;
     f16vec2 sum[16];
     [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
 
@@ -265,9 +267,9 @@ void main(void) {
                 f16vec2 av[4];
                 f16vec2 bv[8];
                 [[unroll]] for (uint r = 0u; r < 4u; r++)
-                    av[r] = buf_a[((wave & 1u) * 32u + lane_row * 4u + r) * STRIDE + k];
+                    av[r] = buf_a[(lane_row * 4u + r) * STRIDE + k];
                 [[unroll]] for (uint t = 0u; t < 8u; t++)
-                    bv[t] = buf_b[((wave >> 1u) * 32u + lane_tok * 8u + t) * STRIDE + k];
+                    bv[t] = buf_b[(wave * 32u + lane_tok * 8u + t) * STRIDE + k];
                 [[unroll]] for (uint r = 0u; r < 4u; r++)
                     [[unroll]] for (uint tp = 0u; tp < 4u; tp++)
                         sum[r * 4u + tp] = fma(f16vec2(av[r].x),

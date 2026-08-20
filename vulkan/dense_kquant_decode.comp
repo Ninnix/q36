@@ -6,7 +6,7 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#ifdef Q36_Q5K_ONLY
+#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
 layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
 #else
 layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
@@ -35,14 +35,16 @@ const uint Q6_K = 14u;
 const uint ROWS = 4u;
 const uint Q8K_WORDS = 74u;
 
-#ifdef Q36_Q5K_ONLY
+#ifdef Q36_Q4K_ONLY
+#define QTYPE Q4_K
+#elif defined(Q36_Q5K_ONLY)
 #define QTYPE Q5_K
 #else
 #define QTYPE pc.type
 #endif
 
 uint load_u8(uint off) {
-#ifdef Q36_Q5K_ONLY
+#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return (ww[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
 #else
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -50,7 +52,7 @@ uint load_u8(uint off) {
 }
 
 uint load_u32(uint off) {
-#ifdef Q36_Q5K_ONLY
+#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return ww[off >> 2u];
 #else
     uint i = off >> 1u;
@@ -63,7 +65,7 @@ int load_i8(uint off) {
 }
 
 float load_f16(uint off) {
-#ifdef Q36_Q5K_ONLY
+#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return unpackHalf2x16(ww[off >> 2u] >> ((off & 2u) * 8u)).x;
 #else
     return unpackHalf2x16(uint(wh[off >> 1u])).x;
