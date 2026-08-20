@@ -19,12 +19,12 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 LLAMA_CPP_DIR ?= llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build
 REFERENCE_MODEL ?= gguf/Qwen3.6-35B-A3B-Q8_0.gguf
-QWEN27B_MODEL ?= gguf/Qwen3.8-27B-UD-IQ3_XXS.gguf
+QWEN27B_MODEL ?= gguf/Qwen3.8-27B-UD-IQ3_S.gguf
 QWEN27B_PROMPT ?= tests/long_context_story_prompt.txt
 QWEN27B_GEN ?= 128
 QWEN27B_GATE_GEN ?= 32
 QWEN27B_LLAMA_PROMPT ?= 64
-QWEN27B_LLAMA_BENCH ?= $(LLAMA_CPP_DIR)/build-metal/bin/llama-bench
+QWEN27B_LLAMA_BENCH ?= $(LLAMA_CPP_DIR)/build-vulkan/bin/llama-bench
 SAMPLING_TEST := tests/test_sampling
 OPENROUTER_MODEL ?= qwen/qwen3.6-35b-a3b
 OPENROUTER_OUT ?= gguf-tools/quality-testing/local/openrouter
@@ -124,6 +124,8 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs_decode.spv \
 	vulkan/dense_iq4_xs_mmq.spv \
 	vulkan/dense_iq1_m.spv \
+	vulkan/dense_extra_decode.spv \
+	vulkan/dense_extra_mmq.spv \
 	vulkan/dense_kquant_mmq.spv \
 	vulkan/dense_kquant_decode.spv \
 	vulkan/dense_q5k_decode.spv \
@@ -164,6 +166,12 @@ vulkan/dense_iq4_xs_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/dense_iq1_m.spv: vulkan/dense_iq1_m.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_extra_decode.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_extra_mmq.spv: vulkan/dense_extra_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
@@ -247,7 +255,7 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-vulkan benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
@@ -259,9 +267,9 @@ help:
 	@echo "  make metal        Build the same binaries with the Metal backend (macOS)"
 	@echo "  make test-metal   Build Metal and run its model-independent unit and kernel tests"
 	@echo "  make test-metal-model  Run Metal model, parity, streaming, and state tests"
-	@echo "  make test-qwen27b-metal-parity  Run short CPU/Metal parity for the IQ3_XXS 27B model"
-	@echo "  make test-qwen27b-vulkan-parity  Run short CPU/Vulkan parity for the IQ3_XXS 27B model"
-	@echo "  make test-qwen27b-llama-parity  Run short llama.cpp/CPU parity for the IQ3_XXS 27B model"
+	@echo "  make test-qwen27b-metal-parity  Run short CPU/Metal parity for the IQ3_S 27B model"
+	@echo "  make test-qwen27b-vulkan-parity  Run short CPU/Vulkan parity for the IQ3_S 27B model"
+	@echo "  make test-qwen27b-llama-parity  Run short llama.cpp/CPU parity for the IQ3_S 27B model"
 	@echo "  make cpu          Build CPU-only ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test"
 	@echo "  make q36-quality-score  Build the OpenRouter/Q36 local scorer"
 	@echo "  make test         Build and run tests"
@@ -531,11 +539,16 @@ benchmark-session-batch: q36-server
 benchmark-gate: q36-bench
 	./tests/release_bench_gate.sh
 
-benchmark-qwen27b: benchmark-qwen27b-metal benchmark-qwen27b-llama
+benchmark-qwen27b: benchmark-qwen27b-vulkan benchmark-qwen27b-llama
 
-benchmark-qwen27b-gate: metal
-	./q36-bench --metal -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GATE_GEN)
-	./q36-bench --metal -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2304 --gen-tokens $(QWEN27B_GATE_GEN)
+benchmark-qwen27b-gate: q36-bench
+	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GATE_GEN)
+	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2304 --gen-tokens $(QWEN27B_GATE_GEN)
+
+benchmark-qwen27b-vulkan: q36-bench
+	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GEN)
+	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2304 --gen-tokens $(QWEN27B_GEN)
+	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 4096 --ctx-max 4096 --ctx-alloc 4352 --gen-tokens $(QWEN27B_GEN)
 
 benchmark-qwen27b-metal: metal
 	./q36-bench --metal -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GEN)

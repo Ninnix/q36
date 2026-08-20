@@ -23,11 +23,15 @@ enum {
     Q36_VK_TENSOR_F32     = 0,
     Q36_VK_TENSOR_F16     = 1,
     Q36_VK_TENSOR_Q2_K    = 10,
+    Q36_VK_TENSOR_Q3_K    = 11,
     Q36_VK_TENSOR_Q4_K    = 12,
     Q36_VK_TENSOR_Q5_K    = 13,
     Q36_VK_TENSOR_Q6_K    = 14,
     Q36_VK_TENSOR_IQ2_XXS = 16,
+    Q36_VK_TENSOR_IQ2_XS  = 17,
     Q36_VK_TENSOR_IQ3_XXS = 18,
+    Q36_VK_TENSOR_IQ1_S   = 19,
+    Q36_VK_TENSOR_IQ4_NL  = 20,
     Q36_VK_TENSOR_IQ3_S   = 21,
     Q36_VK_TENSOR_IQ2_S   = 22,
     Q36_VK_TENSOR_IQ4_XS  = 23,
@@ -209,6 +213,8 @@ typedef struct {
     q36_vk_kernel dense_iq4_xs_decode;
     q36_vk_kernel dense_iq4_xs_mmq;
     q36_vk_kernel dense_iq1_m;
+    q36_vk_kernel dense_extra_decode;
+    q36_vk_kernel dense_extra_mmq;
     q36_vk_kernel dense_kquant_mmq;
     q36_vk_kernel dense_kquant_decode;
     q36_vk_kernel dense_q5k_decode;
@@ -636,6 +642,11 @@ static const char *q36_vk_prof_iq3_shape(uint32_t type, uint32_t n_tok,
     s->out_dim = out_dim;
     const char *kind = type == Q36_VK_TENSOR_IQ3_S ? "iq3_s" :
                        type == Q36_VK_TENSOR_IQ3_XXS ? "iq3_xxs" :
+                       type == Q36_VK_TENSOR_IQ2_XXS ? "iq2_xxs" :
+                       type == Q36_VK_TENSOR_IQ2_XS ? "iq2_xs" :
+                       type == Q36_VK_TENSOR_IQ2_S ? "iq2_s" :
+                       type == Q36_VK_TENSOR_IQ1_S ? "iq1_s" :
+                       type == Q36_VK_TENSOR_IQ4_NL ? "iq4_nl" :
                        type == Q36_VK_TENSOR_IQ4_XS ? "iq4_xs" : "iq";
     snprintf(s->name, sizeof(s->name), "dense_%s_%s_%ux%u_n%u",
              kind,
@@ -2817,6 +2828,8 @@ int q36_gpu_init(void) {
     q36_vk.dense_iq4_xs_decode = Q36_VK_KERNEL("vulkan/dense_iq4_xs_decode.spv", 3, 16, 1u << 2);
     q36_vk.dense_iq4_xs_mmq = Q36_VK_KERNEL("vulkan/dense_iq4_xs_mmq.spv", 3, 20, 1u << 2);
     q36_vk.dense_iq1_m = Q36_VK_KERNEL("vulkan/dense_iq1_m.spv", 4, 20, 1u << 2);
+    q36_vk.dense_extra_decode = Q36_VK_KERNEL("vulkan/dense_extra_decode.spv", 4, 20, 1u << 2);
+    q36_vk.dense_extra_mmq = Q36_VK_KERNEL("vulkan/dense_extra_mmq.spv", 4, 24, 1u << 2);
     q36_vk.dense_kquant_mmq = Q36_VK_KERNEL("vulkan/dense_kquant_mmq.spv", 3, 28, 1u << 2);
     q36_vk.dense_kquant_decode = Q36_VK_KERNEL("vulkan/dense_kquant_decode.spv", 3, 28, 1u << 2);
     q36_vk.dense_q5k_decode = Q36_VK_KERNEL("vulkan/dense_q5k_decode.spv", 3, 28, 1u << 2);
@@ -3169,6 +3182,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.moe_reduce);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_mmq);
     q36_vk_kernel_destroy(&q36_vk.dense_iq1_m);
+    q36_vk_kernel_destroy(&q36_vk.dense_extra_mmq);
+    q36_vk_kernel_destroy(&q36_vk.dense_extra_decode);
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_mmq);
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_decode);
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs);
@@ -4153,7 +4168,7 @@ static int q36_vk_matmul_q8_0_mm(q36_gpu_tensor *out,
     if (ok) {
         const q36_gpu_tensor *bindings[3] = { weights, x, out };
         const char *op = q36_vk.prof_ops ? q36_vk_q8_0_op_name(out_dim, blocks, n_tok) : "dense_q8_0";
-        int f16 = q36_vk_use_q8_mm_f16();
+        int f16 = n_tok >= 32u && out_dim >= 64u && q36_vk_use_q8_mm_f16();
         int out32 = f16 && out_dim == 32u && q36_vk_use_q8_mm_f16_out32();
         q36_vk_kernel *kernel = out32 ? &q36_vk.matmul_q8_0_mm_f16_out32 :
                                 f16 ? &q36_vk.matmul_q8_0_mm_f16 :
@@ -4508,6 +4523,7 @@ int q36_gpu_shared_ffn_decode_tensor(q36_gpu_tensor *out,
 static uint64_t q36_vk_kquant_row_bytes(uint32_t type) {
     switch (type) {
     case Q36_VK_TENSOR_Q2_K: return 84;
+    case Q36_VK_TENSOR_Q3_K: return 110;
     case Q36_VK_TENSOR_Q4_K: return 144;
     case Q36_VK_TENSOR_Q5_K: return 176;
     case Q36_VK_TENSOR_Q6_K: return 210;
@@ -4702,9 +4718,10 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(q36_gpu_tensor *out,
             };
             const q36_gpu_tensor *bindings[3] = { weights, q8, out };
             const char *op = weight_type == Q36_VK_TENSOR_Q2_K ? "dense_q2k_decode" :
+                             (weight_type == Q36_VK_TENSOR_Q3_K ? "dense_q3k_decode" :
                              (weight_type == Q36_VK_TENSOR_Q4_K ? "dense_q4k_decode" :
                              (weight_type == Q36_VK_TENSOR_Q5_K ? "dense_q5k_decode" :
-                                                                 "dense_q6k_decode"));
+                                                                 "dense_q6k_decode")));
             bool q5_full = weight_type == Q36_VK_TENSOR_Q5_K &&
                            out_dim % 4u == 0u;
             q36_vk_kernel *kernel = q5_full ? &q36_vk.dense_q5k_decode :
@@ -4717,7 +4734,7 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(q36_gpu_tensor *out,
         return ok;
     }
 
-    if (q36_gpu_dense_model && !q36_gpu_quality && n_tok >= 32u &&
+    if (q36_gpu_dense_model && !q36_gpu_quality && n_tok > 1u &&
         q36_vk.have_f16 && q36_vk.subgroup_size_control &&
         q36_vk_env_default_on("Q36_VK_DENSE_KQUANT_MMQ")) {
         pthread_mutex_lock(&q36_vk_mu);
@@ -6651,7 +6668,10 @@ static uint64_t q36_vk_iq_block_bytes(uint32_t type) {
     case Q36_VK_TENSOR_Q5_K: return 176;
     case Q36_VK_TENSOR_Q6_K: return 210;
     case Q36_VK_TENSOR_IQ2_XXS: return 66;
+    case Q36_VK_TENSOR_IQ2_XS: return 74;
     case Q36_VK_TENSOR_IQ3_XXS: return 98;
+    case Q36_VK_TENSOR_IQ1_S: return 50;
+    case Q36_VK_TENSOR_IQ4_NL: return 144;
     case Q36_VK_TENSOR_IQ3_S: return 110;
     case Q36_VK_TENSOR_IQ2_S: return 82;
     case Q36_VK_TENSOR_IQ4_XS: return 136;
@@ -7066,10 +7086,15 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
     const unsigned char *source;
     int ok;
 
+    bool extra_type = weight_type == Q36_VK_TENSOR_IQ2_XXS ||
+                      weight_type == Q36_VK_TENSOR_IQ2_XS ||
+                      weight_type == Q36_VK_TENSOR_IQ2_S ||
+                      weight_type == Q36_VK_TENSOR_IQ1_S ||
+                      weight_type == Q36_VK_TENSOR_IQ4_NL;
     if ((weight_type != Q36_VK_TENSOR_IQ3_XXS &&
          weight_type != Q36_VK_TENSOR_IQ3_S &&
          weight_type != Q36_VK_TENSOR_IQ4_XS &&
-         weight_type != Q36_VK_TENSOR_IQ1_M) ||
+         weight_type != Q36_VK_TENSOR_IQ1_M && !extra_type) ||
         in_dim == 0 || (in_dim % Q36_VK_QK_K) != 0 ||
         out_dim == 0 || n_tok == 0 || in_dim > UINT32_MAX ||
         out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
@@ -7086,6 +7111,57 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
         !q36_gpu_tensor_range_ok(q8, 0, q8_bytes)) return 0;
     source = q36_gpu_weight_bytes(model_map, model_size, weight_offset, weight_bytes);
     if (!source) return 0;
+
+    if (extra_type) {
+        pthread_mutex_lock(&q36_vk_mu);
+        q36_gpu_tensor *tables = q36_vk_iq_tables_unlocked();
+        q36_gpu_tensor *weights = tables ?
+            q36_vk_weight_get_unlocked(source, weight_bytes) : NULL;
+        ok = weights != NULL;
+        if (ok) {
+            const q36_gpu_tensor *bindings[4] = { weights, q8, out, tables };
+            const char *op = q36_vk_prof_iq3_shape(
+                weight_type, (uint32_t)n_tok, (uint32_t)in_dim,
+                (uint32_t)out_dim, n_tok == 1u ?
+                    "dense_extra_decode" : "dense_extra_mmq");
+            if (n_tok == 1u) {
+                struct {
+                    uint32_t out_dim;
+                    uint32_t blocks;
+                    uint32_t row_bytes;
+                    uint32_t type;
+                    float scale;
+                } push = {
+                    (uint32_t)out_dim, (uint32_t)blocks,
+                    (uint32_t)row_bytes, weight_type, scale,
+                };
+                ok = q36_vk_run_unlocked(
+                    op, &q36_vk.dense_extra_decode,
+                    bindings, &push, sizeof(push),
+                    ((uint32_t)out_dim + 3u) / 4u, 1, 1);
+            } else {
+                struct {
+                    uint32_t out_dim;
+                    uint32_t n_tok;
+                    uint32_t blocks;
+                    uint32_t row_bytes;
+                    uint32_t type;
+                    float scale;
+                } push = {
+                    (uint32_t)out_dim, (uint32_t)n_tok,
+                    (uint32_t)blocks, (uint32_t)row_bytes,
+                    weight_type, scale,
+                };
+                ok = q36_vk_run_unlocked(
+                    op, &q36_vk.dense_extra_mmq,
+                    bindings, &push, sizeof(push),
+                    ((uint32_t)out_dim + 63u) / 64u,
+                    ((uint32_t)n_tok + 63u) / 64u, 1);
+            }
+        }
+        pthread_mutex_unlock(&q36_vk_mu);
+        return ok;
+    }
 
     if (weight_type == Q36_VK_TENSOR_IQ4_XS && !q36_gpu_quality &&
         q36_vk_use_dense_iq3_fast() && (n_tok != 1u || out_dim % 4u == 0u)) {

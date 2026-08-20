@@ -259,12 +259,16 @@ static const gguf_type_info gguf_types[] = {
     [1]  = {"f16", 1, 2},
     [8]  = {"q8_0", 32, 34},
     [10] = {"q2_k", 256, 84},
+    [11] = {"q3_k", 256, 110},
     [12] = {"q4_k", 256, 144},
     [13] = {"q5_k", 256, 176},
     [14] = {"q6_k", 256, 210},
     [15] = {"q8_k", 256, 292},
     [16] = {"iq2_xxs", 256, 66},
+    [17] = {"iq2_xs", 256, 74},
     [18] = {"iq3_xxs", 256, 98},
+    [19] = {"iq1_s", 256, 50},
+    [20] = {"iq4_nl", 32, 18},
     [21] = {"iq3_s", 256, 110},
     [22] = {"iq2_s", 256, 82},
     [23] = {"iq4_xs", 256, 136},
@@ -277,11 +281,15 @@ enum {
     Q36_TENSOR_F16 = 1,
     Q36_TENSOR_Q8_0 = 8,
     Q36_TENSOR_Q2_K = 10,
+    Q36_TENSOR_Q3_K = 11,
     Q36_TENSOR_Q4_K = 12,
     Q36_TENSOR_Q5_K = 13,
     Q36_TENSOR_Q6_K = 14,
     Q36_TENSOR_IQ2_XXS = 16,
+    Q36_TENSOR_IQ2_XS = 17,
     Q36_TENSOR_IQ3_XXS = 18,
+    Q36_TENSOR_IQ1_S = 19,
+    Q36_TENSOR_IQ4_NL = 20,
     Q36_TENSOR_IQ3_S = 21,
     Q36_TENSOR_IQ2_S = 22,
     Q36_TENSOR_IQ4_XS = 23,
@@ -350,6 +358,13 @@ typedef struct {
 } q36_block_q2_k;
 
 typedef struct {
+    uint8_t hmask[Q36_QK_K / 8];
+    uint8_t qs[Q36_QK_K / 4];
+    uint8_t scales[12];
+    uint16_t d;
+} q36_block_q3_k;
+
+typedef struct {
     uint16_t d;
     uint16_t dmin;
     uint8_t scales[Q36_K_SCALE_SIZE];
@@ -360,6 +375,12 @@ typedef struct {
     uint16_t d;
     uint16_t qs[Q36_QK_K / 8];
 } q36_block_iq2_xxs;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[Q36_QK_K / 8];
+    uint8_t scales[Q36_QK_K / 32];
+} q36_block_iq2_xs;
 
 typedef struct {
     uint16_t d;
@@ -381,6 +402,17 @@ typedef struct {
     uint8_t signs[Q36_QK_K / 8];
     uint8_t scales[Q36_IQ3S_N_SCALE];
 } q36_block_iq3_s;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[Q36_QK_K / 8];
+    uint16_t qh[Q36_QK_K / 32];
+} q36_block_iq1_s;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[16];
+} q36_block_iq4_nl;
 
 typedef struct {
     uint16_t d;
@@ -1772,11 +1804,15 @@ static void q36_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m
 static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes);
 static void q36_dequantize_row_q8_0(const q36_block_q8_0 *x, float *y, uint64_t k);
 static void q36_dequantize_row_q2_k(const q36_block_q2_k *x, float *y, uint64_t k);
+static void q36_dequantize_row_q3_k(const q36_block_q3_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_q4_k(const q36_block_q4_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_q5_k(const q36_block_q5_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_q6_k(const q36_block_q6_k *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq2_xxs(const q36_block_iq2_xxs *x, float *y, uint64_t k);
+static void q36_dequantize_row_iq2_xs(const q36_block_iq2_xs *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq3_xxs(const q36_block_iq3_xxs *x, float *y, uint64_t k);
+static void q36_dequantize_row_iq1_s(const q36_block_iq1_s *x, float *y, uint64_t k);
+static void q36_dequantize_row_iq4_nl(const q36_block_iq4_nl *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq2_s(const q36_block_iq2_s *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq3_s(const q36_block_iq3_s *x, float *y, uint64_t k);
 static void q36_dequantize_row_iq4_xs(const q36_block_iq4_xs *x, float *y, uint64_t k);
@@ -1784,6 +1820,10 @@ static void q36_dequantize_row_iq1_m(const q36_block_iq1_m *x, float *y, uint64_
 
 static const uint8_t *q36_iq2xxs_grid_at(uint32_t idx) {
     return q36_iq2xxs_grid + (size_t)idx * 8u;
+}
+
+static const uint8_t *q36_iq2xs_grid_at(uint32_t idx) {
+    return (const uint8_t *)&q36_iq2xs_grid[idx];
 }
 
 static const uint8_t *q36_iq2s_grid_at(uint32_t idx) {
@@ -1814,6 +1854,9 @@ static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float
     case Q36_TENSOR_Q2_K:
         q36_dequantize_row_q2_k((const q36_block_q2_k *)src, dst, n);
         return true;
+    case Q36_TENSOR_Q3_K:
+        q36_dequantize_row_q3_k((const q36_block_q3_k *)src, dst, n);
+        return true;
     case Q36_TENSOR_Q4_K:
         q36_dequantize_row_q4_k((const q36_block_q4_k *)src, dst, n);
         return true;
@@ -1826,8 +1869,17 @@ static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float
     case Q36_TENSOR_IQ2_XXS:
         q36_dequantize_row_iq2_xxs((const q36_block_iq2_xxs *)src, dst, n);
         return true;
+    case Q36_TENSOR_IQ2_XS:
+        q36_dequantize_row_iq2_xs((const q36_block_iq2_xs *)src, dst, n);
+        return true;
     case Q36_TENSOR_IQ3_XXS:
         q36_dequantize_row_iq3_xxs((const q36_block_iq3_xxs *)src, dst, n);
+        return true;
+    case Q36_TENSOR_IQ1_S:
+        q36_dequantize_row_iq1_s((const q36_block_iq1_s *)src, dst, n);
+        return true;
+    case Q36_TENSOR_IQ4_NL:
+        q36_dequantize_row_iq4_nl((const q36_block_iq4_nl *)src, dst, n);
         return true;
     case Q36_TENSOR_IQ2_S:
         q36_dequantize_row_iq2_s((const q36_block_iq2_s *)src, dst, n);
@@ -1887,6 +1939,42 @@ static void q36_dequantize_row_q2_k(const q36_block_q2_k *x, float *y, uint64_t 
                 for (int l = 0; l < 16; l++) *y++ = dl * (float)((q[l + 16] >> shift) & 3u) - ml;
 
                 shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+static void q36_dequantize_row_q3_k(const q36_block_q3_k *x, float *y, uint64_t k) {
+    const uint32_t mask2 = 0x03030303u;
+    const uint32_t mask4 = 0x0f0f0f0fu;
+    if ((k % Q36_QK_K) != 0) q36_die("q3_k row size mismatch");
+    for (uint64_t i = 0; i < k / Q36_QK_K; i++) {
+        uint32_t aux[4] = {0};
+        memcpy(aux, x[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & mask4) | (((tmp >> 4) & mask2) << 4);
+        aux[3] = ((aux[1] >> 4) & mask4) | (((tmp >> 6) & mask2) << 4);
+        aux[0] = (aux[0] & mask4) | (((tmp >> 0) & mask2) << 4);
+        aux[1] = (aux[1] & mask4) | (((tmp >> 2) & mask2) << 4);
+
+        const int8_t *scales = (const int8_t *)aux;
+        const uint8_t *q = x[i].qs;
+        const uint8_t *hm = x[i].hmask;
+        float d = q36_f16_to_f32(x[i].d);
+        uint8_t m = 1;
+        int is = 0;
+        for (uint32_t n = 0; n < Q36_QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dl = d * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; l++)
+                    *y++ = dl * (float)((int)((q[l] >> shift) & 3u) - ((hm[l] & m) ? 0 : 4));
+                dl = d * (float)(scales[is++] - 32);
+                for (int l = 0; l < 16; l++)
+                    *y++ = dl * (float)((int)((q[l + 16] >> shift) & 3u) - ((hm[l + 16] & m) ? 0 : 4));
+                shift += 2;
+                m = (uint8_t)(m << 1);
             }
             q += 32;
         }
@@ -2013,6 +2101,28 @@ static void q36_dequantize_row_iq2_xxs(const q36_block_iq2_xxs *x, float *y, uin
     }
 }
 
+static void q36_dequantize_row_iq2_xs(const q36_block_iq2_xs *x, float *y, uint64_t k) {
+    if ((k % Q36_QK_K) != 0) q36_die("iq2_xs row size mismatch");
+    for (uint64_t i = 0; i < k / Q36_QK_K; i++) {
+        float d = q36_f16_to_f32(x[i].d);
+        for (uint32_t ib = 0; ib < Q36_QK_K / 32; ib++) {
+            float db[2] = {
+                d * (0.5f + (float)(x[i].scales[ib] & 15u)) * 0.25f,
+                d * (0.5f + (float)(x[i].scales[ib] >> 4)) * 0.25f,
+            };
+            for (uint32_t l = 0; l < 4; l++) {
+                uint16_t qs = x[i].qs[4 * ib + l];
+                const uint8_t *grid = q36_iq2xs_grid_at(qs & 511u);
+                uint8_t signs = q36_ksigns_iq2xs[qs >> 9];
+                for (uint32_t j = 0; j < 8; j++)
+                    y[j] = db[l / 2] * (float)grid[j] *
+                        ((signs & q36_kmask_iq2xs[j]) ? -1.0f : 1.0f);
+                y += 8;
+            }
+        }
+    }
+}
+
 static void q36_dequantize_row_iq2_s(const q36_block_iq2_s *x, float *y, uint64_t k) {
     uint64_t nb;
     if ((k % Q36_QK_K) != 0) q36_die("iq2_s row size mismatch");
@@ -2128,6 +2238,42 @@ static void q36_dequantize_row_iq4_xs(const q36_block_iq4_xs *x, float *y, uint6
     }
 }
 
+static void q36_dequantize_row_iq1_s(const q36_block_iq1_s *x, float *y, uint64_t k) {
+    if ((k % Q36_QK_K) != 0) q36_die("iq1_s row size mismatch");
+    for (uint64_t b = 0; b < k / Q36_QK_K; b++) {
+        float d = q36_f16_to_f32(x[b].d);
+        const uint8_t *qs = x[b].qs;
+        for (uint32_t ib = 0; ib < Q36_QK_K / 32; ib++) {
+            uint16_t qh = x[b].qh[ib];
+            float dl = d * (float)(2u * ((qh >> 12) & 7u) + 1u);
+            float delta = qh & 0x8000u ? -0.125f : 0.125f;
+            for (uint32_t l = 0; l < 4; l++) {
+                uint32_t idx = qs[l] | (((qh >> (3u * l)) & 7u) << 8);
+                const int8_t *grid = (const int8_t *)&iq1s_grid[idx];
+                for (uint32_t j = 0; j < 8; j++) y[j] = dl * ((float)grid[j] + delta);
+                y += 8;
+            }
+            qs += 4;
+        }
+    }
+}
+
+static void q36_dequantize_row_iq4_nl(const q36_block_iq4_nl *x, float *y, uint64_t k) {
+    static const int8_t values[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113,
+    };
+    if ((k % 32u) != 0) q36_die("iq4_nl row size mismatch");
+    for (uint64_t b = 0; b < k / 32u; b++) {
+        float d = q36_f16_to_f32(x[b].d);
+        for (uint32_t j = 0; j < 16; j++) {
+            y[j] = d * (float)values[x[b].qs[j] & 15u];
+            y[j + 16] = d * (float)values[x[b].qs[j] >> 4];
+        }
+        y += 32;
+    }
+}
+
 static void q36_dequantize_row_iq1_m(const q36_block_iq1_m *x, float *y, uint64_t k) {
     if ((k % Q36_QK_K) != 0) q36_die("iq1_m row size mismatch");
     for (uint64_t b = 0; b < k / Q36_QK_K; b++) {
@@ -2234,11 +2380,15 @@ static void q36_scale_inplace(float *x, uint32_t n, float scale) {
 static bool q36_tensor_type_supports_q8k_dot(uint32_t type) {
     switch (type) {
     case Q36_TENSOR_Q2_K:
+    case Q36_TENSOR_Q3_K:
     case Q36_TENSOR_Q4_K:
     case Q36_TENSOR_Q5_K:
     case Q36_TENSOR_Q6_K:
     case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ2_XS:
     case Q36_TENSOR_IQ3_XXS:
+    case Q36_TENSOR_IQ1_S:
+    case Q36_TENSOR_IQ4_NL:
     case Q36_TENSOR_IQ2_S:
     case Q36_TENSOR_IQ3_S:
     case Q36_TENSOR_IQ4_XS:
@@ -2275,7 +2425,8 @@ static bool q36_tensor_row_dot_q8k(uint32_t type, const uint8_t *row, const uint
     uint32_t block_bytes;
     if (!row || !xq || !out || (n % Q36_QK_K) != 0) return false;
     if (type >= sizeof(gguf_types) / sizeof(gguf_types[0]) || !gguf_types[type].block_bytes) return false;
-    block_bytes = gguf_types[type].block_bytes;
+    block_bytes = gguf_types[type].block_bytes *
+                  (Q36_QK_K / gguf_types[type].block_elems);
     for (uint32_t block = 0; block < n / Q36_QK_K; block++) {
         if (!q36_dequantize_row_from_ptr(type, row + (uint64_t)block * block_bytes,
                                          weights, Q36_QK_K)) return false;
@@ -3556,11 +3707,15 @@ static bool tensor_type_is_cpu_matrix(uint32_t type) {
     case Q36_TENSOR_F16:
     case Q36_TENSOR_Q8_0:
     case Q36_TENSOR_Q2_K:
+    case Q36_TENSOR_Q3_K:
     case Q36_TENSOR_Q4_K:
     case Q36_TENSOR_Q5_K:
     case Q36_TENSOR_Q6_K:
     case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ2_XS:
     case Q36_TENSOR_IQ3_XXS:
+    case Q36_TENSOR_IQ1_S:
+    case Q36_TENSOR_IQ4_NL:
     case Q36_TENSOR_IQ2_S:
     case Q36_TENSOR_IQ3_S:
     case Q36_TENSOR_IQ4_XS:
@@ -3635,14 +3790,18 @@ static void tensor_expect_routed_down(const q36_tensor *t, uint32_t ndim, uint64
 static int q36_quant_bits_from_type(uint32_t type) {
     switch (type) {
     case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ2_XS:
     case Q36_TENSOR_IQ2_S:
     case Q36_TENSOR_Q2_K:
         return 2;
     case Q36_TENSOR_IQ3_XXS:
     case Q36_TENSOR_IQ3_S:
+    case Q36_TENSOR_Q3_K:
         return 3;
     case Q36_TENSOR_IQ4_XS:
+    case Q36_TENSOR_IQ4_NL:
         return 4;
+    case Q36_TENSOR_IQ1_S:
     case Q36_TENSOR_IQ1_M:
         return 1;
     case Q36_TENSOR_Q4_K:
@@ -4999,6 +5158,7 @@ static bool q36_gpu_tensor_matmul_scaled(const q36_model *m,
                                                in_dim, out_dim, x, n_tok, scale) != 0;
         break;
     case Q36_TENSOR_Q2_K:
+    case Q36_TENSOR_Q3_K:
     case Q36_TENSOR_Q4_K:
     case Q36_TENSOR_Q5_K:
     case Q36_TENSOR_Q6_K:
@@ -5007,6 +5167,11 @@ static bool q36_gpu_tensor_matmul_scaled(const q36_model *m,
         break;
     case Q36_TENSOR_IQ3_XXS:
     case Q36_TENSOR_IQ3_S:
+    case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ2_XS:
+    case Q36_TENSOR_IQ2_S:
+    case Q36_TENSOR_IQ1_S:
+    case Q36_TENSOR_IQ4_NL:
     case Q36_TENSOR_IQ4_XS:
     case Q36_TENSOR_IQ1_M:
         ok = q36_gpu_matmul_iq_quant_scaled_tensor(out, m->map, m->size, t->abs_offset,
@@ -5036,6 +5201,7 @@ static bool q36_gpu_tensor_matmul_q8_scaled(const q36_model *m,
     }
     switch (t->type) {
     case Q36_TENSOR_Q2_K:
+    case Q36_TENSOR_Q3_K:
     case Q36_TENSOR_Q4_K:
     case Q36_TENSOR_Q5_K:
     case Q36_TENSOR_Q6_K:
@@ -5043,6 +5209,11 @@ static bool q36_gpu_tensor_matmul_q8_scaled(const q36_model *m,
                                                         t->type, in_dim, out_dim, xq, n_tok, scale) != 0;
     case Q36_TENSOR_IQ3_XXS:
     case Q36_TENSOR_IQ3_S:
+    case Q36_TENSOR_IQ2_XXS:
+    case Q36_TENSOR_IQ2_XS:
+    case Q36_TENSOR_IQ2_S:
+    case Q36_TENSOR_IQ1_S:
+    case Q36_TENSOR_IQ4_NL:
     case Q36_TENSOR_IQ4_XS:
     case Q36_TENSOR_IQ1_M:
         return q36_gpu_matmul_iq_quant_q8_scaled_tensor(out, m->map, m->size, t->abs_offset,

@@ -1,0 +1,308 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint wb[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    uint type;
+    float scale;
+} pc;
+
+const uint IQ2_XXS = 16u;
+const uint IQ2_XS = 17u;
+const uint IQ1_S = 19u;
+const uint IQ4_NL = 20u;
+const uint IQ2_S = 22u;
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BK = 32u;
+const uint STRIDE = BK / 2u + 1u;
+const uint Q8K_WORDS = 74u;
+const uint TAB_IQ2XXS = 0u;
+const uint TAB_KSIGNS_BYTES = 2048u;
+const uint TAB_IQ2S = 544u;
+const uint TAB_IQ1S = 3360u;
+const uint TAB_IQ2XS = 7456u;
+
+shared f16vec2 buf_a[BM * STRIDE];
+shared f16vec2 buf_b[BN * STRIDE];
+shared float weight_scale[BM];
+shared float input_scale[BN];
+
+uint load_u8(uint off) {
+    return (wb[off >> 2u] >> (8u * (off & 3u))) & 255u;
+}
+
+uint load_u16(uint off) {
+    return load_u8(off) | (load_u8(off + 1u) << 8u);
+}
+
+uint load_u32(uint off) {
+    uint shift = 8u * (off & 3u);
+    uint v = wb[off >> 2u];
+    return shift == 0u ? v : (v >> shift) | (wb[(off >> 2u) + 1u] << (32u - shift));
+}
+
+uint table_u8(uint off) {
+    return (tables[off >> 2u] >> (8u * (off & 3u))) & 255u;
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+vec4 signed_grid(uint word, uint signs, uint bit0) {
+    vec4 v = unpack_i8(word);
+    return v * vec4((signs & (1u << (bit0 + 0u))) != 0u ? -1.0 : 1.0,
+                    (signs & (1u << (bit0 + 1u))) != 0u ? -1.0 : 1.0,
+                    (signs & (1u << (bit0 + 2u))) != 0u ? -1.0 : 1.0,
+                    (signs & (1u << (bit0 + 3u))) != 0u ? -1.0 : 1.0);
+}
+
+float iq4_value(uint q) {
+    const int values[16] = int[16](
+        -127, -104, -83, -65, -49, -35, -22, -10,
+           1,   13,  25,  38,  53,  69,  89, 113);
+    return float(values[q]);
+}
+
+vec4 dequant_word(uint row, uint qb, uint word) {
+    uint idx = word * 4u;
+    uint group = idx >> 5u;
+    uint l = (idx & 31u) >> 3u;
+    uint part = (idx >> 2u) & 1u;
+    uint base = row * pc.row_bytes;
+    float d;
+
+    if (pc.type == IQ2_XXS) {
+        base += qb * 66u;
+        uint packed = load_u32(base + 6u + 8u * group);
+        uint entry = load_u8(base + 2u + 8u * group + 2u * l);
+        uint signs = table_u8(TAB_KSIGNS_BYTES + ((packed >> (7u * l)) & 127u));
+        d = unpackHalf2x16(load_u16(base)).x *
+            (0.5 + float(packed >> 28u)) * 0.25;
+        return d * signed_grid(tables[TAB_IQ2XXS + entry * 2u + part], signs, part * 4u);
+    }
+    if (pc.type == IQ2_XS) {
+        base += qb * 74u;
+        uint qs = load_u16(base + 2u + 8u * group + 2u * l);
+        uint sc = load_u8(base + 66u + group);
+        uint nibble = l < 2u ? sc & 15u : sc >> 4u;
+        uint signs = table_u8(TAB_KSIGNS_BYTES + (qs >> 9u));
+        d = unpackHalf2x16(load_u16(base)).x *
+            (0.5 + float(nibble)) * 0.25;
+        return d * signed_grid(tables[TAB_IQ2XS + (qs & 511u) * 2u + part],
+                               signs, part * 4u);
+    }
+    if (pc.type == IQ2_S) {
+        base += qb * 82u;
+        uint qh = load_u8(base + 66u + group);
+        uint entry = load_u8(base + 2u + 4u * group + l) |
+                     ((qh << (8u - 2u * l)) & 0x300u);
+        uint signs = load_u8(base + 34u + 4u * group + l);
+        uint sc = load_u8(base + 74u + group);
+        uint nibble = l < 2u ? sc & 15u : sc >> 4u;
+        d = unpackHalf2x16(load_u16(base)).x *
+            (0.5 + float(nibble)) * 0.25;
+        return d * signed_grid(tables[TAB_IQ2S + entry * 2u + part], signs, part * 4u);
+    }
+    if (pc.type == IQ1_S) {
+        base += qb * 50u;
+        uint qh = load_u16(base + 34u + 2u * group);
+        uint entry = load_u8(base + 2u + 4u * group + l) |
+                     (((qh >> (3u * l)) & 7u) << 8u);
+        float delta = (qh & 0x8000u) != 0u ? -0.125 : 0.125;
+        d = unpackHalf2x16(load_u16(base)).x *
+            float(2u * ((qh >> 12u) & 7u) + 1u);
+        return d * (unpack_i8(tables[TAB_IQ1S + entry * 2u + part]) + delta);
+    }
+
+    uint sub = idx >> 5u;
+    uint in_sub = idx & 31u;
+    base += (qb * 8u + sub) * 18u;
+    uint j = in_sub & 15u;
+    uint packed = load_u32(base + 2u + (j & 12u));
+    uint shift = in_sub >= 16u ? 4u : 0u;
+    vec4 v = vec4(iq4_value((packed >> (shift + 0u)) & 15u),
+                  iq4_value((packed >> (shift + 8u)) & 15u),
+                  iq4_value((packed >> (shift + 16u)) & 15u),
+                  iq4_value((packed >> (shift + 24u)) & 15u));
+    d = unpackHalf2x16(load_u16(base)).x;
+    return d * v;
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint tok0 = gl_WorkGroupID.y * BN;
+    uint wave = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint lane_row = lane & 7u;
+    uint lane_tok = lane >> 3u;
+    uint out_row0 = row0 + (wave & 1u) * 32u + lane_row * 4u;
+    uint out_tok0 = tok0 + (wave >> 1u) * 32u + lane_tok * 8u;
+    f16vec2 sum[16];
+    [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
+
+    for (uint qb = 0u; qb < pc.blocks; qb++) {
+        if (lid < BM) {
+            uint row = row0 + lid;
+            uint block_bytes = pc.type == IQ2_XXS ? 66u :
+                               pc.type == IQ2_XS ? 74u :
+                               pc.type == IQ2_S ? 82u : 50u;
+            weight_scale[lid] = row < pc.out_dim && pc.type != IQ4_NL ?
+                unpackHalf2x16(load_u16(row * pc.row_bytes + qb * block_bytes)).x *
+                    pc.scale : 0.0;
+        }
+        if (lid < BN) {
+            uint tok = tok0 + lid;
+            input_scale[lid] = tok < pc.n_tok ?
+                uintBitsToFloat(q8[(tok * pc.blocks + qb) * Q8K_WORDS]) : 0.0;
+        }
+        barrier();
+        for (uint slice = 0u; slice < 8u; slice++) {
+            for (uint i = lid; i < BM * 2u; i += 128u) {
+                uint lr = i >> 1u;
+                uint kw = i & 1u;
+                uint row = row0 + lr;
+                vec4 v[4];
+                [[unroll]] for (uint p = 0u; p < 4u; p++) v[p] = vec4(0.0);
+                if (row < pc.out_dim) {
+                    uint base = row * pc.row_bytes;
+                    if (pc.type == IQ2_XXS) {
+                        base += qb * 66u;
+                        uint packed = load_u32(base + 6u + 8u * slice);
+                        float d = weight_scale[lr] *
+                            (0.5 + float(packed >> 28u)) * 0.25;
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint entry = load_u8(base + 2u + 8u * slice + 2u * p);
+                            uint signs = table_u8(TAB_KSIGNS_BYTES +
+                                ((packed >> (7u * p)) & 127u));
+                            v[p] = d * signed_grid(
+                                tables[TAB_IQ2XXS + entry * 2u + kw], signs, kw * 4u);
+                        }
+                    } else if (pc.type == IQ2_XS) {
+                        base += qb * 74u;
+                        uint sc = load_u8(base + 66u + slice);
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint qs = load_u16(base + 2u + 8u * slice + 2u * p);
+                            uint nibble = p < 2u ? sc & 15u : sc >> 4u;
+                            uint signs = table_u8(TAB_KSIGNS_BYTES + (qs >> 9u));
+                            float d = weight_scale[lr] *
+                                (0.5 + float(nibble)) * 0.25;
+                            v[p] = d * signed_grid(
+                                tables[TAB_IQ2XS + (qs & 511u) * 2u + kw], signs,
+                                kw * 4u);
+                        }
+                    } else if (pc.type == IQ2_S) {
+                        base += qb * 82u;
+                        uint qh = load_u8(base + 66u + slice);
+                        uint sc = load_u8(base + 74u + slice);
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint entry = load_u8(base + 2u + 4u * slice + p) |
+                                ((qh << (8u - 2u * p)) & 0x300u);
+                            uint signs = load_u8(base + 34u + 4u * slice + p);
+                            uint nibble = p < 2u ? sc & 15u : sc >> 4u;
+                            float d = weight_scale[lr] *
+                                (0.5 + float(nibble)) * 0.25;
+                            v[p] = d * signed_grid(
+                                tables[TAB_IQ2S + entry * 2u + kw], signs, kw * 4u);
+                        }
+                    } else if (pc.type == IQ1_S) {
+                        base += qb * 50u;
+                        uint qh = load_u16(base + 34u + 2u * slice);
+                        float d = weight_scale[lr] *
+                            float(2u * ((qh >> 12u) & 7u) + 1u);
+                        float delta = (qh & 0x8000u) != 0u ? -0.125 : 0.125;
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint entry = load_u8(base + 2u + 4u * slice + p) |
+                                (((qh >> (3u * p)) & 7u) << 8u);
+                            v[p] = d * (unpack_i8(
+                                tables[TAB_IQ1S + entry * 2u + kw]) + delta);
+                        }
+                    } else {
+                        base += (qb * 8u + slice) * 18u;
+                        float d = unpackHalf2x16(load_u16(base)).x * pc.scale;
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint packed = load_u32(base + 2u + 4u *
+                                ((kw + 2u * p) & 3u));
+                            uint shift = p >= 2u ? 4u : 0u;
+                            v[p] = d * vec4(
+                                iq4_value((packed >> (shift + 0u)) & 15u),
+                                iq4_value((packed >> (shift + 8u)) & 15u),
+                                iq4_value((packed >> (shift + 16u)) & 15u),
+                                iq4_value((packed >> (shift + 24u)) & 15u));
+                        }
+                    }
+                }
+                [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                    uint dst = lr * STRIDE + 2u * (kw + 2u * p);
+                    buf_a[dst] = f16vec2(v[p].xy);
+                    buf_a[dst + 1u] = f16vec2(v[p].zw);
+                }
+            }
+            for (uint i = lid; i < BN * 2u; i += 128u) {
+                uint lt = i >> 1u;
+                uint kw = i & 1u;
+                uint tok = tok0 + lt;
+                vec4 v[4];
+                [[unroll]] for (uint p = 0u; p < 4u; p++) v[p] = vec4(0.0);
+                if (tok < pc.n_tok) {
+                    uint qbase = (tok * pc.blocks + qb) * Q8K_WORDS;
+                    [[unroll]] for (uint p = 0u; p < 4u; p++)
+                        v[p] = input_scale[lt] * unpack_i8(
+                            q8[qbase + 2u + slice * 8u + kw + 2u * p]);
+                }
+                [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                    uint dst = lt * STRIDE + 2u * (kw + 2u * p);
+                    buf_b[dst] = f16vec2(v[p].xy);
+                    buf_b[dst + 1u] = f16vec2(v[p].zw);
+                }
+            }
+            barrier();
+
+            [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
+                f16vec2 av[4];
+                f16vec2 bv[8];
+                [[unroll]] for (uint r = 0u; r < 4u; r++)
+                    av[r] = buf_a[((wave & 1u) * 32u + lane_row * 4u + r) * STRIDE + k];
+                [[unroll]] for (uint t = 0u; t < 8u; t++)
+                    bv[t] = buf_b[((wave >> 1u) * 32u + lane_tok * 8u + t) * STRIDE + k];
+                [[unroll]] for (uint r = 0u; r < 4u; r++)
+                    [[unroll]] for (uint tp = 0u; tp < 4u; tp++)
+                        sum[r * 4u + tp] = fma(f16vec2(av[r].x),
+                            f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
+                            fma(f16vec2(av[r].y),
+                                f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
+                                sum[r * 4u + tp]));
+            }
+            barrier();
+        }
+    }
+
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint row = out_row0 + r;
+        if (row >= pc.out_dim) continue;
+        [[unroll]] for (uint t = 0u; t < 8u; t++) {
+            uint tok = out_tok0 + t;
+            if (tok < pc.n_tok)
+                y[tok * pc.out_dim + row] = float((t & 1u) == 0u ?
+                    sum[r * 4u + (t >> 1u)].x : sum[r * 4u + (t >> 1u)].y);
+        }
+    }
+}

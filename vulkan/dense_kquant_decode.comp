@@ -25,6 +25,7 @@ layout(push_constant) uniform Push {
 } pc;
 
 const uint Q2_K = 10u;
+const uint Q3_K = 11u;
 const uint Q4_K = 12u;
 const uint Q5_K = 13u;
 const uint Q6_K = 14u;
@@ -88,6 +89,23 @@ uint q2_value(uint base, uint idx) {
     return (load_u8(off) >> ((in_idx >> 5u) * 2u)) & 3u;
 }
 
+int q3_scale(uint base, uint group) {
+    uint lo = load_u8(base + 96u + (group & 7u));
+    lo = group < 8u ? lo & 15u : lo >> 4u;
+    uint hi = (load_u8(base + 104u + (group & 3u)) >>
+               (2u * (group >> 2u))) & 3u;
+    return int(lo | (hi << 4u)) - 32;
+}
+
+int q3_value(uint base, uint idx) {
+    uint half_id = idx >> 7u;
+    uint group = (idx & 127u) >> 4u;
+    uint q = load_u8(base + 32u + half_id * 32u + (idx & 31u));
+    uint m = 1u << (half_id * 4u + (group >> 1u));
+    uint lo = (q >> (2u * (group >> 1u))) & 3u;
+    return int(lo) - ((load_u8(base + (idx & 31u)) & m) != 0u ? 0 : 4);
+}
+
 uint q4_value(uint base, uint idx) {
     uint g = idx >> 5u;
     uint v = load_u8(base + 16u + (g >> 1u) * 32u + (idx & 31u));
@@ -124,6 +142,23 @@ vec4 dequant_word(uint row, uint block, uint word) {
                   q2_value(base, idx + 2u), q2_value(base, idx + 3u));
         return load_f16(base + 80u) * float(load_u8(base + group) & 15u) * qv -
                load_f16(base + 82u) * float(load_u8(base + group) >> 4u);
+    }
+    if (QTYPE == Q3_K) {
+        base += 110u * block;
+        uint half_id = idx >> 7u;
+        uint group = (idx & 127u) >> 4u;
+        uint shift = 2u * (group >> 1u);
+        uint m = 1u << (half_id * 4u + (group >> 1u));
+        uint qs = (load_u32(base + 32u + half_id * 32u + (idx & 31u)) >> shift) &
+                  0x03030303u;
+        uint hm = load_u32(base + (idx & 31u));
+        qv = vec4(float(qs & 255u), float((qs >> 8u) & 255u),
+                  float((qs >> 16u) & 255u), float(qs >> 24u)) -
+             4.0 * vec4((hm & (m << 0u)) != 0u ? 0.0 : 1.0,
+                        (hm & (m << 8u)) != 0u ? 0.0 : 1.0,
+                        (hm & (m << 16u)) != 0u ? 0.0 : 1.0,
+                        (hm & (m << 24u)) != 0u ? 0.0 : 1.0);
+        return load_f16(base + 108u) * float(q3_scale(base, idx >> 4u)) * qv;
     }
     if (QTYPE == Q4_K || QTYPE == Q5_K) {
         base += (QTYPE == Q4_K ? 144u : 176u) * block;
@@ -201,6 +236,30 @@ void main(void) {
                 float part = load_f16(base) * float(sc) * qdot -
                              load_f16(base + 2u) * float(mn) * qsum;
                 acc[r] = fma(yd, part, acc[r]);
+                continue;
+            }
+            if (QTYPE == Q3_K) {
+                uint base = row * pc.row_bytes + 110u * b;
+                int sc = q3_scale(base, itid);
+                uint half_id = itid >> 3u;
+                uint group = itid & 7u;
+                uint shift = 2u * (group >> 1u);
+                uint m = 1u << (half_id * 4u + (group >> 1u));
+                float qdot = 0.0;
+                for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * itid + 4u * i;
+                    uint qs = (load_u32(base + 32u + half_id * 32u + (idx & 31u)) >> shift) &
+                              0x03030303u;
+                    uint hm = load_u32(base + (idx & 31u));
+                    vec4 wv = vec4(float(qs & 255u), float((qs >> 8u) & 255u),
+                                   float((qs >> 16u) & 255u), float(qs >> 24u)) -
+                        4.0 * vec4((hm & (m << 0u)) != 0u ? 0.0 : 1.0,
+                                   (hm & (m << 8u)) != 0u ? 0.0 : 1.0,
+                                   (hm & (m << 16u)) != 0u ? 0.0 : 1.0,
+                                   (hm & (m << 24u)) != 0u ? 0.0 : 1.0);
+                    qdot += dot(wv, qvec[i]);
+                }
+                acc[r] = fma(yd * load_f16(base + 108u) * float(sc), qdot, acc[r]);
                 continue;
             }
             if (QTYPE == Q5_K) {
