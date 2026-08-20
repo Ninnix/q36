@@ -34,3 +34,4 @@ tests/__pycache__/
 /tests/test-vectors/local/
 /gguf-tools/quality-testing/local/
 q36_agent_test
+TODO.md

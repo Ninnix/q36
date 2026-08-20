@@ -6,7 +6,11 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef Q36_Q5K_ONLY
+layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
+#else
 layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
+#endif
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 
@@ -24,16 +28,33 @@ const uint Q2_K = 10u;
 const uint Q4_K = 12u;
 const uint Q5_K = 13u;
 const uint Q6_K = 14u;
+#ifndef Q36_BOUNDS
+#define Q36_BOUNDS 1
+#endif
 const uint ROWS = 4u;
 const uint Q8K_WORDS = 74u;
 
+#ifdef Q36_Q5K_ONLY
+#define QTYPE Q5_K
+#else
+#define QTYPE pc.type
+#endif
+
 uint load_u8(uint off) {
+#ifdef Q36_Q5K_ONLY
+    return (ww[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
+#else
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
+#endif
 }
 
 uint load_u32(uint off) {
+#ifdef Q36_Q5K_ONLY
+    return ww[off >> 2u];
+#else
     uint i = off >> 1u;
     return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
+#endif
 }
 
 int load_i8(uint off) {
@@ -41,7 +62,11 @@ int load_i8(uint off) {
 }
 
 float load_f16(uint off) {
+#ifdef Q36_Q5K_ONLY
+    return unpackHalf2x16(ww[off >> 2u] >> ((off & 2u) * 8u)).x;
+#else
     return unpackHalf2x16(uint(wh[off >> 1u])).x;
+#endif
 }
 
 void k4_scale_min(uint base, uint j, out uint sc, out uint mn) {
@@ -92,7 +117,7 @@ vec4 dequant_word(uint row, uint block, uint word) {
     uint idx = 4u * word;
     uint base = row * pc.row_bytes;
     vec4 qv;
-    if (pc.type == Q2_K) {
+    if (QTYPE == Q2_K) {
         base += 84u * block;
         uint group = idx >> 4u;
         qv = vec4(q2_value(base, idx), q2_value(base, idx + 1u),
@@ -100,12 +125,12 @@ vec4 dequant_word(uint row, uint block, uint word) {
         return load_f16(base + 80u) * float(load_u8(base + group) & 15u) * qv -
                load_f16(base + 82u) * float(load_u8(base + group) >> 4u);
     }
-    if (pc.type == Q4_K || pc.type == Q5_K) {
-        base += (pc.type == Q4_K ? 144u : 176u) * block;
+    if (QTYPE == Q4_K || QTYPE == Q5_K) {
+        base += (QTYPE == Q4_K ? 144u : 176u) * block;
         uint sc;
         uint mn;
         k4_scale_min(base, idx >> 5u, sc, mn);
-        qv = pc.type == Q4_K ?
+        qv = QTYPE == Q4_K ?
             vec4(q4_value(base, idx), q4_value(base, idx + 1u),
                  q4_value(base, idx + 2u), q4_value(base, idx + 3u)) :
             vec4(q5_value(base, idx), q5_value(base, idx + 1u),
@@ -147,15 +172,17 @@ void main(void) {
         for (uint i = 0u; i < 4u; i++)
             qvec[i] = unpack_i8(q8[b * Q8K_WORDS + 2u + 4u * itid + i]);
         float qsum = 0.0;
-        if (pc.type == Q4_K || pc.type == Q5_K || pc.type == Q6_K) {
+        if (QTYPE == Q4_K || QTYPE == Q5_K || QTYPE == Q6_K) {
             for (uint i = 0u; i < 4u; i++)
                 qsum += qvec[i].x + qvec[i].y + qvec[i].z + qvec[i].w;
         }
         float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
         for (uint r = 0u; r < ROWS; r++) {
             uint row = first_row + r;
+#if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
-            if (pc.type == Q4_K) {
+#endif
+            if (QTYPE == Q4_K) {
                 uint base = row * pc.row_bytes + 144u * b;
                 uint group = itid >> 1u;
                 uint sc;
@@ -176,7 +203,7 @@ void main(void) {
                 acc[r] = fma(yd, part, acc[r]);
                 continue;
             }
-            if (pc.type == Q5_K) {
+            if (QTYPE == Q5_K) {
                 uint base = row * pc.row_bytes + 176u * b;
                 uint group = itid >> 1u;
                 uint sc;
@@ -198,7 +225,7 @@ void main(void) {
                 acc[r] = fma(yd, part, acc[r]);
                 continue;
             }
-            if (pc.type == Q6_K) {
+            if (QTYPE == Q6_K) {
                 uint base = row * pc.row_bytes + 210u * b;
                 float qdot = 0.0;
                 for (uint i = 0u; i < 4u; i++) {
@@ -238,6 +265,10 @@ void main(void) {
     for (uint r = 0u; r < ROWS; r++) {
         float total = subgroupAdd(acc[r]);
         uint row = first_row + r;
-        if (lid == 0u && row < pc.out_dim) y[row] = total * pc.scale;
+        if (lid == 0u
+#if Q36_BOUNDS
+            && row < pc.out_dim
+#endif
+        ) y[row] = total * pc.scale;
     }
 }

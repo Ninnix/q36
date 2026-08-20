@@ -4501,6 +4501,33 @@ static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor
     return e->ssd_streaming && il >= 0 && (uint32_t)il >= e->ssd_streaming_full_layers;
 }
 
+static bool q36_vulkan_set_model_spans(const q36_engine *e) {
+    uint64_t *offsets = malloc(e->model.n_tensors * sizeof(*offsets));
+    uint64_t *sizes = malloc(e->model.n_tensors * sizeof(*sizes));
+    uint64_t max_bytes = 0;
+    uint32_t count = 0;
+    bool ok;
+
+    if (!offsets || !sizes) {
+        free(sizes);
+        free(offsets);
+        return false;
+    }
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const q36_tensor *t = &e->model.tensors[i];
+        if (q36_vulkan_prewarm_skip_tensor(e, t)) continue;
+        offsets[count] = t->abs_offset;
+        sizes[count] = t->bytes;
+        if (t->bytes > max_bytes) max_bytes = t->bytes;
+        count++;
+    }
+    ok = q36_gpu_set_model_map_spans(e->model.map, e->model.size,
+                                      offsets, sizes, count, max_bytes) != 0;
+    free(sizes);
+    free(offsets);
+    return ok;
+}
+
 /* Prewarm reader: fills the page cache with pread() a bounded distance ahead
  * of the staging memcpy, so SSD reads overlap the copy into GPU memory.  The
  * bound keeps read-ahead pages from being evicted again before staging on
@@ -9134,7 +9161,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
                 }
             }
         }
-        if (!q36_gpu_set_model_map(e->model.map, e->model.size) ||
+        if (!q36_vulkan_set_model_spans(e) ||
             !q36_gpu_set_model_fd(e->model.fd)) {
             q36_engine_close(e);
             return 1;

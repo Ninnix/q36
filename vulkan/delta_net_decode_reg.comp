@@ -1,0 +1,65 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer State { float s[]; };
+layout(set = 0, binding = 1) readonly buffer Qbuf { float q[]; };
+layout(set = 0, binding = 2) readonly buffer Kbuf { float k[]; };
+layout(set = 0, binding = 3) readonly buffer Vbuf { float v[]; };
+layout(set = 0, binding = 4) readonly buffer GB { float gb[]; };
+layout(set = 0, binding = 5) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+    uint state_dim;
+    uint n_tok;
+} pc;
+
+const uint N = 128u;
+const uint LANES = 8u;
+const uint COLS = 8u;
+const uint ROWS = N / LANES;
+
+void main(void) {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint lane = lid & (LANES - 1u);
+    uint j = gl_WorkGroupID.y * COLS + lid / LANES;
+    if (h >= pc.n_heads || pc.state_dim != N) return;
+
+    uint mat = h * N * N;
+    float state[ROWS];
+    for (uint r = 0u; r < ROWS; r++)
+        state[r] = s[mat + (r * LANES + lane) * N + j];
+
+    float norm = inversesqrt(float(N));
+    for (uint tok = 0u; tok < pc.n_tok; tok++) {
+        uint vec = tok * pc.n_heads * N + h * N;
+        float decay = gb[tok * 2u * pc.n_heads + h];
+        float beta = gb[tok * 2u * pc.n_heads + pc.n_heads + h];
+        float qr[ROWS];
+        float kr[ROWS];
+        float sk = 0.0;
+        for (uint r = 0u; r < ROWS; r++) {
+            uint i = r * LANES + lane;
+            kr[r] = k[vec + i];
+            qr[r] = q[vec + i];
+            state[r] *= decay;
+            sk = fma(state[r], kr[r], sk);
+        }
+        sk = subgroupClusteredAdd(sk, LANES);
+        float d = (v[vec + j] - sk) * beta;
+        float outj = 0.0;
+        for (uint r = 0u; r < ROWS; r++) {
+            state[r] = fma(kr[r], d, state[r]);
+            outj = fma(state[r], qr[r], outj);
+        }
+        outj = subgroupClusteredAdd(outj, LANES);
+        if (lane == 0u) y[vec + j] = outj * norm;
+    }
+
+    for (uint r = 0u; r < ROWS; r++)
+        s[mat + (r * LANES + lane) * N + j] = state[r];
+}
