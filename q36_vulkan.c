@@ -3621,8 +3621,32 @@ void q36_gpu_set_quality(bool quality) {
     q36_gpu_quality = quality;
 }
 
+static void q36_vk_prepare_dense_kernels(void) {
+    /* RADV pipeline creation can take seconds.  Do it while the dense model
+     * opens instead of charging the first prompt that reaches each shape. */
+    q36_vk_kernel *kernels[] = {
+        &q36_vk.dense_iq3_s_mmq,
+        &q36_vk.dense_iq3_s_mmq_r4,
+        &q36_vk.dense_iq3_xxs_mmq,
+        &q36_vk.dense_kquant_mmq,
+        &q36_vk.dense_iq3_s_decode,
+        &q36_vk.dense_iq3_s_decode_r1,
+        &q36_vk.dense_iq3_s_decode_r4,
+        &q36_vk.dense_iq3_xxs_decode_r4,
+        &q36_vk.dense_q4k_decode,
+        &q36_vk.dense_kquant_decode,
+    };
+    if (!q36_vk_env_default_on("Q36_VK_PREPARE_DENSE")) return;
+    pthread_mutex_lock(&q36_vk_mu);
+    for (uint32_t i = 0; i < sizeof(kernels) / sizeof(kernels[0]); i++) {
+        if (!q36_vk_kernel_init(kernels[i])) break;
+    }
+    pthread_mutex_unlock(&q36_vk_mu);
+}
+
 void q36_gpu_set_dense_model(bool dense) {
     q36_gpu_dense_model = dense;
+    if (dense) q36_vk_prepare_dense_kernels();
 }
 
 void q36_gpu_set_ssd_streaming(bool enabled) {
