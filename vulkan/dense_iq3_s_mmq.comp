@@ -15,6 +15,7 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint wb[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+layout(set = 0, binding = 4) readonly buffer B16 { uint b16[]; };
 
 layout(push_constant) uniform Push {
     uint out_dim;
@@ -43,7 +44,6 @@ shared f16vec2 buf_a[BM * STRIDE];
 shared f16vec2 buf_b[BN * STRIDE];
 shared uint grid_lut[512];
 shared float weight_scale[BM];
-shared float input_scale[BN];
 
 uint load_u8(uint off) {
     return (wb[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
@@ -51,6 +51,13 @@ uint load_u8(uint off) {
 
 uint load_u16(uint off) {
     return (wb[off >> 2u] >> ((off & 3u) * 8u)) & 65535u;
+}
+
+uint load_u32(uint off) {
+    uint shift = (off & 3u) * 8u;
+    uint word = wb[off >> 2u];
+    return shift == 0u ? word :
+        (word >> shift) | (wb[(off >> 2u) + 1u] << (32u - shift));
 }
 
 vec4 unpack_i8(uint v) {
@@ -88,11 +95,6 @@ void main(void) {
                 unpackHalf2x16(load_u16(row * pc.row_bytes + 110u * qb)).x *
                     pc.scale : 0.0;
         }
-        if (lid < BN) {
-            uint tok = tok0 + lid;
-            input_scale[lid] = tok < pc.n_tok ?
-                uintBitsToFloat(q8[(tok * pc.blocks + qb) * Q8K_WORDS]) : 0.0;
-        }
         barrier();
         for (uint slice_tile = 0u; slice_tile < 8u / SLICES_PER_TILE; slice_tile++) {
             for (uint i = lid; i < BM * 2u * SLICES_PER_TILE; i += 128u) {
@@ -110,13 +112,18 @@ void main(void) {
                     uint sc = load_u8(base + 106u + (slice >> 1u));
                     uint ls = 2u * ((slice & 1u) == 0u ? sc & 15u : sc >> 4u) + 1u;
                     float d = weight_scale[lr] * float(ls);
+                    /* One word load covers this item's four qs bytes
+                     * (stride 2 from base+2+8*slice+kw) and one covers its
+                     * four sign bytes, instead of eight byte extractions. */
+                    uint qs0 = load_u32(base + 2u + 8u * slice);
+                    uint qs1 = load_u32(base + 6u + 8u * slice);
+                    uint signs4 = load_u32(base + 74u + 4u * slice);
                     [[unroll]] for (uint p = 0u; p < 4u; p++) {
                         uint lane4 = kw + 2u * p;
-                        uint word = slice * 8u + lane4;
-                        uint entry = load_u8(base + 2u + word) |
+                        uint qsw = p < 2u ? qs0 : qs1;
+                        uint entry = ((qsw >> (8u * (lane4 & 3u))) & 255u) |
                                      ((qh << (8u - lane4)) & 256u);
-                        uint signs = load_u8(base + 74u + 4u * slice + p);
-                        uint mask = sign_mask(signs >> (4u * kw));
+                        uint mask = sign_mask((signs4 >> (8u * p + 4u * kw)) & 15u);
                         uint grid = grid_lut[entry];
                         v[p] = d * unpack_i8((grid ^ mask) +
                                              (mask & 0x01010101u));
@@ -134,22 +141,18 @@ void main(void) {
                 uint lt = i / (2u * SLICES_PER_TILE);
                 uint part = i % (2u * SLICES_PER_TILE);
                 uint slice_half = part >> 1u;
-                uint kw = part & 1u;
+                uint kh = part & 1u;
                 uint slice = SLICES_PER_TILE * slice_tile + slice_half;
                 uint tok = tok0 + lt;
-                vec4 v[4];
-                [[unroll]] for (uint p = 0u; p < 4u; p++) v[p] = vec4(0.0);
+                uint dst = lt * STRIDE + 16u * slice_half + 8u * kh;
                 if (tok < pc.n_tok) {
-                    uint qbase = (tok * pc.blocks + qb) * Q8K_WORDS;
-                    [[unroll]] for (uint p = 0u; p < 4u; p++)
-                        v[p] = input_scale[lt] * unpack_i8(
-                            q8[qbase + 2u + slice * 8u + kw + 2u * p]);
-                }
-                [[unroll]] for (uint p = 0u; p < 4u; p++) {
-                    uint dst = lt * STRIDE + 16u * slice_half +
-                               2u * (kw + 2u * p);
-                    buf_b[dst] = f16vec2(v[p].xy);
-                    buf_b[dst + 1u] = f16vec2(v[p].zw);
+                    uint src = (tok * pc.blocks + qb) * 128u +
+                               slice * 16u + 8u * kh;
+                    [[unroll]] for (uint j = 0u; j < 8u; j++)
+                        buf_b[dst + j] = unpackFloat2x16(b16[src + j]);
+                } else {
+                    [[unroll]] for (uint j = 0u; j < 8u; j++)
+                        buf_b[dst + j] = f16vec2(0.0);
                 }
             }
             barrier();

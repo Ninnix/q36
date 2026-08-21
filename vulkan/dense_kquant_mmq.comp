@@ -9,6 +9,7 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly buffer Weights { uint wb[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer B16 { uint b16[]; };
 
 layout(push_constant) uniform Push {
     uint in_dim;
@@ -35,7 +36,9 @@ shared f16vec2 buf_a[BM * STRIDE];
 shared f16vec2 buf_b[BN * STRIDE];
 shared float weight_d[BM];
 shared float weight_dm[BM];
-shared float input_d[BN];
+/* Q4_K packed (scale | min<<8) per 32-value group, decoded once per block
+ * per row instead of once per dequantized word. */
+shared uint k4_scmn[BM * 8u];
 
 uint load_u8(uint off) {
     return (wb[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
@@ -150,14 +153,20 @@ vec4 dequant_word(uint row, uint qb, uint word) {
                         (hm & (m << 24u)) != 0u ? 0.0 : 1.0);
         v = weight_d[row & (BM - 1u)] *
             float(q3_scale(base, idx >> 4u)) * qv;
-    } else if (pc.type == Q4_K || pc.type == Q5_K) {
-        uint bytes = pc.type == Q4_K ? 144u : 176u;
-        base += bytes * qb;
-        qv = pc.type == Q4_K ?
-            vec4(q4_value(base, idx), q4_value(base, idx + 1u),
-                 q4_value(base, idx + 2u), q4_value(base, idx + 3u)) :
-            vec4(q5_value(base, idx), q5_value(base, idx + 1u),
-                 q5_value(base, idx + 2u), q5_value(base, idx + 3u));
+    } else if (pc.type == Q4_K) {
+        base += 144u * qb;
+        uint g = idx >> 5u;
+        uint w = load_u32(base + 16u + (g >> 1u) * 32u + (idx & 31u));
+        uint nib = (g & 1u) == 0u ? w & 0x0f0f0f0fu : (w >> 4u) & 0x0f0f0f0fu;
+        qv = vec4(float(nib & 255u), float((nib >> 8u) & 255u),
+                  float((nib >> 16u) & 255u), float(nib >> 24u));
+        uint sm = k4_scmn[(row & (BM - 1u)) * 8u + g];
+        v = weight_d[row & (BM - 1u)] * float(sm & 255u) * qv -
+            weight_dm[row & (BM - 1u)] * float(sm >> 8u);
+    } else if (pc.type == Q5_K) {
+        base += 176u * qb;
+        qv = vec4(q5_value(base, idx), q5_value(base, idx + 1u),
+                  q5_value(base, idx + 2u), q5_value(base, idx + 3u));
         uint sc;
         uint mn;
         k4_scale_min(base, idx >> 5u, sc, mn);
@@ -220,6 +229,12 @@ void main(void) {
                     base += 144u * qb;
                     d = load_f16(base);
                     dm = load_f16(base + 2u);
+                    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                        uint sc;
+                        uint mn;
+                        k4_scale_min(base, j, sc, mn);
+                        k4_scmn[lid * 8u + j] = sc | (mn << 8u);
+                    }
                 } else if (pc.type == Q5_K) {
                     base += 176u * qb;
                     d = load_f16(base);
@@ -232,11 +247,6 @@ void main(void) {
             weight_d[lid] = d;
             weight_dm[lid] = dm;
         }
-        if (lid < BN) {
-            uint tok = tok0 + lid;
-            input_d[lid] = tok < pc.n_tok ?
-                uintBitsToFloat(q8[(tok * pc.blocks + qb) * Q8K_WORDS]) : 0.0;
-        }
         barrier();
         for (uint slice = 0u; slice < 8u; slice++) {
             for (uint i = lid; i < BM * 8u; i += 128u) {
@@ -248,18 +258,20 @@ void main(void) {
                 buf_a[dst] = f16vec2(v.xy);
                 buf_a[dst + 1u] = f16vec2(v.zw);
             }
-            for (uint i = lid; i < BN * 8u; i += 128u) {
-                uint lt = i >> 3u;
-                uint kw = i & 7u;
+            for (uint i = lid; i < BN * 2u; i += 128u) {
+                uint lt = i >> 1u;
+                uint kh = i & 1u;
                 uint tok = tok0 + lt;
-                vec4 v = vec4(0.0);
+                uint dst = lt * STRIDE + 8u * kh;
                 if (tok < pc.n_tok) {
-                    uint qbase = (tok * pc.blocks + qb) * Q8K_WORDS;
-                    v = input_d[lt] * unpack_i8(q8[qbase + 2u + slice * 8u + kw]);
+                    uint src = (tok * pc.blocks + qb) * 128u +
+                               slice * 16u + 8u * kh;
+                    [[unroll]] for (uint j = 0u; j < 8u; j++)
+                        buf_b[dst + j] = unpackFloat2x16(b16[src + j]);
+                } else {
+                    [[unroll]] for (uint j = 0u; j < 8u; j++)
+                        buf_b[dst + j] = f16vec2(0.0);
                 }
-                uint dst = lt * STRIDE + 2u * kw;
-                buf_b[dst] = f16vec2(v.xy);
-                buf_b[dst + 1u] = f16vec2(v.zw);
             }
             barrier();
 

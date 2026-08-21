@@ -68,6 +68,7 @@ VULKAN_SHADERS := \
 	vulkan/delta_gates.spv \
 	vulkan/quantize_q8_0.spv \
 	vulkan/quantize_q8_k.spv \
+	vulkan/predequant_b16.spv \
 	vulkan/matmul_q8_0.spv \
 	vulkan/matmul_q8_0_q36.spv \
 	vulkan/matmul_q8_0_f32b.spv \
@@ -199,6 +200,9 @@ vulkan/dense_extra_decode.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/dense_extra_mmq.spv: vulkan/dense_extra_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/predequant_b16.spv: vulkan/predequant_b16.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp

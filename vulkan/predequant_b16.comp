@@ -1,0 +1,39 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+/* Expand a Q8_K activation panel to packed f16 pairs in natural k order.
+ * Each lane converts one 4-value qs word: value = f16(d * q), exactly the
+ * rounding the dense MMQ kernels applied when staging their token tile,
+ * so consuming this panel is bit-identical to re-dequantizing Q8_K.
+ * Doing it once here lets every 32-row output tile of the MMQ kernels
+ * stage activations with plain vector copies. */
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 1) writeonly buffer B16 { uint b16[]; };
+
+layout(push_constant) uniform Push {
+    uint total_blocks;
+} pc;
+
+const uint Q8K_WORDS = 74u;
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+void main(void) {
+    uint idx = gl_GlobalInvocationID.x;
+    uint blk = idx >> 6u;
+    uint w = idx & 63u;
+    if (blk >= pc.total_blocks) return;
+    float d = uintBitsToFloat(q8[blk * Q8K_WORDS]);
+    vec4 v = d * unpack_i8(q8[blk * Q8K_WORDS + 2u + w]);
+    uint o = blk * 128u + 2u * w;
+    b16[o] = packFloat2x16(f16vec2(v.xy));
+    b16[o + 1u] = packFloat2x16(f16vec2(v.zw));
+}
