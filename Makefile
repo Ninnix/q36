@@ -90,8 +90,10 @@ VULKAN_SHADERS := \
 	vulkan/delta_net.spv \
 	vulkan/delta_net_fast.spv \
 	vulkan/delta_net_cols.spv \
+	vulkan/delta_net_cols_f16.spv \
 	vulkan/delta_net_decode.spv \
 	vulkan/delta_net_decode_reg.spv \
+	vulkan/delta_net_decode_reg_f16.spv \
 	vulkan/attn_scores.spv \
 	vulkan/attn_post.spv \
 	vulkan/attn_reduce.spv \
@@ -262,8 +264,14 @@ vulkan/moe_down_gemm.spv: vulkan/moe_down_gemm.comp
 vulkan/delta_net_cols.spv: vulkan/delta_net_cols.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/delta_net_cols_f16.spv: vulkan/delta_net_cols.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STATE_F16=1 -o $@ $<
+
 vulkan/delta_net_decode_reg.spv: vulkan/delta_net_decode_reg.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/delta_net_decode_reg_f16.spv: vulkan/delta_net_decode_reg.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STATE_F16=1 -o $@ $<
 
 vulkan/attn_decode_fused.spv: vulkan/attn_decode_fused.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

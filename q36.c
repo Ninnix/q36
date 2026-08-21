@@ -727,6 +727,7 @@ typedef struct {
 typedef struct {
     uint32_t prefill_cap;
     bool recur_conv_fused;
+    bool recur_state_f16;
     q36_vulkan_full_attn_cache full[Q36_MAX_LAYER];
     q36_vulkan_recurrent_cache recurrent[Q36_MAX_LAYER];
     q36_gpu_tensor *hidden;
@@ -5280,13 +5281,15 @@ static bool q36_gpu_tensor_matmul_dense_q8_scaled(const q36_model *m,
 
 static bool q36_vulkan_runtime_reset(q36_vulkan_runtime *rt) {
     uint64_t state_dim = (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE * Q36_N_SSM_DT_RANK;
+    uint64_t state_bytes;
     if (!rt) return false;
+    state_bytes = state_dim * (rt->recur_state_f16 ? sizeof(uint16_t) : sizeof(float));
     if (!q36_gpu_tensor_zero(rt->hidden) || !q36_gpu_tensor_zero(rt->next_hidden)) return false;
     if (rt->last_h && !q36_gpu_tensor_zero(rt->last_h)) return false;
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         if (rt->recurrent[il].conv && !q36_gpu_tensor_zero(rt->recurrent[il].conv)) return false;
         if (rt->recurrent[il].state && !q36_gpu_tensor_zero(rt->recurrent[il].state)) return false;
-        if (rt->recurrent[il].state && q36_gpu_tensor_bytes(rt->recurrent[il].state) != state_dim * sizeof(float)) return false;
+        if (rt->recurrent[il].state && q36_gpu_tensor_bytes(rt->recurrent[il].state) != state_bytes) return false;
     }
     return true;
 }
@@ -5374,6 +5377,13 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         rt->recur_conv_fused = !quality && !ssd_streaming &&
                                (!env || !env[0] || env[0] != '0');
     }
+#ifndef Q36_METAL
+    {
+        const char *env = getenv("Q36_VK_RECURRENT_STATE_F16");
+        rt->recur_state_f16 = !quality && !ssd_streaming &&
+                              (!env || !env[0] || env[0] != '0');
+    }
+#endif
     state_dim = (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE * Q36_N_SSM_DT_RANK;
     hist_rows = Q36_N_SSM_CONV - 1u;
     /* Activation scratch carries prefill_cap token rows for batched prefill;
@@ -5638,11 +5648,13 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
             if (!rt->full[il].k || !rt->full[il].v) goto fail;
         } else {
             rt->recurrent[il].conv = q36_gpu_tensor_alloc(hist_rows * Q36_N_SSM_CONV_DIM * sizeof(float));
-            rt->recurrent[il].state = q36_gpu_tensor_alloc(state_dim * sizeof(float));
+            rt->recurrent[il].state = q36_gpu_tensor_alloc(
+                state_dim * (rt->recur_state_f16 ? sizeof(uint16_t) : sizeof(float)));
             if (!rt->recurrent[il].conv || !rt->recurrent[il].state) goto fail;
             if (enable_mtp) {
                 rt->spec_recurrent[il].conv = q36_gpu_tensor_alloc(hist_rows * Q36_N_SSM_CONV_DIM * sizeof(float));
-                rt->spec_recurrent[il].state = q36_gpu_tensor_alloc(state_dim * sizeof(float));
+                rt->spec_recurrent[il].state = q36_gpu_tensor_alloc(
+                    state_dim * (rt->recur_state_f16 ? sizeof(uint16_t) : sizeof(float)));
                 if (!rt->spec_recurrent[il].conv || !rt->spec_recurrent[il].state) goto fail;
             }
         }
@@ -7842,15 +7854,13 @@ static uint64_t q36_vulkan_recurrent_conv_bytes(void) {
     return (uint64_t)(Q36_N_SSM_CONV - 1u) * Q36_N_SSM_CONV_DIM * sizeof(float);
 }
 
-static uint64_t q36_vulkan_recurrent_state_bytes(void) {
-    return (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE * Q36_N_SSM_DT_RANK * sizeof(float);
-}
-
 static bool q36_vulkan_spec_frontier_copy(q36_vulkan_recurrent_cache *dst,
                                           const q36_vulkan_recurrent_cache *src) {
     if (!dst || !src || !dst->conv || !src->conv || !dst->state || !src->state) return false;
     if (!q36_gpu_tensor_copy(dst->conv, 0, src->conv, 0, q36_vulkan_recurrent_conv_bytes())) return false;
-    if (!q36_gpu_tensor_copy(dst->state, 0, src->state, 0, q36_vulkan_recurrent_state_bytes())) return false;
+    if (q36_gpu_tensor_bytes(dst->state) != q36_gpu_tensor_bytes(src->state) ||
+        !q36_gpu_tensor_copy(dst->state, 0, src->state, 0,
+                             q36_gpu_tensor_bytes(src->state))) return false;
     return true;
 }
 
@@ -10598,6 +10608,64 @@ static int q36_payload_read_tensor(q36_gpu_tensor *tensor, FILE *fp,
     *remaining -= bytes;
     return 0;
 }
+
+static int q36_payload_write_recurrent_state(FILE *fp,
+                                              const q36_gpu_tensor *tensor,
+                                              bool f16,
+                                              char *err, size_t errlen) {
+    if (!f16)
+        return q36_payload_write_tensor(fp, tensor,
+                                        q36_recurrent_state_bytes(), err, errlen);
+    uint16_t half[8192];
+    float full[8192];
+    uint64_t elems = q36_recurrent_state_bytes() / sizeof(float);
+    for (uint64_t off = 0; off < elems; off += 8192u) {
+        uint64_t n = elems - off;
+        if (n > 8192u) n = 8192u;
+        if (!q36_gpu_tensor_read(tensor, off * sizeof(uint16_t), half,
+                                  n * sizeof(uint16_t))) {
+            q36_payload_set_err(err, errlen, "failed to read FP16 recurrent state");
+            return 1;
+        }
+        for (uint64_t i = 0; i < n; i++) full[i] = q36_f16_to_f32(half[i]);
+        if (fwrite(full, sizeof(float), (size_t)n, fp) != n) {
+            q36_payload_set_err(err, errlen, "failed to write recurrent state");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
+                                             bool f16, uint64_t *remaining,
+                                             char *err, size_t errlen) {
+    uint64_t bytes = q36_recurrent_state_bytes();
+    if (!f16)
+        return q36_payload_read_tensor(tensor, fp, bytes, remaining, err, errlen);
+    if (!remaining || *remaining < bytes) {
+        q36_payload_set_err(err, errlen, "truncated recurrent state");
+        return 1;
+    }
+    uint16_t half[8192];
+    float full[8192];
+    uint64_t elems = bytes / sizeof(float);
+    for (uint64_t off = 0; off < elems; off += 8192u) {
+        uint64_t n = elems - off;
+        if (n > 8192u) n = 8192u;
+        if (fread(full, sizeof(float), (size_t)n, fp) != n) {
+            q36_payload_set_err(err, errlen, "failed to read recurrent state");
+            return 1;
+        }
+        for (uint64_t i = 0; i < n; i++) half[i] = q36_f32_to_f16(full[i]);
+        if (!q36_gpu_tensor_write(tensor, off * sizeof(uint16_t), half,
+                                   n * sizeof(uint16_t))) {
+            q36_payload_set_err(err, errlen, "failed to upload FP16 recurrent state");
+            return 1;
+        }
+    }
+    *remaining -= bytes;
+    return 0;
+}
 #endif
 
 uint64_t q36_session_payload_bytes(q36_session *s) {
@@ -10810,7 +10878,9 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         } else {
             q36_vulkan_recurrent_cache *c = &rt->recurrent[il];
             if (q36_payload_write_tensor(fp, c->conv, q36_recurrent_conv_bytes(), err, errlen) != 0 ||
-                q36_payload_write_tensor(fp, c->state, q36_recurrent_state_bytes(), err, errlen) != 0)
+                q36_payload_write_recurrent_state(fp, c->state,
+                                                  rt->recur_state_f16,
+                                                  err, errlen) != 0)
                 return 1;
         }
     }
@@ -10972,7 +11042,9 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
             } else {
                 q36_vulkan_recurrent_cache *c = &rt->recurrent[il];
                 if (q36_payload_read_tensor(c->conv, fp, q36_recurrent_conv_bytes(), &remaining, err, errlen) != 0 ||
-                    q36_payload_read_tensor(c->state, fp, q36_recurrent_state_bytes(), &remaining, err, errlen) != 0)
+                    q36_payload_read_recurrent_state(c->state, fp,
+                                                     rt->recur_state_f16,
+                                                     &remaining, err, errlen) != 0)
                     return 1;
             }
         }

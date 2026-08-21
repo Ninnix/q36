@@ -179,8 +179,10 @@ typedef struct {
     q36_vk_kernel delta_net;
     q36_vk_kernel delta_net_fast;
     q36_vk_kernel delta_net_cols;
+    q36_vk_kernel delta_net_cols_f16;
     q36_vk_kernel delta_net_decode;
     q36_vk_kernel delta_net_decode_reg;
+    q36_vk_kernel delta_net_decode_reg_f16;
     q36_vk_kernel attn_scores;
     q36_vk_kernel attn_post;
     q36_vk_kernel attn_reduce;
@@ -2813,8 +2815,10 @@ int q36_gpu_init(void) {
     q36_vk.delta_net = Q36_VK_KERNEL("vulkan/delta_net.spv", 6, 12, (1u << 0) | (1u << 5));
     q36_vk.delta_net_fast = Q36_VK_KERNEL("vulkan/delta_net_fast.spv", 6, 12, (1u << 0) | (1u << 5));
     q36_vk.delta_net_cols = Q36_VK_KERNEL("vulkan/delta_net_cols.spv", 6, 16, (1u << 0) | (1u << 5));
+    q36_vk.delta_net_cols_f16 = Q36_VK_KERNEL("vulkan/delta_net_cols_f16.spv", 6, 16, (1u << 0) | (1u << 5));
     q36_vk.delta_net_decode = Q36_VK_KERNEL("vulkan/delta_net_decode.spv", 6, 12, (1u << 0) | (1u << 5));
     q36_vk.delta_net_decode_reg = Q36_VK_KERNEL("vulkan/delta_net_decode_reg.spv", 6, 12, (1u << 0) | (1u << 5));
+    q36_vk.delta_net_decode_reg_f16 = Q36_VK_KERNEL("vulkan/delta_net_decode_reg_f16.spv", 6, 12, (1u << 0) | (1u << 5));
     q36_vk.attn_scores = Q36_VK_KERNEL("vulkan/attn_scores.spv", 3, 28, 1u << 2);
     q36_vk.attn_post = Q36_VK_KERNEL("vulkan/attn_post.spv", 4, 28, (1u << 0) | (1u << 3));
     q36_vk.attn_reduce = Q36_VK_KERNEL("vulkan/attn_reduce.spv", 4, 28, 1u << 3);
@@ -3255,8 +3259,10 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.attn_post);
     q36_vk_kernel_destroy(&q36_vk.attn_scores);
     q36_vk_kernel_destroy(&q36_vk.delta_net_cols);
+    q36_vk_kernel_destroy(&q36_vk.delta_net_cols_f16);
     q36_vk_kernel_destroy(&q36_vk.delta_net_decode);
     q36_vk_kernel_destroy(&q36_vk.delta_net_decode_reg);
+    q36_vk_kernel_destroy(&q36_vk.delta_net_decode_reg_f16);
     q36_vk_kernel_destroy(&q36_vk.delta_net_fast);
     q36_vk_kernel_destroy(&q36_vk.delta_net);
     q36_vk_kernel_destroy(&q36_vk.delta_gates);
@@ -5988,8 +5994,9 @@ int q36_gpu_delta_net_decode_tensor(q36_gpu_tensor *state,
     uint64_t vec_bytes = (uint64_t)n_heads * state_dim * sizeof(float);
     uint64_t gb_bytes = 2u * (uint64_t)n_heads * sizeof(float);
     uint64_t state_bytes = vec_bytes * state_dim;
+    bool state_f16 = state && state->bytes == state_bytes / 2u;
     if (n_heads == 0 || state_dim == 0 || state_dim > 128 || n_tok == 0) return 0;
-    if (!q36_gpu_tensor_range_ok(state, 0, state_bytes) ||
+    if (!q36_gpu_tensor_range_ok(state, 0, state_f16 ? state_bytes / 2u : state_bytes) ||
         !q36_gpu_tensor_range_ok(q, 0, vec_bytes * n_tok) ||
         !q36_gpu_tensor_range_ok(k, 0, vec_bytes * n_tok) ||
         !q36_gpu_tensor_range_ok(v, 0, vec_bytes * n_tok) ||
@@ -6021,15 +6028,18 @@ int q36_gpu_delta_net_decode_tensor(q36_gpu_tensor *state,
                     uint32_t tok_end;
                 } cpush = { n_heads, state_dim, t0,
                             t0 + 128u < n_tok ? t0 + 128u : n_tok };
-                ok = q36_vk_run_unlocked("delta_net_cols", &q36_vk.delta_net_cols,
+                ok = q36_vk_run_unlocked("delta_net_cols",
+                                         state_f16 ? &q36_vk.delta_net_cols_f16 :
+                                                     &q36_vk.delta_net_cols,
                                          bindings, &cpush, sizeof(cpush),
                                          n_heads, (state_dim + 3u) / 4u, 1);
             }
             pthread_mutex_unlock(&q36_vk_mu);
             return ok;
         } else if (state_dim == 128u && q36_vk_use_delta_decode()) {
-            bool reg = q36_vk_use_delta_reg();
-            kernel = reg ? &q36_vk.delta_net_decode_reg :
+            bool reg = state_f16 || q36_vk_use_delta_reg();
+            kernel = state_f16 ? &q36_vk.delta_net_decode_reg_f16 :
+                     reg ? &q36_vk.delta_net_decode_reg :
                            &q36_vk.delta_net_decode;
             name = "delta_net_decode";
             groups_y = state_dim / (reg ? 8u : 32u);

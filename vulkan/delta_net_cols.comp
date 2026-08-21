@@ -1,5 +1,9 @@
 #version 460
 
+#ifdef Q36_STATE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -8,9 +12,15 @@
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef Q36_STATE_F16
+layout(set = 0, binding = 0) buffer State {
+    float16_t s[];
+};
+#else
 layout(set = 0, binding = 0) buffer State {
     float s[];
 };
+#endif
 
 layout(set = 0, binding = 1) readonly buffer Qbuf {
     float q[];
@@ -64,7 +74,7 @@ void main(void) {
 
     for (uint r = 0u; r < ROWS_PER_LANE; r++) {
         uint i = r * LANES + lane;
-        shard[r] = s[mat + i * N + j];
+        shard[r] = float(s[mat + i * N + j]);
     }
 
     for (uint tok = pc.tok0; tok < pc.tok_end; tok++) {
@@ -99,6 +109,10 @@ void main(void) {
 
     for (uint r = 0u; r < ROWS_PER_LANE; r++) {
         uint i = r * LANES + lane;
+#ifdef Q36_STATE_F16
+        s[mat + i * N + j] = float16_t(shard[r]);
+#else
         s[mat + i * N + j] = shard[r];
+#endif
     }
 }

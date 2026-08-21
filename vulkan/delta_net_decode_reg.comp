@@ -1,10 +1,18 @@
 #version 460
+#ifdef Q36_STATE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef Q36_STATE_F16
+layout(set = 0, binding = 0) buffer State { float16_t s[]; };
+#else
 layout(set = 0, binding = 0) buffer State { float s[]; };
+#endif
 layout(set = 0, binding = 1) readonly buffer Qbuf { float q[]; };
 layout(set = 0, binding = 2) readonly buffer Kbuf { float k[]; };
 layout(set = 0, binding = 3) readonly buffer Vbuf { float v[]; };
@@ -32,7 +40,7 @@ void main(void) {
     uint mat = h * N * N;
     float state[ROWS];
     for (uint r = 0u; r < ROWS; r++)
-        state[r] = s[mat + (r * LANES + lane) * N + j];
+        state[r] = float(s[mat + (r * LANES + lane) * N + j]);
 
     float norm = inversesqrt(float(N));
     for (uint tok = 0u; tok < pc.n_tok; tok++) {
@@ -60,6 +68,11 @@ void main(void) {
         if (lane == 0u) y[vec + j] = outj * norm;
     }
 
-    for (uint r = 0u; r < ROWS; r++)
+    for (uint r = 0u; r < ROWS; r++) {
+#ifdef Q36_STATE_F16
+        s[mat + (r * LANES + lane) * N + j] = float16_t(state[r]);
+#else
         s[mat + (r * LANES + lane) * N + j] = state[r];
+#endif
+    }
 }
