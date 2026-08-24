@@ -92,7 +92,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
     if (pc.type == IQ2_XXS) {
         base += qb * 66u;
         uint packed = load_u32(base + 6u + 8u * group);
-        uint entry = load_u8(base + 2u + 8u * group + 2u * l);
+        uint entry = load_u8(base + 2u + 8u * group + l);
         uint signs = table_u8(TAB_KSIGNS_BYTES + ((packed >> (7u * l)) & 127u));
         d = unpackHalf2x16(load_u16(base)).x *
             (0.5 + float(packed >> 28u)) * 0.25;
@@ -190,7 +190,7 @@ void main(void) {
                         float d = weight_scale[lr] *
                             (0.5 + float(packed >> 28u)) * 0.25;
                         [[unroll]] for (uint p = 0u; p < 4u; p++) {
-                            uint entry = load_u8(base + 2u + 8u * slice + 2u * p);
+                            uint entry = load_u8(base + 2u + 8u * slice + p);
                             uint signs = table_u8(TAB_KSIGNS_BYTES +
                                 ((packed >> (7u * p)) & 127u));
                             v[p] = d * signed_grid(

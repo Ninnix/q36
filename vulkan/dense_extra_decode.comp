@@ -84,7 +84,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
     if (pc.type == IQ2_XXS) {
         base += qb * 66u;
         uint packed = load_u32(base + 6u + 8u * group);
-        uint entry = load_u8(base + 2u + 8u * group + 2u * l);
+        uint entry = load_u8(base + 2u + 8u * group + l);
         uint signs = table_u8(TAB_KSIGNS_BYTES + ((packed >> (7u * l)) & 127u));
         d = unpackHalf2x16(load_u16(base)).x *
             (0.5 + float(packed >> 28u)) * 0.25;
@@ -153,7 +153,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         d = unpackHalf2x16(load_u16(base)).x *
             (0.5 + float(packed >> 28u)) * 0.25;
         for (uint l = 0u; l < 4u; l++) {
-            uint entry = load_u8(base + 2u + 8u * group + 2u * l);
+            uint entry = load_u8(base + 2u + 8u * group + l);
             uint signs = table_u8(TAB_KSIGNS_BYTES + ((packed >> (7u * l)) & 127u));
             sum += dot(signed_grid(tables[TAB_IQ2XXS + entry * 2u], signs, 0u), qv[2u * l]);
             sum += dot(signed_grid(tables[TAB_IQ2XXS + entry * 2u + 1u], signs, 4u), qv[2u * l + 1u]);
