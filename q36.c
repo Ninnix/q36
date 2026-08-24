@@ -1389,7 +1389,14 @@ static uint64_t q36_vulkan_scratch_bytes(
         }
     }
     if (backend == Q36_BACKEND_METAL && Q36_MODEL_DENSE) {
-        bytes += (uint64_t)cap * Q36_N_FF_SHARED * 2u * sizeof(float);
+        const uint64_t dense_ffn_panel_bytes =
+            (uint64_t)cap * Q36_N_FF_SHARED * sizeof(float);
+        const uint64_t reusable_panels = metal_attention_bytes /
+            dense_ffn_panel_bytes > 2u ? 2u :
+            metal_attention_bytes / dense_ffn_panel_bytes;
+        /* Attention/recurrent scratch is dead before dense FFN starts.  Reuse
+         * it for as many complete FFN panels as it can hold. */
+        bytes += (2u - reusable_panels) * dense_ffn_panel_bytes;
     } else if (backend != Q36_BACKEND_METAL) {
         bytes += (uint64_t)cap *
                  (Q36_N_FF_SHARED * 2u +
@@ -4665,11 +4672,26 @@ static bool q36_tensor_is_disabled_embedded_mtp(const q36_engine *e,
            memcmp(t->name.ptr, prefix, (size_t)len) == 0;
 }
 
+#ifdef Q36_METAL
+static bool q36_metal_q5_output_cache_candidate(const q36_engine *e,
+                                                const q36_tensor *t) {
+    const char *enabled = getenv("Q36_METAL_Q5_OUTPUT_CACHE");
+    return e && !e->ssd_streaming &&
+           (!enabled || enabled[0] != '0') &&
+           Q36_MODEL_DENSE && t && t == e->weights.output &&
+           t->type == Q36_TENSOR_Q5_K;
+}
+
+#endif
+
 static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor *t) {
     /* The dense runtime executes only the trunk; its appended MTP block must
      * not consume the resident model arena. */
     if (t == e->weights.token_embd || t->bytes == 0 ||
         q36_tensor_is_disabled_embedded_mtp(e, t)) return true;
+#ifdef Q36_METAL
+    if (q36_metal_q5_output_cache_candidate(e, t)) return true;
+#endif
     int il = q36_weights_tensor_routed_layer(&e->weights, t);
     return e->ssd_streaming && il >= 0 && (uint32_t)il >= e->ssd_streaming_full_layers;
 }
@@ -4752,6 +4774,15 @@ static void q36_vulkan_prewarm_weights(const q36_engine *e) {
         __atomic_store_n(&reader.staged, UINT64_MAX, __ATOMIC_RELAXED);
         pthread_join(reader_thread, NULL);
     }
+#ifdef Q36_METAL
+    if (q36_metal_q5_output_cache_candidate(e, e->weights.output) &&
+        !q36_gpu_prepare_q5_k_output_cache(
+            e->model.map, e->model.size, e->weights.output->abs_offset,
+            Q36_N_EMBD, Q36_N_VOCAB)) {
+        fprintf(stderr,
+                "q36: Metal Q5_K output cache unavailable; using GGUF weights\n");
+    }
+#endif
     /* The MTP support model is fetched through the same whole-tensor cache
      * keys at draft time; without a prewarm the first drafts pay its whole
      * upload (~1.2s spread over the first replies). */
@@ -5547,9 +5578,27 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
      * control/shared tensors into non-overlapping views of that 32 MiB owner. */
     if (Q36_MODEL_DENSE) {
         /* Dense gate/up need two full-width owners. Mid overwrites gate;
-         * the routed controls, shared tail and scalar are never used. */
-        Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
-        Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
+         * the routed controls, shared tail and scalar are never used.  Large
+         * attention scratch is dead by this point in every layer, so reuse it
+         * for one or both panels when large enough. */
+        const uint64_t ffn_panel_bytes =
+            (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float);
+        if (rt->scores &&
+            q36_gpu_tensor_bytes(rt->scores) >= 2u * ffn_panel_bytes) {
+            rt->ffn_shared_gate = q36_gpu_tensor_view(
+                rt->scores, 0, ffn_panel_bytes);
+            rt->ffn_shared_up = q36_gpu_tensor_view(
+                rt->scores, ffn_panel_bytes, ffn_panel_bytes);
+            if (!rt->ffn_shared_gate || !rt->ffn_shared_up) goto fail;
+        } else if (rt->scores &&
+                   q36_gpu_tensor_bytes(rt->scores) >= ffn_panel_bytes) {
+            rt->ffn_shared_gate = q36_gpu_tensor_view(
+                rt->scores, 0, ffn_panel_bytes);
+            Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
+        } else {
+            Q36_GPU_ALLOC_F32(ffn_shared_gate, Q36_N_FF_SHARED);
+            Q36_GPU_ALLOC_F32(ffn_shared_up, Q36_N_FF_SHARED);
+        }
         rt->ffn_shared_mid = q36_gpu_tensor_view(
             rt->ffn_shared_gate, 0,
             (uint64_t)Q36_N_FF_SHARED * prefill_cap * sizeof(float));
@@ -6793,15 +6842,42 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
     float *outp;
     if (!rt || !m || !l || !inp || !out) return false;
     if (Q36_MODEL_DENSE) {
-        if (!q36_gpu_quantize_q8_k_tensor(rt->inp_q8, inp, Q36_N_EMBD, n_tok) ||
-            !q36_gpu_tensor_matmul_q8_or_float_scaled(
-                m, l->ffn_gate_shexp, inp, rt->inp_q8,
-                rt->ffn_shared_gate, Q36_N_EMBD, Q36_N_FF_SHARED,
-                n_tok, 1.0f) ||
-            !q36_gpu_tensor_matmul_q8_or_float_scaled(
-                m, l->ffn_up_shexp, inp, rt->inp_q8,
-                rt->ffn_shared_up, Q36_N_EMBD, Q36_N_FF_SHARED,
-                n_tok, 1.0f)) {
+        if (!q36_gpu_quantize_q8_k_tensor(
+                rt->inp_q8, inp, Q36_N_EMBD, n_tok)) {
+            return false;
+        }
+        bool pair_projected = false;
+#ifdef Q36_METAL
+        const char *iq3_pair = getenv("Q36_METAL_IQ3_PAIR");
+        if (n_tok == 1u && (!iq3_pair || iq3_pair[0] != '0') &&
+            l->ffn_gate_shexp->type == Q36_TENSOR_IQ3_S &&
+            l->ffn_up_shexp->type == Q36_TENSOR_IQ3_S) {
+            pair_projected = q36_gpu_matmul_iq3_s_pair_tensor(
+                rt->ffn_shared_gate, rt->ffn_shared_up,
+                m->map, m->size,
+                l->ffn_gate_shexp->abs_offset,
+                l->ffn_up_shexp->abs_offset,
+                Q36_N_EMBD, Q36_N_FF_SHARED, inp) != 0;
+        } else if (n_tok == 1u && (!iq3_pair || iq3_pair[0] != '0') &&
+                   l->ffn_gate_shexp->type == Q36_TENSOR_IQ3_XXS &&
+                   l->ffn_up_shexp->type == Q36_TENSOR_IQ3_XXS) {
+            pair_projected = q36_gpu_matmul_iq3_xxs_pair_tensor(
+                rt->ffn_shared_gate, rt->ffn_shared_up,
+                m->map, m->size,
+                l->ffn_gate_shexp->abs_offset,
+                l->ffn_up_shexp->abs_offset,
+                Q36_N_EMBD, Q36_N_FF_SHARED, inp) != 0;
+        }
+#endif
+        if (!pair_projected &&
+            (!q36_gpu_tensor_matmul_q8_or_float_scaled(
+                 m, l->ffn_gate_shexp, inp, rt->inp_q8,
+                 rt->ffn_shared_gate, Q36_N_EMBD, Q36_N_FF_SHARED,
+                 n_tok, 1.0f) ||
+             !q36_gpu_tensor_matmul_q8_or_float_scaled(
+                 m, l->ffn_up_shexp, inp, rt->inp_q8,
+                 rt->ffn_shared_up, Q36_N_EMBD, Q36_N_FF_SHARED,
+                 n_tok, 1.0f))) {
             return false;
         }
         bool fused_swiglu_q8 = false;
@@ -9240,6 +9316,50 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     }
     vocab_load(&e->vocab, &e->model);
     weights_bind(&e->weights, &e->model);
+    if (Q36_MODEL_DENSE && getenv("Q36_DUMP_DENSE_TYPES")) {
+        uint64_t iq4_xs_tensors = 0;
+        uint64_t iq4_xs_bytes = 0;
+        uint64_t iq4_xs_blocks = 0;
+        for (uint32_t il = 0; il < Q36_N_LAYER; ++il) {
+            const q36_layer_weights *l = &e->weights.layer[il];
+            if (l->kind == Q36_LAYER_FULL_ATTN) {
+                fprintf(stderr,
+                        "q36: dense layer %u kind=attention q=%s k=%s v=%s o=%s ffn_gate=%s ffn_up=%s ffn_down=%s\n",
+                        il, tensor_type_name(l->attn_q->type),
+                        tensor_type_name(l->attn_k->type),
+                        tensor_type_name(l->attn_v->type),
+                        tensor_type_name(l->attn_output->type),
+                        tensor_type_name(l->ffn_gate_shexp->type),
+                        tensor_type_name(l->ffn_up_shexp->type),
+                        tensor_type_name(l->ffn_down_shexp->type));
+            } else {
+                fprintf(stderr,
+                        "q36: dense layer %u kind=recurrent qkv=%s z=%s beta=%s alpha=%s o=%s ffn_gate=%s ffn_up=%s ffn_down=%s\n",
+                        il, tensor_type_name(l->attn_qkv->type),
+                        tensor_type_name(l->attn_gate->type),
+                        tensor_type_name(l->ssm_beta->type),
+                        tensor_type_name(l->ssm_alpha->type),
+                        tensor_type_name(l->ssm_out->type),
+                        tensor_type_name(l->ffn_gate_shexp->type),
+                        tensor_type_name(l->ffn_up_shexp->type),
+                        tensor_type_name(l->ffn_down_shexp->type));
+            }
+        }
+        for (uint64_t it = 0; it < e->model.n_tensors; ++it) {
+            const q36_tensor *t = &e->model.tensors[it];
+            if (t->type != Q36_TENSOR_IQ4_XS) continue;
+            iq4_xs_tensors++;
+            iq4_xs_bytes += t->bytes;
+            iq4_xs_blocks += t->elements / Q36_QK_K;
+        }
+        fprintf(stderr,
+                "q36: dense IQ4_XS tensors=%" PRIu64 " bytes=%" PRIu64
+                " blocks=%" PRIu64 " exact-scale-expanded-bytes=%" PRIu64
+                " delta=%" PRIu64 "\n",
+                iq4_xs_tensors, iq4_xs_bytes, iq4_xs_blocks,
+                iq4_xs_bytes + iq4_xs_blocks * 2u,
+                iq4_xs_blocks * 2u);
+    }
     if (e->ssd_streaming && !q36_backend_supports_ssd_streaming(e->backend)) {
         fprintf(stderr,
                 "q36: --ssd-streaming requires a Metal or Vulkan GPU graph backend\n");

@@ -1,5 +1,12 @@
 // Small Qwen3.6 graph primitives and shape-specialized dense operations.
 
+kernel void q36_f32_to_f16(device const float *src [[buffer(0)]],
+                            device half *dst [[buffer(1)]],
+                            constant uint &count [[buffer(2)]],
+                            uint i [[thread_position_in_grid]]) {
+    if (i < count) dst[i] = (half)src[i];
+}
+
 kernel void q36_add_f32(device float *out [[buffer(0)]],
                          device const float *a [[buffer(1)]],
                          device const float *b [[buffer(2)]],

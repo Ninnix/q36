@@ -57,6 +57,13 @@ int q36_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
 int q36_gpu_finish_model_cache(void);
 int q36_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int q36_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+#ifdef Q36_METAL
+int q36_gpu_prepare_q5_k_output_cache(const void *model_map,
+                                      uint64_t model_size,
+                                      uint64_t weight_offset,
+                                      uint64_t in_dim,
+                                      uint64_t out_dim);
+#endif
 void q36_gpu_set_quality(bool quality);
 void q36_gpu_set_dense_model(bool dense);
 void q36_gpu_set_micro_batch(bool enabled);
@@ -194,6 +201,28 @@ int q36_gpu_matmul_q8_0_pair_scaled_tensor(
         const q36_gpu_tensor *x,
         float                   scale_a,
         float                   scale_b);
+
+int q36_gpu_matmul_iq3_s_pair_tensor(
+        q36_gpu_tensor       *out_a,
+        q36_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x);
+
+int q36_gpu_matmul_iq3_xxs_pair_tensor(
+        q36_gpu_tensor       *out_a,
+        q36_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x);
 
 int q36_gpu_matmul_k_quant_tensor(
         q36_gpu_tensor       *out,

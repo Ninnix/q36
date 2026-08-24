@@ -295,7 +295,7 @@ CORE_OBJS := q36_gpu_core.o q36_vulkan.o
 METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
 CPU_CORE_OBJS := q36_cpu.o
 
-.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-vulkan benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
+.PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-metal-gate benchmark-qwen27b-vulkan benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
 all: q36 q36-server q36-bench q36-agent q36-eval q36_test
 
@@ -317,6 +317,7 @@ help:
 	@echo "  make benchmark-session-batch  Benchmark old, 1/2/4/8-slot, and ordered-fallback server decode"
 	@echo "  make benchmark-qwen27b  Benchmark q36 at 128, 2048, and 4096 prompt tokens, then llama.cpp at its fitting context"
 	@echo "  make benchmark-qwen27b-gate  Quick 128/2048 comparison gate with 32 decode tokens"
+	@echo "  make benchmark-qwen27b-metal-gate  Quick Metal 128/2048 gate with 32 decode tokens"
 	@echo "  make test-reference       Compare Q36 CPU against tracked llama.cpp results"
 	@echo "  make test-reference-local Compare Q36 CPU against ignored local results"
 	@echo "  make test-vectors-local   Capture ignored local llama.cpp results"
@@ -527,7 +528,7 @@ test-metal-model: metal
 	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --ssd-streaming-parity --mtp-verifier
 
 test-qwen27b-metal-parity: metal
-	./q36_test --gpu-cpu-parity --model $(QWEN27B_MODEL) --case short
+	./q36_test --dense-quant-model-rows --gpu-cpu-parity --model $(QWEN27B_MODEL) --case short
 
 test-qwen27b-vulkan-parity: q36_test
 	./q36_test --vulkan-cpu-parity --model $(QWEN27B_MODEL) --case short
@@ -584,6 +585,10 @@ benchmark-qwen27b: benchmark-qwen27b-vulkan benchmark-qwen27b-llama
 benchmark-qwen27b-gate: q36-bench
 	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GATE_GEN)
 	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2304 --gen-tokens $(QWEN27B_GATE_GEN)
+
+benchmark-qwen27b-metal-gate: metal
+	./q36-bench --metal -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GATE_GEN)
+	./q36-bench --metal -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 2048 --ctx-max 2048 --ctx-alloc 2304 --gen-tokens $(QWEN27B_GATE_GEN)
 
 benchmark-qwen27b-vulkan: q36-bench
 	./q36-bench --vulkan -m $(QWEN27B_MODEL) --prompt-file $(QWEN27B_PROMPT) --ctx-start 128 --ctx-max 128 --ctx-alloc 512 --prefill-chunk 128 --gen-tokens $(QWEN27B_GEN)

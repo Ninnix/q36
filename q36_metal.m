@@ -53,6 +53,11 @@ static bool q36_micro_batch;
 static bool q36_ssd_streaming;
 static bool q36_dense_model;
 static bool q36_metal_mpp_enabled;
+static id<MTLBuffer> q36_q5_output_cache;
+static uint64_t q36_q5_output_cache_bytes;
+static uint64_t q36_q5_output_offset;
+static uint64_t q36_q5_output_in_dim;
+static uint64_t q36_q5_output_out_dim;
 
 static uint64_t q36_gpu_system_memory_bytes(void) {
     uint64_t bytes = 0;
@@ -204,8 +209,16 @@ static id<MTLBuffer> q36_shared_up_scratch;
 static id<MTLBuffer> q36_shared_down_scratch;
 static NSUInteger q36_shared_mid_scratch_bytes;
 static NSUInteger q36_shared_down_scratch_bytes;
+static id<MTLBuffer> q36_dense_rhs_f16;
+static NSUInteger q36_dense_rhs_f16_bytes;
+static id<MTLBuffer> q36_dense_rhs_source;
+static uint64_t q36_dense_rhs_source_offset;
+static uint64_t q36_dense_rhs_in_dim;
+static uint64_t q36_dense_rhs_tokens;
 static bool q36_prof_active;
+static bool q36_decode_profile_enabled;
 static double q36_prof_gpu_seconds;
+static double q36_last_gpu_seconds;
 static uint64_t q36_prof_command_buffers;
 
 static void q36_streaming_cache_clear(bool clear_full_layers);
@@ -231,6 +244,7 @@ static int q36_metal_wait(void) {
     q36_batch = nil;
     pthread_mutex_unlock(&q36_mu);
     if (!cb) return 1;
+    q36_last_gpu_seconds = 0.0;
     [cb commit];
     [cb waitUntilCompleted];
     if (cb.status == MTLCommandBufferStatusError) {
@@ -238,10 +252,13 @@ static int q36_metal_wait(void) {
                 cb.error.localizedDescription.UTF8String);
         return 0;
     }
-    if (q36_prof_active) {
+    {
         const double start = cb.GPUStartTime;
         const double end = cb.GPUEndTime;
-        if (end > start) q36_prof_gpu_seconds += end - start;
+        if (end > start) q36_last_gpu_seconds = end - start;
+    }
+    if (q36_prof_active) {
+        q36_prof_gpu_seconds += q36_last_gpu_seconds;
         q36_prof_command_buffers++;
     }
     return 1;
@@ -305,7 +322,18 @@ static void q36_metal_append_u32_table(NSMutableString *source,
     [source appendString:@"};\n"];
 }
 
-static void q36_metal_append_iq3_tables(NSMutableString *source) {
+static void q36_metal_append_u64_table(NSMutableString *source,
+                                        NSString *name,
+                                        const uint64_t *values, size_t count) {
+    [source appendFormat:@"constant ulong %@[%zu] = {", name, count];
+    for (size_t i = 0; i < count; i++)
+        [source appendFormat:(i ? @",%lluul" : @"%lluul"),
+                             (unsigned long long)values[i]];
+    [source appendString:@"};\n"];
+}
+
+static void q36_metal_append_dense_iq_tables(NSMutableString *source) {
+    uint64_t iq1s_grid[2048];
     q36_metal_append_u8_table(source, @"q36_dense_kmask_iq3",
                               q36_kmask_iq2xs,
                               sizeof(q36_kmask_iq2xs));
@@ -320,6 +348,23 @@ static void q36_metal_append_iq3_tables(NSMutableString *source) {
                                q36_iq3s_grid,
                                sizeof(q36_iq3s_grid) /
                                    sizeof(q36_iq3s_grid[0]));
+    q36_metal_append_u8_table(source, @"q36_dense_iq2xxs_grid",
+                              q36_iq2xxs_grid,
+                              sizeof(q36_iq2xxs_grid) - 1u);
+    q36_metal_append_u64_table(source, @"q36_dense_iq2xs_grid",
+                               q36_iq2xs_grid,
+                               sizeof(q36_iq2xs_grid) /
+                                   sizeof(q36_iq2xs_grid[0]));
+    q36_metal_append_u64_table(source, @"q36_dense_iq2s_grid",
+                               q36_iq2s_grid,
+                               sizeof(q36_iq2s_grid) /
+                                   sizeof(q36_iq2s_grid[0]));
+    if (q36_quant_pack_iq1_grid) {
+        q36_quant_pack_iq1_grid(iq1s_grid);
+        q36_metal_append_u64_table(source, @"q36_dense_iq1s_grid",
+                                   iq1s_grid,
+                                   sizeof(iq1s_grid) / sizeof(iq1s_grid[0]));
+    }
 }
 
 static NSString *q36_metal_source(void) {
@@ -335,7 +380,7 @@ static NSString *q36_metal_source(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableString *source = [NSMutableString
         stringWithUTF8String:q36_metal_base_source];
-    q36_metal_append_iq3_tables(source);
+    q36_metal_append_dense_iq_tables(source);
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv(spec[0].UTF8String);
         NSMutableArray<NSString *> *paths = [NSMutableArray array];
@@ -803,15 +848,16 @@ static int q36_quant_float_matmul(
     id<MTLBuffer> weights = q36_model_view(
         map, size, offset, out_dim * row_bytes, &inner);
     if (!weights || (!q36_batch && !q36_gpu_begin_commands())) return 0;
-
     if (tokens <= 5u) {
+        const bool decode_profile = tokens == 1u &&
+            q36_decode_profile_enabled;
         const bool iq3_rows = q36_dense_model && tokens == 1u &&
             ([mv_stem containsString:@"iq3_xxs"] ||
              [mv_stem containsString:@"iq3_s"]);
         const bool k_rows = q36_dense_model && tokens == 1u &&
             ([mv_stem containsString:@"q4_K"] ||
              [mv_stem containsString:@"q6_K"]);
-        const bool multi_rows = iq3_rows || k_rows;
+        const bool multi_rows = q36_dense_model && tokens == 1u;
         NSString *kernel;
         if (iq3_rows) {
             kernel = [mv_stem containsString:@"iq3_xxs"]
@@ -821,6 +867,11 @@ static int q36_quant_float_matmul(
             kernel = [mv_stem containsString:@"q4_K"]
                 ? @"kernel_mul_mv_rows_q4_K_f32"
                 : @"kernel_mul_mv_rows_q6_K_f32";
+        } else if (multi_rows) {
+            kernel = [mv_stem stringByReplacingOccurrencesOfString:
+                @"kernel_mul_mv_ext_" withString:@"kernel_mul_mv_rows_"];
+            kernel = [kernel stringByReplacingOccurrencesOfString:
+                @"_f32_r1_" withString:@"_f32"];
         } else {
             kernel = [NSString stringWithFormat:@"%@%llu", mv_stem,
                        (unsigned long long)tokens];
@@ -838,6 +889,14 @@ static int q36_quant_float_matmul(
             in_dim * tokens * sizeof(float),
             (int32_t)out_dim, (int32_t)tokens, 1, 1, 1
         };
+        const uint64_t rows_per_sg = multi_rows && !k_rows ? 4u :
+                                     (k_rows ? 2u : 1u);
+        const uint64_t rows_per_group = rows_per_sg * nsg;
+        /* Isolate this projection in its own command buffer only when the
+         * diagnostic is requested.  The default path keeps its normal
+         * command-buffer batching and has no extra synchronization. */
+        if (decode_profile &&
+            (!q36_metal_wait() || !q36_gpu_begin_commands())) return 0;
         id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
         enc.label = kernel;
         [enc setComputePipelineState:p];
@@ -849,38 +908,69 @@ static int q36_quant_float_matmul(
             [enc setThreadgroupMemoryLength:
                 [mv_stem containsString:@"iq3_xxs"] ? 1152u : 2048u
                                       atIndex:0];
-        const uint64_t rows_per_sg = iq3_rows ? 4u : (k_rows ? 2u : 1u);
-        const uint64_t rows_per_group = rows_per_sg * nsg;
         [enc dispatchThreadgroups:MTLSizeMake(
                                               (out_dim + rows_per_group - 1u) /
                                                   rows_per_group,
                                               1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
         [enc endEncoding];
+        if (decode_profile) {
+            if (!q36_metal_wait()) return 0;
+            fprintf(stderr,
+                    "q36: Metal decode-profile %s in=%llu out=%llu %.6f ms\n",
+                    kernel.UTF8String, (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    q36_last_gpu_seconds * 1000.0);
+        }
     } else {
         const bool bc_inp = false;
         const bool bc_out = (out_dim % 64u) != 0 || (tokens % 32u) != 0;
+        const bool rhs_f16 = q36_dense_rhs_f16 &&
+            q36_dense_rhs_source == x->buffer &&
+            q36_dense_rhs_source_offset == x->offset &&
+            q36_dense_rhs_in_dim == in_dim && q36_dense_rhs_tokens == tokens;
+        NSString *selected_mm = mm_kernel;
+        if (rhs_f16 && [mm_kernel hasSuffix:@"_f32"])
+            selected_mm = [[mm_kernel substringToIndex:mm_kernel.length - 4u]
+                stringByAppendingString:@"_f16"];
         id<MTLComputePipelineState> p =
-            q36_pipeline_mm(mm_kernel, bc_inp, bc_out);
+            q36_pipeline_mm(selected_mm, bc_inp, bc_out);
         if (!p) return 0;
+        const uint64_t rhs_element_bytes =
+            rhs_f16 ? sizeof(uint16_t) : sizeof(float);
         q36_q8_mm_args args = {
             (int32_t)in_dim, 1, row_bytes, row_bytes * out_dim,
-            row_bytes * out_dim, 1, sizeof(float), in_dim * sizeof(float),
-            in_dim * tokens * sizeof(float), in_dim * tokens * sizeof(float),
+            row_bytes * out_dim, 1, rhs_element_bytes,
+            in_dim * rhs_element_bytes,
+            in_dim * tokens * rhs_element_bytes,
+            in_dim * tokens * rhs_element_bytes,
             (int32_t)out_dim, (int32_t)tokens, 1, 1
         };
         id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
-        enc.label = mm_kernel;
+        enc.label = selected_mm;
         [enc setComputePipelineState:p];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
-        [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+        [enc setBuffer:rhs_f16 ? q36_dense_rhs_f16 : x->buffer
+              offset:rhs_f16 ? 0 : x->offset atIndex:2];
         [enc setBuffer:out->buffer offset:out->offset atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+        [enc setThreadgroupMemoryLength:
+            (bc_out || !rhs_f16) ? 8192u : 6144u atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((tokens + 31u) / 32u,
                                               (out_dim + 63u) / 64u, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [enc endEncoding];
+        if (getenv("Q36_METAL_FORMAT_PROFILE")) {
+            if (!q36_metal_wait()) return 0;
+            fprintf(stderr,
+                    "q36: Metal format-profile %s in=%llu out=%llu "
+                    "tokens=%llu %.6f ms\n",
+                    selected_mm.UTF8String,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim,
+                    (unsigned long long)tokens,
+                    q36_last_gpu_seconds * 1000.0);
+        }
     }
     return q36_scale_rows(out, tokens * out_dim, scale);
 }
@@ -934,6 +1024,8 @@ int q36_gpu_init(void) {
             return 0;
         }
         q36_gpu_print_device_summary();
+        q36_decode_profile_enabled =
+            getenv("Q36_METAL_DECODE_PROFILE") != NULL;
         q36_metal_mpp_enabled = q36_metal_detect_mpp();
         if (q36_metal_mpp_enabled)
             fprintf(stderr, "q36: Metal TensorOps routed-MoE prefill enabled\n");
@@ -993,11 +1085,23 @@ void q36_gpu_cleanup(void) {
         q36_moe_id_map_bytes = 0;
         q36_moe_mid_f16_scratch_bytes = 0;
         q36_metal_mpp_enabled = false;
+        q36_decode_profile_enabled = false;
         q36_shared_gate_scratch = nil;
         q36_shared_up_scratch = nil;
         q36_shared_down_scratch = nil;
         q36_shared_mid_scratch_bytes = 0;
         q36_shared_down_scratch_bytes = 0;
+        q36_dense_rhs_f16 = nil;
+        q36_dense_rhs_f16_bytes = 0;
+        q36_dense_rhs_source = nil;
+        q36_dense_rhs_source_offset = 0;
+        q36_dense_rhs_in_dim = 0;
+        q36_dense_rhs_tokens = 0;
+        q36_q5_output_cache = nil;
+        q36_q5_output_cache_bytes = 0;
+        q36_q5_output_offset = 0;
+        q36_q5_output_in_dim = 0;
+        q36_q5_output_out_dim = 0;
         q36_pipelines = nil;
         q36_model_views = nil;
         q36_library = nil;
@@ -1130,6 +1234,11 @@ int q36_gpu_set_model_map(const void *map, uint64_t size) {
         q36_model_residency_clear();
         q36_streaming_cache_clear(true);
         [q36_model_views removeAllObjects];
+        q36_q5_output_cache = nil;
+        q36_q5_output_cache_bytes = 0;
+        q36_q5_output_offset = 0;
+        q36_q5_output_in_dim = 0;
+        q36_q5_output_out_dim = 0;
     }
     q36_model_map = map;
     q36_model_size = size;
@@ -1180,6 +1289,20 @@ int q36_gpu_finish_model_cache(void) {
             q36_model_residency_added = true;
         }
     }
+    if (q36_dense_model &&
+        q36_env_enabled("Q36_METAL_DENSE_RHS_F16", true)) {
+        static NSString *const kernels[] = {
+            @"kernel_mul_mm_q2_K_f16",
+            @"kernel_mul_mm_q3_K_f16", @"kernel_mul_mm_q4_K_f16",
+            @"kernel_mul_mm_q5_K_f16", @"kernel_mul_mm_q6_K_f16",
+            @"kernel_mul_mm_iq2_xxs_f16", @"kernel_mul_mm_iq2_xs_f16",
+            @"kernel_mul_mm_iq2_s_f16", @"kernel_mul_mm_iq1_s_f16",
+            @"kernel_mul_mm_iq3_xxs_f16", @"kernel_mul_mm_iq3_s_f16",
+            @"kernel_mul_mm_iq4_nl_f16", @"kernel_mul_mm_iq4_xs_f16",
+        };
+        for (NSUInteger i = 0; i < sizeof(kernels) / sizeof(kernels[0]); i++)
+            if (!q36_pipeline_mm(kernels[i], false, false)) return 0;
+    }
     return 1;
 }
 
@@ -1189,6 +1312,59 @@ int q36_gpu_cache_q8_f16_range(const void *map, uint64_t size,
                                const char *label) {
     (void)in_dim; (void)out_dim;
     return q36_gpu_cache_model_range(map, size, offset, bytes, label);
+}
+
+int q36_gpu_prepare_q5_k_output_cache(
+        const void *map, uint64_t size, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim) {
+    const uint64_t src_block_bytes = 176u;
+    const uint64_t dst_block_bytes = 276u;
+    if (!map || !in_dim || (in_dim & 255u) || !out_dim ||
+        in_dim / 256u > UINT32_MAX / out_dim) return 0;
+    const uint64_t n_blocks = (in_dim / 256u) * out_dim;
+    if (n_blocks > UINT32_MAX || n_blocks > UINT64_MAX / dst_block_bytes ||
+        n_blocks > UINT64_MAX / src_block_bytes) return 0;
+    const uint64_t src_bytes = n_blocks * src_block_bytes;
+    const uint64_t dst_bytes = n_blocks * dst_block_bytes;
+    if (offset > size || src_bytes > size - offset ||
+        dst_bytes > (uint64_t)NSUIntegerMax) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> src = q36_model_view(
+        map, size, offset, src_bytes, &inner);
+    id<MTLBuffer> dst = [q36_device
+        newBufferWithLength:(NSUInteger)dst_bytes
+                    options:MTLResourceStorageModePrivate];
+    id<MTLComputePipelineState> p = q36_pipeline(
+        @"q36_repack_q5_K_expanded");
+    if (!src || !dst || !p ||
+        (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    const uint32_t count = (uint32_t)n_blocks;
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"q36_repack_q5_K_expanded";
+    [enc setComputePipelineState:p];
+    [enc setBuffer:src offset:(NSUInteger)inner atIndex:0];
+    [enc setBuffer:dst offset:0 atIndex:1];
+    [enc setBytes:&count length:sizeof(count) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    if (!q36_metal_wait()) return 0;
+
+    // The source head is omitted from model residency. Drop its temporary
+    // no-copy view now that the private expanded cache is ready.
+    NSString *key = [NSString stringWithFormat:
+        @"%016" PRIx64 ":%016" PRIx64, offset, src_bytes];
+    [q36_model_views removeObjectForKey:key];
+    q36_q5_output_cache = dst;
+    q36_q5_output_cache_bytes = dst_bytes;
+    q36_q5_output_offset = offset;
+    q36_q5_output_in_dim = in_dim;
+    q36_q5_output_out_dim = out_dim;
+    fprintf(stderr,
+            "q36: Metal Q5_K output cache %.2f GiB (source %.2f GiB)\n",
+            (double)dst_bytes / 1073741824.0,
+            (double)src_bytes / 1073741824.0);
+    return 1;
 }
 
 void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
@@ -1757,6 +1933,12 @@ uint64_t q36_gpu_recommended_working_set_size(void) {
 void q36_gpu_print_memory_report(const char *label) {
     uint64_t cache_bytes = 0;
     uint64_t full_bytes = 0;
+    const uint64_t allocated_bytes = q36_device
+        ? (uint64_t)q36_device.currentAllocatedSize : 0;
+    const uint64_t working_set_bytes = q36_device
+        ? (uint64_t)q36_device.recommendedMaxWorkingSetSize : 0;
+    const double working_set_pct = working_set_bytes
+        ? 100.0 * (double)allocated_bytes / (double)working_set_bytes : 0.0;
     pthread_mutex_lock(&q36_stream_mu);
     if (q36_streaming_gate) cache_bytes += q36_streaming_gate.length;
     if (q36_streaming_up) cache_bytes += q36_streaming_up.length;
@@ -1769,12 +1951,21 @@ void q36_gpu_print_memory_report(const char *label) {
     }
     fprintf(stderr,
             "q36: Metal memory%s%s: live %.2f MiB, peak %.2f MiB "
+            "allocated=%.2f GiB model_mapped=%.2f GiB "
+            "working_set=%.2f GiB pressure=%.1f%% rhs_panel=%.2f MiB "
+            "q5_head=%.2f GiB "
             "ssd=%s cache=%u/%u cache_gib=%.2f full_gib=%.2f "
             "hits=%" PRIu64 " misses=%" PRIu64 " loads=%" PRIu64
             " evictions=%" PRIu64 " reads_gib=%.2f\n",
             label ? " " : "", label ? label : "",
             (double)q36_live_bytes / (1024.0 * 1024.0),
             (double)q36_peak_bytes / (1024.0 * 1024.0),
+            (double)allocated_bytes / 1073741824.0,
+            (double)q36_model_size / 1073741824.0,
+            (double)working_set_bytes / 1073741824.0,
+            working_set_pct,
+            (double)q36_dense_rhs_f16_bytes / (1024.0 * 1024.0),
+            (double)q36_q5_output_cache_bytes / 1073741824.0,
             q36_ssd_streaming ? "on" : "off",
             q36_streaming_expert_count,
             q36_streaming_expert_cap ?
@@ -2563,6 +2754,7 @@ static uint64_t q36_kquant_row_bytes(uint32_t type, uint64_t in_dim) {
     uint64_t block_bytes = 0;
     switch (type) {
     case 10: block_bytes = 84u; break;
+    case 11: block_bytes = 110u; break;
     case 12: block_bytes = 144u; break;
     case 13: block_bytes = 176u; break;
     case 14: block_bytes = 210u; break;
@@ -2574,10 +2766,43 @@ static uint64_t q36_kquant_row_bytes(uint32_t type, uint64_t in_dim) {
 int q36_gpu_quantize_q8_k_tensor(q36_gpu_tensor *out,
                                   const q36_gpu_tensor *x,
                                   uint64_t in_dim, uint64_t tokens) {
-    /* Dense Metal consumes the original float activation in native IQ3/K
-     * kernels.  Its callers retain the shared Vulkan q8_K staging calls, so
-     * acknowledge those without introducing a command-buffer wait. */
-    if (q36_dense_model) return out && x && in_dim && tokens;
+    /* Dense Metal shares one F16 activation panel across every prefill output
+     * tile and paired projection. Decode keeps consuming the original F32 row. */
+    if (q36_dense_model) {
+        if (!out || !x || !in_dim || !tokens ||
+            in_dim > UINT64_MAX / tokens ||
+            in_dim * tokens > UINT32_MAX ||
+            x->bytes < in_dim * tokens * sizeof(float)) return 0;
+        if (tokens <= 5u ||
+            !q36_env_enabled("Q36_METAL_DENSE_RHS_F16", true)) {
+            q36_dense_rhs_source = nil;
+            return 1;
+        }
+        const uint64_t count64 = in_dim * tokens;
+        const uint64_t bytes64 = count64 * sizeof(uint16_t);
+        if (bytes64 > NSUIntegerMax) return 0;
+        if (!q36_dense_rhs_f16 || q36_dense_rhs_f16_bytes < bytes64) {
+            q36_dense_rhs_f16 = [q36_device
+                newBufferWithLength:(NSUInteger)bytes64
+                            options:MTLResourceStorageModePrivate];
+            if (!q36_dense_rhs_f16) return 0;
+            q36_dense_rhs_f16_bytes = (NSUInteger)bytes64;
+        }
+        uint32_t count = (uint32_t)count64;
+        id<MTLComputeCommandEncoder> enc = q36_encoder(@"q36_f32_to_f16");
+        if (!enc) return 0;
+        [enc setBuffer:x->buffer offset:x->offset atIndex:0];
+        [enc setBuffer:q36_dense_rhs_f16 offset:0 atIndex:1];
+        [enc setBytes:&count length:sizeof(count) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(count, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        q36_dense_rhs_source = x->buffer;
+        q36_dense_rhs_source_offset = x->offset;
+        q36_dense_rhs_in_dim = in_dim;
+        q36_dense_rhs_tokens = tokens;
+        return 1;
+    }
     if (!q36_quant_q8_k || !out || !x || !in_dim || (in_dim & 255u) ||
         !tokens || out->bytes < tokens * (in_dim / 256u) * sizeof(q36_metal_q8_k) ||
         x->bytes < tokens * in_dim * sizeof(float)) return 0;
@@ -2628,17 +2853,72 @@ static int q36_kquant_q8_host(q36_gpu_tensor *out, const void *map,
     return 1;
 }
 
+static int q36_q5_output_cached_matmul(
+        q36_gpu_tensor *out, uint64_t offset,
+        uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x, uint64_t tokens, float scale) {
+    if (!q36_q5_output_cache || offset != q36_q5_output_offset ||
+        in_dim != q36_q5_output_in_dim || out_dim != q36_q5_output_out_dim ||
+        tokens != 1u || !out || !x ||
+        x->bytes < in_dim * sizeof(float) ||
+        out->bytes < out_dim * sizeof(float)) return 0;
+    const int16_t nsg = 4, nxpsg = 32;
+    id<MTLComputePipelineState> p = q36_pipeline_mv_ext(
+        @"kernel_mul_mv_rows_q5_K_expanded_f32", nsg, nxpsg);
+    if (!p || (!q36_batch && !q36_gpu_begin_commands())) return 0;
+    const uint64_t row_bytes = (in_dim / 256u) * 276u;
+    q36_q8_mv_args args = {
+        (int32_t)in_dim, (int32_t)out_dim, 1,
+        276u, row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, (int32_t)in_dim, 1, 1,
+        sizeof(float), in_dim * sizeof(float),
+        in_dim * sizeof(float), in_dim * sizeof(float),
+        (int32_t)out_dim, 1, 1, 1, 1
+    };
+    const bool decode_profile = q36_decode_profile_enabled;
+    if (decode_profile &&
+        (!q36_metal_wait() || !q36_gpu_begin_commands())) return 0;
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mv_rows_q5_K_expanded_f32";
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:q36_q5_output_cache offset:0 atIndex:1];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:2];
+    [enc setBuffer:out->buffer offset:out->offset atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    [enc endEncoding];
+    if (decode_profile) {
+        if (!q36_metal_wait()) return 0;
+        fprintf(stderr,
+                "q36: Metal decode-profile %s in=%llu out=%llu %.6f ms\n",
+                "kernel_mul_mv_rows_q5_K_expanded_f32",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                q36_last_gpu_seconds * 1000.0);
+    }
+    return q36_scale_rows(out, out_dim, scale);
+}
+
 int q36_gpu_matmul_k_quant_scaled_tensor(
         q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
         uint32_t type, uint64_t in_dim, uint64_t out_dim,
         const q36_gpu_tensor *x, uint64_t tokens, float scale) {
-    if (type == 12u || type == 14u) {
+    if (type >= 10u && type <= 14u) {
+        if (type == 13u && q36_q5_output_cached_matmul(
+                out, offset, in_dim, out_dim, x, tokens, scale)) return 1;
+        NSString *kind = type == 10u ? @"q2_K" :
+                         type == 11u ? @"q3_K" :
+                         type == 12u ? @"q4_K" :
+                         type == 13u ? @"q5_K" : @"q6_K";
+        const uint64_t bytes = type == 10u ? 84u :
+                               type == 11u ? 110u :
+                               type == 12u ? 144u :
+                               type == 13u ? 176u : 210u;
         return q36_quant_float_matmul(
-            type == 12u ? @"kernel_mul_mv_ext_q4_K_f32_r1_"
-                        : @"kernel_mul_mv_ext_q6_K_f32_r1_",
-            type == 12u ? @"kernel_mul_mm_q4_K_f32"
-                        : @"kernel_mul_mm_q6_K_f32",
-            type == 12u ? 144u : 210u,
+            [NSString stringWithFormat:@"kernel_mul_mv_ext_%@_f32_r1_", kind],
+            [NSString stringWithFormat:@"kernel_mul_mm_%@_f32", kind],
+            bytes,
             out, map, size, offset, in_dim, out_dim, x, tokens, scale);
     }
     if (!x || !in_dim || (in_dim & 255u) ||
@@ -2691,14 +2971,152 @@ int q36_gpu_matmul_iq_quant_scaled_tensor(
         q36_gpu_tensor *out, const void *map, uint64_t size, uint64_t offset,
         uint32_t type, uint64_t in_dim, uint64_t out_dim,
         const q36_gpu_tensor *x, uint64_t tokens, float scale) {
-    if (type != 18u && type != 21u) return 0;
+    NSString *kind = type == 16u ? @"iq2_xxs" :
+                     type == 17u ? @"iq2_xs" :
+                     type == 18u ? @"iq3_xxs" :
+                     type == 19u ? @"iq1_s" :
+                     type == 20u ? @"iq4_nl" :
+                     type == 21u ? @"iq3_s" :
+                     type == 22u ? @"iq2_s" :
+                     type == 23u ? @"iq4_xs" : nil;
+    const uint64_t bytes = type == 16u ? 66u :
+                           type == 17u ? 74u :
+                           type == 18u ? 98u :
+                           type == 19u ? 50u :
+                           type == 20u ? 144u :
+                           type == 21u ? 110u :
+                           type == 22u ? 82u :
+                           type == 23u ? 136u : 0u;
+    if (!kind || !bytes) return 0;
     return q36_quant_float_matmul(
-        type == 18u ? @"kernel_mul_mv_ext_iq3_xxs_f32_r1_"
-                    : @"kernel_mul_mv_ext_iq3_s_f32_r1_",
-        type == 18u ? @"kernel_mul_mm_iq3_xxs_f32"
-                    : @"kernel_mul_mm_iq3_s_f32",
-        type == 18u ? 98u : 110u,
+        [NSString stringWithFormat:@"kernel_mul_mv_ext_%@_f32_r1_", kind],
+        [NSString stringWithFormat:@"kernel_mul_mm_%@_f32", kind],
+        bytes,
         out, map, size, offset, in_dim, out_dim, x, tokens, scale);
+}
+
+int q36_gpu_matmul_iq3_s_pair_tensor(
+        q36_gpu_tensor *out_a, q36_gpu_tensor *out_b,
+        const void *map, uint64_t size,
+        uint64_t offset_a, uint64_t offset_b,
+        uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x) {
+    const uint64_t block_bytes = 110u;
+    if (!out_a || !out_b || !map || !x || !in_dim || (in_dim & 255u) ||
+        !out_dim || in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        x->bytes < in_dim * sizeof(float) ||
+        out_a->bytes < out_dim * sizeof(float) ||
+        out_b->bytes < out_dim * sizeof(float)) return 0;
+    const uint64_t row_bytes = (in_dim / 256u) * block_bytes;
+    if (!row_bytes || out_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner_a = 0, inner_b = 0;
+    id<MTLBuffer> weights_a = q36_model_view(
+        map, size, offset_a, out_dim * row_bytes, &inner_a);
+    id<MTLBuffer> weights_b = q36_model_view(
+        map, size, offset_b, out_dim * row_bytes, &inner_b);
+    if (!weights_a || !weights_b ||
+        (!q36_batch && !q36_gpu_begin_commands())) return 0;
+
+    const int16_t nsg = 2, nxpsg = 32;
+    id<MTLComputePipelineState> p = q36_pipeline_mv_ext(
+        @"kernel_mul_mv_rows_iq3_s_pair_tg_f32", nsg, nxpsg);
+    if (!p) return 0;
+    q36_q8_mv_args args = {
+        (int32_t)in_dim, (int32_t)out_dim, 1,
+        block_bytes, row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, (int32_t)in_dim, 1, 1,
+        sizeof(float), in_dim * sizeof(float),
+        in_dim * sizeof(float), in_dim * sizeof(float),
+        (int32_t)out_dim, 1, 1, 1, 1
+    };
+    const bool decode_profile = q36_decode_profile_enabled;
+    if (decode_profile &&
+        (!q36_metal_wait() || !q36_gpu_begin_commands())) return 0;
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mv_rows_iq3_s_pair_tg_f32";
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights_a offset:(NSUInteger)inner_a atIndex:1];
+    [enc setBuffer:weights_b offset:(NSUInteger)inner_b atIndex:2];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:3];
+    [enc setBuffer:out_a->buffer offset:out_a->offset atIndex:4];
+    [enc setBuffer:out_b->buffer offset:out_b->offset atIndex:5];
+    [enc setThreadgroupMemoryLength:2048u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    [enc endEncoding];
+    if (decode_profile) {
+        if (!q36_metal_wait()) return 0;
+        fprintf(stderr,
+                "q36: Metal decode-profile %s in=%llu out=%llu %.6f ms\n",
+                "kernel_mul_mv_rows_iq3_s_pair_tg_f32",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                q36_last_gpu_seconds * 1000.0);
+    }
+    return 1;
+}
+
+int q36_gpu_matmul_iq3_xxs_pair_tensor(
+        q36_gpu_tensor *out_a, q36_gpu_tensor *out_b,
+        const void *map, uint64_t size,
+        uint64_t offset_a, uint64_t offset_b,
+        uint64_t in_dim, uint64_t out_dim,
+        const q36_gpu_tensor *x) {
+    const uint64_t block_bytes = 98u;
+    if (!out_a || !out_b || !map || !x || !in_dim || (in_dim & 255u) ||
+        !out_dim || in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        x->bytes < in_dim * sizeof(float) ||
+        out_a->bytes < out_dim * sizeof(float) ||
+        out_b->bytes < out_dim * sizeof(float)) return 0;
+    const uint64_t row_bytes = (in_dim / 256u) * block_bytes;
+    if (!row_bytes || out_dim > UINT64_MAX / row_bytes) return 0;
+    uint64_t inner_a = 0, inner_b = 0;
+    id<MTLBuffer> weights_a = q36_model_view(
+        map, size, offset_a, out_dim * row_bytes, &inner_a);
+    id<MTLBuffer> weights_b = q36_model_view(
+        map, size, offset_b, out_dim * row_bytes, &inner_b);
+    if (!weights_a || !weights_b ||
+        (!q36_batch && !q36_gpu_begin_commands())) return 0;
+
+    const int16_t nsg = 2, nxpsg = 32;
+    id<MTLComputePipelineState> p = q36_pipeline_mv_ext(
+        @"kernel_mul_mv_rows_iq3_xxs_pair_tg_f32", nsg, nxpsg);
+    if (!p) return 0;
+    q36_q8_mv_args args = {
+        (int32_t)in_dim, (int32_t)out_dim, 1,
+        block_bytes, row_bytes, row_bytes * out_dim,
+        row_bytes * out_dim, (int32_t)in_dim, 1, 1,
+        sizeof(float), in_dim * sizeof(float),
+        in_dim * sizeof(float), in_dim * sizeof(float),
+        (int32_t)out_dim, 1, 1, 1, 1
+    };
+    const bool decode_profile = q36_decode_profile_enabled;
+    if (decode_profile &&
+        (!q36_metal_wait() || !q36_gpu_begin_commands())) return 0;
+    id<MTLComputeCommandEncoder> enc = [q36_batch computeCommandEncoder];
+    enc.label = @"kernel_mul_mv_rows_iq3_xxs_pair_tg_f32";
+    [enc setComputePipelineState:p];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:weights_a offset:(NSUInteger)inner_a atIndex:1];
+    [enc setBuffer:weights_b offset:(NSUInteger)inner_b atIndex:2];
+    [enc setBuffer:x->buffer offset:x->offset atIndex:3];
+    [enc setBuffer:out_a->buffer offset:out_a->offset atIndex:4];
+    [enc setBuffer:out_b->buffer offset:out_b->offset atIndex:5];
+    [enc setThreadgroupMemoryLength:1152u atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 7u) / 8u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
+    [enc endEncoding];
+    if (decode_profile) {
+        if (!q36_metal_wait()) return 0;
+        fprintf(stderr,
+                "q36: Metal decode-profile %s in=%llu out=%llu %.6f ms\n",
+                "kernel_mul_mv_rows_iq3_xxs_pair_tg_f32",
+                (unsigned long long)in_dim,
+                (unsigned long long)out_dim,
+                q36_last_gpu_seconds * 1000.0);
+    }
+    return 1;
 }
 
 int q36_gpu_matmul_iq_quant_q8_scaled_tensor(
