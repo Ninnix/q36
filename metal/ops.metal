@@ -7,6 +7,40 @@ kernel void q36_f32_to_f16(device const float *src [[buffer(0)]],
     if (i < count) dst[i] = (half)src[i];
 }
 
+/* Match the CPU Q8_K activation boundary without materializing the packed
+ * block: select the first signed maximum, round to int8, then immediately
+ * reconstruct F32 for the native dense IQ3 matvec. */
+kernel void q36_q8_k_roundtrip_f32(
+        device const float *src [[buffer(0)]],
+        device float *dst [[buffer(1)]],
+        threadgroup float *signed_max [[threadgroup(0)]],
+        uint block [[threadgroup_position_in_grid]],
+        uint lane [[thread_position_in_threadgroup]]) {
+    const uint i = block * 256u + lane;
+    signed_max[lane] = src[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride; stride >>= 1u) {
+        if (lane < stride &&
+            abs(signed_max[lane + stride]) > abs(signed_max[lane]))
+            signed_max[lane] = signed_max[lane + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0u) {
+        const float maxv = signed_max[0];
+        const float inv = maxv == 0.0f ? 0.0f : -127.0f / maxv;
+        signed_max[0] = inv;
+        signed_max[1] = inv == 0.0f ? 0.0f : 1.0f / inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = signed_max[0];
+    if (inv == 0.0f) {
+        dst[i] = 0.0f;
+        return;
+    }
+    const int q = clamp(int(rint(inv * src[i])), -128, 127);
+    dst[i] = float(q) * signed_max[1];
+}
+
 kernel void q36_add_f32(device float *out [[buffer(0)]],
                          device const float *a [[buffer(1)]],
                          device const float *b [[buffer(2)]],

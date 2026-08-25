@@ -215,6 +215,13 @@ static id<MTLBuffer> q36_dense_rhs_source;
 static uint64_t q36_dense_rhs_source_offset;
 static uint64_t q36_dense_rhs_in_dim;
 static uint64_t q36_dense_rhs_tokens;
+static id<MTLBuffer> q36_dense_q8_f32;
+static NSUInteger q36_dense_q8_f32_bytes;
+static id<MTLBuffer> q36_dense_q8_source;
+static uint64_t q36_dense_q8_source_offset;
+static uint64_t q36_dense_q8_in_dim;
+static uint64_t q36_dense_q8_tokens;
+static bool q36_dense_q8_ready;
 static bool q36_prof_active;
 static bool q36_decode_profile_enabled;
 static double q36_prof_gpu_seconds;
@@ -1097,6 +1104,13 @@ void q36_gpu_cleanup(void) {
         q36_dense_rhs_source_offset = 0;
         q36_dense_rhs_in_dim = 0;
         q36_dense_rhs_tokens = 0;
+        q36_dense_q8_f32 = nil;
+        q36_dense_q8_f32_bytes = 0;
+        q36_dense_q8_source = nil;
+        q36_dense_q8_source_offset = 0;
+        q36_dense_q8_in_dim = 0;
+        q36_dense_q8_tokens = 0;
+        q36_dense_q8_ready = false;
         q36_q5_output_cache = nil;
         q36_q5_output_cache_bytes = 0;
         q36_q5_output_offset = 0;
@@ -2763,16 +2777,50 @@ static uint64_t q36_kquant_row_bytes(uint32_t type, uint64_t in_dim) {
     return (in_dim / 256u) * block_bytes;
 }
 
+static int q36_dense_prepare_q8_f32(uint64_t in_dim, uint64_t tokens) {
+    if (!q36_dense_q8_source || !in_dim || !tokens || (in_dim & 255u) ||
+        in_dim > UINT64_MAX / tokens / sizeof(float)) return 0;
+    const uint64_t bytes64 = in_dim * tokens * sizeof(float);
+    if (bytes64 > NSUIntegerMax) return 0;
+    if (!q36_dense_q8_f32 || q36_dense_q8_f32_bytes < bytes64) {
+        q36_dense_q8_f32 = [q36_device
+            newBufferWithLength:(NSUInteger)bytes64
+                        options:MTLResourceStorageModePrivate];
+        if (!q36_dense_q8_f32) return 0;
+        q36_dense_q8_f32_bytes = (NSUInteger)bytes64;
+    }
+    id<MTLComputeCommandEncoder> enc =
+        q36_encoder(@"q36_q8_k_roundtrip_f32");
+    if (!enc) return 0;
+    [enc setBuffer:q36_dense_q8_source
+            offset:q36_dense_q8_source_offset atIndex:0];
+    [enc setBuffer:q36_dense_q8_f32 offset:0 atIndex:1];
+    [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(in_dim * tokens / 256u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    q36_dense_q8_ready = true;
+    return 1;
+}
+
 int q36_gpu_quantize_q8_k_tensor(q36_gpu_tensor *out,
                                   const q36_gpu_tensor *x,
                                   uint64_t in_dim, uint64_t tokens) {
-    /* Dense Metal shares one F16 activation panel across every prefill output
-     * tile and paired projection. Decode keeps consuming the original F32 row. */
+    /* Dense Metal shares one F16 activation panel across prefill output tiles.
+     * IQ3 projections lazily reconstruct the CPU Q8_K activation boundary in
+     * F32 for parity; other decode projections keep the original F32 row. */
     if (q36_dense_model) {
         if (!out || !x || !in_dim || !tokens ||
             in_dim > UINT64_MAX / tokens ||
             in_dim * tokens > UINT32_MAX ||
             x->bytes < in_dim * tokens * sizeof(float)) return 0;
+        if (!(in_dim & 255u)) {
+            q36_dense_q8_source = x->buffer;
+            q36_dense_q8_source_offset = x->offset;
+            q36_dense_q8_in_dim = in_dim;
+            q36_dense_q8_tokens = tokens;
+        } else q36_dense_q8_source = nil;
+        q36_dense_q8_ready = false;
         if (tokens <= 5u ||
             !q36_env_enabled("Q36_METAL_DENSE_RHS_F16", true)) {
             q36_dense_rhs_source = nil;
@@ -2988,6 +3036,21 @@ int q36_gpu_matmul_iq_quant_scaled_tensor(
                            type == 22u ? 82u :
                            type == 23u ? 136u : 0u;
     if (!kind || !bytes) return 0;
+    q36_gpu_tensor rounded;
+    if (q36_dense_model && (type == 18u || type == 21u) &&
+        q36_dense_q8_source == x->buffer &&
+        q36_dense_q8_source_offset == x->offset &&
+        q36_dense_q8_in_dim == in_dim && q36_dense_q8_tokens == tokens) {
+        if (!q36_dense_q8_ready &&
+            !q36_dense_prepare_q8_f32(in_dim, tokens)) return 0;
+        rounded = (q36_gpu_tensor){
+            .buffer = q36_dense_q8_f32,
+            .offset = 0,
+            .bytes = in_dim * tokens * sizeof(float),
+            .owner = false,
+        };
+        x = &rounded;
+    }
     return q36_quant_float_matmul(
         [NSString stringWithFormat:@"kernel_mul_mv_ext_%@_f32_r1_", kind],
         [NSString stringWithFormat:@"kernel_mul_mm_%@_f32", kind],

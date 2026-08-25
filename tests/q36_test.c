@@ -5186,15 +5186,9 @@ static void test_logit_comparison_print(const char *name, const char *case_id, i
 
 static void test_logit_comparison_assert_strict(const char *name, const char *case_id, int step,
                                         const test_logit_comparison *result) {
-    const char *model = test_model_path();
-    /* IQ3_XS 27B keeps identical greedy output and strong broad-rank overlap,
-     * but one short EOS position can swap two nearly tied top-five entries
-     * under Metal simdgroup accumulation. Keep every other strict gate and
-     * the legacy top-five floor for all existing model paths. */
-    const int top5_floor = model && strstr(model, "Qwen3.6-27B") ? 3 : 4;
     test_logit_comparison_print(name, case_id, step, result);
     TEST_ASSERT(result->same_top1);
-    TEST_ASSERT(result->top5_overlap >= top5_floor);
+    TEST_ASSERT(result->top5_overlap >= 4);
     TEST_ASSERT(result->top20_overlap >= 15);
     TEST_ASSERT(result->top64_overlap >= 40);
     TEST_ASSERT(result->top20_max_abs <= 8.0f);
