@@ -6273,7 +6273,7 @@ static void test_gpu_cpu_parity(void) {
         return;
     }
     for (size_t i = 0; i < N_CASES; i++) {
-        if (!cases[i].prompt_text && !test_vector_case_selected(cases[i].id)) continue;
+        if (!test_vector_case_selected(cases[i].id)) continue;
         selected[i] = true;
         fprintf(stderr, "q36-test: gpu-cpu-parity CPU capture %s\n", cases[i].id);
         test_backend_parity_capture_cpu(cpu_engine, &cases[i], &captures[i]);

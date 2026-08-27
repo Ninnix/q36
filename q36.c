@@ -37,10 +37,6 @@
 #include "q36_quant.h"
 #include "q36_ssd.h"
 
-#define GGML_COMMON_DECL_C
-#define GGML_COMMON_IMPL_C
-#include "llama.cpp/ggml/src/ggml-common.h"
-
 #define Q36_GGUF_MAGIC 0x46554747u
 #define Q36_MAX_DIMS 8
 #define Q36_NEG_INF (-1.0e30f)
@@ -1911,7 +1907,7 @@ bool q36_quant_dequantize(uint32_t type, const void *src, float *out, uint32_t n
 }
 
 void q36_quant_pack_iq1_grid(void *dst) {
-    memcpy(dst, iq1s_grid, sizeof(iq1s_grid));
+    memcpy(dst, q36_iq1s_grid, sizeof(q36_iq1s_grid));
 }
 
 static void q36_dequantize_row_q8_0(const q36_block_q8_0 *x, float *y, uint64_t k) {
@@ -2257,7 +2253,7 @@ static void q36_dequantize_row_iq1_s(const q36_block_iq1_s *x, float *y, uint64_
             float delta = qh & 0x8000u ? -0.125f : 0.125f;
             for (uint32_t l = 0; l < 4; l++) {
                 uint32_t idx = qs[l] | (((qh >> (3u * l)) & 7u) << 8);
-                const int8_t *grid = (const int8_t *)&iq1s_grid[idx];
+                const int8_t *grid = (const int8_t *)&q36_iq1s_grid[idx];
                 for (uint32_t j = 0; j < 8; j++) y[j] = dl * ((float)grid[j] + delta);
                 y += 8;
             }
@@ -2298,7 +2294,7 @@ static void q36_dequantize_row_iq1_m(const q36_block_iq1_m *x, float *y, uint64_
             };
             for (uint32_t l = 0; l < 4; l++) {
                 uint32_t hi = l & 1 ? qh[l / 2] << 4 : qh[l / 2] << 8;
-                const int8_t *grid = (const int8_t *)&iq1s_grid[qs[l] | (hi & 0x700)];
+                const int8_t *grid = (const int8_t *)&q36_iq1s_grid[qs[l] | (hi & 0x700)];
                 float delta = qh[l / 2] & (l & 1 ? 0x80 : 0x08) ? -0.125f : 0.125f;
                 for (uint32_t j = 0; j < 8; j++) y[j] = dl[l / 2] * ((float)grid[j] + delta);
                 y += 8;
