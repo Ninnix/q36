@@ -1355,6 +1355,17 @@ static uint32_t q36_vk_find_memory_type_avoiding(uint32_t bits,
     return UINT32_MAX;
 }
 
+static uint64_t q36_vk_memory_total(void) {
+    uint64_t total = 0;
+    const bool uma = q36_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+
+    for (uint32_t i = 0; i < q36_vk.mem_props.memoryHeapCount; i++) {
+        VkMemoryHeap heap = q36_vk.mem_props.memoryHeaps[i];
+        if (uma || (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) total += heap.size;
+    }
+    return total;
+}
+
 static void q36_vk_kernel_destroy(q36_vk_kernel *k) {
     if (!q36_vk.device || !k) return;
     if (k->pipeline) vkDestroyPipeline(q36_vk.device, k->pipeline, NULL);
@@ -2965,14 +2976,11 @@ int q36_gpu_init(void) {
 #endif
     vkGetPhysicalDeviceMemoryProperties(q36_vk.physical, &q36_vk.mem_props);
 
-    uint64_t device_bytes = 0;
-    for (uint32_t i = 0; i < q36_vk.mem_props.memoryHeapCount; i++) {
-        if (q36_vk.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-            device_bytes += q36_vk.mem_props.memoryHeaps[i].size;
-    }
+    uint64_t device_bytes = q36_vk_memory_total();
     if (device_bytes) {
-        fprintf(stderr, "q36: Vulkan device %s, %.2f GiB memory\n",
-                q36_vk.props.deviceName, (double)device_bytes / 1073741824.0);
+        fprintf(stderr, "q36: Vulkan device %s, %.2f GiB%s\n",
+                q36_vk.props.deviceName, (double)device_bytes / 1073741824.0,
+                q36_vk.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? " UMA" : " memory");
     } else {
         fprintf(stderr, "q36: Vulkan device %s\n", q36_vk.props.deviceName);
     }
@@ -3709,17 +3717,8 @@ void q36_gpu_set_streaming_expert_cache_layout(
 }
 
 uint64_t q36_gpu_recommended_working_set_size(void) {
-    uint64_t best = 0;
     if (!q36_vk.ready) return 0;
-    for (uint32_t i = 0; i < q36_vk.mem_props.memoryHeapCount; i++) {
-        if ((q36_vk.mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
-        if (q36_vk.mem_props.memoryHeaps[i].size > best) best = q36_vk.mem_props.memoryHeaps[i].size;
-    }
-    if (best != 0) return best;
-    for (uint32_t i = 0; i < q36_vk.mem_props.memoryHeapCount; i++) {
-        if (q36_vk.mem_props.memoryHeaps[i].size > best) best = q36_vk.mem_props.memoryHeaps[i].size;
-    }
-    return best;
+    return q36_vk_memory_total();
 }
 
 uint32_t q36_gpu_stream_expert_cache_configured_count(void) {
