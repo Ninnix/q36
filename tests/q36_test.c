@@ -33,6 +33,8 @@ static bool test_is_cpu_only_build(void) {
 
 static q36_engine *test_engine_fast;
 static q36_engine *test_engine_quality;
+static const char *test_model_override;
+static const char *test_case_override;
 
 static void test_skip(const char *name, const char *reason) {
     fprintf(stderr, "%s: SKIP (%s)\n", name, reason);
@@ -52,6 +54,7 @@ static q36_backend test_default_backend(void) {
 
 static const char *test_model_path(void) {
     const char *model_path = getenv("Q36_TEST_MODEL");
+    if (test_model_override) return test_model_override;
     return (model_path && model_path[0]) ? model_path : Q36_DEFAULT_MODEL_PATH;
 }
 
@@ -634,7 +637,7 @@ done:
 }
 
 static bool test_vector_case_selected(const char *id) {
-    const char *filter = getenv("Q36_TEST_VECTOR_CASE");
+    const char *filter = test_case_override ? test_case_override : getenv("Q36_TEST_VECTOR_CASE");
     char buf[256];
     if (!filter || !filter[0]) return true;
     snprintf(buf, sizeof(buf), "%s", filter);
@@ -2903,6 +2906,182 @@ static void test_vulkan_kquant_matvec(void) {
     test_vulkan_kquant_one(TEST_TENSOR_Q6_K, sizeof(test_block_q6_K));
 #endif
 }
+
+#ifndef Q36_NO_GPU
+static const char *test_dense_quant_type_name(uint32_t type) {
+    static const char *names[] = {
+        [10] = "Q2_K", [11] = "Q3_K", [12] = "Q4_K", [13] = "Q5_K",
+        [14] = "Q6_K", [16] = "IQ2_XXS", [17] = "IQ2_XS",
+        [18] = "IQ3_XXS", [19] = "IQ1_S", [20] = "IQ4_NL",
+        [21] = "IQ3_S", [22] = "IQ2_S", [23] = "IQ4_XS",
+    };
+    return type < sizeof(names) / sizeof(names[0]) && names[type]
+        ? names[type] : "unknown";
+}
+
+static void test_dense_quant_model_rows(void) {
+    static const uint32_t types[] = {
+        10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23,
+    };
+    enum { out_dim = 8 };
+    q36_engine *engine = NULL;
+
+    if (!test_model_available(test_model_path())) {
+        test_skip("dense-quant-model-rows", "model file not found");
+        return;
+    }
+    engine = test_open_runtime_engine(test_model_path(), 1);
+    TEST_ASSERT(engine != NULL);
+    if (!engine) return;
+    TEST_ASSERT(q36_gpu_init() != 0);
+    q36_gpu_set_dense_model(true);
+
+    for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+        const uint32_t type = types[ti];
+        char tensor_name[256];
+        uint32_t in_dim = 0, packed_type = 0, packed_n = 0;
+        uint64_t row_bytes = 0;
+        if (q36_engine_debug_first_tensor_of_type(
+                engine, type, tensor_name, sizeof(tensor_name), &in_dim) != 0)
+            continue;
+        TEST_ASSERT(q36_engine_debug_tensor_row_packed(
+            engine, tensor_name, 0, NULL, 0, &row_bytes, &packed_type,
+            &packed_n) == 0);
+        TEST_ASSERT(type == packed_type && in_dim == packed_n);
+        if (!row_bytes || type != packed_type || in_dim != packed_n) continue;
+
+        const uint64_t weight_bytes = row_bytes * out_dim;
+        const uint64_t model_bytes =
+            type == 18u ? 2u * weight_bytes : weight_bytes;
+        const uint64_t weight_alloc = test_round_up_u64(
+            model_bytes, (uint64_t)getpagesize());
+        void *weights = NULL;
+        float *dequant = malloc((size_t)in_dim * sizeof(*dequant));
+        TEST_ASSERT(posix_memalign(&weights, (size_t)getpagesize(),
+                                  (size_t)weight_alloc) == 0);
+        TEST_ASSERT(dequant != NULL);
+        if (!weights || !dequant) {
+            free(weights);
+            free(dequant);
+            continue;
+        }
+        memset(weights, 0, (size_t)weight_alloc);
+        for (uint32_t row = 0; row < out_dim; row++) {
+            TEST_ASSERT(q36_engine_debug_tensor_row_packed(
+                engine, tensor_name, row,
+                (uint8_t *)weights + (uint64_t)row * row_bytes, row_bytes,
+                NULL, NULL, NULL) == 0);
+        }
+        if (type == 18u)
+            memcpy((uint8_t *)weights + weight_bytes, weights,
+                   (size_t)weight_bytes);
+
+        static const uint32_t token_counts[] = {1u, 2u, 5u, 8u};
+        for (uint32_t tokens_i = 0;
+             tokens_i < sizeof(token_counts) / sizeof(token_counts[0]);
+             tokens_i++) {
+            const uint32_t tokens = token_counts[tokens_i];
+            const uint64_t x_count = (uint64_t)tokens * in_dim;
+            const uint64_t out_count = (uint64_t)tokens * out_dim;
+            float *x_host = malloc((size_t)x_count * sizeof(*x_host));
+            float *got = malloc((size_t)out_count * sizeof(*got));
+            float *want = malloc((size_t)out_count * sizeof(*want));
+            q36_gpu_tensor *x = q36_gpu_tensor_alloc(x_count * sizeof(float));
+            q36_gpu_tensor *out = q36_gpu_tensor_alloc(out_count * sizeof(float));
+            TEST_ASSERT(x_host && got && want && x && out);
+            if (!x_host || !got || !want || !x || !out) {
+                free(x_host); free(got); free(want);
+                q36_gpu_tensor_free(x); q36_gpu_tensor_free(out);
+                continue;
+            }
+            for (uint64_t i = 0; i < x_count; i++)
+                x_host[i] = sinf((float)(i * 17u + type * 31u) * 0.013f)
+                    * (0.25f + (float)(i % 11u) * 0.03125f);
+            for (uint32_t row = 0; row < out_dim; row++) {
+                TEST_ASSERT(q36_quant_dequantize(
+                    type, (const uint8_t *)weights + (uint64_t)row * row_bytes,
+                    dequant, in_dim));
+                for (uint32_t tok = 0; tok < tokens; tok++) {
+                    double sum = 0.0;
+                    for (uint32_t i = 0; i < in_dim; i++)
+                        sum += (double)dequant[i] * x_host[(uint64_t)tok * in_dim + i];
+                    want[(uint64_t)tok * out_dim + row] = (float)sum;
+                }
+            }
+            TEST_ASSERT(q36_gpu_tensor_write(
+                x, 0, x_host, x_count * sizeof(float)) != 0);
+            TEST_ASSERT(q36_gpu_set_model_map(weights, weight_alloc) != 0);
+            int ok = type <= 14
+                ? q36_gpu_matmul_k_quant_scaled_tensor(
+                    out, weights, weight_alloc, 0, type, in_dim, out_dim,
+                    x, tokens, 1.0f)
+                : q36_gpu_matmul_iq_quant_scaled_tensor(
+                    out, weights, weight_alloc, 0, type, in_dim, out_dim,
+                    x, tokens, 1.0f);
+            TEST_ASSERT(ok != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(
+                out, 0, got, out_count * sizeof(float)) != 0);
+            double max_abs = 0.0, rms = 0.0, ref_rms = 0.0;
+            for (uint64_t i = 0; i < out_count; i++) {
+                double d = (double)got[i] - want[i];
+                if (fabs(d) > max_abs) max_abs = fabs(d);
+                rms += d * d;
+                ref_rms += (double)want[i] * want[i];
+            }
+            rms = sqrt(rms / (double)out_count);
+            ref_rms = sqrt(ref_rms / (double)out_count);
+            fprintf(stderr,
+                    "q36-test: dense quant %-7s tokens=%u tensor=%s max_abs=%.7g rel_rms=%.7g\n",
+                    test_dense_quant_type_name(type), tokens, tensor_name,
+                    max_abs, rms / fmax(ref_rms, 1.0e-20));
+            TEST_ASSERT(isfinite(max_abs) && isfinite(rms));
+            TEST_ASSERT(max_abs < (tokens == 1 ? 1.0e-5 : 2.0e-3));
+            TEST_ASSERT(rms / fmax(ref_rms, 1.0e-20) <
+                        (tokens == 1 ? 1.0e-5 : 1.0e-3));
+#ifdef Q36_METAL
+            if (type == 18u && tokens == 1u) {
+                q36_gpu_tensor *out_b =
+                    q36_gpu_tensor_alloc(out_count * sizeof(float));
+                TEST_ASSERT(out_b != NULL);
+                if (out_b) {
+                    TEST_ASSERT(q36_gpu_matmul_iq3_xxs_pair_tensor(
+                        out, out_b, weights, weight_alloc,
+                        0, weight_bytes, in_dim, out_dim, x) != 0);
+                    TEST_ASSERT(q36_gpu_tensor_read(
+                        out, 0, got, out_count * sizeof(float)) != 0);
+                    double pair_max_abs = 0.0;
+                    for (uint64_t i = 0; i < out_count; i++)
+                        pair_max_abs = fmax(
+                            pair_max_abs, fabs((double)got[i] - want[i]));
+                    TEST_ASSERT(q36_gpu_tensor_read(
+                        out_b, 0, got, out_count * sizeof(float)) != 0);
+                    for (uint64_t i = 0; i < out_count; i++)
+                        pair_max_abs = fmax(
+                            pair_max_abs, fabs((double)got[i] - want[i]));
+                    fprintf(stderr,
+                            "q36-test: dense IQ3_XXS pair max_abs=%.7g\n",
+                            pair_max_abs);
+                    TEST_ASSERT(isfinite(pair_max_abs) &&
+                                pair_max_abs < 1.0e-5);
+                    q36_gpu_tensor_free(out_b);
+                }
+            }
+#endif
+            free(x_host); free(got); free(want);
+            q36_gpu_tensor_free(x); q36_gpu_tensor_free(out);
+        }
+        free(dequant);
+        free(weights);
+    }
+    q36_gpu_set_dense_model(false);
+    q36_gpu_cleanup();
+    q36_engine_close(engine);
+}
+#else
+static void test_dense_quant_model_rows(void) {
+    test_skip("dense-quant-model-rows", "CPU-only build");
+}
+#endif
 
 static float test_swiglu_ref(float gate, float up) {
     return gate / (1.0f + expf(-gate)) * up;
@@ -6807,6 +6986,7 @@ static const q36_test_entry test_entries[] = {
     {"--llama-parity-batch-loose", "llama-parity-batch-loose", "HF-template loose Q36 parity against live batch llama.cpp", test_llama_parity_batch_loose},
 #endif
     {"--vulkan-kernels", "vulkan-kernels", "isolated Vulkan-kernel numeric regressions", test_vulkan_kernels},
+    {"--dense-quant-model-rows", "dense-quant-model-rows", "dense model quant kernels against CPU-dequantized GGUF rows", test_dense_quant_model_rows},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
@@ -6824,6 +7004,10 @@ static void test_print_help(const char *prog) {
     }
     puts("  --list");
     puts("      Print test names only.");
+    puts("  --model FILE");
+    puts("      Override the model path for selected tests.");
+    puts("  --case FILTER");
+    puts("      Run vector cases whose names contain FILTER.");
     puts("  -h, --help");
     puts("      Show this help.");
     puts("\nEnvironment:");
@@ -6871,6 +7055,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--all")) {
             run_all = true;
+        } else if (!strcmp(argv[i], "--model") && i + 1 < argc) {
+            test_model_override = argv[++i];
+        } else if (!strcmp(argv[i], "--case") && i + 1 < argc) {
+            test_case_override = argv[++i];
         } else if (!strcmp(argv[i], "--list")) {
             for (size_t j = 0; j < sizeof(test_entries) / sizeof(test_entries[0]); j++) {
                 puts(test_entries[j].flag);

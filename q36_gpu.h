@@ -28,6 +28,8 @@ void q36_gpu_parallel_for_rows(uint64_t n_rows,
                                void *ctx);
 
 q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes);
+/* Persistent storage whose rows are written before use. */
+q36_gpu_tensor *q36_gpu_tensor_alloc_uninitialized(uint64_t bytes);
 /* Output-only scratch. Contents are undefined until a GPU command writes it. */
 q36_gpu_tensor *q36_gpu_tensor_alloc_scratch(uint64_t bytes);
 q36_gpu_tensor *q36_gpu_tensor_view(const q36_gpu_tensor *base, uint64_t offset, uint64_t bytes);
@@ -55,7 +57,15 @@ int q36_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, cons
 int q36_gpu_finish_model_cache(void);
 int q36_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int q36_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+#ifdef Q36_METAL
+int q36_gpu_prepare_q5_k_output_cache(const void *model_map,
+                                      uint64_t model_size,
+                                      uint64_t weight_offset,
+                                      uint64_t in_dim,
+                                      uint64_t out_dim);
+#endif
 void q36_gpu_set_quality(bool quality);
+void q36_gpu_set_dense_model(bool dense);
 void q36_gpu_set_micro_batch(bool enabled);
 /* True when the fused attention path will serve q36_gpu_attn_decode_tensor;
  * the runtime then skips the per-context scores scratch. Sampled once. */
@@ -126,6 +136,16 @@ int q36_gpu_quantize_q8_k_tensor(
         uint64_t                in_dim,
         uint64_t                n_tok);
 
+int q36_gpu_swiglu_q8_k_tensor(
+        q36_gpu_tensor       *out,
+        q36_gpu_tensor       *q8,
+        const q36_gpu_tensor *gate,
+        const q36_gpu_tensor *up,
+        uint32_t                in_dim,
+        uint32_t                n_tok,
+        float                   clamp,
+        float                   weight);
+
 int q36_gpu_matmul_f16_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,
@@ -182,6 +202,28 @@ int q36_gpu_matmul_q8_0_pair_scaled_tensor(
         float                   scale_a,
         float                   scale_b);
 
+int q36_gpu_matmul_iq3_s_pair_tensor(
+        q36_gpu_tensor       *out_a,
+        q36_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x);
+
+int q36_gpu_matmul_iq3_xxs_pair_tensor(
+        q36_gpu_tensor       *out_a,
+        q36_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x);
+
 int q36_gpu_matmul_k_quant_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,
@@ -217,6 +259,30 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(
         uint64_t                n_tok,
         float                   scale);
 
+int q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+        q36_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *q8,
+        uint64_t                n_tok,
+        float                   scale);
+
+int q36_gpu_matmul_iq_quant_scaled_tensor(
+        q36_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   scale);
+
 int q36_gpu_rms_norm_plain_rows_tensor(
         q36_gpu_tensor       *out,
         const q36_gpu_tensor *x,
@@ -241,6 +307,16 @@ int q36_gpu_recurrent_norm_gate_tensor(
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint32_t                width,
+        uint32_t                rows,
+        float                   eps);
+
+int q36_gpu_recurrent_norm_gate_q8_k_tensor(
+        q36_gpu_tensor       *state,
+        q36_gpu_tensor       *q8,
+        const q36_gpu_tensor *gate,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
         uint32_t                rows,
         float                   eps);
 
@@ -541,7 +617,7 @@ typedef struct {
 
 /* Routed expert FFN over n_tok rows of x with per-token expert selections,
  * mirroring the routed half of q36_forward_ffn() including all .scale
- * applications.  Supports Q2_K / Q4_K / Q5_K / Q6_K / IQ2_XXS / IQ2_S / IQ3_S expert quants. */
+ * applications.  Supports Q2_K / Q4_K / Q5_K / Q6_K / IQ2_XXS / IQ3_XXS / IQ2_S / IQ3_S expert quants. */
 int q36_gpu_moe_ffn_tensor(
         q36_gpu_tensor       *out,
         const void             *model_map,

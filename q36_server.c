@@ -3364,7 +3364,11 @@ static bool send_all(int fd, const void *p, size_t n) {
     long long deadline = wall_ms() + Q36_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
         if (g_stop_requested) return false;
+#ifdef Q36_SERVER_TEST
+        ssize_t w = write(fd, s, n);
+#else
         ssize_t w = send(fd, s, n, 0);
+#endif
         if (w < 0 && errno == EINTR) continue;
         if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             long long remaining = deadline - wall_ms();
@@ -9893,9 +9897,17 @@ static tool_schema_orders make_bash_order(void) {
 static char *read_socket_text(int fd) {
     buf b = {0};
     char tmp[1024];
-    ssize_t n;
-    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
-        buf_append(&b, tmp, (size_t)n);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+        ssize_t n = read(fd, tmp, sizeof(tmp));
+        if (n > 0) {
+            buf_append(&b, tmp, (size_t)n);
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
     }
     return buf_take(&b);
 }

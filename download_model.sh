@@ -3,10 +3,12 @@ set -e
 
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
 KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
+DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 Q2_Q4_FILE="Qwen3.6-35B-A3B-Layers34-39Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-Q8Rest-imatrix.gguf"
 MTP_FILE="Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf"
 KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
+DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${Q36_GGUF_DIR:-"$ROOT/gguf"}
@@ -24,6 +26,7 @@ Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh kat-coder [--token TOKEN]
+  ./download_model.sh 27b [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
 
 Targets:
@@ -42,6 +45,9 @@ Targets:
        KAT-Coder V2.5 Dev IQ2_XXS imatrix quant from $KAT_REPO,
        about 11 GB on disk.
 
+  27b
+       Dense Qwen3.8 27B Dynamic 3.0 IQ3_S quant from $DENSE_REPO.
+
   mtp  Optional speculative decoding component for either main-model target.
        It must be enabled explicitly with --mtp when starting a runtime.
 
@@ -54,7 +60,7 @@ Environment:
   Q36_GGUF_DIR   Directory used for downloaded GGUF files.
                  Default: ./gguf
 
-After either main-model download the script updates the legacy link:
+After a main-model download the script updates the legacy link:
   ./q36moe.gguf -> <download directory>/<selected model>
 
 With the default output directory, q2-imatrix matches the compiled model path:
@@ -84,6 +90,7 @@ case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_FILE ;;
     kat-coder) MODEL_REPO=$KAT_REPO; MODEL_FILE=$KAT_FILE ;;
+    27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
     -h|--help|help)
         usage

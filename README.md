@@ -2,8 +2,8 @@
   <img src="logo.svg" alt="QuarkStar logo" width="220">
 </p>
 
-**QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B** and
-**KAT-Coder-V2.5-Dev**.
+**QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B**,
+**Qwen3.8-27B**.
 It is self-contained and deliberately narrow, not a general GGUF runner. 
 The main paths are `qwen35moe`-specific Vulkan and Metal graph executors with
 Q36-specific loading, prompt rendering, tool calls, KV state, HTTP server,
@@ -142,21 +142,17 @@ and offline tooling. For normal usage, keep reading the next sections.
 
 ## Model Weights
 
-This implementation works with Qwen3.6-35B-A3B and text-only
-KAT-Coder-V2.5-Dev GGUFs with the same `qwen35moe` tensor shape. It is not a
-general GGUF loader, and arbitrary GGUF files will not have
+This implementation works with Qwen3.6-35B-A3B and dense Qwen3.8-27B GGUFs.
+It is not a general GGUF loader, and arbitrary GGUF files will not have
 the tensor layout, quantization mix, metadata, or optional MTP state expected by
 the engine. The 2 bit quantizations provided here are verified to be actually
 high quality: they behave well, work under coding agents, call tools in a reliable way.
 
-KAT-Coder is selected from `general.name`; no model-name flag is needed. The
-runtime gives it a distinct KV-cache identity, advertises
-`kat-coder-v2.5-dev`, uses its native chat/tool template, and recognizes every
-GGUF control and user-defined tokenizer token. Start it explicitly:
+Start dense Qwen3.8-27B explicitly:
 
 ```sh
 ./q36-server \
-  -m gguf/KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf \
+  -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf \
   --vulkan
 ```
 
@@ -176,7 +172,7 @@ Download one main model.
 ```sh
 ./download_model.sh q2-imatrix   # 16 GB unified memory machines
 ./download_model.sh q2-q4-imatrix # higher quality; stream on 16 GB machines
-./download_model.sh kat-coder     # KAT-Coder V2.5 Dev IQ2_XXS imatrix
+./download_model.sh 27b           # Dense Qwen3.8-27B IQ3_S
 ```
 
 Choose one. The first target matches the compiled default path. Select the
@@ -187,10 +183,10 @@ second explicitly:
   --ssd-streaming -p "Hello"
 ```
 
-The script downloads Qwen models from
-`https://huggingface.co/Ninnix96/Qwen3.6-35B-A3B-gguf` and KAT-Coder from
-`https://huggingface.co/Ninnix96/KAT-Coder-V2.5-Dev-gguf`. It stores files
-under `./gguf/`, resumes partial downloads with `curl -C -`, and updates
+The script downloads Qwen3.6 models from
+`https://huggingface.co/Ninnix96/Qwen3.6-35B-A3B-gguf` and dense Qwen3.8-27B
+from `https://huggingface.co/unsloth/Qwen3.8-27B-GGUF`. It stores files under
+`./gguf/`, resumes partial downloads with `curl -C -`, and updates
 `./q36moe.gguf` to point at the selected model for older scripts.
 
 Then build for the target platform:
@@ -560,7 +556,7 @@ Supported endpoints:
 calls use the native Qwen3 Coder tagged format, and generated calls are mapped
 back to OpenAI tool calls.
 
-Both Qwen3.6 and KAT-Coder accept the fixed-template controls:
+Both Qwen3.6 and Qwen3.8 accept the fixed-template controls:
 
 ```json
 "chat_template_kwargs": {
@@ -575,11 +571,10 @@ strip reasoning before the latest user query. System and user messages may also
 contain `<|think_on|>` or `<|think_off|>`; Q36 removes the control marker before
 rendering and applies it to subsequent turns.
 
-When omitted by the client, KAT-Coder uses `temperature=0.7`, `top_k=20`,
-`top_p=0.8`, `min_p=0.05`, and `presence_penalty=1.5` in both thinking modes.
-Qwen uses `temperature=1`, `top_p=1`, no top-k cap, and `min_p=0.05`. CLI,
-agent, and server use the loaded model's defaults. Eval stays fixed at the Qwen
-sampling defaults for comparable runs. Explicit values always win.
+When omitted by the client, Qwen uses `temperature=1`, `top_p=1`, no top-k cap,
+and `min_p=0.05`. CLI, agent, and server use the loaded model's defaults. Eval
+stays fixed at the Qwen sampling defaults for comparable runs. Explicit values
+always win.
 
 `/v1/responses` accepts string or message-array input, instructions, direct
 tool schemas, function-call continuations, function-call outputs, sampling
@@ -824,7 +819,7 @@ prompt again.
 
 ## Thinking Modes
 
-Qwen3.6-35B-A3B and KAT-Coder-V2.5-Dev have distinct non-thinking and thinking modes, controlled
+Qwen3.6-35B-A3B and Qwen3.8-27B have distinct non-thinking and thinking modes, controlled
 natively by `<think>...</think>` blocks rendered into the prompt. The server
 defaults to thinking mode.
 

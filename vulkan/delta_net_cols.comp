@@ -1,16 +1,26 @@
 #version 460
 
+#ifdef Q36_STATE_F16
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-/* Prefill-only delta-net: one workgroup owns one (head, state column) and the
- * 32 lanes split the 128-row dot/update. Decode keeps the exact path. */
+/* Prefill-only delta-net: four wave32s own four state columns and share the
+ * q/k vector which is otherwise reread once per column. */
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef Q36_STATE_F16
+layout(set = 0, binding = 0) buffer State {
+    float16_t s[];
+};
+#else
 layout(set = 0, binding = 0) buffer State {
     float s[];
 };
+#endif
 
 layout(set = 0, binding = 1) readonly buffer Qbuf {
     float q[];
@@ -46,11 +56,16 @@ layout(push_constant) uniform Push {
 const uint N = 128u;
 const uint LANES = 32u;
 const uint ROWS_PER_LANE = N / LANES;
+const uint COLS = 4u;
+
+shared float qtile[N];
+shared float ktile[N];
 
 void main(void) {
     uint h = gl_WorkGroupID.x;
-    uint j = gl_WorkGroupID.y;
-    uint lane = gl_LocalInvocationID.x;
+    uint j = gl_WorkGroupID.y * COLS + gl_SubgroupID;
+    uint lid = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
     if (h >= pc.n_heads || j >= N || pc.state_dim != N) return;
 
     uint mat = h * N * N;
@@ -59,11 +74,16 @@ void main(void) {
 
     for (uint r = 0u; r < ROWS_PER_LANE; r++) {
         uint i = r * LANES + lane;
-        shard[r] = s[mat + i * N + j];
+        shard[r] = float(s[mat + i * N + j]);
     }
 
     for (uint tok = pc.tok0; tok < pc.tok_end; tok++) {
         uint vec = tok * pc.n_heads * N + h * N;
+        if (lid < N) {
+            qtile[lid] = q[vec + lid];
+            ktile[lid] = k[vec + lid];
+        }
+        barrier();
         float decay = gb[tok * 2u * pc.n_heads + h];
         float beta = gb[tok * 2u * pc.n_heads + pc.n_heads + h];
 
@@ -71,7 +91,7 @@ void main(void) {
         for (uint r = 0u; r < ROWS_PER_LANE; r++) {
             uint i = r * LANES + lane;
             shard[r] *= decay;
-            sk_part = fma(shard[r], k[vec + i], sk_part);
+            sk_part = fma(shard[r], ktile[i], sk_part);
         }
         float sk = subgroupAdd(sk_part);
         float d = (v[vec + j] - sk) * beta;
@@ -79,15 +99,20 @@ void main(void) {
         float out_part = 0.0;
         for (uint r = 0u; r < ROWS_PER_LANE; r++) {
             uint i = r * LANES + lane;
-            shard[r] = fma(k[vec + i], d, shard[r]);
-            out_part = fma(shard[r], q[vec + i], out_part);
+            shard[r] = fma(ktile[i], d, shard[r]);
+            out_part = fma(shard[r], qtile[i], out_part);
         }
         float outj = subgroupAdd(out_part);
         if (lane == 0u) y[vec + j] = outj * norm;
+        barrier();
     }
 
     for (uint r = 0u; r < ROWS_PER_LANE; r++) {
         uint i = r * LANES + lane;
+#ifdef Q36_STATE_F16
+        s[mat + i * N + j] = float16_t(shard[r]);
+#else
         s[mat + i * N + j] = shard[r];
+#endif
     }
 }

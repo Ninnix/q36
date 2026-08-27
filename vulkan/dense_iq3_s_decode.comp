@@ -1,0 +1,135 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
+
+const uint q36_iq3s_grid[512] = uint[512](
+#include "../q36_iq3s_grid_values.inc"
+);
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint8_t wb[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+#ifndef Q36_ROWS
+#define Q36_ROWS 5
+#endif
+#ifndef Q36_BOUNDS
+#define Q36_BOUNDS 1
+#endif
+const uint ROWS = Q36_ROWS;
+const uint Q8K_WORDS = 74u;
+const uint TAB_IQ3S_GRID = 2592u;
+
+shared uint grid_lut[512];
+
+uint load_u8(uint off) {
+    return uint(wb[off]);
+}
+
+uint load_u16(uint off) {
+    uint16_t lo = uint16_t(wb[off]);
+    uint16_t hi = uint16_t(wb[off + 1u]);
+    return uint(lo | (hi << uint16_t(8)));
+}
+
+uint load_u32(uint off) {
+    return uint(wb[off]) | (uint(wb[off + 1u]) << 8u) |
+           (uint(wb[off + 2u]) << 16u) | (uint(wb[off + 3u]) << 24u);
+}
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint itid = lid & 7u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+    for (uint i = lid; i < 512u; i += 64u)
+        grid_lut[i] = q36_iq3s_grid[i];
+    barrier();
+
+    for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+        uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
+        vec4 qv[8];
+        for (uint l = 0u; l < 8u; l++) qv[l] = unpack_i8(q8[qbase + l]);
+        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
+
+        for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+#if Q36_BOUNDS
+            if (row >= pc.out_dim) continue;
+#endif
+            uint base = row * pc.row_bytes + 110u * b;
+            uint qh = load_u8(base + 66u + itid);
+            uint qs0 = load_u32(base + 2u + 8u * itid);
+            uint qs1 = load_u32(base + 6u + 8u * itid);
+            uint signs4 = load_u32(base + 74u + 4u * itid);
+            float sum = 0.0;
+            for (uint l = 0u; l < 4u; l++) {
+                uint qs = l < 2u ? qs0 >> (16u * l) : qs1 >> (16u * (l - 2u));
+                uint signs = (signs4 >> (8u * l)) & 255u;
+                uint grid0 = grid_lut[(qs & 255u) |
+                                      ((qh << (8u - 2u * l)) & 256u)];
+                uint grid1 = grid_lut[((qs >> 8u) & 255u) |
+                                      ((qh << (7u - 2u * l)) & 256u)];
+                vec4 weight0 = unpack_i8(grid0) * vec4(
+                    (signs & 1u) != 0u ? -1.0 : 1.0,
+                    (signs & 2u) != 0u ? -1.0 : 1.0,
+                    (signs & 4u) != 0u ? -1.0 : 1.0,
+                    (signs & 8u) != 0u ? -1.0 : 1.0);
+                vec4 weight1 = unpack_i8(grid1) * vec4(
+                    (signs & 16u) != 0u ? -1.0 : 1.0,
+                    (signs & 32u) != 0u ? -1.0 : 1.0,
+                    (signs & 64u) != 0u ? -1.0 : 1.0,
+                    (signs & 128u) != 0u ? -1.0 : 1.0);
+                vec4 q0 = qv[2u * l];
+                vec4 q1 = qv[2u * l + 1u];
+                sum = fma(weight0.x, q0.x,
+                      fma(weight0.y, q0.y,
+                      fma(weight0.z, q0.z,
+                      fma(weight0.w, q0.w,
+                      fma(weight1.x, q1.x,
+                      fma(weight1.y, q1.y,
+                      fma(weight1.z, q1.z,
+                      fma(weight1.w, q1.w, sum))))))));
+            }
+            uint sc = load_u8(base + 106u + (itid >> 1u));
+            int ls = 2 * int((itid & 1u) == 0u ? sc & 15u : sc >> 4u) + 1;
+            float wd = unpackHalf2x16(load_u16(base)).x;
+            acc[r] = fma(wd * yd * float(ls), sum, acc[r]);
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) {
+        float total = subgroupAdd(acc[r]);
+        uint row = first_row + r;
+        if (lid == 0u
+#if Q36_BOUNDS
+            && row < pc.out_dim
+#endif
+        )
+            y[row] = total * pc.scale;
+    }
+}

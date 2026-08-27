@@ -1,0 +1,105 @@
+#version 460
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer State { float state[]; };
+layout(set = 0, binding = 1) readonly buffer Gate { float gatev[]; };
+layout(set = 0, binding = 2) readonly buffer Weight { float weight[]; };
+layout(set = 0, binding = 3) writeonly buffer Q8K { uint q8[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    float eps;
+} pc;
+
+const uint Q8K_WORDS = 74u;
+
+shared double sh_sum[256];
+shared float sh_val[256];
+shared float sh_abs[256];
+shared uint sh_idx[256];
+shared int sh_q[256];
+shared int sh_bsum[16];
+
+int nearest_int(float fval) {
+    precise float val = fval + 12582912.0f;
+    uint bits = floatBitsToUint(val);
+    return int(bits & 0x007fffffu) - 0x00400000;
+}
+
+uint pack_i8x4(int a0, int a1, int a2, int a3) {
+    return (uint(a0) & 255u)
+         | ((uint(a1) & 255u) << 8u)
+         | ((uint(a2) & 255u) << 16u)
+         | ((uint(a3) & 255u) << 24u);
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint row = 2u * gl_WorkGroupID.x + (lid >> 7u);
+    uint col = lid & 127u;
+    uint off = row * 128u + col;
+    float v = state[off];
+    sh_sum[lid] = double(v) * double(v);
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (lid < s) sh_sum[lid] += sh_sum[lid + s];
+        if (lid >= 128u && lid < 128u + s)
+            sh_sum[lid] += sh_sum[lid + s];
+        barrier();
+    }
+    uint root = lid & 128u;
+    float scale = inversesqrt(float(sh_sum[root] / 128.0) + pc.eps);
+    float g = gatev[off];
+    v = (g / (1.0 + exp(-g))) * ((v * scale) * weight[col]);
+    state[off] = v;
+    sh_val[lid] = v;
+    sh_abs[lid] = abs(v);
+    sh_idx[lid] = lid;
+    barrier();
+
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            float other_abs = sh_abs[lid + s];
+            uint other_idx = sh_idx[lid + s];
+            if (other_abs > sh_abs[lid] ||
+                (other_abs == sh_abs[lid] && other_idx < sh_idx[lid])) {
+                sh_abs[lid] = other_abs;
+                sh_val[lid] = sh_val[lid + s];
+                sh_idx[lid] = other_idx;
+            }
+        }
+        barrier();
+    }
+    float maxv = sh_val[0];
+    float iscale = maxv != 0.0 ? float(-127.0 / double(maxv)) : 0.0;
+    float d = iscale != 0.0 ? float(1.0 / double(iscale)) : 0.0;
+    int q = iscale != 0.0 ? nearest_int(iscale * v) : 0;
+    if (q > 127) q = 127;
+    sh_q[lid] = q;
+    barrier();
+
+    uint out_base = gl_WorkGroupID.x * Q8K_WORDS;
+    if (lid == 0u) {
+        q8[out_base] = floatBitsToUint(d);
+        q8[out_base + 1u] = 0u;
+    }
+    if (lid < 64u) {
+        uint i = 4u * lid;
+        q8[out_base + 2u + lid] = pack_i8x4(
+            sh_q[i], sh_q[i + 1u], sh_q[i + 2u], sh_q[i + 3u]);
+    }
+    if (lid < 16u) {
+        uint i = 16u * lid;
+        int sum = 0;
+        for (uint j = 0u; j < 16u; j++) sum += sh_q[i + j];
+        sh_bsum[lid] = sum;
+    }
+    barrier();
+    if (lid < 8u) {
+        int s0 = sh_bsum[2u * lid];
+        int s1 = sh_bsum[2u * lid + 1u];
+        q8[out_base + 66u + lid] =
+            (uint(s0) & 0xffffu) | ((uint(s1) & 0xffffu) << 16u);
+    }
+}

@@ -1,0 +1,103 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
+layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+#ifndef Q36_BOUNDS
+#define Q36_BOUNDS 1
+#endif
+const uint ROWS = 4u;
+const uint Q8K_WORDS = 74u;
+const int values[16] = int[16](
+    -127, -104, -83, -65, -49, -35, -22, -10,
+       1,   13,  25,  38,  53,  69,  89, 113);
+shared float value_lut[16];
+
+vec4 unpack_i8(uint v) {
+    return vec4(float(bitfieldExtract(int(v), 0, 8)),
+                float(bitfieldExtract(int(v), 8, 8)),
+                float(bitfieldExtract(int(v), 16, 8)),
+                float(bitfieldExtract(int(v), 24, 8)));
+}
+
+vec4 unpack_iq4(uint v, uint shift) {
+    return vec4(value_lut[(v >> (shift + 0u)) & 15u],
+                value_lut[(v >> (shift + 8u)) & 15u],
+                value_lut[(v >> (shift + 16u)) & 15u],
+                value_lut[(v >> (shift + 24u)) & 15u]);
+}
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint itid = lid & 7u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[ROWS];
+    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+    if (lid < 16u) value_lut[lid] = float(values[lid]);
+    barrier();
+
+    for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+        uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
+        vec4 qv[8];
+        for (uint l = 0u; l < 8u; l++) qv[l] = unpack_i8(q8[qbase + l]);
+        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
+        uint ib = itid;
+
+        for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+#if Q36_BOUNDS
+            if (row >= pc.out_dim) continue;
+#endif
+            uint base = (row * pc.row_bytes + 136u * b) >> 2u;
+            uint meta0 = ww[base];
+            uint meta1 = ww[base + 1u];
+            float sum = 0.0;
+            for (uint l = 0u; l < 4u; l++) {
+                uint packed = ww[base + 2u + 4u * ib + l];
+                vec4 w0 = unpack_iq4(packed, 0u);
+                vec4 w1 = unpack_iq4(packed, 4u);
+                vec4 q0 = qv[l];
+                vec4 q1 = qv[l + 4u];
+                sum = fma(w0.x, q0.x,
+                      fma(w0.y, q0.y,
+                      fma(w0.z, q0.z,
+                      fma(w0.w, q0.w,
+                      fma(w1.x, q1.x,
+                      fma(w1.y, q1.y,
+                      fma(w1.z, q1.z,
+                      fma(w1.w, q1.w, sum))))))));
+            }
+            uint sl = meta1 >> (8u * (ib >> 1u));
+            uint sh = meta0 >> 16u;
+            int ls = int((sl >> (4u * (ib & 1u))) & 15u) |
+                     int(((sh >> (2u * ib)) & 3u) << 4u);
+            float wd = unpackHalf2x16(meta0).x;
+            acc[r] = fma(wd * yd * float(ls - 32), sum, acc[r]);
+        }
+    }
+
+    for (uint r = 0u; r < ROWS; r++) {
+        float total = subgroupAdd(acc[r]);
+        uint row = first_row + r;
+        if (lid == 0u
+#if Q36_BOUNDS
+            && row < pc.out_dim
+#endif
+        ) y[row] = total * pc.scale;
+    }
+}
