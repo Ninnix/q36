@@ -821,21 +821,57 @@ static bool agent_initial_thinking_enabled(const agent_config *cfg) {
     return thinking;
 }
 
+static bool agent_ascii_contains_ci(const char *s, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n) return true;
+    for (; *s; s++) {
+        size_t i = 0;
+        while (i < n && s[i] &&
+               tolower((unsigned char)s[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
 static bool agent_tool_response_is_error(const char *content) {
-    char lower[500];
+    char head[121];
     content = content ? content : "";
     size_t len = strlen(content);
-    if (len >= sizeof(lower) || strstr(content, "$ ")) return false;
-    for (size_t i = 0; i < len; i++)
-        lower[i] = (char)tolower((unsigned char)content[i]);
-    lower[len] = '\0';
-    if (strstr(lower, "took ")) return false;
-    if (len > 80) lower[80] = '\0';
-    return strstr(lower, "\"error\":") || strstr(lower, "error:") ||
-           strstr(lower, "err!") || strstr(lower, "fatal:") ||
-           strstr(lower, "exception:") || strstr(lower, "traceback") ||
-           strstr(lower, "command not found") || strstr(lower, "invalid syntax") ||
-           strstr(lower, "failed to");
+    size_t head_len = len < sizeof(head) - 1 ? len : sizeof(head) - 1;
+    for (size_t i = 0; i < head_len; i++)
+        head[i] = (char)tolower((unsigned char)content[i]);
+    head[head_len] = '\0';
+
+    bool code = agent_ascii_contains_ci(content, "throw new ") ||
+                agent_ascii_contains_ci(content, "throw error") ||
+                agent_ascii_contains_ci(content, "console.error") ||
+                agent_ascii_contains_ci(content, "logger.error") ||
+                agent_ascii_contains_ci(content, "logging.error") ||
+                strstr(head, "import ") || strstr(head, "def ") ||
+                strstr(head, "function ");
+    if (code) return false;
+
+    bool exit_zero = strstr(head, "exit code: 0") ||
+                     strstr(head, "process exited with code 0");
+    bool error_ok = strstr(head, "\"error\": null") ||
+                    strstr(head, "\"error\":null") ||
+                    strstr(head, "\"error\": false") ||
+                    strstr(head, "\"error\":false") ||
+                    strstr(head, "\"error\": \"\"") ||
+                    strstr(head, "\"error\":\"\"");
+    bool strong = (strstr(head, "\"error\":") && !error_ok) ||
+                  strstr(head, "\"status\": \"error\"") ||
+                  strstr(head, "\"status\":\"error\"") ||
+                  strstr(head, "traceback (most recent call last):") ||
+                  strstr(head, "command not found") ||
+                  strstr(head, "invalid syntax") || strstr(head, "fatal:") ||
+                  ((strstr(head, "exit code: ") ||
+                    strstr(head, "process exited with code")) && !exit_zero) ||
+                  !strncmp(head, "exception:", 10) ||
+                  !strncmp(head, "failed to ", 10);
+    bool weak = strstr(head, "error:") || strstr(head, "err!");
+    bool weak_suppressed = strstr(head, "$ ") || strstr(head, "took ") || len >= 600;
+    return strong || (weak && !weak_suppressed);
 }
 
 /* ============================================================================
@@ -848,16 +884,34 @@ static const char agent_tools_prompt_intro[] =
     "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
     "then summarize results briefly.\n\n"
     "# Tools\n\n"
-    "You have access to the following functions. If you call one, reply with no suffix using exactly:\n\n"
+    "You have access to the following functions. If you choose to call a function ONLY reply "
+    "in the following format with NO suffix:\n\n"
+    "<think>\n"
+    "Brief explanation of tool call\n"
+    "</think>\n"
     "<tool_call>\n"
-    "<function=$TOOL_NAME>\n"
-    "<parameter=$PARAMETER_NAME>\n"
-    "$PARAMETER_VALUE\n"
+    "<function=example_function_name>\n"
+    "<parameter=example_parameter_name>\n"
+    "value\n"
     "</parameter>\n"
     "</function>\n"
     "</tool_call>\n\n"
-    "Required parameters must be present. Tool calls are not allowed inside <think></think>; "
-    "finish thinking before emitting a tool call.\n\n"
+    "<IMPORTANT>\n"
+    "Reminder:\n"
+    "- You can use the <think></think> block to plan your next tool call OR to synthesize data "
+    "and formulate your final response to the user.\n"
+    "- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n"
+    "- Function calls MUST use an inner <function=...></function> block nested within "
+    "<tool_call></tool_call> XML tags. Required parameters MUST be specified.\n"
+    "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after "
+    "thinking, with NO conversational text before it.\n"
+    "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with "
+    "NO spaces or indentation before them.\n"
+    "- To call multiple functions, output a separate, completely closed "
+    "<tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.\n"
+    "- If you have all necessary data, provide your final answer directly to the user without "
+    "any tool call.\n"
+    "</IMPORTANT>\n\n"
     "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
     "If read says more lines are available, call more with count=<lines> to read the next chunk; "
     "more defaults to the next 500 lines. "
@@ -6393,6 +6447,11 @@ static void test_agent_chat_template_controls(void) {
 static void test_agent_edit_upto_prompt_is_opt_in(void) {
     char *exact = agent_build_tools_prompt(false);
     char *upto = agent_build_tools_prompt(true);
+    AGENT_TEST_ASSERT(strstr(exact,
+        "To call multiple functions, output a separate, completely closed") != NULL);
+    AGENT_TEST_ASSERT(strstr(exact, "Do NOT nest <tool_call> blocks.") != NULL);
+    AGENT_TEST_ASSERT(strstr(exact,
+        "provide your final answer directly to the user without any tool call") != NULL);
     AGENT_TEST_ASSERT(strstr(exact, "[upto]") == NULL);
     AGENT_TEST_ASSERT(strstr(upto, "[upto]") != NULL);
     free(exact);
@@ -6404,6 +6463,14 @@ static void test_agent_tool_error_recovery(void) {
         "Tool result 1 (edit):\nTool error: old text did not match\n"));
     AGENT_TEST_ASSERT(!agent_tool_response_is_error(
         "command took 2.0s\nerror: appears in captured output\n"));
+    AGENT_TEST_ASSERT(!agent_tool_response_is_error(
+        "{\"error\": null, \"result\": \"ok\"}"));
+    AGENT_TEST_ASSERT(!agent_tool_response_is_error("throw new Error('example')"));
+    char traceback[900];
+    memset(traceback, 'x', sizeof(traceback));
+    memcpy(traceback, "Traceback (most recent call last):", 34);
+    traceback[sizeof(traceback) - 1] = '\0';
+    AGENT_TEST_ASSERT(agent_tool_response_is_error(traceback));
 
     int failures = 0;
     char *text = agent_tool_response_add_warning(
@@ -8045,7 +8112,6 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_worker_maybe_append_system_prompt_reminder(w);
         q36_think_mode think_mode = w->thinking_enabled ?
             enabled_think_mode(cfg) : Q36_THINK_NONE;
-        if (consecutive_failures >= 2) think_mode = Q36_THINK_NONE;
         q36_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
 
         const q36_tokens *prompt_for_sync = &w->transcript;

@@ -1383,6 +1383,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         if (**p != '{') return false;
         (*p)++;
         chat_msg msg = {0};
+        int reasoning_rank = 0;
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -1403,10 +1404,22 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     free(key);
                     goto fail;
                 }
-            } else if (!strcmp(key, "reasoning_content")) {
-                if (!json_content_replace(p, &msg.reasoning)) {
+            } else if (!strcmp(key, "reasoning_content") ||
+                       !strcmp(key, "thinking") ||
+                       !strcmp(key, "reasoning")) {
+                char *reasoning = NULL;
+                int rank = !strcmp(key, "reasoning_content") ? 3 :
+                           !strcmp(key, "thinking") ? 2 : 1;
+                if (!json_content_replace(p, &reasoning)) {
                     free(key);
                     goto fail;
+                }
+                if (rank > reasoning_rank) {
+                    free(msg.reasoning);
+                    msg.reasoning = reasoning;
+                    reasoning_rank = rank;
+                } else {
+                    free(reasoning);
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 if (!json_string_replace(p, &msg.tool_call_id)) {
@@ -1802,9 +1815,9 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "- You can use the <think></think> block to plan your next tool call OR to synthesize data and formulate your final response to the user.\n"
         "- ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.\n"
         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.\n"
-        "- If you choose to call a tool, output the <tool_call> block immediately after thinking, with no conversational text before it.\n"
-        "- The <tool_call> and <function> tags must begin a new line with no indentation.\n"
-        "- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for each function.\n"
+        "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.\n"
+        "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.\n"
+        "- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.\n"
         "- If you have all necessary data, provide your final answer directly to the user without any tool call.\n"
         "</IMPORTANT>");
 }
@@ -1929,7 +1942,10 @@ static void append_qwen_parameter(buf *b, const json_arg *arg) {
 static void append_qwen_arguments(buf *b, const char *json,
                                   const tool_schema_order *order) {
     json_args args = {0};
-    if (!json_args_parse(json, &args)) return;
+    if (!json_args_parse(json, &args)) {
+        if (json && json[0]) buf_puts(b, json);
+        return;
+    }
     if (order) {
         for (int i = 0; i < order->len; i++) {
             int idx = json_args_find_unused(&args, order->prop[i]);
@@ -1956,7 +1972,8 @@ static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls,
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-        if (i || (content_nonempty && i == 0)) buf_puts(b, "\n\n");
+        if (i) buf_putc(b, '\n');
+        else if (content_nonempty) buf_puts(b, "\n\n");
         buf_puts(b, "<tool_call>\n<function=");
         buf_puts(b, tc->name ? tc->name : "");
         buf_puts(b, ">\n");
@@ -2020,21 +2037,57 @@ static char *chat_content_text(const char *s, bool controls, bool *thinking) {
     return trimmed;
 }
 
+static bool ascii_contains_ci(const char *s, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n) return true;
+    for (; *s; s++) {
+        size_t i = 0;
+        while (i < n && s[i] &&
+               tolower((unsigned char)s[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
 static bool tool_response_is_error(const char *content) {
-    char lower[500];
+    char head[121];
     content = content ? content : "";
     size_t len = strlen(content);
-    if (len >= sizeof(lower) || strstr(content, "$ ")) return false;
-    for (size_t i = 0; i < len; i++)
-        lower[i] = (char)tolower((unsigned char)content[i]);
-    lower[len] = '\0';
-    if (strstr(lower, "took ")) return false;
-    if (len > 80) lower[80] = '\0';
-    return strstr(lower, "\"error\":") || strstr(lower, "error:") ||
-           strstr(lower, "err!") || strstr(lower, "fatal:") ||
-           strstr(lower, "exception:") || strstr(lower, "traceback") ||
-           strstr(lower, "command not found") || strstr(lower, "invalid syntax") ||
-           strstr(lower, "failed to");
+    size_t head_len = len < sizeof(head) - 1 ? len : sizeof(head) - 1;
+    for (size_t i = 0; i < head_len; i++)
+        head[i] = (char)tolower((unsigned char)content[i]);
+    head[head_len] = '\0';
+
+    bool code = ascii_contains_ci(content, "throw new ") ||
+                ascii_contains_ci(content, "throw error") ||
+                ascii_contains_ci(content, "console.error") ||
+                ascii_contains_ci(content, "logger.error") ||
+                ascii_contains_ci(content, "logging.error") ||
+                strstr(head, "import ") || strstr(head, "def ") ||
+                strstr(head, "function ");
+    if (code) return false;
+
+    bool exit_zero = strstr(head, "exit code: 0") ||
+                     strstr(head, "process exited with code 0");
+    bool error_ok = strstr(head, "\"error\": null") ||
+                    strstr(head, "\"error\":null") ||
+                    strstr(head, "\"error\": false") ||
+                    strstr(head, "\"error\":false") ||
+                    strstr(head, "\"error\": \"\"") ||
+                    strstr(head, "\"error\":\"\"");
+    bool strong = (strstr(head, "\"error\":") && !error_ok) ||
+                  strstr(head, "\"status\": \"error\"") ||
+                  strstr(head, "\"status\":\"error\"") ||
+                  strstr(head, "traceback (most recent call last):") ||
+                  strstr(head, "command not found") ||
+                  strstr(head, "invalid syntax") || strstr(head, "fatal:") ||
+                  ((strstr(head, "exit code: ") ||
+                    strstr(head, "process exited with code")) && !exit_zero) ||
+                  !strncmp(head, "exception:", 10) ||
+                  !strncmp(head, "failed to ", 10);
+    bool weak = strstr(head, "error:") || strstr(head, "err!");
+    bool weak_suppressed = strstr(head, "$ ") || strstr(head, "took ") || len >= 600;
+    return strong || (weak && !weak_suppressed);
 }
 
 static void append_tool_error_warning(buf *out, int failures) {
@@ -2078,6 +2131,22 @@ static void apply_chat_thinking_controls(const chat_msgs *msgs, bool *thinking) 
     }
 }
 
+static char *leading_system_content(const chat_msgs *msgs, int *count,
+                                    bool *thinking) {
+    buf out = {0};
+    *count = 0;
+    while (*count < msgs->len && role_is_system(msgs->v[*count].role)) {
+        char *part = chat_content_text(msgs->v[*count].content, true, thinking);
+        if (text_has_trimmed_content(part)) {
+            if (out.len) buf_puts(&out, "\n\n");
+            buf_puts(&out, part);
+        }
+        free(part);
+        (*count)++;
+    }
+    return buf_take(&out);
+}
+
 static char *assistant_message_parts(const chat_msg *m, char **reasoning_out) {
     static const char *ends[] = {
         "\n</think>", "\n</thinking>", "\n</ think>", "\n</think >",
@@ -2085,6 +2154,22 @@ static char *assistant_message_parts(const chat_msg *m, char **reasoning_out) {
     const char *content = m->content ? m->content : "";
     if (text_has_trimmed_content(m->reasoning)) {
         *reasoning_out = chat_content_text(m->reasoning, false, NULL);
+        const char *end = NULL;
+        size_t end_len = 0;
+        if (!strncmp(content, "<think>", 7)) {
+            end = strstr(content, "</think>");
+            end_len = 8;
+        } else if (!strncmp(content, "<thinking>", 10)) {
+            end = strstr(content, "</thinking>");
+            end_len = 11;
+        } else if (!strncmp(content, "</think>", 8)) {
+            end = content;
+            end_len = 8;
+        } else if (!strncmp(content, "</thinking>", 11)) {
+            end = content;
+            end_len = 11;
+        }
+        if (end) content = end + end_len;
         return chat_content_text(content, false, NULL);
     }
 
@@ -2095,6 +2180,12 @@ static char *assistant_message_parts(const chat_msg *m, char **reasoning_out) {
         tag = "</think>";
     } else if (!strncmp(content, "</thinking>", 11)) {
         end = content;
+        tag = "</thinking>";
+    } else if (!strncmp(content, "<think>", 7) && strstr(content, "</think>")) {
+        end = strstr(content, "</think>");
+        tag = "</think>";
+    } else if (!strncmp(content, "<thinking>", 10) && strstr(content, "</thinking>")) {
+        end = strstr(content, "</thinking>");
         tag = "</thinking>";
     }
     for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
@@ -2155,9 +2246,8 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
     int failures = 0;
 
     buf out = {0};
-    bool first_system = msgs->len > 0 && role_is_system(msgs->v[0].role);
-    char *first_content = first_system ?
-        chat_content_text(msgs->v[0].content, true, &thinking) : NULL;
+    int system_head = 0;
+    char *first_content = leading_system_content(msgs, &system_head, &thinking);
     if (tool_schemas && tool_schemas[0]) {
         buf_puts(&out, "<|im_start|>system\n");
         append_kat_tools_prompt_text(&out, tool_schemas);
@@ -2166,7 +2256,7 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
             buf_puts(&out, first_content);
         }
         buf_puts(&out, "<|im_end|>\n");
-    } else if (first_system && text_has_trimmed_content(first_content)) {
+    } else if (text_has_trimmed_content(first_content)) {
         buf_puts(&out, "<|im_start|>system\n");
         buf_puts(&out, first_content);
         buf_puts(&out, "<|im_end|>\n");
@@ -2176,7 +2266,7 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
-            if (i == 0 && first_system) continue;
+            if (i < system_head) continue;
             char *content = chat_content_text(m->content, true, &thinking);
             buf_puts(&out, "<|im_start|>system\n");
             buf_puts(&out, content);
@@ -2234,7 +2324,7 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
     }
 
     buf_puts(&out, "<|im_start|>assistant\n");
-    if (!thinking || failures >= 2) buf_puts(&out, "<think>\n\n</think>\n\n");
+    if (!thinking) buf_puts(&out, "<think>\n\n</think>\n\n");
     else {
         buf_puts(&out, "<think>\n");
         if (think_mode == Q36_THINK_MAX) buf_puts(&out, q36_think_max_prefix());
@@ -2252,9 +2342,8 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
 
     buf out = {0};
     if (think_mode == Q36_THINK_MAX) buf_puts(&out, q36_think_max_prefix());
-    bool first_system = msgs->len > 0 && role_is_system(msgs->v[0].role);
-    char *first_content = first_system ?
-        chat_content_text(msgs->v[0].content, true, &thinking) : NULL;
+    int system_head = 0;
+    char *first_content = leading_system_content(msgs, &system_head, &thinking);
     if (tool_schemas && tool_schemas[0]) {
         buf_puts(&out, "<|im_start|>system\n");
         append_tools_prompt_text(&out, tool_schemas);
@@ -2263,7 +2352,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
             buf_puts(&out, first_content);
         }
         buf_puts(&out, "<|im_end|>\n");
-    } else if (first_system && text_has_trimmed_content(first_content)) {
+    } else if (text_has_trimmed_content(first_content)) {
         buf_puts(&out, "<|im_start|>system\n");
         buf_puts(&out, first_content);
         buf_puts(&out, "<|im_end|>\n");
@@ -2273,7 +2362,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
-            if (i == 0 && first_system) continue;
+            if (i < system_head) continue;
             char *content = chat_content_text(m->content, true, &thinking);
             buf_puts(&out, "<|im_start|>system\n");
             buf_puts(&out, content);
@@ -2331,7 +2420,7 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
     }
 
     buf_puts(&out, "<|im_start|>assistant\n");
-    if (!thinking || failures >= 2) buf_puts(&out, "<think>\n\n</think>\n\n");
+    if (!thinking) buf_puts(&out, "<think>\n\n</think>\n\n");
     else buf_puts(&out, "<think>\n");
     return buf_take(&out);
 }
@@ -11311,12 +11400,25 @@ static void test_qwen_tool_call_rendering(void) {
     append_qwen_tool_calls_text(&b, &multi, NULL, false);
     const char *rendered_multi = b.ptr ? b.ptr : "";
     TEST_ASSERT(strstr(rendered_multi, "<tool_call>") != NULL);
+    TEST_ASSERT(strstr(rendered_multi, "</tool_call>\n<tool_call>") != NULL);
+    TEST_ASSERT(strstr(rendered_multi, "</tool_call>\n\n<tool_call>") == NULL);
     int count = 0;
     for (const char *p = rendered_multi; (p = strstr(p, "<tool_call>")) != NULL; p++) count++;
     TEST_ASSERT(count == 2);
 
     buf_free(&b);
     tool_calls_free(&multi);
+
+    tool_calls scalar = {0};
+    tc = (tool_call){
+        .name = xstrdup("odd_tool"),
+        .arguments = xstrdup("[1,true,null]"),
+    };
+    tool_calls_push(&scalar, tc);
+    append_qwen_tool_calls_text(&b, &scalar, NULL, false);
+    TEST_ASSERT(strstr(b.ptr, "<function=odd_tool>\n[1,true,null]</function>") != NULL);
+    buf_free(&b);
+    tool_calls_free(&scalar);
 }
 
 static void test_tool_separator_whitespace_is_not_content(void) {
@@ -12403,6 +12505,7 @@ static void test_kat_template_tool_round(void) {
     char *prompt = render_chat_prompt_text_profile(
         &msgs, "{\"name\":\"read\"}", NULL, Q36_THINK_HIGH, true, false);
     TEST_ASSERT(strstr(prompt, "<IMPORTANT>\nReminder:") != NULL);
+    TEST_ASSERT(strstr(prompt, "Do NOT nest <tool_call> blocks.") != NULL);
     TEST_ASSERT(strstr(prompt,
         "<think>\nneed reads\n</think>\n\n<tool_call>\n<function=read>") != NULL);
     TEST_ASSERT(strstr(prompt,
@@ -12485,6 +12588,23 @@ static void test_fixed_template_chronological_system_messages(void) {
     TEST_ASSERT(tools && client && first && tools < first && first < client);
     free(prompt);
     chat_msgs_free(&msgs);
+
+    msgs = (chat_msgs){0};
+    chat_msg system = {.role = xstrdup("system"), .content = xstrdup("first system")};
+    developer = (chat_msg){
+        .role = xstrdup("developer"),
+        .content = xstrdup("second system"),
+    };
+    user1 = (chat_msg){.role = xstrdup("user"), .content = xstrdup("question")};
+    chat_msgs_push(&msgs, system);
+    chat_msgs_push(&msgs, developer);
+    chat_msgs_push(&msgs, user1);
+    prompt = render_chat_prompt_text(&msgs, "TOOL_SCHEMA", NULL, Q36_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt,
+        "</IMPORTANT>\n\nfirst system\n\nsecond system<|im_end|>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>system\nsecond system") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
 }
 
 static void test_fixed_template_tool_error_recovery(void) {
@@ -12507,7 +12627,9 @@ static void test_fixed_template_tool_error_recovery(void) {
             "Your previous approach is incorrect. You MUST use a fundamentally "
             "different approach or corrected arguments.") != NULL);
         TEST_ASSERT(strstr(prompt,
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
+            "<|im_start|>assistant\n<think>\n") != NULL);
+        TEST_ASSERT(strstr(prompt,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n") == NULL);
         TEST_ASSERT(strstr(prompt,
             "</tool_response>\n<tool_response>") != NULL);
         free(prompt);
@@ -12515,8 +12637,16 @@ static void test_fixed_template_tool_error_recovery(void) {
     }
 
     TEST_ASSERT(!tool_response_is_error("{\"error_count\": 0, \"result\": \"ok\"}"));
+    TEST_ASSERT(!tool_response_is_error("{\"error\": null, \"result\": \"ok\"}"));
+    TEST_ASSERT(!tool_response_is_error("Process exited with code 0"));
+    TEST_ASSERT(!tool_response_is_error("throw new Error('example')"));
     TEST_ASSERT(!tool_response_is_error("$ printf 'error: example'"));
     TEST_ASSERT(!tool_response_is_error("error: appears in output; command took 1.2s"));
+    char traceback[900];
+    memset(traceback, 'x', sizeof(traceback));
+    memcpy(traceback, "Traceback (most recent call last):", 34);
+    traceback[sizeof(traceback) - 1] = '\0';
+    TEST_ASSERT(tool_response_is_error(traceback));
 }
 
 static void test_fixed_template_reasoning_extraction(void) {
@@ -12540,6 +12670,38 @@ static void test_fixed_template_reasoning_extraction(void) {
     prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_HIGH);
     TEST_ASSERT(strstr(prompt, "The literal string </think> is documentation.") != NULL);
     free(prompt);
+
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup("<think>single line thought</think>answer");
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt,
+        "<think>\nsingle line thought\n</think>\n\nanswer") != NULL);
+    free(prompt);
+
+    msgs.v[1].reasoning = xstrdup("explicit thought");
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt,
+        "<think>\nexplicit thought\n</think>\n\nanswer") != NULL);
+    TEST_ASSERT(strstr(prompt, "single line thought") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_reasoning_message_aliases(void) {
+    const char *p =
+        "[{\"role\":\"assistant\",\"reasoning_content\":\"openai\","
+        "\"thinking\":\"anthropic\",\"reasoning\":\"responses\","
+        "\"content\":\"answer\"}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].reasoning && !strcmp(msgs.v[0].reasoning, "openai"));
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"assistant\",\"reasoning\":\"vllm\",\"content\":\"answer\"}]";
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].reasoning && !strcmp(msgs.v[0].reasoning, "vllm"));
     chat_msgs_free(&msgs);
 }
 
@@ -12799,6 +12961,7 @@ static void q36_server_unit_tests_run(void) {
     test_fixed_template_chronological_system_messages();
     test_fixed_template_tool_error_recovery();
     test_fixed_template_reasoning_extraction();
+    test_reasoning_message_aliases();
     test_chat_template_kwargs_parse();
     test_qwen_tool_call_rendering();
     test_tool_separator_whitespace_is_not_content();
