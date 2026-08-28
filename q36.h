@@ -240,6 +240,7 @@ int q36_test_sample_logits_penalized(float *logits, uint32_t n_vocab,
                                      float presence_penalty,
                                      float frequency_penalty,
                                      uint64_t *rng, float *prob_scratch);
+uint32_t q36_test_kv_next_cap(uint32_t cap, uint32_t need, uint32_t limit);
 #endif
 bool q36_session_in_think(q36_session *s);
 int q36_session_eos_to_think_close(q36_session *s, int token);

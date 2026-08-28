@@ -259,6 +259,19 @@ static void benchmark(const float *logits, float *scratch, uint32_t n,
 }
 
 int main(void) {
+    CHECK(q36_test_kv_next_cap(32768, 32769, 100000) == 40960,
+          "KV growth after 32k should reserve 40k");
+    CHECK(q36_test_kv_next_cap(40960, 40961, 100000) == 51200,
+          "KV growth after 40k should reserve 50k");
+    CHECK(q36_test_kv_next_cap(51200, 70000, 100000) == 80000,
+          "KV growth should cover large jumps without doubling");
+    CHECK(q36_test_kv_next_cap(80000, 90000, 100000) == 100000,
+          "KV growth should clamp to the context limit");
+    CHECK(q36_test_kv_next_cap(32768, 32769, 40001) == 40001,
+          "KV growth should clamp to a nearby context limit");
+    CHECK(q36_test_kv_next_cap(32768, 40002, 40001) == 0,
+          "KV growth should reject requests beyond the context limit");
+
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

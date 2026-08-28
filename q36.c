@@ -4922,7 +4922,9 @@ static uint32_t q36_kv_initial_cap(int ctx_size) {
 static uint32_t q36_kv_next_cap(uint32_t cap, uint32_t need, uint32_t limit) {
     uint32_t next = cap;
     while (next < need) {
-        uint32_t grown = next <= limit / 2u ? next * 2u : limit;
+        if (next >= limit) return 0;
+        uint32_t step = next / 4u;
+        uint32_t grown = step <= limit - next ? next + step : limit;
         if (grown <= next) return 0;
         next = grown;
     }
@@ -9173,6 +9175,10 @@ int q36_test_sample_logits_penalized(float *logits, uint32_t n_vocab,
         logits, n_vocab, temperature, top_k, top_p, min_p,
         tokens, n_tokens, presence_penalty, frequency_penalty,
         rng, prob_scratch);
+}
+
+uint32_t q36_test_kv_next_cap(uint32_t cap, uint32_t need, uint32_t limit) {
+    return q36_kv_next_cap(cap, need, limit);
 }
 #endif
 

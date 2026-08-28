@@ -6453,6 +6453,11 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 q36_vk_weight_get_unlocked(sinks, (uint64_t)n_head * sizeof(float)) :
                 (q36_gpu_tensor *)qg;
             ok = part != NULL && sinks_t != NULL;
+            /* Long attention makes a dispatch-count batch exceed AMDGPU's
+             * scheduler timeout.  Keep each heavy slice in its own queued
+             * command buffer; the ring still records ahead of the GPU. */
+            bool submit_slices = n_groups >= 7u;
+            if (ok && submit_slices) ok = q36_vk_submit_eager_unlocked();
             for (uint32_t tok0 = 0; ok && tok0 < n_tok; tok0 += attn_chunk) {
                 uint32_t chunk = n_tok - tok0;
                 if (chunk > attn_chunk) chunk = attn_chunk;
@@ -6472,6 +6477,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 ok = q36_vk_run_unlocked("attn_combine", &q36_vk.attn_combine,
                                          cbind, &cpush, sizeof(cpush),
                                          n_head, chunk, 1);
+                if (ok && submit_slices) ok = q36_vk_submit_eager_unlocked();
             }
             pthread_mutex_unlock(&q36_vk_mu);
             return ok;
