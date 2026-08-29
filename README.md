@@ -377,6 +377,10 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
+Adaptive thinking closure starts after 50000 thinking tokens by default. Use
+`--thinking-budget N` to change that threshold independently of the `--tokens`
+hard output limit.
+
 Agent user and system messages accept `<|think_on|>` and `<|think_off|>`.
 The marker is removed before rendering and remains in effect for later turns.
 Historical thinking stays in the append-only transcript until compaction.
@@ -394,9 +398,9 @@ weights also default to a 100000-token context with F16 KV:
 
 Explicit `--ctx`, `-ctk`, and `-ctv` values override the preset.
 
-The Metal source-path rule described under Backends also applies before
-`q36-agent --chdir` opens the model. When changing to another project, provide
-the absolute shader-source paths documented there.
+`q36-agent --chdir` loads its model and runtime assets from the launch directory,
+then changes to the requested project for agent tools. Built-in path tools also
+expand `~` to the current user's home directory.
 
 Sessions are stored in `~/.q36/kvcache`. Use `/save` to persist the current
 session, `/list` to show saved sessions, and `/switch <sha>` to resume one.
@@ -902,7 +906,7 @@ The fixed header is little-endian:
 ```text
 0   u8[3]  magic = "KVC"
 3   u8     version = 1
-4   u8     routed expert quant bits, currently 2
+4   u8     representative model tensor quant bits: 1-6 or 8
 5   u8     save reason: 0 unknown, 1 cold, 2 continued, 3 evict, 4 shutdown
 6   u8     extension flags, bit 0 = appended tool-id map
 7   u8     reserved

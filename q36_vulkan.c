@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -137,6 +138,7 @@ typedef struct {
     bool subgroup_clustered;
     bool bc250;
     uint32_t subgroup_size;
+    char shader_root[PATH_MAX];
 
     q36_vk_kernel matmul_f16;
     q36_vk_kernel matmul_f32;
@@ -1380,7 +1382,14 @@ static void q36_vk_kernel_destroy(q36_vk_kernel *k) {
 }
 
 static void *q36_read_file(const char *path, size_t *len_out) {
-    FILE *fp = fopen(path, "rb");
+    char rooted[PATH_MAX];
+    FILE *fp = NULL;
+    if (path && path[0] != '/' && q36_vk.shader_root[0] &&
+        snprintf(rooted, sizeof(rooted), "%s/%s",
+                 q36_vk.shader_root, path) < (int)sizeof(rooted)) {
+        fp = fopen(rooted, "rb");
+    }
+    if (!fp) fp = fopen(path, "rb");
     if (!fp) return NULL;
     if (fseek(fp, 0, SEEK_END) != 0) {
         fclose(fp);
@@ -2777,6 +2786,8 @@ int q36_gpu_init(void) {
     }
 
     memset(&q36_vk, 0, sizeof(q36_vk));
+    if (!getcwd(q36_vk.shader_root, sizeof(q36_vk.shader_root)))
+        q36_vk.shader_root[0] = '\0';
     q36_vk.prof_ops = getenv("Q36_VK_PROF_OP") || getenv("Q36_VK_PROF") || getenv("Q36_VK_PROF_KERNEL");
     /* write_mask marks the bindings each shader writes; the lazy-flush
      * tracker uses it so host reads of input-only tensors do not submit

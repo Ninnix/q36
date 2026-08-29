@@ -109,6 +109,7 @@ typedef struct {
 q36_kvstore_options q36_kvstore_default_options(void);
 uint8_t q36_kvstore_reason_code(const char *reason);
 const char *q36_kvstore_key_kind(uint8_t ext_flags);
+bool q36_kvstore_quant_bits_valid(int quant_bits);
 
 bool q36_kvstore_open(q36_kvstore *kc, const char *dir, uint64_t budget_mb,
                       bool reject_different_quant, q36_kvstore_options opt,

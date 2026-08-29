@@ -244,6 +244,7 @@ uint32_t q36_test_kv_next_cap(uint32_t cap, uint32_t need, uint32_t limit);
 #endif
 bool q36_session_in_think(q36_session *s);
 int q36_session_eos_to_think_close(q36_session *s, int token);
+int q36_session_token_rank(q36_session *s, int token, int max_rank);
 int q36_session_top_logprobs(q36_session *s, q36_token_score *out, int k);
 int q36_session_eval(q36_session *s, int token, char *err, size_t errlen);
 int q36_sessions_eval_batch(q36_decode_item *items, int count,

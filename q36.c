@@ -10092,6 +10092,28 @@ int q36_session_eos_to_think_close(q36_session *s, int token) {
     return close;
 }
 
+int q36_session_token_rank(q36_session *s, int token, int max_rank) {
+    if (!s || !s->logits || token < 0 || token >= (int)Q36_N_VOCAB ||
+        max_rank <= 0) return 0;
+    if (s->gpu_top2_valid) {
+        if (s->gpu_top2[0] == token) return 1;
+        if (s->gpu_top2[1] == token) return max_rank >= 2 ? 2 : 0;
+        if (max_rank <= 2) return 0;
+    }
+    if (!q36_session_ensure_logits_host(s)) return 0;
+    float target = s->logits[token];
+    if (!isfinite(target)) return 0;
+    int rank = 1;
+    for (uint32_t i = 0; i < Q36_N_VOCAB; i++) {
+        if ((int)i == token || !isfinite(s->logits[i])) continue;
+        if (s->logits[i] > target ||
+            (s->logits[i] == target && (int)i < token)) {
+            if (++rank > max_rank) return 0;
+        }
+    }
+    return rank;
+}
+
 int q36_session_top_logprobs(q36_session *s, q36_token_score *out, int k) {
     float max_logit = Q36_NEG_INF;
     double sum = 0.0;

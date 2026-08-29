@@ -188,6 +188,15 @@ const char *q36_kvstore_key_kind(uint8_t ext_flags) {
     return "token-text";
 }
 
+bool q36_kvstore_quant_bits_valid(int quant_bits) {
+    switch (quant_bits) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 8:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void q36_kvstore_le_put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v;
     p[1] = (uint8_t)(v >> 8);
@@ -436,7 +445,7 @@ bool q36_kvstore_read_header(FILE *fp, q36_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = q36_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && q36_kvstore_quant_bits_valid(e->quant_bits);
 }
 
 bool q36_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -940,7 +949,7 @@ bool q36_kvstore_store_live_prefix_text(q36_kvstore *kc,
     q36_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = q36_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (!q36_kvstore_quant_bits_valid(quant_bits)) {
         q36_tokens_free(&store_tokens);
         return false;
     }
@@ -1224,7 +1233,7 @@ int q36_kvstore_try_load_text(q36_kvstore *kc,
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = q36_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    if (!q36_kvstore_quant_bits_valid(quant_bits)) return 0;
     const int model_id = q36_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = q36_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,

@@ -6545,6 +6545,15 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
     le_put64(h + 40, payload_bytes);
 }
 
+static bool kv_quant_bits_valid(int quant_bits) {
+    switch (quant_bits) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 8:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     uint8_t h[KV_CACHE_FIXED_HEADER];
     if (fread(h, 1, sizeof(h), fp) != sizeof(h)) return false;
@@ -6563,7 +6572,7 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && kv_quant_bits_valid(e->quant_bits);
 }
 
 static bool kv_read_entry_file(const char *path, const char sha[41], kv_entry *out) {
@@ -6932,7 +6941,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
     tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = q36_engine_routed_quant_bits(s->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (!kv_quant_bits_valid(quant_bits)) {
         q36_tokens_free(&store_tokens);
         return false;
     }
@@ -7108,7 +7117,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = q36_engine_routed_quant_bits(s->engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    if (!kv_quant_bits_valid(quant_bits)) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = kv_cache_find_text_prefix(kc, prompt_text, quant_bits,
                                         q36_session_ctx(slot->session));
@@ -11790,6 +11799,14 @@ static void test_kv_cache_store_len_uses_configured_boundary(void) {
     TEST_ASSERT(kv_cache_store_len(&kc, 3500) == 3500);
 }
 
+static void test_kv_quant_bits(void) {
+    TEST_ASSERT(kv_quant_bits_valid(1));
+    TEST_ASSERT(kv_quant_bits_valid(3));
+    TEST_ASSERT(kv_quant_bits_valid(8));
+    TEST_ASSERT(!kv_quant_bits_valid(0));
+    TEST_ASSERT(!kv_quant_bits_valid(7));
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -12947,6 +12964,7 @@ static void q36_server_unit_tests_run(void) {
     test_exact_tool_replay_can_be_disabled();
     test_qwen_tool_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
+    test_kv_quant_bits();
     test_kv_tool_map_filters_by_qwen_tool_text();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();

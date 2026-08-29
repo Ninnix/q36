@@ -54,6 +54,7 @@ typedef struct {
     const char *system;
     const char *trace_path;
     int n_predict;
+    int thinking_budget;
     int ctx_size;
     float temperature;
     int top_k;
@@ -363,6 +364,16 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
+static bool agent_expand_home_path(const char *path, char *out, size_t out_len) {
+    if (!path || !out || out_len == 0) return false;
+    const char *home = getenv("HOME");
+    if (path[0] != '~' || (path[1] != '/' && path[1] != '\0') ||
+        !home || !home[0]) {
+        return snprintf(out, out_len, "%s", path) < (int)out_len;
+    }
+    return snprintf(out, out_len, "%s%s", home, path + 1) < (int)out_len;
+}
+
 static char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
@@ -538,7 +549,8 @@ static agent_config parse_options(int argc, char **argv) {
         },
         .gen = {
             .system = "You are a helpful coding assistant running inside q36-agent.",
-            .n_predict = 50000,
+            .n_predict = 100000,
+            .thinking_budget = 50000,
             .ctx_size = AGENT_RESIDENT_CTX,
             .temperature = Q36_DEFAULT_TEMPERATURE,
             .top_k = 0,
@@ -595,6 +607,8 @@ static agent_config parse_options(int argc, char **argv) {
             cache_type_v_set = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--thinking-budget")) {
+            c.gen.thinking_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--temp")) {
             c.gen.temperature = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 100.0f);
             c.gen.temperature_set = true;
@@ -4095,8 +4109,8 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         return false;
     }
     const int quant_bits = q36_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
-        snprintf(err, err_len, "unsupported routed quantization for KV save");
+    if (!q36_kvstore_quant_bits_valid(quant_bits)) {
+        snprintf(err, err_len, "unsupported model quantization for KV save");
         return false;
     }
     const int model_id = q36_engine_model_id(w->engine);
@@ -5631,11 +5645,35 @@ static bool agent_parse_bool_default(const char *s, bool def) {
 #define AGENT_TOOL_RESULT_RESERVE_TOKENS 1024
 #define AGENT_EDIT_UPTO_MIN_PREFIX_BYTES 64
 #define AGENT_EDIT_UPTO_MIN_PREFIX_LINES 2
-#define AGENT_COMPACT_SOFT_PERCENT 85
+/* Leave room for the private summary without crossing the next KV growth tier. */
+#define AGENT_COMPACT_SOFT_PERCENT 70
 #define AGENT_COMPACT_MIN_FREE_TOKENS 8192
 #define AGENT_COMPACT_TAIL_DIVISOR 10
 #define AGENT_COMPACT_TAIL_CAP_TOKENS 50000
 #define AGENT_COMPACT_SUMMARY_MAX_TOKENS 4096
+
+static bool agent_context_should_compact(int ctx, int used) {
+    if (ctx <= 0 || used <= 0) return false;
+    if (used >= (ctx * AGENT_COMPACT_SOFT_PERCENT) / 100) return true;
+    int free_threshold = AGENT_COMPACT_MIN_FREE_TOKENS;
+    int proportional = ctx / 4;
+    if (free_threshold > proportional) free_threshold = proportional;
+    return ctx - used <= free_threshold;
+}
+
+static int agent_think_close_rank_limit(int think_tokens, int start_tokens) {
+    if (think_tokens < start_tokens || start_tokens <= 0) return 0;
+    int64_t elapsed = (int64_t)think_tokens - start_tokens;
+    if (elapsed * 100 >= (int64_t)start_tokens * 98) return 64;
+    if (elapsed * 100 >= (int64_t)start_tokens * 95) return 32;
+    if (elapsed * 100 >= (int64_t)start_tokens * 90) return 16;
+    if (elapsed * 100 >= (int64_t)start_tokens * 80) return 8;
+    if (elapsed >= 4096) return 5;
+    if (elapsed >= 2048) return 4;
+    if (elapsed >= 1024) return 3;
+    if (elapsed >= 512) return 2;
+    return 1;
+}
 
 typedef struct {
     size_t start;
@@ -5686,9 +5724,14 @@ static void agent_split_lines(const char *data, size_t len, agent_line_spans *sp
 
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
                                  char *err, size_t errlen) {
-    FILE *fp = fopen(path, "rb");
+    char expanded[PATH_MAX];
+    if (!agent_expand_home_path(path, expanded, sizeof(expanded))) {
+        snprintf(err, errlen, "path is too long: %s", path ? path : "");
+        return -1;
+    }
+    FILE *fp = fopen(expanded, "rb");
     if (!fp) {
-        snprintf(err, errlen, "open %s: %s", path, strerror(errno));
+        snprintf(err, errlen, "open %.160s: %s", expanded, strerror(errno));
         return -1;
     }
     char *buf = NULL;
@@ -5700,8 +5743,8 @@ static int agent_read_file_bytes(const char *path, char **data, size_t *len,
             if (used + n > AGENT_FILE_MAX_BYTES) {
                 fclose(fp);
                 free(buf);
-                snprintf(err, errlen, "file too large: %s exceeds %d bytes",
-                         path, AGENT_FILE_MAX_BYTES);
+                snprintf(err, errlen, "file too large: %.160s exceeds %d bytes",
+                         expanded, AGENT_FILE_MAX_BYTES);
                 return -1;
             }
             if (used + n + 1 > cap) {
@@ -5715,7 +5758,7 @@ static int agent_read_file_bytes(const char *path, char **data, size_t *len,
         }
         if (n < sizeof(tmp)) {
             if (ferror(fp)) {
-                snprintf(err, errlen, "read %s: %s", path, strerror(errno));
+                snprintf(err, errlen, "read %.160s: %s", expanded, strerror(errno));
                 fclose(fp);
                 free(buf);
                 return -1;
@@ -5918,7 +5961,10 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (!content) return xstrdup("Tool error: write requires content\n");
-    FILE *fp = fopen(path, "wb");
+    char expanded[PATH_MAX];
+    if (!agent_expand_home_path(path, expanded, sizeof(expanded)))
+        return xstrdup("Tool error: write path is too long\n");
+    FILE *fp = fopen(expanded, "wb");
     if (!fp) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: open for write failed: ");
@@ -5944,7 +5990,10 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
 static char *agent_tool_list(const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
-    DIR *dir = opendir(path);
+    char expanded[PATH_MAX];
+    if (!agent_expand_home_path(path, expanded, sizeof(expanded)))
+        return xstrdup("Tool error: list path is too long\n");
+    DIR *dir = opendir(expanded);
     if (!dir) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: opendir failed: ");
@@ -5961,7 +6010,8 @@ static char *agent_tool_list(const agent_tool_call *call) {
     while ((de = readdir(dir)) != NULL && shown < 300) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+        if (snprintf(full, sizeof(full), "%s/%s", expanded, de->d_name) >=
+            (int)sizeof(full)) continue;
         struct stat st;
         if (lstat(full, &st) != 0) continue;
         char type = S_ISDIR(st.st_mode) ? 'd' :
@@ -5985,19 +6035,24 @@ static char *agent_tool_list(const agent_tool_call *call) {
 
 static int agent_write_file_bytes(const char *path, const char *data, size_t len,
                                   char *err, size_t errlen) {
-    FILE *fp = fopen(path, "wb");
+    char expanded[PATH_MAX];
+    if (!agent_expand_home_path(path, expanded, sizeof(expanded))) {
+        snprintf(err, errlen, "path is too long: %s", path ? path : "");
+        return -1;
+    }
+    FILE *fp = fopen(expanded, "wb");
     if (!fp) {
-        snprintf(err, errlen, "open %s: %s", path, strerror(errno));
+        snprintf(err, errlen, "open %.160s: %s", expanded, strerror(errno));
         return -1;
     }
     size_t wr = fwrite(data, 1, len, fp);
     if (wr != len) {
-        snprintf(err, errlen, "write %s: %s", path, strerror(errno));
+        snprintf(err, errlen, "write %.160s: %s", expanded, strerror(errno));
         fclose(fp);
         return -1;
     }
     if (fclose(fp) != 0) {
-        snprintf(err, errlen, "close %s: %s", path, strerror(errno));
+        snprintf(err, errlen, "close %.160s: %s", expanded, strerror(errno));
         return -1;
     }
     return 0;
@@ -6511,6 +6566,7 @@ static void test_agent_streaming_defaults(void) {
                          "--top-p", "0.95", "--min-p", "0.05"};
     char *overridev[] = {"q36-agent", "--temp", "0.2", "--top-k", "7",
                          "--top-p", "0.6", "--min-p", "0.01"};
+    char *budgetv[] = {"q36-agent", "--thinking-budget", "32000"};
     char *uptov[] = {"q36-agent", "--edit-upto"};
     agent_config def = parse_options(1, defv);
     agent_config stream = parse_options(2, streamv);
@@ -6524,10 +6580,14 @@ static void test_agent_streaming_defaults(void) {
     agent_config chunk = parse_options(3, chunkv);
     agent_config sampling = parse_options(9, samplingv);
     agent_config override = parse_options(9, overridev);
+    agent_config budget = parse_options(3, budgetv);
     agent_config upto = parse_options(2, uptov);
     agent_apply_sampling_defaults(&override, NULL);
 
     AGENT_TEST_ASSERT(!def.engine.ssd_streaming);
+    AGENT_TEST_ASSERT(def.gen.n_predict == 100000);
+    AGENT_TEST_ASSERT(def.gen.thinking_budget == 50000);
+    AGENT_TEST_ASSERT(budget.gen.thinking_budget == 32000);
     AGENT_TEST_ASSERT(!def.edit_upto);
     AGENT_TEST_ASSERT(upto.edit_upto);
     AGENT_TEST_ASSERT(def.gen.ctx_size == AGENT_RESIDENT_CTX);
@@ -6578,6 +6638,43 @@ static void test_agent_streaming_defaults(void) {
     AGENT_TEST_ASSERT(override.gen.min_p_set);
 }
 
+static void test_agent_context_pressure_helpers(void) {
+    AGENT_TEST_ASSERT(!agent_context_should_compact(100000, 69999));
+    AGENT_TEST_ASSERT(agent_context_should_compact(100000, 70000));
+    AGENT_TEST_ASSERT(!agent_context_should_compact(64000, 44799));
+    AGENT_TEST_ASSERT(agent_context_should_compact(64000, 44800));
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(49999, 50000) == 0);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(50000, 50000) == 1);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(50512, 50000) == 2);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(51024, 50000) == 3);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(52048, 50000) == 4);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(54096, 50000) == 5);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(90000, 50000) == 8);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(95000, 50000) == 16);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(97500, 50000) == 32);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(99000, 50000) == 64);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(31999, 32000) == 0);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(32000, 32000) == 1);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(32512, 32000) == 2);
+    AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(1));
+    AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(3));
+    AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(8));
+    AGENT_TEST_ASSERT(!q36_kvstore_quant_bits_valid(0));
+    AGENT_TEST_ASSERT(!q36_kvstore_quant_bits_valid(7));
+    AGENT_TEST_ASSERT(!q36_kvstore_quant_bits_valid(9));
+
+    char path[PATH_MAX];
+    const char *home = getenv("HOME");
+    AGENT_TEST_ASSERT(agent_expand_home_path("/tmp/x", path, sizeof(path)));
+    AGENT_TEST_ASSERT(!strcmp(path, "/tmp/x"));
+    if (home && home[0]) {
+        AGENT_TEST_ASSERT(agent_expand_home_path("~/x", path, sizeof(path)));
+        char expected[PATH_MAX];
+        snprintf(expected, sizeof(expected), "%s/x", home);
+        AGENT_TEST_ASSERT(!strcmp(path, expected));
+    }
+}
+
 static void test_agent_welcome_banner(void) {
     agent_config cfg = {0};
     char banner[256];
@@ -6597,6 +6694,7 @@ static void q36_agent_unit_tests_run(void) {
     test_agent_edit_upto_prompt_is_opt_in();
     test_agent_tool_error_recovery();
     test_agent_streaming_defaults();
+    test_agent_context_pressure_helpers();
     test_agent_welcome_banner();
 }
 #endif
@@ -6843,6 +6941,9 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    char expanded[PATH_MAX];
+    if (!agent_expand_home_path(path, expanded, sizeof(expanded)))
+        return xstrdup("Tool error: search path is too long\n");
     const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,
@@ -6867,7 +6968,7 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         }
         ctx.regex_ready = true;
     }
-    agent_search_path(&ctx, path, 0);
+    agent_search_path(&ctx, expanded, 0);
     if (ctx.regex_ready) regfree(&ctx.regex);
     if (!ctx.out.ptr) agent_buf_puts(&ctx.out, "No matches\n");
     else {
@@ -7656,14 +7757,8 @@ static char *agent_bash_jobs_compaction_observation(agent_worker *w) {
  * tool result.  The fixed free-token threshold is capped proportionally for
  * smaller contexts so tests with tiny contexts still compact rather than fail. */
 static bool agent_worker_should_compact(agent_worker *w) {
-    int ctx = w->cfg->gen.ctx_size;
-    int used = w->transcript.len;
-    if (ctx <= 0 || used <= 0) return false;
-    if (used >= (ctx * AGENT_COMPACT_SOFT_PERCENT) / 100) return true;
-    int free_threshold = AGENT_COMPACT_MIN_FREE_TOKENS;
-    int proportional = ctx / 4;
-    if (free_threshold > proportional) free_threshold = proportional;
-    return ctx - used <= free_threshold;
+    return agent_context_should_compact(w->cfg->gen.ctx_size,
+                                        w->transcript.len);
 }
 
 static int agent_special_token_id(q36_engine *engine, const char *rendered) {
@@ -8097,8 +8192,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * the tool result as a tool message, then ask the model to continue. */
     int consecutive_failures = 0;
     for (int tool_round = 0; ; tool_round++) {
-        if (tool_round > 0 &&
-            !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
+        if (!agent_worker_compact_if_needed(w, "soft limit before generation",
                                             compact_err, sizeof(compact_err)))
         {
             if (agent_err_is_interrupted(compact_err)) {
@@ -8187,6 +8281,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool got_tool = false;
         bool malformed_tool = false;
         bool early_tool_error = false;
+        bool compact_after_generation = false;
         int generated = 0;
         double t0 = now_sec();
 
@@ -8198,6 +8293,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
+        int think_close_id = agent_special_token_id(w->engine, "</think>");
+        int think_close_start = cfg->gen.thinking_budget;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
             bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
@@ -8205,7 +8302,27 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;
             }
-            int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            int close_rank = 0;
+            int close_rank_limit = 0;
+            bool in_think = think_close_id >= 0 &&
+                            q36_session_in_think(w->session);
+            if (in_think) {
+                close_rank_limit = agent_think_close_rank_limit(generated,
+                                                                think_close_start);
+                if (close_rank_limit > 0)
+                    close_rank = q36_session_token_rank(
+                        w->session, think_close_id, close_rank_limit);
+            }
+            bool hard_close = in_think && generated + 1 >= max_tokens;
+            int token = close_rank > 0 || hard_close ? think_close_id :
+                worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            if (close_rank > 0)
+                agent_trace(w,
+                    "closing thinking at token=%d rank=%d accepted_rank=%d",
+                    generated, close_rank, close_rank_limit);
+            else if (hard_close)
+                agent_trace(w, "closing thinking at hard token budget=%d",
+                            max_tokens);
             token = q36_session_eos_to_think_close(w->session, token);
             if (token == q36_token_eos(w->engine)) break;
 
@@ -8257,6 +8374,23 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 malformed_tool = true;
                 break;
             }
+            if (agent_worker_should_compact(w) &&
+                !stream.qwen_tool_active && stream.qwen_tool_start_len == 0) {
+                if (q36_session_in_think(w->session) && generated < max_tokens) {
+                    int close = q36_session_eos_to_think_close(
+                        w->session, q36_token_eos(w->engine));
+                    if (close != q36_token_eos(w->engine) &&
+                        worker_accept_generated_token(w, close, &generated, t0,
+                                                      &stream, err,
+                                                      sizeof(err)) != 0) {
+                        agent_qwen_tool_parser_free(&qwen_tool);
+                        agent_set_error(w, err);
+                        return 1;
+                    }
+                }
+                compact_after_generation = true;
+                break;
+            }
         }
 
         bool interrupted = worker_should_interrupt(w);
@@ -8290,6 +8424,28 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         q36_tokens_push(&w->transcript, q36_token_eos(w->engine));
+
+        if (compact_after_generation && !got_tool && !malformed_tool &&
+            !early_tool_error) {
+            agent_qwen_tool_parser_free(&qwen_tool);
+            if (!agent_worker_compact(w, "soft limit during assistant generation",
+                                      compact_err, sizeof(compact_err))) {
+                if (agent_err_is_interrupted(compact_err)) {
+                    worker_clear_interrupt(w);
+                    agent_set_status(w, AGENT_WORKER_IDLE);
+                    return 0;
+                }
+                agent_set_error(w, compact_err[0] ? compact_err :
+                                "context compaction failed");
+                return 1;
+            }
+            q36_chat_append_message(
+                w->engine, &w->transcript, "system",
+                "Automatic context compaction paused the previous assistant "
+                "response. Continue the current user task from the durable "
+                "summary and recent transcript.");
+            continue;
+        }
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_qwen_tool_parser_free(&qwen_tool);
@@ -10629,13 +10785,35 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
 #ifndef Q36_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
-    if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
-        fprintf(stderr, "q36-agent: failed to chdir to %s: %s\n",
-                cfg.chdir_path, strerror(errno));
-        return 1;
+    char workdir[PATH_MAX] = {0};
+    if (cfg.chdir_path) {
+        struct stat st;
+        if (!agent_expand_home_path(cfg.chdir_path, workdir, sizeof(workdir))) {
+            fprintf(stderr, "q36-agent: failed to chdir to %s: path is too long\n",
+                    cfg.chdir_path);
+            return 1;
+        }
+        if (stat(workdir, &st) != 0) {
+            fprintf(stderr, "q36-agent: failed to chdir to %s: %s\n",
+                    cfg.chdir_path, strerror(errno));
+            return 1;
+        }
+        if (!S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "q36-agent: failed to chdir to %s: not a directory\n",
+                    cfg.chdir_path);
+            return 1;
+        }
     }
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &cfg.engine) != 0) return 1;
+    if (cfg.chdir_path) {
+        if (chdir(workdir) != 0) {
+            fprintf(stderr, "q36-agent: failed to chdir to %s: %s\n",
+                    cfg.chdir_path, strerror(errno));
+            q36_engine_close(engine);
+            return 1;
+        }
+    }
     agent_apply_sampling_defaults(&cfg, engine);
     log_context_memory(cfg.engine.backend,
                        cfg.gen.ctx_size,
