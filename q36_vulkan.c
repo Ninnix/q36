@@ -6423,7 +6423,13 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
             q36_vk_use_attn_qtile()) {
             uint32_t n_spans = (kv_max + 511u) / 512u;
             uint32_t n_groups = (n_spans + 7u) / 8u;
-            uint32_t attn_chunk = n_groups > 1u ? 512u : n_tok;
+            uint32_t attn_chunk = n_tok;
+            /* Eager submits bound command buffers, not a dispatch itself. */
+            if (n_groups > 1u) {
+                attn_chunk = (5u * 512u) / n_groups;
+                if (attn_chunk > 512u) attn_chunk = 512u;
+                if (attn_chunk == 0u) attn_chunk = 1u;
+            }
             uint64_t part_bytes = (uint64_t)attn_chunk * n_head * n_groups *
                                   (head_dim + 2u) * sizeof(float);
             struct {
@@ -6467,7 +6473,7 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
             /* Long attention makes a dispatch-count batch exceed AMDGPU's
              * scheduler timeout.  Keep each heavy slice in its own queued
              * command buffer; the ring still records ahead of the GPU. */
-            bool submit_slices = n_groups >= 7u;
+            bool submit_slices = n_groups >= 5u;
             if (ok && submit_slices) ok = q36_vk_submit_eager_unlocked();
             for (uint32_t tok0 = 0; ok && tok0 < n_tok; tok0 += attn_chunk) {
                 uint32_t chunk = n_tok - tok0;

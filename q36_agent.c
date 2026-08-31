@@ -5645,8 +5645,7 @@ static bool agent_parse_bool_default(const char *s, bool def) {
 #define AGENT_TOOL_RESULT_RESERVE_TOKENS 1024
 #define AGENT_EDIT_UPTO_MIN_PREFIX_BYTES 64
 #define AGENT_EDIT_UPTO_MIN_PREFIX_LINES 2
-/* Leave room for the private summary without crossing the next KV growth tier. */
-#define AGENT_COMPACT_SOFT_PERCENT 70
+#define AGENT_COMPACT_SOFT_PERCENT 85
 #define AGENT_COMPACT_MIN_FREE_TOKENS 8192
 #define AGENT_COMPACT_TAIL_DIVISOR 10
 #define AGENT_COMPACT_TAIL_CAP_TOKENS 50000
@@ -5656,7 +5655,7 @@ static bool agent_context_should_compact(int ctx, int used) {
     if (ctx <= 0 || used <= 0) return false;
     if (used >= (ctx * AGENT_COMPACT_SOFT_PERCENT) / 100) return true;
     int free_threshold = AGENT_COMPACT_MIN_FREE_TOKENS;
-    int proportional = ctx / 4;
+    int proportional = ctx / 8;
     if (free_threshold > proportional) free_threshold = proportional;
     return ctx - used <= free_threshold;
 }
@@ -6639,10 +6638,10 @@ static void test_agent_streaming_defaults(void) {
 }
 
 static void test_agent_context_pressure_helpers(void) {
-    AGENT_TEST_ASSERT(!agent_context_should_compact(100000, 69999));
-    AGENT_TEST_ASSERT(agent_context_should_compact(100000, 70000));
-    AGENT_TEST_ASSERT(!agent_context_should_compact(64000, 44799));
-    AGENT_TEST_ASSERT(agent_context_should_compact(64000, 44800));
+    AGENT_TEST_ASSERT(!agent_context_should_compact(100000, 84999));
+    AGENT_TEST_ASSERT(agent_context_should_compact(100000, 85000));
+    AGENT_TEST_ASSERT(!agent_context_should_compact(64000, 54399));
+    AGENT_TEST_ASSERT(agent_context_should_compact(64000, 54400));
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(49999, 50000) == 0);
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(50000, 50000) == 1);
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(50512, 50000) == 2);
