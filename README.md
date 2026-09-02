@@ -156,6 +156,24 @@ Start dense Qwen3.8-27B explicitly:
   --vulkan
 ```
 
+### Vision
+
+Q36 accepts the matching Qwen3-VL projector as a disk-backed sidecar. It maps
+the file without copying the model and streams one weight tensor at a time
+through a reusable Vulkan buffer. The full 0.9 GiB projector is never retained
+in RAM or VRAM, and streamed pages are released after each dispatch.
+
+```sh
+./q36 --vision gguf/Qwen3.6-35B-A3B-mmproj-F16.gguf
+./q36 -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf \
+  --vision gguf/Qwen3.8-27B-mmproj-F16.gguf
+```
+
+At the interactive prompt, `/read photo.jpg` and `/read image.png` submit an
+image turn. JPEG and PNG decoding is built in. The sidecar output dimension is
+validated against the selected standard or dense language model before use.
+Vision prompt execution currently requires Vulkan.
+
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
 majority of all the model space: the other components (shared experts,
@@ -201,6 +219,9 @@ make metal            # macOS / Apple Silicon
 The normal and CPU-only builds are self-contained. They do not require a
 llama.cpp checkout or GGML libraries; those are used only by explicit optional
 reference targets under `make test-llama` and `make test-vectors-local`.
+
+The vendored JPEG/PNG decoder in `third_party/iris` is Copyright (c) 2026
+Salvatore Sanfilippo and distributed under its included MIT license.
 
 `gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf` is
 the default model path used by all runtime binaries. Pass `-m` to select another

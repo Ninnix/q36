@@ -141,6 +141,8 @@ typedef struct {
     char shader_root[PATH_MAX];
 
     q36_vk_kernel matmul_f16;
+    q36_vk_kernel vision_matmul_f16;
+    q36_vk_kernel vision_attention;
     q36_vk_kernel matmul_f32;
     q36_vk_kernel matmul_f32_fast;
     q36_vk_kernel add;
@@ -150,6 +152,7 @@ typedef struct {
     q36_vk_kernel swiglu;
     q36_vk_kernel swiglu_q8_k;
     q36_vk_kernel rope;
+    q36_vk_kernel rope_mrope;
     q36_vk_kernel rms_norm_rope;
     q36_vk_kernel rms_norm_rope_kv;
     q36_vk_kernel copy_rows;
@@ -401,6 +404,7 @@ enum {
     Q36_VK_MAX_THREADS = 32,
 };
 static q36_gpu_tensor *q36_vk_pool[Q36_VK_POOL_CAP];
+static q36_gpu_tensor *q36_vk_vision_weight;
 static uint32_t q36_vk_pool_n;
 static q36_gpu_tensor *q36_vk_private_pool[Q36_VK_PRIVATE_POOL_CAP];
 static uint32_t q36_vk_private_pool_n;
@@ -2793,6 +2797,8 @@ int q36_gpu_init(void) {
      * tracker uses it so host reads of input-only tensors do not submit
      * the open batch. */
     q36_vk.matmul_f16 = Q36_VK_KERNEL("vulkan/matmul_f16.spv", 3, 16, 1u << 2);
+    q36_vk.vision_matmul_f16 = Q36_VK_KERNEL("vulkan/vision_matmul_f16.spv", 3, 16, 1u << 2);
+    q36_vk.vision_attention = Q36_VK_KERNEL("vulkan/vision_attention.spv", 2, 4, 1u << 1);
     q36_vk.matmul_f32 = Q36_VK_KERNEL("vulkan/matmul_f32.spv", 3, 16, 1u << 2);
     q36_vk.matmul_f32_fast = Q36_VK_KERNEL("vulkan/matmul_f32_fast.spv", 3, 16, 1u << 2);
     q36_vk.add = Q36_VK_KERNEL("vulkan/add.spv", 3, 4, 1u << 2);
@@ -2803,6 +2809,7 @@ int q36_gpu_init(void) {
     q36_vk.swiglu_q8_k = Q36_VK_KERNEL("vulkan/swiglu_q8_k.spv", 4, 20,
                                         (1u << 2) | (1u << 3));
     q36_vk.rope = Q36_VK_KERNEL("vulkan/rope_qwen.spv", 1, 16, 1u << 0);
+    q36_vk.rope_mrope = Q36_VK_KERNEL("vulkan/rope_qwen_mrope.spv", 2, 12, 1u << 0);
     q36_vk.rms_norm_rope = Q36_VK_KERNEL("vulkan/rms_norm_rope_qwen.spv", 3, 24, 1u << 2);
     q36_vk.rms_norm_rope_kv = Q36_VK_KERNEL("vulkan/rms_norm_rope_kv_qwen.spv", 5, 24,
                                             (1u << 2) | (1u << 4));
@@ -3224,6 +3231,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_completed_seq = 0;
     q36_vk_hazard_reset();
     q36_vk_b16_ring_destroy_unlocked();
+    q36_vk_tensor_free_unlocked(q36_vk_vision_weight);
+    q36_vk_vision_weight = NULL;
     while (q36_vk_retired_n) q36_vk_tensor_free_unlocked(q36_vk_retired[--q36_vk_retired_n]);
     while (q36_vk_pool_n) q36_vk_tensor_free_unlocked(q36_vk_pool[--q36_vk_pool_n]);
     while (q36_vk_private_pool_n)
@@ -3302,6 +3311,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.copy_rows);
     q36_vk_kernel_destroy(&q36_vk.rms_norm_rope_kv);
     q36_vk_kernel_destroy(&q36_vk.rms_norm_rope);
+    q36_vk_kernel_destroy(&q36_vk.rope_mrope);
     q36_vk_kernel_destroy(&q36_vk.rope);
     q36_vk_kernel_destroy(&q36_vk.swiglu);
     q36_vk_kernel_destroy(&q36_vk.swiglu_q8_k);
@@ -3332,6 +3342,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.matmul_f32);
     q36_vk_kernel_destroy(&q36_vk.matmul_f32_fast);
     q36_vk_kernel_destroy(&q36_vk.matmul_f16);
+    q36_vk_kernel_destroy(&q36_vk.vision_matmul_f16);
+    q36_vk_kernel_destroy(&q36_vk.vision_attention);
     for (uint32_t i = 0; i < Q36_VK_CB_RING; i++) {
         if (q36_vk_ring[i].pool) vkDestroyDescriptorPool(q36_vk.device, q36_vk_ring[i].pool, NULL);
         if (q36_vk_ring[i].fence) vkDestroyFence(q36_vk.device, q36_vk_ring[i].fence, NULL);
@@ -3964,6 +3976,63 @@ int q36_gpu_matmul_f16_tensor(q36_gpu_tensor *out,
     if (!q36_u64_mul_ok(in_dim, out_dim, &elems)) return 0;
     return q36_vk_matmul_dense(&q36_vk.matmul_f16, out, model_map, model_size, weight_offset,
                                elems * sizeof(uint16_t), in_dim, out_dim, x, n_tok, 1.0f);
+}
+
+int q36_gpu_vision_stream_init(uint64_t max_weight_bytes) {
+    if (q36_vk_vision_weight && q36_vk_vision_weight->bytes >= max_weight_bytes)
+        return 1;
+    q36_gpu_tensor_free(q36_vk_vision_weight);
+    q36_vk_vision_weight = q36_gpu_tensor_alloc_uninitialized(max_weight_bytes);
+    return q36_vk_vision_weight != NULL;
+}
+
+int q36_gpu_vision_matmul_f16_disk(q36_gpu_tensor *out, int fd,
+                                   uint64_t offset, uint64_t in_dim,
+                                   uint64_t out_dim,
+                                   const q36_gpu_tensor *x,
+                                   uint64_t n_tok) {
+    uint64_t weight_bytes = in_dim * out_dim * sizeof(uint16_t);
+    if (!q36_vk_vision_weight || weight_bytes > q36_vk_vision_weight->bytes ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX)
+        return 0;
+    unsigned char *dst = q36_gpu_tensor_contents_named(
+        q36_vk_vision_weight, "submit_wait_vision_weight_reuse");
+    if (!dst) return 0;
+    uint64_t done = 0;
+    while (done < weight_bytes) {
+        ssize_t n = pread(fd, dst + done, (size_t)(weight_bytes - done),
+                          (off_t)(offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 0;
+        done += (uint64_t)n;
+    }
+    pthread_mutex_lock(&q36_vk_mu);
+    struct {
+        uint32_t in_dim;
+        uint32_t out_dim;
+        uint32_t n_tok;
+        float scale;
+    } push = {(uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, 1.0f};
+    const q36_gpu_tensor *bindings[3] = {q36_vk_vision_weight, x, out};
+    int ok = q36_vk_run_unlocked("vision_f16", &q36_vk.vision_matmul_f16,
+                                 bindings, &push, sizeof(push),
+                                 ((uint32_t)out_dim + 15u) / 16u,
+                                 ((uint32_t)n_tok + 15u) / 16u, 1);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+
+int q36_gpu_vision_attention(q36_gpu_tensor *out,
+                             const q36_gpu_tensor *qkv,
+                             uint32_t rows) {
+    if (!out || !qkv || !rows) return 0;
+    struct { uint32_t rows; } push = {rows};
+    const q36_gpu_tensor *bindings[2] = {qkv, out};
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok = q36_vk_run_unlocked("vision_attention", &q36_vk.vision_attention,
+                                 bindings, &push, sizeof(push), rows, 16u, 1u);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
 }
 
 /* The f32 tensors in this model are the small control projections (expert
@@ -5636,6 +5705,31 @@ int q36_gpu_rope_qwen_rows_tensor(q36_gpu_tensor *x,
     return ok;
 }
 
+int q36_gpu_rope_qwen_mrope_rows_tensor(q36_gpu_tensor *x,
+                                        uint32_t n_head,
+                                        const uint32_t *positions,
+                                        uint32_t n_tok) {
+    if (n_head == 0 || n_tok == 0 || !positions) return 0;
+    q36_gpu_tensor *gpos = q36_gpu_tensor_alloc((uint64_t)n_tok * 3u * sizeof(*positions));
+    if (!gpos || !q36_gpu_tensor_write(gpos, 0, positions,
+                                        (uint64_t)n_tok * 3u * sizeof(*positions))) {
+        q36_gpu_tensor_free(gpos);
+        return 0;
+    }
+    struct {
+        uint32_t n_head;
+        uint32_t head_dim;
+        uint32_t n_tok;
+    } push = { n_head, Q36_VK_N_HEAD_DIM, n_tok };
+    const q36_gpu_tensor *bindings[2] = { x, gpos };
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok = q36_vk_run_unlocked("attn_mrope", &q36_vk.rope_mrope,
+                                 bindings, &push, sizeof(push), n_head, n_tok, 1);
+    pthread_mutex_unlock(&q36_vk_mu);
+    q36_gpu_tensor_free(gpos);
+    return ok;
+}
+
 int q36_gpu_rms_norm_rope_qwen_rows_tensor(q36_gpu_tensor *dst,
                                            const q36_gpu_tensor *src,
                                            const void *model_map,
@@ -6249,7 +6343,7 @@ int q36_gpu_attn_kv_store_tensor(q36_gpu_tensor *k_cache,
      * avoiding the host round-trip that costs ~200 pipeline flushes per run. */
     if (!q36_gpu_quality &&
         (k_row % 32u) == 0u && (v_row % 32u) == 0u &&
-        k_row <= 512u && v_row <= 512u && /* sh_row staging: 16 blocks max */
+        k_row <= 1024u && v_row <= 1024u &&
         k_cache_type >= 1u && k_cache_type <= 2u &&
         v_cache_type >= 1u && v_cache_type <= 2u &&
         q36_vk_env_default_on("Q36_VK_GPU_KV_STORE")) {

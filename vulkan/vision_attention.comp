@@ -1,0 +1,45 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 1) writeonly buffer Output { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+} pc;
+
+shared float dotv[128];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    uint d = lane;
+    uint qbase = row * 3456u + head * 72u;
+    float acc = 0.0;
+    float high = -3.402823466e38;
+    float denom = 0.0;
+    for (uint kr = 0; kr < pc.rows; kr++) {
+        uint kbase = kr * 3456u + 1152u + head * 72u;
+        dotv[lane] = d < 72u ? qkv[qbase + d] * qkv[kbase + d] : 0.0;
+        barrier();
+        for (uint stride = 64u; stride != 0u; stride >>= 1u) {
+            if (lane < stride) dotv[lane] += dotv[lane + stride];
+            barrier();
+        }
+        float score = dotv[0] * 0.1178511301977579;
+        float next = max(high, score);
+        float old_scale = kr == 0u ? 0.0 : exp(high - next);
+        float new_scale = exp(score - next);
+        denom = denom * old_scale + new_scale;
+        if (d < 72u) {
+            uint vbase = kr * 3456u + 2304u + head * 72u;
+            acc = acc * old_scale + new_scale * qkv[vbase + d];
+        }
+        high = next;
+        barrier();
+    }
+    if (d < 72u)
+        outv[row * 1152u + head * 72u + d] = acc / denom;
+}

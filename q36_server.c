@@ -111,6 +111,25 @@ static bool random_bytes(void *dst, size_t len) {
     return true;
 }
 
+static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
+    unsigned char bytes[12];
+    size_t pos = snprintf(dst, dstlen, "%s", prefix);
+    static uint64_t fallback_ctr;
+    if (pos >= dstlen) return;
+    if (!random_bytes(bytes, sizeof(bytes))) {
+        uint64_t a = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+        uint32_t b = (uint32_t)(++fallback_ctr ^ (uint64_t)(uintptr_t)dst);
+        memcpy(bytes, &a, sizeof(a));
+        memcpy(bytes + sizeof(a), &b, sizeof(b));
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes) && pos + 1 < dstlen; i++) {
+        dst[pos++] = hex[bytes[i] >> 4];
+        if (pos + 1 < dstlen) dst[pos++] = hex[bytes[i] & 15];
+    }
+    dst[pos] = '\0';
+}
+
 static char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
@@ -5672,7 +5691,6 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
-    uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -8394,16 +8412,12 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             kv_cache_note_store(slot, cold_store_len);
         }
     }
-    pthread_mutex_lock(&s->mu);
-    uint64_t request_seq = ++s->seq;
-    pthread_mutex_unlock(&s->mu);
     char id[96];
     if (j->req.api == API_RESPONSES) {
-        snprintf(id, sizeof(id), "resp_%llu", (unsigned long long)request_seq);
+        responses_random_id(id, sizeof(id), "resp_");
     } else {
-        snprintf(id, sizeof(id), "%s-%llu",
-                 j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-                 (unsigned long long)request_seq);
+        responses_random_id(id, sizeof(id),
+                            j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
     }
 
     bool structured_stream = request_uses_structured_stream(&j->req);
@@ -8446,8 +8460,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
-    uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ (request_seq << 1) ^ (uint64_t)(uintptr_t)j);
+    uint64_t rng = j->req.seed;
+    if (!rng && !random_bytes(&rng, sizeof(rng)))
+        rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
+    if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);

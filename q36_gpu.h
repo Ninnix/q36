@@ -44,6 +44,15 @@ int q36_gpu_tensor_read(const q36_gpu_tensor *tensor, uint64_t offset, void *dat
 int q36_gpu_tensor_copy(q36_gpu_tensor *dst, uint64_t dst_offset,
                           const q36_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int q36_gpu_vision_stream_init(uint64_t max_weight_bytes);
+int q36_gpu_vision_matmul_f16_disk(q36_gpu_tensor *out, int fd,
+                                   uint64_t offset, uint64_t in_dim,
+                                   uint64_t out_dim,
+                                   const q36_gpu_tensor *x,
+                                   uint64_t n_tok);
+int q36_gpu_vision_attention(q36_gpu_tensor *out,
+                             const q36_gpu_tensor *qkv,
+                             uint32_t rows);
 
 int q36_gpu_begin_commands(void);
 int q36_gpu_flush_commands(void);
@@ -416,6 +425,12 @@ int q36_gpu_rope_qwen_rows_tensor(
         q36_gpu_tensor *x,
         uint32_t          n_head,
         uint32_t          pos0,
+        uint32_t          n_tok);
+
+int q36_gpu_rope_qwen_mrope_rows_tensor(
+        q36_gpu_tensor *x,
+        uint32_t          n_head,
+        const uint32_t   *positions,
         uint32_t          n_tok);
 
 int q36_gpu_rms_norm_rope_qwen_rows_tensor(

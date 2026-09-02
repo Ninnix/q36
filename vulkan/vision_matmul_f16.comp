@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer Input { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint in_dim;
+    uint out_dim;
+    uint n_tok;
+    float scale;
+} pc;
+
+shared float wt[16][16];
+shared float xt[16][16];
+
+float f16_at(uint i) {
+    uint v = w[i >> 1];
+    uint h = (i & 1u) == 0u ? v & 0xffffu : v >> 16;
+    return unpackHalf2x16(h).x;
+}
+
+void main() {
+    uint o = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    uint r = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+    float sum = 0.0;
+    for (uint base = 0; base < pc.in_dim; base += 16u) {
+        uint kx = base + gl_LocalInvocationID.y;
+        uint ky = base + gl_LocalInvocationID.x;
+        wt[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            o < pc.out_dim && kx < pc.in_dim ?
+            f16_at(o * pc.in_dim + kx) : 0.0;
+        xt[gl_LocalInvocationID.y][gl_LocalInvocationID.x] =
+            r < pc.n_tok && ky < pc.in_dim ?
+            x[r * pc.in_dim + ky] : 0.0;
+        barrier();
+        for (uint k = 0; k < 16u; k++)
+            sum += xt[gl_LocalInvocationID.y][k] *
+                   wt[k][gl_LocalInvocationID.x];
+        barrier();
+    }
+    if (r < pc.n_tok && o < pc.out_dim)
+        y[r * pc.out_dim + o] = sum * pc.scale;
+}

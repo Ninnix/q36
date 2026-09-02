@@ -461,6 +461,16 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
+static bool parse_steering_level(const char *arg, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(arg, &end);
+    if (!arg[0] || *end || errno == ERANGE || !isfinite(v) ||
+        v < -100.0f || v > 100.0f) return false;
+    *out = v;
+    return true;
+}
+
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -476,6 +486,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/steer") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -9157,6 +9168,7 @@ typedef struct {
     int reserved_rows;
     bool output_cursor_saved;
     bool output_at_scroll_boundary;
+    agent_input_buf deferred_output;
     double last_prompt_redraw_time;
     char cpr_buf[32];
     size_t cpr_len;
@@ -9169,6 +9181,10 @@ typedef struct {
 static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len);
 static void editor_hide(agent_editor *ed);
 static void editor_show(agent_editor *ed);
+static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
+                                                       const char *text,
+                                                       size_t len,
+                                                       bool settle_boundary);
 
 typedef enum {
     CPR_INVALID,
@@ -9725,6 +9741,8 @@ static int editor_start(agent_editor *ed, const char *prompt,
 /* Stop the live editor and restore stdin flags. */
 static void editor_stop(agent_editor *ed) {
     if (!ed->active) return;
+    if (ed->deferred_output.len)
+        editor_write_scroll_output_preserve_prompt(ed, NULL, 0, true);
     /* q36-agent treats linenoise as a live input widget, not as persistent
      * command scrollback.  Clear it before shutdown so submitting a line and
      * immediately reopening the editor does not leave the accepted
@@ -9845,22 +9863,39 @@ static bool editor_prompt_redraw_due(agent_editor *ed) {
     return false;
 }
 
-static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
+static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
                                                        const char *text,
-                                                       size_t len) {
+                                                       size_t len,
+                                                       bool settle_boundary) {
     static const char sync_start[] = "\x1b[?2026h";
     static const char sync_end[] = "\x1b[?2026l";
-    if (!len) return;
+    agent_input_buf_append(&ed->deferred_output, text, len);
+    if (!ed->deferred_output.len) return false;
+
+    agent_editor predicted = *ed;
+    editor_note_output(&predicted, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    bool at_boundary = predicted.output_line_open && predicted.output_col == 0;
+    if (at_boundary && !settle_boundary) return false;
 
     write_all(STDOUT_FILENO, sync_start, sizeof(sync_start) - 1);
     editor_restore_output_cursor(ed);
-    editor_write_terminal_text(text, len);
-    editor_note_output(ed, text, len);
+    editor_write_terminal_text(ed->deferred_output.ptr,
+                               ed->deferred_output.len);
+    editor_note_output(ed, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    if (at_boundary) {
+        write_all(STDOUT_FILENO, "\r\n", 2);
+        ed->output_col = 0;
+        ed->output_line_open = false;
+    }
+    agent_input_buf_free(&ed->deferred_output);
     editor_save_output_cursor(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     editor_move_to_prompt_cursor(ed);
     write_all(STDOUT_FILENO, sync_end, sizeof(sync_end) - 1);
     ed->output_at_scroll_boundary = true;
+    return true;
 }
 
 /* Serialize async model/tool output with linenoise.  This is the central
@@ -9871,11 +9906,12 @@ static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
 static void editor_write_async(agent_editor *ed, const char *text, size_t len,
                                const char *prompt, const char *status,
                                bool force_show) {
-    if (ed->scroll_region && ed->active && !ed->hidden && len) {
+    if (ed->scroll_region && ed->active && !ed->hidden &&
+        (len || ed->deferred_output.len)) {
         bool prompt_changed = strcmp(ed->prompt, prompt) != 0;
         bool status_changed = strcmp(ed->status, status ? status : "") != 0;
 
-        editor_write_scroll_output_preserve_prompt(ed, text, len);
+        editor_write_scroll_output_preserve_prompt(ed, text, len, force_show);
         if (prompt_changed) editor_update_prompt(ed, prompt);
         if (status_changed) editor_update_status(ed, status);
         if ((force_show || editor_prompt_redraw_due(ed)) &&
@@ -9946,6 +9982,7 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /steer [F]   Show or set FFN steering for subsequent tokens.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -10448,7 +10485,7 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
         build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-        if (out && out_len) {
+        if ((out && out_len) || editor.deferred_output.len) {
             bool force_show = st.state == AGENT_WORKER_IDLE ||
                               st.state == AGENT_WORKER_ERROR ||
                               st.state == AGENT_WORKER_STOPPED;
@@ -10619,6 +10656,28 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
                             printf("usage: /power <1..100>\n");
                         } else {
                             worker_request_power(&worker, power);
+                        }
+                    }
+                } else if (!strncmp(cmd, "/steer", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 6;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            printf("Steering FFN: %g.\n",
+                                   (double)q36_session_directional_steering_ffn(
+                                       worker.session));
+                        } else {
+                            float scale = 0.0f;
+                            if (!parse_steering_level(arg, &scale)) {
+                                printf("usage: /steer <-100..100>\n");
+                            } else if (q36_session_set_directional_steering_ffn(
+                                           worker.session, scale) == 0) {
+                                worker.cfg->engine.directional_steering_ffn = scale;
+                                printf("Steering FFN: %g.\n", (double)scale);
+                            }
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {

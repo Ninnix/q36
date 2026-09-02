@@ -1,0 +1,48 @@
+#version 460
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer InputOutput {
+    float x[];
+};
+
+layout(set = 0, binding = 1) readonly buffer Positions {
+    uint pos[];
+};
+
+layout(push_constant) uniform Push {
+    uint n_head;
+    uint head_dim;
+    uint n_tok;
+} pc;
+
+void main(void) {
+    uint pair = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    if (pair >= 32u || head >= pc.n_head || tok >= pc.n_tok) return;
+    uint base = (tok * pc.n_head + head) * pc.head_dim;
+    float theta_scale = pow(10000000.0f, -2.0f / 64.0f);
+    float theta[4] = {
+        float(pos[tok * 3u]),
+        float(pos[tok * 3u + 1u]),
+        float(pos[tok * 3u + 2u]),
+        0.0f
+    };
+    for (uint i = 0u; i < pair; i++) {
+        theta[0] *= theta_scale;
+        theta[1] *= theta_scale;
+        theta[2] *= theta_scale;
+        theta[3] *= theta_scale;
+    }
+    uint axis = 3u;
+    if (pair % 3u == 1u && pair < 33u) axis = 1u;
+    else if (pair % 3u == 2u && pair < 30u) axis = 2u;
+    else if (pair % 3u == 0u && pair < 33u) axis = 0u;
+    float c = cos(theta[axis]);
+    float s = sin(theta[axis]);
+    float x0 = x[base + pair];
+    float x1 = x[base + pair + 32u];
+    x[base + pair] = x0 * c - x1 * s;
+    x[base + pair + 32u] = x0 * s + x1 * c;
+}

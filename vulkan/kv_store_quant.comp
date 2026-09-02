@@ -27,7 +27,7 @@ const uint QK = 32u;
 /* All shared vars at global scope */
 shared float sh_blk[32];   /* one block of source values */
 shared float sh_extreme;   /* reduction result for current block */
-shared uint  sh_row[144];  /* staging: up to 576 bytes */
+shared uint  sh_row[272];  /* staging: up to 1088 bytes */
 
 int nearest_int(float f) {
     precise float g = f + 12582912.0;  /* keep the fma contractor away */

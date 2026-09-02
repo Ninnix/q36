@@ -10,6 +10,8 @@
 
 #define Q36_DEFAULT_MODEL_FILE "Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 #define Q36_DEFAULT_MODEL_PATH "gguf/" Q36_DEFAULT_MODEL_FILE
+#define Q36_DEFAULT_VISION_PATH "gguf/Qwen3.6-35B-A3B-mmproj-F16.gguf"
+#define Q36_DENSE_VISION_PATH "gguf/Qwen3.8-27B-mmproj-F16.gguf"
 #define Q36_CONTEXT_MAX 262144
 #define Q36_CONTEXT_ALLOC_MAX (Q36_CONTEXT_MAX + 1)
 
@@ -79,6 +81,7 @@ typedef bool (*q36_session_cancel_fn)(void *ud);
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *vision_path;
     q36_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
@@ -101,6 +104,21 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
 } q36_engine_options;
+
+typedef struct {
+    float *data;
+    uint32_t token_count;
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t width;
+    uint32_t height;
+    uint8_t fingerprint[32];
+} q36_vision_embedding;
+
+typedef struct {
+    uint32_t token_start;
+    q36_vision_embedding embedding;
+} q36_vision_span;
 
 typedef void (*q36_token_emit_fn)(void *ud, int token);
 typedef void (*q36_generation_done_fn)(void *ud);
@@ -136,6 +154,19 @@ int q36_engine_set_power(q36_engine *e, int power_percent);
 const char *q36_engine_model_name(q36_engine *e);
 int q36_engine_model_id(q36_engine *e);
 bool q36_engine_is_kat_coder(q36_engine *e);
+bool q36_engine_has_vision(q36_engine *e);
+int q36_engine_vision_encode_file(q36_engine *e, const char *path,
+                                  q36_vision_embedding *out,
+                                  char *err, size_t errlen);
+int q36_engine_vision_encode_memory(q36_engine *e,
+                                    const uint8_t *data, size_t len,
+                                    q36_vision_embedding *out,
+                                    char *err, size_t errlen);
+void q36_vision_embedding_free(q36_vision_embedding *embedding);
+int q36_prompt_append_vision(q36_engine *e, q36_tokens *prompt,
+                             q36_vision_span *span,
+                             q36_vision_embedding *embedding,
+                             char *err, size_t errlen);
 void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
                                   int *top_k, float *top_p, float *min_p);
 const char *q36_backend_name(q36_backend backend);
@@ -193,6 +224,11 @@ void q36_encode_chat_prompt(
         q36_tokens *out);
 void q36_chat_append_max_effort_prefix(q36_engine *e, q36_tokens *tokens);
 void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role, const char *content);
+int q36_chat_append_vision_message(q36_engine *e, q36_tokens *tokens,
+                                    const char *role, const char *content,
+                                    q36_vision_span *span,
+                                    q36_vision_embedding *embedding,
+                                    char *err, size_t errlen);
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode);
 
 char *q36_token_text(q36_engine *e, int token, size_t *len);
@@ -202,6 +238,8 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size);
 void q36_session_free(q36_session *s);
 int q36_session_power(q36_session *s);
 int q36_session_set_power(q36_session *s, int power_percent);
+float q36_session_directional_steering_ffn(q36_session *s);
+int q36_session_set_directional_steering_ffn(q36_session *s, float scale);
 void q36_session_set_progress(q36_session *s, q36_session_progress_fn fn, void *ud);
 void q36_session_set_display_progress(q36_session *s, q36_session_progress_fn fn, void *ud);
 void q36_session_set_cancel(q36_session *s, q36_session_cancel_fn fn, void *ud);
@@ -213,6 +251,10 @@ typedef enum {
 } q36_session_rewrite_result;
 
 int q36_session_sync(q36_session *s, const q36_tokens *prompt, char *err, size_t errlen);
+int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
+                            const q36_vision_span *images, size_t image_count,
+                            char *err, size_t errlen);
+bool q36_session_has_vision_state(const q36_session *s);
 bool q36_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 q36_session_rewrite_result q36_session_rewrite_from_common(
         q36_session *s, const q36_tokens *prompt, int common,

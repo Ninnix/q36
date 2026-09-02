@@ -4,11 +4,15 @@ set -e
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
 KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
 DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
+VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
 Q2_Q4_FILE="Qwen3.6-35B-A3B-Layers34-39Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-Q8Rest-imatrix.gguf"
 MTP_FILE="Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf"
 KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
+VISION_REMOTE="mmproj-F16.gguf"
+VISION_FILE="Qwen3.6-35B-A3B-mmproj-F16.gguf"
+DENSE_VISION_FILE="Qwen3.8-27B-mmproj-F16.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${Q36_GGUF_DIR:-"$ROOT/gguf"}
@@ -27,6 +31,8 @@ Usage:
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh kat-coder [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
+  ./download_model.sh qwen36-vision [--token TOKEN]
+  ./download_model.sh qwen38-vision [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
 
 Targets:
@@ -47,6 +53,14 @@ Targets:
 
   27b
        Dense Qwen3.8 27B Dynamic 3.0 IQ3_S quant from $DENSE_REPO.
+
+  qwen36-vision
+       Qwen3.6 35B A3B F16 vision projector from $VISION_REPO.
+       It is downloaded as $VISION_FILE and does not update ./q36moe.gguf.
+
+  qwen38-vision
+       Qwen3.8 27B F16 vision projector from $DENSE_REPO.
+       It is downloaded as $DENSE_VISION_FILE and does not update ./q36moe.gguf.
 
   mtp  Optional speculative decoding component for either main-model target.
        It must be enabled explicitly with --mtp when starting a runtime.
@@ -85,12 +99,25 @@ MODEL=$1
 shift
 LINK_MODEL=1
 MODEL_REPO=$REPO
+MODEL_REMOTE=
 
 case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_FILE ;;
     kat-coder) MODEL_REPO=$KAT_REPO; MODEL_FILE=$KAT_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
+    qwen36-vision)
+        MODEL_REPO=$VISION_REPO
+        MODEL_REMOTE=$VISION_REMOTE
+        MODEL_FILE=$VISION_FILE
+        LINK_MODEL=0
+        ;;
+    qwen38-vision)
+        MODEL_REPO=$DENSE_REPO
+        MODEL_REMOTE=$VISION_REMOTE
+        MODEL_FILE=$DENSE_VISION_FILE
+        LINK_MODEL=0
+        ;;
     mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
     -h|--help|help)
         usage
@@ -121,6 +148,10 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+if [ -z "$MODEL_REMOTE" ]; then
+    MODEL_REMOTE=$MODEL_FILE
+fi
 
 if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
     TOKEN=$(cat "$HOME/.cache/huggingface/token")
@@ -163,13 +194,21 @@ download_one() {
     mv "$part" "$out"
 }
 
-download_one "$MODEL_REPO" "$MODEL_FILE" "$MODEL_FILE"
+download_one "$MODEL_REPO" "$MODEL_REMOTE" "$MODEL_FILE"
 
 if [ "$MODEL" = "mtp" ]; then
     echo
     echo "MTP is an optional component for q2-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./q36 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
+elif [ "$MODEL" = "qwen36-vision" ]; then
+    echo
+    echo "Vision projector downloaded. Use it with the standard model:"
+    echo "  ./q36 --vision $OUT_DIR/$VISION_FILE"
+elif [ "$MODEL" = "qwen38-vision" ]; then
+    echo
+    echo "Vision projector downloaded. Use it with the dense model:"
+    echo "  ./q36 -m $OUT_DIR/$DENSE_FILE --vision $OUT_DIR/$DENSE_VISION_FILE"
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" q36moe.gguf

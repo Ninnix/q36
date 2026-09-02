@@ -88,6 +88,8 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --vision FILE\n"
+        "      Qwen3-VL mmproj sidecar. It remains disk-backed.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -897,6 +899,7 @@ static void print_repl_help(void) {
     puts("  /nothink       Disable thinking mode.");
     puts("  /clear         Clear the current chat history.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
@@ -915,7 +918,30 @@ typedef struct {
     int max_prefix_tokens;
     q36_think_mode enabled_think_mode;
     bool thinking_enabled;
+    q36_vision_span *images;
+    size_t image_count;
+    size_t image_cap;
 } repl_chat;
+
+static void repl_chat_trim_images(repl_chat *chat, size_t count) {
+    while (chat->image_count > count) {
+        chat->image_count--;
+        q36_vision_embedding_free(&chat->images[chat->image_count].embedding);
+    }
+}
+
+static q36_vision_span *repl_chat_add_image(repl_chat *chat) {
+    if (chat->image_count == chat->image_cap) {
+        size_t cap = chat->image_cap ? chat->image_cap * 2u : 4u;
+        void *p = realloc(chat->images, cap * sizeof(chat->images[0]));
+        if (!p) return NULL;
+        chat->images = p;
+        chat->image_cap = cap;
+    }
+    q36_vision_span *span = &chat->images[chat->image_count++];
+    memset(span, 0, sizeof(*span));
+    return span;
+}
 
 static q36_think_mode repl_chat_think_mode(const repl_chat *chat) {
     if (!chat->thinking_enabled) return Q36_THINK_NONE;
@@ -959,10 +985,14 @@ static void repl_chat_apply_max_prefix(q36_engine *engine, repl_chat *chat, bool
         q36_chat_append_max_effort_prefix(engine, &prefix);
         tokens_insert(&chat->transcript, 1, &prefix);
         chat->max_prefix_tokens = prefix.len;
+        for (size_t i = 0; i < chat->image_count; i++)
+            chat->images[i].token_start += (uint32_t)prefix.len;
         q36_tokens_free(&prefix);
         if (chat->session) q36_session_invalidate(chat->session);
     } else if (!enable && chat->max_prefix_tokens > 0) {
         tokens_remove(&chat->transcript, 1, chat->max_prefix_tokens);
+        for (size_t i = 0; i < chat->image_count; i++)
+            chat->images[i].token_start -= (uint32_t)chat->max_prefix_tokens;
         chat->max_prefix_tokens = 0;
         if (chat->session) q36_session_invalidate(chat->session);
     }
@@ -999,6 +1029,7 @@ static void repl_chat_reset(q36_engine *engine, repl_chat *chat, const cli_confi
     if (!chat) return;
     q36_session_invalidate(chat->session);
     q36_tokens_free(&chat->transcript);
+    repl_chat_trim_images(chat, 0);
     chat->max_prefix_tokens = 0;
     chat->enabled_think_mode = cfg->gen.think_mode == Q36_THINK_NONE ?
         Q36_THINK_HIGH : cfg->gen.think_mode;
@@ -1016,6 +1047,8 @@ static void repl_chat_free(repl_chat *chat) {
     if (!chat) return;
     q36_session_free(chat->session);
     q36_tokens_free(&chat->transcript);
+    repl_chat_trim_images(chat, 0);
+    free(chat->images);
     memset(chat, 0, sizeof(*chat));
 }
 
@@ -1030,7 +1063,8 @@ static int repl_chat_set_ctx(q36_engine *engine, repl_chat *chat, int ctx_size) 
  * and assistant markers, then q36_session_sync() decides whether this is a KV
  * continuation.  If prompt processing fails, the transcript rolls back before
  * returning to the prompt. */
-static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, const char *user_text) {
+static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat,
+                         const char *user_text, q36_vision_embedding *image) {
     if (!chat->session) {
         fprintf(stderr, "q36: no active interactive KV cache\n");
         return 1;
@@ -1041,7 +1075,22 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
     q36_think_mode think_mode = repl_chat_think_mode(chat);
     repl_chat_apply_max_prefix(engine, chat, think_mode == Q36_THINK_MAX);
     const int rollback_len = chat->transcript.len;
-    q36_chat_append_message(engine, &chat->transcript, "user", user_text);
+    const size_t rollback_images = chat->image_count;
+    char err[160] = {0};
+    if (image) {
+        q36_vision_span *span = repl_chat_add_image(chat);
+        if (!span || !q36_chat_append_vision_message(
+                engine, &chat->transcript, "user", user_text,
+                span, image, err, sizeof(err))) {
+            repl_chat_trim_images(chat, rollback_images);
+            chat->transcript.len = rollback_len;
+            fprintf(stderr, "q36: failed to add image: %s\n",
+                    err[0] ? err : "out of memory");
+            return 1;
+        }
+    } else {
+        q36_chat_append_message(engine, &chat->transcript, "user", user_text);
+    }
     q36_chat_append_assistant_prefix(engine, &chat->transcript, think_mode);
 
     const int old_pos = q36_session_pos(chat->session);
@@ -1049,7 +1098,6 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
     const int cached = common == old_pos && chat->transcript.len >= old_pos ? common : 0;
     const int suffix = chat->transcript.len - cached;
 
-    char err[160];
     cli_prefill_progress progress = {
         .base_tokens = cached,
         .input_tokens = suffix,
@@ -1057,9 +1105,14 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
     };
     const double t_prefill0 = cli_now_sec();
     q36_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
-    if (q36_session_sync(chat->session, &chat->transcript, err, sizeof(err)) != 0) {
+    int sync_rc = chat->image_count ? q36_session_sync_vision(
+        chat->session, &chat->transcript, chat->images, chat->image_count,
+        err, sizeof(err)) : q36_session_sync(
+        chat->session, &chat->transcript, err, sizeof(err));
+    if (sync_rc != 0) {
         q36_session_set_progress(chat->session, NULL, NULL);
         chat->transcript.len = rollback_len;
+        repl_chat_trim_images(chat, rollback_images);
         chat->thinking_enabled = old_thinking;
         repl_chat_apply_max_prefix(engine, chat,
                                    repl_chat_think_mode(chat) == Q36_THINK_MAX);
@@ -1161,6 +1214,16 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat, c
     return 0;
 }
 
+static bool cli_file_has_image_magic(const char *path) {
+    unsigned char magic[8] = {0};
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    size_t n = fread(magic, 1, sizeof(magic), fp);
+    fclose(fp);
+    return (n >= 8 && !memcmp(magic, "\x89PNG\r\n\x1a\n", 8)) ||
+           (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
+}
+
 static int run_repl(q36_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
@@ -1224,6 +1287,25 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
         } else if (!strcmp(cmd, "/clear")) {
             repl_chat_reset(engine, &chat, cfg);
             puts("Chat cleared.");
+        } else if (!strncmp(cmd, "/steer", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            if (!arg[0]) {
+                printf("Steering FFN: %g.\n",
+                       (double)q36_session_directional_steering_ffn(chat.session));
+            } else {
+                char *end = NULL;
+                errno = 0;
+                float scale = strtof(arg, &end);
+                if (*end || errno == ERANGE || !isfinite(scale) ||
+                    scale < -100.0f || scale > 100.0f) {
+                    fprintf(stderr, "q36: /steer must be between -100 and 100\n");
+                } else if (q36_session_set_directional_steering_ffn(
+                               chat.session, scale) == 0) {
+                    cfg->engine.directional_steering_ffn = scale;
+                    printf("Steering FFN: %g.\n", (double)scale);
+                }
+            }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {
@@ -1255,10 +1337,22 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {
                 fprintf(stderr, "q36: /read needs a file path\n");
+            } else if (cli_file_has_image_magic(path)) {
+                q36_vision_embedding image = {0};
+                char image_err[256] = {0};
+                if (!q36_engine_vision_encode_file(engine, path, &image,
+                                                   image_err, sizeof(image_err))) {
+                    fprintf(stderr, "q36: /read image failed: %s\n", image_err);
+                } else {
+                    fprintf(stderr, "q36: image %ux%u, %u image tokens\n",
+                            image.width, image.height, image.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &image);
+                    q36_vision_embedding_free(&image);
+                }
             } else {
                 char *prompt = read_prompt_file(path, false);
                 if (prompt) {
-                    rc = run_chat_turn(engine, cfg, &chat, prompt);
+                    rc = run_chat_turn(engine, cfg, &chat, prompt, NULL);
                     free(prompt);
                 }
             }
@@ -1266,7 +1360,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             fprintf(stderr, "q36: unknown command: %s\n", cmd);
             fprintf(stderr, "q36: type /help for commands\n");
         } else {
-            rc = run_chat_turn(engine, cfg, &chat, cmd);
+            rc = run_chat_turn(engine, cfg, &chat, cmd, NULL);
         }
         linenoiseFree(line);
     }
@@ -1379,6 +1473,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

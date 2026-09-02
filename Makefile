@@ -46,6 +46,8 @@ METAL_LDFLAGS := $(LDFLAGS) $(DARWIN_MIN_FLAG)
 METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
 	vulkan/matmul_f16.spv \
+	vulkan/vision_matmul_f16.spv \
+	vulkan/vision_attention.spv \
 	vulkan/matmul_f32.spv \
 	vulkan/matmul_f32_fast.spv \
 	vulkan/add.spv \
@@ -55,6 +57,7 @@ VULKAN_SHADERS := \
 	vulkan/swiglu.spv \
 	vulkan/swiglu_q8_k.spv \
 	vulkan/rope_qwen.spv \
+	vulkan/rope_qwen_mrope.spv \
 	vulkan/rms_norm_rope_qwen.spv \
 	vulkan/rms_norm_rope_kv_qwen.spv \
 	vulkan/copy_rows.spv \
@@ -291,9 +294,9 @@ vulkan/attn_prefill_qtile2.spv: vulkan/attn_prefill_qtile2.comp
 
 # Vulkan is the default backend. CORE_OBJS holds the GPU engine; CPU_CORE_OBJS
 # is the -DQ36_NO_GPU reference build selected by `make cpu`.
-CORE_OBJS := q36_gpu_core.o q36_vulkan.o
-METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o
-CPU_CORE_OBJS := q36_cpu.o
+CORE_OBJS := q36_gpu_core.o q36_vulkan.o q36_image.o
+METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o q36_image.o
+CPU_CORE_OBJS := q36_cpu.o q36_image.o
 
 .PHONY: all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-metal-gate benchmark-qwen27b-vulkan benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
@@ -341,7 +344,7 @@ metal: q36_cli_metal.o q36_server.o q36_bench.o q36_agent.o q36_eval.o q36_help.
 	$(CC) $(METAL_LDFLAGS) -o q36-bench q36_bench.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(METAL_LDFLAGS) -o q36-agent q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 	$(CC) $(METAL_LDFLAGS) -o q36-eval q36_eval.o q36_help.o q36_ssd.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
-	$(CC) $(METAL_LDFLAGS) -o q36_test q36_test_metal.o rax.o q36_ssd.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
+	$(CC) $(METAL_LDFLAGS) -o q36_test q36_test_metal.o rax.o q36_ssd.o q36_image.o q36_gpu_core_metal_test.o q36_metal.o $(METAL_LDLIBS)
 
 q36: q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_cli.o q36_ssd.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
@@ -376,10 +379,10 @@ cpu: q36_cli_cpu.o linenoise_cpu.o q36_server_cpu.o rax_cpu.o q36_bench_cpu.o q3
 	$(CC) $(CPU_CFLAGS) -o q36_test q36_test_cpu.o rax_cpu.o q36_ssd_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 # --- GPU (default) objects ---
-q36_gpu_core.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_gpu_core.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36.c
 
-q36_gpu_core_metal.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_gpu_core_metal.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36.c
 
 q36_gpu_core_metal_test.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
@@ -458,8 +461,11 @@ vulkan/matmul_q6k_mmq.spv: vulkan/matmul_q6k_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 # --- CPU-only objects (-DQ36_NO_GPU) ---
-q36_cpu.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_cpu.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36.c
+
+q36_image.o: q36_image.c q36_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	$(CC) $(GPU_CFLAGS) -c -o $@ q36_image.c
 
 q36_cli_cpu.o: q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_cli.c
@@ -497,7 +503,7 @@ q36_sampling_test_core.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tab
 tests/test_sampling.o: tests/test_sampling.c q36.h
 	$(CC) $(CPU_CFLAGS) -DQ36_TEST_HOOKS -I. -c -o $@ $<
 
-$(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o
+$(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o q36_image.o
 	$(CC) $(LDFLAGS) $(DARWIN_MIN_FLAG) -o $@ $^ $(LDLIBS)
 
 linenoise_cpu.o: linenoise.c linenoise.h
