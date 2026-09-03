@@ -6507,6 +6507,89 @@ static void test_vulkan_fusion_parity(void) {
     free(fused);
     free(fallback);
 }
+
+static float *test_capture_queue_logits(bool ace, int *vocab_out,
+                                        int *steps_out) {
+#ifdef Q36_METAL
+    (void)ace;
+    (void)vocab_out;
+    (void)steps_out;
+    return NULL;
+#else
+    test_env_value env = {.name = "Q36_VK_ACE"};
+    q36_engine_options opt = {
+        .model_path = test_model_path(),
+        .backend = Q36_BACKEND_VULKAN,
+    };
+    q36_engine *engine = NULL;
+    q36_session *session = NULL;
+    q36_tokens prompt = {0};
+    float *copy = NULL;
+    char err[160] = {0};
+    int vocab = 0;
+    int steps = 0;
+
+    test_fusion_env_set(&env, 1, !ace);
+    TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
+    if (!engine) goto done;
+    q36_encode_chat_prompt(engine, "", "Name Italy's capital.",
+                           Q36_THINK_NONE, &prompt);
+    TEST_ASSERT(q36_session_create(&session, engine, 4096) == 0);
+    if (!session) goto done;
+    TEST_ASSERT(q36_session_sync(session, &prompt, err, sizeof(err)) == 0);
+    for (int step = 0; step < 4; step++) {
+        const float *logits = q36_session_logits(session, &vocab);
+        TEST_ASSERT(logits != NULL && vocab > 0);
+        if (!logits || vocab <= 0) break;
+        if (!copy) copy = malloc(4u * (size_t)vocab * sizeof(*copy));
+        TEST_ASSERT(copy != NULL);
+        if (!copy) break;
+        memcpy(copy + (size_t)step * vocab, logits,
+               (size_t)vocab * sizeof(*copy));
+        steps++;
+        if (step == 3) break;
+        int token = q36_session_argmax(session);
+        TEST_ASSERT(token >= 0);
+        if (token < 0) break;
+        TEST_ASSERT(q36_session_eval(session, token, err, sizeof(err)) == 0);
+    }
+
+done:
+    if (vocab_out) *vocab_out = vocab;
+    if (steps_out) *steps_out = steps;
+    q36_tokens_free(&prompt);
+    q36_session_free(session);
+    q36_engine_close(engine);
+    test_fusion_env_restore(&env, 1);
+    return copy;
+#endif
+}
+
+static void test_vulkan_queue_parity(void) {
+#ifdef Q36_METAL
+    test_skip("vulkan-queue-parity", "Vulkan-only test");
+#else
+    if (!test_model_available(test_model_path())) {
+        test_skip("vulkan-queue-parity", "model file not found");
+        return;
+    }
+    int fallback_vocab = 0, fallback_steps = 0;
+    int ace_vocab = 0, ace_steps = 0;
+    float *fallback = test_capture_queue_logits(false, &fallback_vocab,
+                                                &fallback_steps);
+    float *ace = test_capture_queue_logits(true, &ace_vocab, &ace_steps);
+    TEST_ASSERT(fallback && ace);
+    TEST_ASSERT(fallback_vocab == ace_vocab);
+    TEST_ASSERT(fallback_steps == ace_steps);
+    if (fallback && ace && fallback_vocab == ace_vocab &&
+        fallback_steps == ace_steps) {
+        TEST_ASSERT(memcmp(fallback, ace,
+                           (size_t)ace_vocab * ace_steps * sizeof(*ace)) == 0);
+    }
+    free(fallback);
+    free(ace);
+#endif
+}
 #else
 static void test_gpu_cpu_parity(void) {
     test_skip("gpu-cpu-parity", "CPU-only build");
@@ -6518,6 +6601,10 @@ static void test_ssd_streaming_parity(void) {
 
 static void test_vulkan_fusion_parity(void) {
     test_skip("vulkan-fusion-parity", "CPU-only build");
+}
+
+static void test_vulkan_queue_parity(void) {
+    test_skip("vulkan-queue-parity", "CPU-only build");
 }
 #endif
 
@@ -6975,6 +7062,7 @@ static const q36_test_entry test_entries[] = {
     {"--gpu-cpu-parity", "gpu-cpu-parity", "CPU/GPU logits top1/top5/top15/top64 parity", test_gpu_cpu_parity},
     {"--ssd-streaming-parity", "ssd-streaming-parity", "resident/warm/cold/cache-pressure GPU parity", test_ssd_streaming_parity},
     {"--vulkan-fusion-parity", "vulkan-fusion-parity", "fused Vulkan path against complete feature fallbacks", test_vulkan_fusion_parity},
+    {"--vulkan-queue-parity", "vulkan-queue-parity", "ACE and graphics queues produce bit-identical logits", test_vulkan_queue_parity},
     {"--mtp-verifier", "mtp-verifier", "MTP commits replay through plain target decode", test_mtp_verifier_replay},
     {"--qwen-tool-call-format", "qwen-tool-call-format", "Qwen tool-call rendering format unit test", test_qwen_tool_call_format},
     {"--kat-model-support", "kat-model-support", "KAT model identity and special tokenizer tokens", test_kat_model_support},

@@ -124,6 +124,7 @@ typedef struct {
     VkPhysicalDeviceProperties props;
     VkPhysicalDeviceMemoryProperties mem_props;
     uint32_t queue_family;
+    uint32_t queue_count;
     uint32_t timestamp_valid_bits;
     uint32_t api_version;
     bool ready;
@@ -137,6 +138,7 @@ typedef struct {
     bool subgroup_arithmetic;
     bool subgroup_clustered;
     bool bc250;
+    bool ace_queue;
     uint32_t subgroup_size;
     char shader_root[PATH_MAX];
 
@@ -2944,12 +2946,26 @@ int q36_gpu_init(void) {
         VkQueueFamilyProperties *qprops = calloc(nq, sizeof(qprops[0]));
         if (!qprops) continue;
         vkGetPhysicalDeviceQueueFamilyProperties(devs[di], &nq, qprops);
+        uint32_t compute = UINT32_MAX;
+        uint32_t ace = UINT32_MAX;
         for (uint32_t qi = 0; qi < nq; qi++) {
             if ((qprops[qi].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) continue;
+            if (compute == UINT32_MAX) compute = qi;
+            if ((qprops[qi].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0 &&
+                ace == UINT32_MAX) ace = qi;
+        }
+        if (compute != UINT32_MAX) {
+            const char *ace_env = getenv("Q36_VK_ACE");
+            bool bc250 = candidate_props.vendorID == 0x1002u &&
+                         candidate_props.deviceID == 0x13feu;
+            bool use_ace = bc250 && ace != UINT32_MAX &&
+                           (!ace_env || !ace_env[0] || ace_env[0] != '0');
+            uint32_t qi = use_ace ? ace : compute;
             q36_vk.physical = devs[di];
             q36_vk.queue_family = qi;
+            q36_vk.queue_count = qprops[qi].queueCount;
             q36_vk.timestamp_valid_bits = qprops[qi].timestampValidBits;
-            break;
+            q36_vk.ace_queue = use_ace;
         }
         free(qprops);
     }
@@ -3004,6 +3020,12 @@ int q36_gpu_init(void) {
     }
     fprintf(stderr, "q36: Vulkan generic backend%s, subgroup %u\n",
             q36_vk.bc250 ? ", BC-250 fast path" : "", q36_vk.subgroup_size);
+    if (q36_vk.bc250) {
+        fprintf(stderr, "q36: Vulkan queue family %u: %s (%u queue%s exposed)\n",
+                q36_vk.queue_family,
+                q36_vk.ace_queue ? "ACE compute" : "graphics fallback",
+                q36_vk.queue_count, q36_vk.queue_count == 1 ? "" : "s");
+    }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {

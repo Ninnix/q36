@@ -555,7 +555,7 @@ test-all: test test-vulkan
 
 test-model: q36_test
 	@echo "=== Model-dependent tests (requires q36moe.gguf) ==="
-	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --mtp-verifier
+	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --vulkan-queue-parity --mtp-verifier
 
 test-session-batch: q36_test
 	./q36_test --vulkan-session-batch
