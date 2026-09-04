@@ -18,8 +18,8 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
-const uint BM = 64u;
-const uint BN = 64u;
+const uint BM = 32u;
+const uint BN = 128u;
 const uint BK = 32u;
 const uint STRIDE = BK / 2u + 1u;
 const uint Q8K_WORDS = 74u;
@@ -68,8 +68,8 @@ void main(void) {
     uint tok0 = gl_WorkGroupID.y * BN;
     uint wave = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
-    uint warp_row = wave & 1u;
-    uint warp_tok = wave >> 1u;
+    uint warp_row = 0u;
+    uint warp_tok = wave;
     uint thread_row = lane & 3u;
     uint thread_tok = lane >> 2u;
     f16vec2 sum[16];
