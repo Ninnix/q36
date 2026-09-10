@@ -170,7 +170,9 @@ in RAM or VRAM, and streamed pages are released after each dispatch.
 ```
 
 At the interactive prompt, `/read photo.jpg` and `/read image.png` submit an
-image turn. JPEG and PNG decoding is built in. The sidecar output dimension is
+image turn. An optional prompt can be passed along with the image (e.g.
+`/read photo.jpg Describe this image` or `/read "path/with spaces/img.png" What is here?`).
+JPEG and PNG decoding is built in. The sidecar output dimension is
 validated against the selected standard or dense language model before use.
 Vision prompt execution currently requires Vulkan. `q36-agent --vision FILE`
 exposes `view_image` for local files. `q36-server --vision FILE` accepts OpenAI
@@ -236,7 +238,8 @@ the default model path used by all runtime binaries. Pass `-m` to select another
 supported GGUF from `./gguf/`. Run `./q36 --help` and
 `./q36-server --help` for the full flag list.
 
-If you want to regenerate GGUF files or collect a new imatrix, see
+If you want to regenerate GGUF files, quantize community fine-tunes / abliterated models
+(via `--strip-nextn`), or collect a new imatrix, see
 [gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
 Qwen3.6 model-building work. The native quantizer accepts Q8, F16, or BF16
 inputs; imatrix collection still uses the optional llama.cpp tooling.
@@ -526,7 +529,7 @@ q36>
 
 The CLI keeps the rendered transcript and live graph KV checkpoint, so each
 turn extends the previous conversation. Useful commands are `/help`, `/think`,
-`/think-max`, `/nothink`, `/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts
+`/think-max`, `/nothink`, `/ctx N`, `/read FILE [PROMPT]`, and `/quit`. Ctrl+C interrupts
 the current generation and returns to `q36>`.
 
 Thinking mode is enabled by default. Use `/nothink` or `--nothink` for direct
