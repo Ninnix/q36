@@ -133,6 +133,7 @@ typedef struct {
     bool force;
     bool strict_imatrix;
     bool synthetic_imatrix;
+    bool strip_nextn;
     int threads;
     int q4_start;
     int q4_end;
@@ -420,7 +421,7 @@ static int64_t tensor_nelems_i64(const tensor *t) {
     return n;
 }
 
-static gguf gguf_open(const char *path) {
+static gguf gguf_open(const char *path, bool strip_nextn) {
     gguf g = { .fd = -1, .split_no = -1, .split_count = -1, .split_tensors = -1 };
     g.path = xstrdup(path);
     g.fd = open(path, O_RDONLY);
@@ -446,6 +447,13 @@ static gguf gguf_open(const char *path) {
     size_t keep_cap = size_add(size_mul((size_t)g.n_kv, 2), 1);
     size_t *spans = xcalloc(keep_cap, sizeof(spans[0]));
     size_t keep_n = 0;
+    bool patch_block_count = false;
+    size_t block_count_rec_start = 0;
+    size_t block_count_val_rel = 0;
+    uint32_t old_block_count = 0;
+    uint32_t new_block_count = 0;
+    char block_count_key[128] = {0};
+
     for (uint64_t i = 0; i < g.n_kv; i++) {
         size_t rec_start = p;
         char *key = pull_str(g.map, g.size, &p);
@@ -458,10 +466,26 @@ static gguf gguf_open(const char *path) {
             g.split_count = pull_u16(g.map, g.size, &p);
         } else if (!strcmp(key, "split.tensors.count") && type == GGUF_TYPE_INT32) {
             g.split_tensors = (int32_t)pull_u32(g.map, g.size, &p);
+        } else if (strip_nextn && (ends(key, ".block_count") || !strcmp(key, "block_count")) && type == GGUF_TYPE_UINT32) {
+            size_t val_pos = p;
+            uint32_t val = pull_u32(g.map, g.size, &p);
+            if (val == 41) {
+                patch_block_count = true;
+                block_count_rec_start = rec_start;
+                block_count_val_rel = val_pos - rec_start;
+                old_block_count = val;
+                new_block_count = 40;
+                snprintf(block_count_key, sizeof(block_count_key), "%s", key);
+            }
         } else {
             skip_value(g.map, g.size, &p, type);
         }
-        if (!imatrix_kv(key) && !split_kv(key)) {
+        bool keep = !imatrix_kv(key) && !split_kv(key);
+        if (strip_nextn && (ends(key, ".nextn_predict_layers") || !strcmp(key, "nextn_predict_layers") || strstr(key, "nextn_predict_layers"))) {
+            keep = false;
+            fprintf(stderr, "info: stripped metadata key %s\n", key);
+        }
+        if (keep) {
             spans[keep_n++] = rec_start - kv_start;
             spans[keep_n++] = p - kv_start;
         }
@@ -475,7 +499,12 @@ static gguf gguf_open(const char *path) {
     size_t q = 0;
     for (size_t i = 0; i < keep_n; i += 2) {
         size_t n = spans[i + 1] - spans[i];
-        memcpy(g.kv.data + q, g.map + kv_start + spans[i], n);
+        size_t span_orig_start = kv_start + spans[i];
+        memcpy(g.kv.data + q, g.map + span_orig_start, n);
+        if (patch_block_count && span_orig_start == block_count_rec_start) {
+            memcpy(g.kv.data + q + block_count_val_rel, &new_block_count, sizeof(uint32_t));
+            fprintf(stderr, "info: patched %s %u -> %u\n", block_count_key, old_block_count, new_block_count);
+        }
         q = size_add(q, n);
     }
     g.n_kv = keep_n / 2;
@@ -487,25 +516,42 @@ static gguf gguf_open(const char *path) {
         g.n_tensors > SIZE_MAX / sizeof(g.tensors[0]))
         die("bad GGUF: tensor count exceeds file size");
     g.tensors = xcalloc((size_t)g.n_tensors, sizeof(g.tensors[0]));
+    uint64_t kept_tensors = 0;
     for (uint64_t i = 0; i < g.n_tensors; i++) {
-        tensor *t = &g.tensors[i];
-        t->name = pull_str(g.map, g.size, &p);
-        t->n_dims = (int)pull_u32(g.map, g.size, &p);
-        if (t->n_dims < 1 || t->n_dims > Q36Q_MAX_DIMS) die("bad tensor rank");
-        for (int j = 0; j < t->n_dims; j++) {
+        char *name = pull_str(g.map, g.size, &p);
+        int n_dims = (int)pull_u32(g.map, g.size, &p);
+        if (n_dims < 1 || n_dims > Q36Q_MAX_DIMS) die("bad tensor rank");
+        int64_t ne[Q36Q_MAX_DIMS] = {0};
+        for (int j = 0; j < n_dims; j++) {
             uint64_t dim = pull_u64(g.map, g.size, &p);
             if (dim == 0 || dim > INT64_MAX) die("bad tensor shape");
-            t->ne[j] = (int64_t)dim;
+            ne[j] = (int64_t)dim;
         }
-        t->type = (q36q_type)pull_u32(g.map, g.size, &p);
-        t->old_offset = pull_u64(g.map, g.size, &p);
-        t->size = tensor_size(t->type, t->ne, t->n_dims);
-        if (!t->size) {
+        q36q_type type = (q36q_type)pull_u32(g.map, g.size, &p);
+        uint64_t old_offset = pull_u64(g.map, g.size, &p);
+        size_t tsize = tensor_size(type, ne, n_dims);
+        if (!tsize) {
             fprintf(stderr, "error: unsupported tensor type or shape: %s type=%u\n",
-                    t->name, (unsigned)t->type);
+                    name, (unsigned)type);
             exit(1);
         }
+        if (strip_nextn && (starts(name, "blk.40.") || strstr(name, ".nextn_"))) {
+            free(name);
+            continue;
+        }
+        tensor *t = &g.tensors[kept_tensors++];
+        t->name = name;
+        t->n_dims = n_dims;
+        for (int j = 0; j < n_dims; j++) t->ne[j] = ne[j];
+        t->type = type;
+        t->old_offset = old_offset;
+        t->size = tsize;
     }
+    if (strip_nextn && kept_tensors < g.n_tensors) {
+        fprintf(stderr, "info: stripped %" PRIu64 " nextn/MTP tensors (kept %" PRIu64 " tensors)\n",
+                g.n_tensors - kept_tensors, kept_tensors);
+    }
+    g.n_tensors = kept_tensors;
     g.data_offset = pad(p, g.alignment);
     for (uint64_t i = 0; i < g.n_tensors; i++) {
         tensor *t = &g.tensors[i];
@@ -524,16 +570,16 @@ static gguf gguf_open(const char *path) {
     return g;
 }
 
-static gguf gguf_open_many(char **paths, int n) {
+static gguf gguf_open_many(char **paths, int n, bool strip_nextn) {
     if (n == 1) {
-        gguf g = gguf_open(paths[0]);
+        gguf g = gguf_open(paths[0], strip_nextn);
         if (g.split_count > 1) die("split GGUF input requires one --in per shard");
         return g;
     }
     gguf g = { .fd = -1, .n_shards = n };
     g.path = xstrdup(paths[0]);
     g.shards = xcalloc((size_t)n, sizeof(g.shards[0]));
-    for (int i = 0; i < n; i++) g.shards[i] = gguf_open(paths[i]);
+    for (int i = 0; i < n; i++) g.shards[i] = gguf_open(paths[i], strip_nextn);
 
     gguf *first = &g.shards[0];
     g.version = first->version;
@@ -596,7 +642,7 @@ static void gguf_close(gguf *g) {
 }
 
 static void imatrix_load_gguf(imatrix *im, const char *path) {
-    gguf g = gguf_open(path);
+    gguf g = gguf_open(path, false);
     int cap = 128;
     im->entries = xcalloc((size_t)cap, sizeof(im->entries[0]));
     im->n_entries = 0;
@@ -1238,6 +1284,7 @@ static void usage(const char *argv0) {
     printf("  --threads N                quantization workers, default 1\n");
     printf("  --q4-expert-layers A-B     quantize routed experts in layers A..B as q4_k\n");
     printf("  --q4-expert-last N         quantize routed experts in the last N layers as q4_k\n");
+    printf("  --strip-nextn              strip MTP/nextn layer 40 for q36 MoE compatibility\n");
     printf("  --dry-run                  parse metadata and print plan only\n");
     printf("  --force                    overwrite output\n");
 }
@@ -1261,6 +1308,8 @@ static params parse_args(int argc, char **argv) {
             p.dry_run = true;
         } else if (!strcmp(a, "--force")) {
             p.force = true;
+        } else if (!strcmp(a, "--strip-nextn") || !strcmp(a, "--strip-mtp")) {
+            p.strip_nextn = true;
         } else if (!strcmp(a, "--imatrix-strict")) {
             p.strict_imatrix = true;
         } else if (!strcmp(a, "--allow-synthetic-imatrix")) {
@@ -1292,7 +1341,7 @@ int main(int argc, char **argv) {
     params pa = parse_args(argc, argv);
     imatrix im = {0};
     if (pa.imatrix) imatrix_load(&im, pa.imatrix, pa.strict_imatrix);
-    gguf in = gguf_open_many(pa.inputs, pa.n_inputs);
+    gguf in = gguf_open_many(pa.inputs, pa.n_inputs, pa.strip_nextn);
     if (pa.q4_last) {
         int last = max_routed_layer(&in);
         if (pa.q4_last > last + 1) die("--q4-expert-last exceeds routed layer count");
