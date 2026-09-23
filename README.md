@@ -411,9 +411,11 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-Adaptive thinking closure starts after 50000 thinking tokens by default. Use
-`--thinking-budget N` to change that threshold independently of the `--tokens`
-hard output limit.
+Adaptive thinking closure starts after 50000 thinking tokens by default. For
+budgets of at least 8000, its allowed `</think>` rank rises to the top 64 over
+the next `min(N/2, 8192)` tokens, where `N` is `--thinking-budget`. Smaller
+budgets keep the previous ranking schedule. The rank can rise further if
+thinking continues. This is a soft budget; `--tokens` is the hard output limit.
 
 Agent user and system messages accept `<|think_on|>` and `<|think_off|>`.
 The marker is removed before rendering and remains in effect for later turns.

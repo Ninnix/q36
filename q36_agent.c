@@ -6027,14 +6027,38 @@ static bool agent_context_should_compact(int ctx, int used) {
 static int agent_think_close_rank_limit(int think_tokens, int start_tokens) {
     if (think_tokens < start_tokens || start_tokens <= 0) return 0;
     int64_t elapsed = (int64_t)think_tokens - start_tokens;
-    if (elapsed * 100 >= (int64_t)start_tokens * 98) return 64;
-    if (elapsed * 100 >= (int64_t)start_tokens * 95) return 32;
-    if (elapsed * 100 >= (int64_t)start_tokens * 90) return 16;
-    if (elapsed * 100 >= (int64_t)start_tokens * 80) return 8;
-    if (elapsed >= 4096) return 5;
-    if (elapsed >= 2048) return 4;
-    if (elapsed >= 1024) return 3;
-    if (elapsed >= 512) return 2;
+    /* Short-budget runs need the original gentle schedule. */
+    if (start_tokens < 8000) {
+        if (elapsed * 100 >= (int64_t)start_tokens * 98) return 64;
+        if (elapsed * 100 >= (int64_t)start_tokens * 95) return 32;
+        if (elapsed * 100 >= (int64_t)start_tokens * 90) return 16;
+        if (elapsed * 100 >= (int64_t)start_tokens * 80) return 8;
+        if (elapsed >= 4096) return 5;
+        if (elapsed >= 2048) return 4;
+        if (elapsed >= 1024) return 3;
+        if (elapsed >= 512) return 2;
+        return 1;
+    }
+    int64_t window = start_tokens / 2;
+    if (window > 8192) window = 8192;
+    if (elapsed * 4 >= window * 5) return 256;
+    if (elapsed * 8 >= window * 9) return 128;
+    if (elapsed >= window) return 64;
+    if (elapsed * 16 >= window * 15) return 32;
+    if (elapsed * 8 >= window * 7) return 16;
+    if (elapsed * 4 >= window * 3) return 8;
+    int64_t rank5 = window * 3 / 4;
+    if (rank5 > 4096) rank5 = 4096;
+    if (elapsed >= rank5) return 5;
+    int64_t rank4 = window / 2;
+    if (rank4 > 2048) rank4 = 2048;
+    if (elapsed >= rank4) return 4;
+    int64_t rank3 = window / 4;
+    if (rank3 > 1024) rank3 = 1024;
+    if (elapsed >= rank3) return 3;
+    int64_t rank2 = window / 8;
+    if (rank2 > 512) rank2 = 512;
+    if (elapsed >= rank2) return 2;
     return 1;
 }
 
@@ -7168,19 +7192,22 @@ static void test_agent_context_pressure_helpers(void) {
     AGENT_TEST_ASSERT(agent_context_should_compact(100000, 70000));
     AGENT_TEST_ASSERT(!agent_context_should_compact(64000, 44799));
     AGENT_TEST_ASSERT(agent_context_should_compact(64000, 44800));
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(49999, 50000) == 0);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(50000, 50000) == 1);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(50512, 50000) == 2);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(51024, 50000) == 3);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(52048, 50000) == 4);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(54096, 50000) == 5);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(90000, 50000) == 8);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(95000, 50000) == 16);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(97500, 50000) == 32);
-    AGENT_TEST_ASSERT(agent_think_close_rank_limit(99000, 50000) == 64);
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(31999, 32000) == 0);
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(32000, 32000) == 1);
     AGENT_TEST_ASSERT(agent_think_close_rank_limit(32512, 32000) == 2);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(33024, 32000) == 3);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(34048, 32000) == 4);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(36096, 32000) == 5);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(38144, 32000) == 8);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(39168, 32000) == 16);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(39680, 32000) == 32);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(40192, 32000) == 64);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(41216, 32000) == 128);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(42240, 32000) == 256);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(8000, 8000) == 1);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(12000, 8000) == 64);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(512, 512) == 1);
+    AGENT_TEST_ASSERT(agent_think_close_rank_limit(1014, 512) == 64);
     AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(1));
     AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(3));
     AGENT_TEST_ASSERT(q36_kvstore_quant_bits_valid(8));
@@ -9133,12 +9160,21 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     agent_publish(w, "\x1b[0m\n", 5);
     q36_tokens_free(&prompt);
 
-    if (!summary.ptr || !summary.ptr[0]) {
-        snprintf(err, err_len, "compaction summary was empty");
-        q36_session_invalidate(w->session);
-        q36_tokens_free(&sys);
+    bool summary_empty = true;
+    for (size_t i = 0; i < summary.len; i++) {
+        if (!isspace((unsigned char)summary.ptr[i])) {
+            summary_empty = false;
+            break;
+        }
+    }
+    if (summary_empty) {
+        agent_trace(w, "compaction summary empty; retaining recent transcript without a summary");
+        agent_publishf(w, "COMPACTING summary unavailable; retaining recent conversation only\n");
         free(summary.ptr);
-        return false;
+        memset(&summary, 0, sizeof(summary));
+        agent_buf_puts(&summary,
+            "Automatic summary was unavailable. Earlier conversation may be missing; "
+            "use the recent transcript below and ask for missing details if needed.\n");
     }
 
     agent_trace_text(w, "compaction-summary", summary.ptr, summary.len);
@@ -9810,6 +9846,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_tool_observation_puts(
                 &observation, qwen_tool.error[0] ? qwen_tool.error : "parse error");
             agent_tool_observation_puts(&observation, "\n");
+            if (stream.qwen_tool_in_think)
+                agent_tool_observation_puts(&observation,
+                    "Close thinking with </think> before retrying the tool call.\n");
             agent_tool_observation_puts(
                 &observation, agent_qwen_tool_syntax_reminder);
         } else {
