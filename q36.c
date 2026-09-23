@@ -1290,8 +1290,62 @@ const char *q36_think_mode_name(q36_think_mode mode) {
     case Q36_THINK_NONE: return "none";
     case Q36_THINK_HIGH: return "high";
     case Q36_THINK_MAX: return "max";
+    case Q36_THINK_LOW: return "low";
+    case Q36_THINK_MEDIUM: return "medium";
+    case Q36_THINK_XHIGH: return "xhigh";
     default: return "unknown";
     }
+}
+
+const char *q36_qwen38_effort_instruction(q36_think_mode mode) {
+    if (mode == Q36_THINK_LOW)
+        return "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+    if (mode == Q36_THINK_MEDIUM || mode == Q36_THINK_NONE) return NULL;
+    return "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+}
+
+q36_think_mode q36_qwen38_mode_for_budget(int budget) {
+    if (budget <= 8000) return Q36_THINK_LOW;
+    if (budget <= 16000) return Q36_THINK_MEDIUM;
+    if (budget <= 24000) return Q36_THINK_HIGH;
+    return Q36_THINK_XHIGH;
+}
+
+int q36_think_close_rank_limit(int think_tokens, int start_tokens) {
+    if (think_tokens < start_tokens || start_tokens <= 0) return 0;
+    int64_t elapsed = (int64_t)think_tokens - start_tokens;
+    if (start_tokens < 8000) {
+        if (elapsed * 100 >= (int64_t)start_tokens * 98) return 64;
+        if (elapsed * 100 >= (int64_t)start_tokens * 95) return 32;
+        if (elapsed * 100 >= (int64_t)start_tokens * 90) return 16;
+        if (elapsed * 100 >= (int64_t)start_tokens * 80) return 8;
+        if (elapsed >= 4096) return 5;
+        if (elapsed >= 2048) return 4;
+        if (elapsed >= 1024) return 3;
+        if (elapsed >= 512) return 2;
+        return 1;
+    }
+    int64_t window = start_tokens / 2;
+    if (window > 8192) window = 8192;
+    if (elapsed * 4 >= window * 5) return 256;
+    if (elapsed * 8 >= window * 9) return 128;
+    if (elapsed >= window) return 64;
+    if (elapsed * 16 >= window * 15) return 32;
+    if (elapsed * 8 >= window * 7) return 16;
+    if (elapsed * 4 >= window * 3) return 8;
+    int64_t rank5 = window * 3 / 4;
+    if (rank5 > 4096) rank5 = 4096;
+    if (elapsed >= rank5) return 5;
+    int64_t rank4 = window / 2;
+    if (rank4 > 2048) rank4 = 2048;
+    if (elapsed >= rank4) return 4;
+    int64_t rank3 = window / 4;
+    if (rank3 > 1024) rank3 = 1024;
+    if (elapsed >= rank3) return 3;
+    int64_t rank2 = window / 8;
+    if (rank2 > 512) rank2 = 512;
+    if (elapsed >= rank2) return 2;
+    return 1;
 }
 
 const char *q36_think_max_prefix(void) {
@@ -10176,6 +10230,10 @@ const char *q36_engine_model_name(q36_engine *e) {
 int q36_engine_model_id(q36_engine *e) {
     if (e && e->kat_coder) return 2;
     return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
+}
+
+bool q36_engine_is_qwen38(q36_engine *e) {
+    return e && e->variant == Q36_VARIANT_27B;
 }
 
 bool q36_engine_is_kat_coder(q36_engine *e) {

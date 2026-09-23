@@ -280,6 +280,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--chdir DIR", "Set the agent tool working directory; runtime assets load first.");
     opt(fp, c, "-n, --tokens N", "Hard output limit per assistant generation. Default: 100000.");
     opt(fp, c, "--thinking-budget N", "Begin adaptive </think> rank closing after N thinking tokens. Default: 50000.");
+    opt(fp, c, "--think-low, --think-medium, --think, --think-xhigh", "Select the initial dense thinking mode without changing the budget.");
+    opt(fp, c, "Tab", "Cycle dense low/medium/high/xhigh or MoE off/on; keep the current thinking budget.");
     para(fp, c, "User and system messages accept persistent <|think_on|> and <|think_off|> controls.");
     fputc('\n', fp);
 }
@@ -315,7 +317,8 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "Qwen and KAT-Coder chat requests default to high-effort thinking.");
+    para(fp, c, "Qwen3.8 chat requests default to xhigh; Qwen3.6 uses thinking on/off.");
+    para(fp, c, "thinking.budget_tokens starts adaptive thinking closure; Qwen3.8 maps budgets through 8k/16k/24k to low/medium/high, then xhigh.");
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 98304; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or chat_template_kwargs.enable_thinking=false selects non-thinking mode.");
