@@ -522,6 +522,7 @@ rax_cpu.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ rax.c
 
 test: all q36_agent_test $(SAMPLING_TEST) test-quality
+	$(MAKE) -C gguf-tools test
 	./q36-eval --self-test-extractors
 	./q36_agent_test
 	python3 tests/test_agent_password.py ./q36_agent_test

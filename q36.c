@@ -71,6 +71,8 @@ static const char Q36_REASONING_EFFORT_MAX_PREFIX[] =
 enum {
     Q36_MAX_LAYER = 64,
     Q36_MTP_MAX_DRAFT = 16,
+    Q36_MOE_MTP_TENSORS = 20,
+    Q36_DENSE_MTP_TENSORS = 15,
     Q36_CPU_MAX_THREADS = 32,
     Q36_CPU_PREFILL_CHUNK_DEFAULT = 16,
 };
@@ -551,6 +553,8 @@ typedef struct {
 struct q36_engine {
     q36_model model;
     q36_model mtp_model;
+    bool mtp_embedded;
+    uint64_t mtp_embedded_bytes;
     q36_model vision_model;
     q36_vocab vocab;
     q36_weights weights;
@@ -4740,7 +4744,7 @@ static uint64_t q36_streaming_model_limit(q36_engine *e, uint64_t contexts) {
      * explicitly, plus a bounded staging margin independent of context size. */
     uint64_t budget = recommended / 5 * 4;
     uint64_t reserve = 256ull * 1024 * 1024;
-    if (e->mtp_ready) reserve += e->mtp_model.size;
+    if (e->mtp_ready) reserve += e->mtp_embedded ? e->mtp_embedded_bytes : e->mtp_model.size;
     if (contexts >= budget || reserve >= budget - contexts) return 0;
     return budget - contexts - reserve;
 }
@@ -5082,7 +5086,8 @@ static bool q36_tensor_is_disabled_embedded_mtp(const q36_engine *e,
                                                 const q36_tensor *t) {
     char prefix[32];
     int len;
-    if (!e || !Q36_MODEL_DENSE || e->mtp_ready || !t) return false;
+    if (!e || e->mtp_embedded || !t) return false;
+    if (!Q36_MODEL_DENSE && e->model.n_tensors != Q36_TENSOR_COUNT + Q36_MOE_MTP_TENSORS) return false;
     len = snprintf(prefix, sizeof(prefix), "blk.%u.", Q36_N_LAYER);
     return len > 0 && (uint64_t)len <= t->name.len &&
            memcmp(t->name.ptr, prefix, (size_t)len) == 0;
@@ -5101,8 +5106,7 @@ static bool q36_metal_q5_output_cache_candidate(const q36_engine *e,
 #endif
 
 static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor *t) {
-    /* The dense runtime executes only the trunk; its appended MTP block must
-     * not consume the resident model arena. */
+    /* An unused MTP block must not consume the resident model arena. */
     if (t == e->weights.token_embd || t->bytes == 0 ||
         q36_tensor_is_disabled_embedded_mtp(e, t)) return true;
 #ifdef Q36_METAL
@@ -5237,7 +5241,7 @@ static void q36_vulkan_prewarm_weights(const q36_engine *e) {
     /* The MTP support model is fetched through the same whole-tensor cache
      * keys at draft time; without a prewarm the first drafts pay its whole
      * upload (~1.2s spread over the first replies). */
-    if (e->mtp_ready) {
+    if (e->mtp_ready && !e->mtp_embedded) {
         for (uint64_t i = 0; i < e->mtp_model.n_tensors; i++) {
             const q36_tensor *t = &e->mtp_model.tensors[i];
             if (t == e->mtp_weights.token_embd || t->bytes == 0) continue;
@@ -5283,7 +5287,7 @@ static void config_validate_model(const q36_model *m) {
     Q36_META_KEY("nextn_predict_layers");
     model_get_u32(m, key, &nextn_layers);
     if (block_count != Q36_N_LAYER &&
-        !(Q36_MODEL_DENSE && nextn_layers == 1 && block_count == Q36_N_LAYER + 1)) {
+        !(nextn_layers == 1 && block_count == Q36_N_LAYER + 1)) {
         Q36_META_KEY("block_count");
         config_expect_u32(key, block_count, Q36_N_LAYER);
     }
@@ -5325,7 +5329,9 @@ static void config_validate_model(const q36_model *m) {
 #undef Q36_EXPECT_U32
 #undef Q36_META_KEY
     if (m->n_tensors != Q36_TENSOR_COUNT &&
-        !(Q36_MODEL_DENSE && nextn_layers == 1 && m->n_tensors == Q36_TENSOR_COUNT + 15)) {
+        !(nextn_layers == 1 && block_count == Q36_N_LAYER + 1 &&
+          m->n_tensors == Q36_TENSOR_COUNT +
+                          (Q36_MODEL_DENSE ? Q36_DENSE_MTP_TENSORS : Q36_MOE_MTP_TENSORS))) {
         fprintf(stderr, "q36: expected %u tensors, got %" PRIu64 "\n", Q36_TENSOR_COUNT, m->n_tensors);
         exit(1);
     }
@@ -9992,7 +9998,22 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         q36_engine_close(e);
         return 1;
 #else
-        model_open(&e->mtp_model, opt->mtp_path, true);
+        if (!strcmp(opt->mtp_path, opt->model_path)) {
+            if (e->model.n_tensors != Q36_TENSOR_COUNT + Q36_MOE_MTP_TENSORS) {
+                fprintf(stderr, "q36: --mtp model has no embedded MTP block\n");
+                q36_engine_close(e);
+                return 1;
+            }
+            e->mtp_model = e->model;
+            e->mtp_embedded = true;
+            for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                const q36_tensor *t = &e->model.tensors[i];
+                if (t->name.len >= 7 && !memcmp(t->name.ptr, "blk.40.", 7))
+                    e->mtp_embedded_bytes += t->bytes;
+            }
+        } else {
+            model_open(&e->mtp_model, opt->mtp_path, true);
+        }
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         model_get_f32_compat(&e->mtp_model, "qwen35moe.expert_weights_scale", &e->mtp_expert_weights_scale);
         e->mtp_ready = true;
@@ -10124,7 +10145,7 @@ void q36_engine_close(q36_engine *e) {
     free(e->directional_steering_dirs);
     vocab_free(&e->vocab);
     model_close(&e->vision_model);
-    model_close(&e->mtp_model);
+    if (!e->mtp_embedded) model_close(&e->mtp_model);
     model_close(&e->model);
     free(e->directional_steering_file);
     q36_ssd_memory_lock_release(&e->simulated_memory);

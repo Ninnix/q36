@@ -89,7 +89,7 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
+        "      MTP support GGUF, or the same path as -m for an embedded block.\n"
         "  --prefix-file FILE\n"
         "      Preload complete USER:/ASSISTANT: conversation pairs.\n"
         "  --vision FILE\n"
@@ -172,8 +172,8 @@ static void usage(FILE *fp) {
         "      Clear the current chat history and reset the KV cache.\n"
         "  /ctx N\n"
         "      Recreate the interactive session with a new context size.\n"
-        "  /read FILE\n"
-        "      Read a prompt from FILE and run it as the next user message.\n"
+        "  /read FILE [PROMPT]\n"
+        "      Read a prompt from FILE, or submit an image with an optional PROMPT.\n"
         "  /quit, /exit\n"
         "      Leave the interactive prompt.\n"
         "  Ctrl+C\n"
@@ -1372,7 +1372,24 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             linenoiseFree(line);
             break;
         } else if (!strncmp(cmd, "/read", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
-            char *path = trim_inplace(cmd + 5);
+            char *args = trim_inplace(cmd + 5);
+            char *path = args;
+            char *user_prompt = "";
+            if (args[0] == '"' || args[0] == '\'') {
+                char quote = args[0];
+                path = args + 1;
+                char *end = strchr(path, quote);
+                if (end) {
+                    *end = '\0';
+                    user_prompt = trim_inplace(end + 1);
+                }
+            } else {
+                char *sep = strpbrk(args, " \t\r\n\v\f");
+                if (sep) {
+                    *sep = '\0';
+                    user_prompt = trim_inplace(sep + 1);
+                }
+            }
             if (!path[0]) {
                 fprintf(stderr, "q36: /read needs a file path\n");
             } else if (cli_file_has_image_magic(path)) {
@@ -1384,7 +1401,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                 } else {
                     fprintf(stderr, "q36: image %ux%u, %u image tokens\n",
                             image.width, image.height, image.token_count);
-                    rc = run_chat_turn(engine, cfg, &chat, "", &image);
+                    rc = run_chat_turn(engine, cfg, &chat, user_prompt, &image);
                     q36_vision_embedding_free(&image);
                 }
             } else {
