@@ -1236,8 +1236,13 @@ static const char *web_extract_search_js =
 "const seen=new Set();"
 "for(const a of document.querySelectorAll('a[href]')){if(!visible(a))continue;let href=a.href||'';"
 "try{const u=new URL(href);if(u.pathname==='/url'&&u.searchParams.get('q'))href=u.searchParams.get('q');}catch{}"
-"let u;try{u=new URL(href);}catch{continue;}if(!/^https?:$/.test(u.protocol))continue;if(bad(u.hostname))continue;"
-"const text=esc(a.innerText||a.textContent);if(text.length<3)continue;if(seen.has(u.href))continue;seen.add(u.href);"
+"let u;try{u=new URL(href);}catch{continue;}if(!/^https?:$/.test(u.protocol))continue;"
+/* Google may wrap result URLs in opaque /goto redirects. Keep those links
+ * when attached to a result heading; visit_page follows the redirect. */
+"const heading=a.querySelector('h3');"
+"const redirect=heading&&/(^|\\.)google\\./.test(u.hostname)&&u.pathname==='/goto'&&u.searchParams.has('url');"
+"if(bad(u.hostname)&&!redirect)continue;"
+"const text=esc(heading?heading.innerText:(a.innerText||a.textContent));if(text.length<3)continue;if(seen.has(u.href))continue;seen.add(u.href);"
 "lines.push(`- [${text.slice(0,180)}](${u.href})`);if(seen.size>=20)break;}"
 "lines.push('','## Text snapshot',clean(document.body.innerText).slice(0,1200));"
 "return lines.join('\\n');"

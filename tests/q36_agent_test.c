@@ -690,6 +690,80 @@ static void test_worker_free(agent_worker *w) {
     pthread_cond_destroy(&w->cond);
 }
 
+static void test_worker_ownership(void) {
+    agent_config cfg = {0};
+    agent_worker w;
+    test_worker_init(&w, &cfg);
+    w.initialized = true;
+    AGENT_TEST_ASSERT(worker_is_idle(&w));
+    w.active = true;
+    AGENT_TEST_ASSERT(!worker_is_idle(&w));
+    AGENT_TEST_ASSERT(!worker_submit(&w, "next turn"));
+    w.active = false;
+    w.save_requested = true;
+    AGENT_TEST_ASSERT(!worker_is_idle(&w));
+    AGENT_TEST_ASSERT(!worker_submit(&w, "next turn"));
+    worker_pause(&w);
+    AGENT_TEST_ASSERT(worker_is_idle(&w));
+    AGENT_TEST_ASSERT(!worker_take_save_requested(&w) && w.save_requested);
+    AGENT_TEST_ASSERT(!worker_submit(&w, "next turn"));
+    worker_resume(&w);
+    AGENT_TEST_ASSERT(worker_take_save_requested(&w));
+    w.interrupt = true;
+    AGENT_TEST_ASSERT(worker_submit(&w, "next turn"));
+    AGENT_TEST_ASSERT(!w.interrupt && !worker_is_idle(&w));
+    free(w.cmd_text);
+    test_worker_free(&w);
+}
+
+static void *test_worker_ui_wait(void *arg) {
+    agent_worker *w = arg;
+    if (w->cfg->gen.seed == 0) {
+        free(worker_request_queued_user_drain(w));
+    } else if (w->cfg->gen.seed == 1) {
+        agent_password_request request = {0};
+        agent_request_password(w, &request);
+    } else {
+        char err[160];
+        agent_web_confirm(w, "Allow?", err, sizeof(err));
+    }
+    worker_clear_interrupt(w);
+    agent_set_status(w, AGENT_WORKER_IDLE);
+    while (worker_wait_for_work(w)) {
+        pthread_mutex_lock(&w->mu);
+        free(w->cmd_text);
+        w->cmd_text = NULL;
+        w->status.state = AGENT_WORKER_IDLE;
+        pthread_mutex_unlock(&w->mu);
+    }
+    return NULL;
+}
+
+static void test_worker_pause_ui_waits(void) {
+    for (int request = 0; request < 3; request++) {
+        agent_config cfg = {0};
+        cfg.gen.seed = request;
+        agent_worker w;
+        test_worker_init(&w, &cfg);
+        w.initialized = true;
+        w.active = true;
+        w.status.state = AGENT_WORKER_GENERATING;
+        pthread_t thread;
+        AGENT_TEST_ASSERT(pthread_create(&thread, NULL, test_worker_ui_wait, &w) == 0);
+        struct pollfd pfd = {.fd = w.wake_fd[0], .events = POLLIN};
+        AGENT_TEST_ASSERT(poll(&pfd, 1, 2000) == 1);
+        worker_pause(&w);
+        AGENT_TEST_ASSERT(worker_is_idle(&w) && !w.interrupt);
+        worker_resume(&w);
+        AGENT_TEST_ASSERT(worker_submit(&w, "continue after cancelled exit"));
+        worker_pause(&w);
+        AGENT_TEST_ASSERT(worker_is_idle(&w));
+        worker_stop(&w);
+        pthread_join(thread, NULL);
+        test_worker_free(&w);
+    }
+}
+
 static void *password_job_thread(void *arg) {
     agent_worker *w = arg;
     agent_bash_refresh_for(w, w->bash_jobs, 10);
@@ -815,6 +889,8 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--terminal-driver")) return test_terminal_driver();
     if (argc == 3 && !strcmp(argv[1], "--terminal-fixtures")) test_output_dir = argv[2];
     q36_agent_unit_tests_run();
+    test_worker_ownership();
+    test_worker_pause_ui_waits();
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();

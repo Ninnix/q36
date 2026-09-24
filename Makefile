@@ -46,6 +46,7 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 METAL_LDFLAGS := $(LDFLAGS) $(DARWIN_MIN_FLAG)
 METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
+	vulkan/gdn_front.spv \
 	vulkan/matmul_f16.spv \
 	vulkan/vision_matmul_f16.spv \
 	vulkan/vision_attention.spv \
@@ -446,6 +447,9 @@ rax.o: rax.c rax.h rax_malloc.h
 
 vulkan/%.spv: vulkan/%.comp
 	$(GLSLC) -O -o $@ $<
+
+vulkan/gdn_front.spv: vulkan/gdn_front.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_f32_fast.spv: vulkan/matmul_f32_fast.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

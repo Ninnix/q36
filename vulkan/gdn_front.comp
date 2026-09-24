@@ -1,0 +1,100 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 384) in;
+layout(binding=0) buffer History { float history[]; };
+layout(binding=1) readonly buffer Current { float cur[]; };
+layout(binding=2) readonly buffer Conv { float cw[]; };
+layout(binding=3) readonly buffer Input { vec4 xv[]; };
+layout(binding=4) readonly buffer Alpha { uint16_t wa[]; };
+layout(binding=5) readonly buffer Beta { uint16_t wb[]; };
+layout(binding=6) readonly buffer Dt { float dt[]; };
+layout(binding=7) readonly buffer A { float av[]; };
+layout(binding=8) writeonly buffer Q { float qout[]; };
+layout(binding=9) writeonly buffer K { float kout[]; };
+layout(binding=10) writeonly buffer V { float vout[]; };
+layout(binding=11) writeonly buffer Gates { float gb[]; };
+layout(push_constant) uniform Push {
+    uint groups;
+    uint heads;
+    uint blocks;
+    float alpha_scale;
+    float beta_scale;
+    float eps;
+} pc;
+
+shared float qv[128], kv[128], sa[6], sb[6];
+shared double sq[64], sk[64];
+
+float sigmoid_stable(float x) {
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    float z=exp(x);
+    return z/(1.0+z);
+}
+
+/* Each key-head group owns its convolution history and all associated
+ * value heads. Keep the existing convolution, Q8 dot and norm trees.
+ * Read all owned channels before writing Q/K, which may alias raw QKV. */
+void main() {
+    uint tid=gl_LocalInvocationID.x, h=gl_WorkGroupID.x;
+    uint per=pc.heads/pc.groups, channels=(2u*pc.groups+pc.heads)*128u;
+    if (tid<128u) for (uint j=0u; j<2u+per; j++) {
+        uint c=(j<2u ? j*pc.groups+h : 2u*pc.groups+h+(j-2u)*pc.groups)*128u+tid;
+        float acc=0.0;
+        for (uint t=0u; t<3u; t++) acc+=history[t*channels+c]*cw[c*4u+t];
+        float x=cur[c];
+        acc+=x*cw[c*4u+3u];
+        history[c]=history[channels+c];
+        history[channels+c]=history[2u*channels+c];
+        history[2u*channels+c]=x;
+        float v=acc*sigmoid_stable(acc);
+        if (j==0u) qv[tid]=v;
+        else if (j==1u) kv[tid]=v;
+        else vout[(h+(j-2u)*pc.groups)*128u+tid]=v;
+    }
+    barrier();
+    if (tid<64u) {
+        sq[tid]=double(qv[tid])*double(qv[tid])+double(qv[tid+64u])*double(qv[tid+64u]);
+        sk[tid]=double(kv[tid])*double(kv[tid])+double(kv[tid+64u])*double(kv[tid+64u]);
+    }
+    barrier();
+    for (uint s=32u; s>0u; s>>=1u) {
+        if (tid<s) { sq[tid]+=sq[tid+s]; sk[tid]+=sk[tid+s]; }
+        barrier();
+    }
+    float qs=1.0/max(sqrt(float(sq[0])),pc.eps);
+    float ks=1.0/max(sqrt(float(sk[0])),pc.eps);
+    uint lane=tid%128u;
+    for (uint j=tid/128u; j<per; j+=3u) {
+        uint row=h+j*pc.groups;
+        qout[row*128u+lane]=qv[lane]*qs;
+        kout[row*128u+lane]=kv[lane]*ks;
+        float aa=0.0, ab=0.0;
+        uint eoff=(lane&3u)*8u;
+        for (uint b=lane>>2u; b<pc.blocks; b+=32u) {
+            uint base=(row*pc.blocks+b)*17u, q=base+1u+(eoff>>1u);
+            uint a0=uint(wa[q])|(uint(wa[q+1u])<<16u);
+            uint a1=uint(wa[q+2u])|(uint(wa[q+3u])<<16u);
+            uint b0=uint(wb[q])|(uint(wb[q+1u])<<16u);
+            uint b1=uint(wb[q+2u])|(uint(wb[q+3u])<<16u);
+            uint xi=(b*32u+eoff)>>2u;
+            vec4 x0=xv[xi], x1=xv[xi+1u];
+            aa+=unpackHalf2x16(uint(wa[base])).x*(dot(vec4(unpack8(int(a0))),x0)+dot(vec4(unpack8(int(a1))),x1));
+            ab+=unpackHalf2x16(uint(wb[base])).x*(dot(vec4(unpack8(int(b0))),x0)+dot(vec4(unpack8(int(b1))),x1));
+        }
+        aa=subgroupAdd(aa); ab=subgroupAdd(ab);
+        if (subgroupElect()) { sa[gl_SubgroupID]=aa; sb[gl_SubgroupID]=ab; }
+        barrier();
+        if (lane==0u) {
+            aa=sa[j*2u]+sa[j*2u+1u]; ab=sb[j*2u]+sb[j*2u+1u];
+            float a=aa*pc.alpha_scale+dt[row];
+            float sp=a>20.0 ? a : log(1.0+exp(a));
+            gb[row]=exp(sp*av[row]);
+            gb[pc.heads+row]=sigmoid_stable(ab*pc.beta_scale);
+        }
+        barrier();
+    }
+}

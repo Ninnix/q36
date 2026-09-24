@@ -811,8 +811,10 @@ typedef struct {
     bool stream_include_usage;
     bool ignore_eos;
     q36_think_mode think_mode;
+    int thinking_budget;
     bool has_tools;
     bool kat_coder;
+    bool qwen38;
     bool preserve_thinking;
     bool prompt_preserves_reasoning;
     tool_replay_stats tool_replay;
@@ -932,6 +934,7 @@ static void request_set_model_profile(request *r, q36_engine *e) {
     free(r->model);
     r->model = xstrdup(q36_engine_model_name(e));
     r->kat_coder = q36_engine_is_kat_coder(e);
+    r->qwen38 = q36_engine_is_qwen38(e);
     if (r->kat_coder) r->presence_penalty = 1.5f;
 }
 
@@ -979,11 +982,18 @@ static void request_sampling(const request *r, float *temperature, int *top_k,
 
 static q36_think_mode think_mode_from_enabled(bool enabled, q36_think_mode effort) {
     if (!enabled || effort == Q36_THINK_NONE) return Q36_THINK_NONE;
-    return effort == Q36_THINK_MAX ? Q36_THINK_MAX : Q36_THINK_HIGH;
+    return effort;
+}
+
+static q36_think_mode think_mode_from_budget(const request *r, q36_think_mode effort) {
+    if (r->qwen38 && r->thinking_budget > 0 &&
+        effort != Q36_THINK_NONE && effort != Q36_THINK_MAX)
+        return q36_qwen38_mode_for_budget(r->thinking_budget);
+    return effort;
 }
 
 static bool parse_reasoning_effort_name(const char *s, q36_think_mode *out) {
-    if (!s) return false;
+    if (!s || !*s) return false;
     if (!strcmp(s, "none")) {
         *out = Q36_THINK_NONE;
         return true;
@@ -992,13 +1002,21 @@ static bool parse_reasoning_effort_name(const char *s, q36_think_mode *out) {
         *out = Q36_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "xhigh") || !strcmp(s, "high") ||
-        !strcmp(s, "medium") || !strcmp(s, "low"))
-    {
-        *out = Q36_THINK_HIGH;
-        return true;
+    if (!strcmp(s, "low") || !strcmp(s, "minimal")) *out = Q36_THINK_LOW;
+    else if (!strcmp(s, "medium")) *out = Q36_THINK_MEDIUM;
+    else if (!strcmp(s, "high")) *out = Q36_THINK_HIGH;
+    else if (!strcmp(s, "xhigh")) *out = Q36_THINK_XHIGH;
+    else {
+        unsigned level = 0;
+        for (const char *p = s; *p; p++) {
+            if (*p < '0' || *p > '9') return false;
+            level = level * 10u + (unsigned)(*p - '0');
+            if (level > 100) return false;
+        }
+        *out = !level ? Q36_THINK_NONE : level <= 33 ? Q36_THINK_LOW :
+               level <= 66 ? Q36_THINK_MEDIUM : Q36_THINK_XHIGH;
     }
-    return false;
+    return true;
 }
 
 static bool parse_reasoning_effort_value(const char **p, q36_think_mode *out) {
@@ -1011,7 +1029,8 @@ static bool parse_reasoning_effort_value(const char **p, q36_think_mode *out) {
     return ok;
 }
 
-static bool parse_thinking_control_value(const char **p, bool *thinking_enabled) {
+static bool parse_thinking_control_value(const char **p, bool *thinking_enabled,
+                                         int *thinking_budget) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     if (**p == 't' || **p == 'f') return json_bool(p, thinking_enabled);
@@ -1036,6 +1055,14 @@ static bool parse_thinking_control_value(const char **p, bool *thinking_enabled)
             if (!strcmp(type, "enabled")) *thinking_enabled = true;
             else if (!strcmp(type, "disabled")) *thinking_enabled = false;
             free(type);
+        } else if (!strcmp(key, "budget_tokens")) {
+            double value;
+            if (!json_number(p, &value) || value < 0 || value > INT_MAX ||
+                value != (int)value) {
+                free(key);
+                return false;
+            }
+            *thinking_budget = (int)value;
         } else if (!json_skip_value(p)) {
             free(key);
             return false;
@@ -2753,7 +2780,8 @@ static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
 static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                           const tool_schema_orders *tool_orders,
                                           q36_think_mode think_mode,
-                                          bool preserve_thinking) {
+                                          bool preserve_thinking,
+                                          const char *reasoning_instruction) {
     bool thinking = q36_think_mode_enabled(think_mode);
     int last_query = last_chat_query(msgs);
     int failures = 0;
@@ -2762,17 +2790,19 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
     if (think_mode == Q36_THINK_MAX) buf_puts(&out, q36_think_max_prefix());
     int system_head = 0;
     char *first_content = leading_system_content(msgs, &system_head, &thinking);
-    if (tool_schemas && tool_schemas[0]) {
+    bool has_tools = tool_schemas && tool_schemas[0];
+    bool has_content = text_has_trimmed_content(first_content);
+    if (has_tools || has_content || reasoning_instruction) {
         buf_puts(&out, "<|im_start|>system\n");
-        append_tools_prompt_text(&out, tool_schemas);
-        if (text_has_trimmed_content(first_content)) {
-            buf_puts(&out, "\n\n");
-            buf_puts(&out, first_content);
+        if (reasoning_instruction) {
+            buf_puts(&out, reasoning_instruction);
+            if (has_tools || has_content) buf_puts(&out, "\n\n");
         }
-        buf_puts(&out, "<|im_end|>\n");
-    } else if (text_has_trimmed_content(first_content)) {
-        buf_puts(&out, "<|im_start|>system\n");
-        buf_puts(&out, first_content);
+        if (has_tools) {
+            append_tools_prompt_text(&out, tool_schemas);
+            if (has_content) buf_puts(&out, "\n\n");
+        }
+        if (has_content) buf_puts(&out, first_content);
         buf_puts(&out, "<|im_end|>\n");
     }
     free(first_content);
@@ -2854,14 +2884,27 @@ static char *render_chat_prompt_text_profile(const chat_msgs *msgs,
     if (kat_coder) return render_kat_chat_prompt_text(msgs, tool_schemas, tool_orders,
                                                       think_mode, preserve_thinking);
     return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode,
-                                        preserve_thinking);
+                                        preserve_thinking, NULL);
+}
+
+static char *render_chat_prompt_text_model(const chat_msgs *msgs,
+                                           const char *tool_schemas,
+                                           const tool_schema_orders *tool_orders,
+                                           q36_think_mode think_mode,
+                                           bool kat_coder, bool qwen38,
+                                           bool preserve_thinking) {
+    if (!qwen38) return render_chat_prompt_text_profile(
+        msgs, tool_schemas, tool_orders, think_mode, kat_coder, preserve_thinking);
+    return render_qwen_chat_prompt_text(
+        msgs, tool_schemas, tool_orders, think_mode, preserve_thinking,
+        q36_qwen38_effort_instruction(think_mode));
 }
 
 #ifdef Q36_SERVER_TEST
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      q36_think_mode think_mode) {
-    return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode, true);
+    return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode, true, NULL);
 }
 #endif
 
@@ -3127,7 +3170,8 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->thinking_budget)) {
                 free(key);
                 goto bad;
             }
@@ -3176,15 +3220,16 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+        think_mode_from_enabled(thinking_enabled,
+            think_mode_from_budget(r, reasoning_effort)), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_profile(
+    r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->preserve_thinking);
+        r->kat_coder, r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3565,15 +3610,16 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+        think_mode_from_enabled(thinking_enabled,
+            think_mode_from_budget(r, reasoning_effort)), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tools = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_profile(
+    r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tools, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->preserve_thinking);
+        r->kat_coder, r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tools);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3759,7 +3805,8 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
             }
             got_thinking = true;
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->thinking_budget)) {
                 free(key);
                 goto bad;
             }
@@ -3823,15 +3870,16 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+        think_mode_from_enabled(thinking_enabled,
+            think_mode_from_budget(r, reasoning_effort)), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_profile(
+    r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->preserve_thinking);
+        r->kat_coder, r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3997,7 +4045,8 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
                 goto bad;
             }
         } else if (!strcmp(key, "thinking")) {
-            if (!parse_thinking_control_value(&p, &thinking_enabled)) {
+            if (!parse_thinking_control_value(&p, &thinking_enabled,
+                                              &r->thinking_budget)) {
                 free(key);
                 goto bad;
             }
@@ -4052,9 +4101,11 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
     chat_msgs_push(&msgs, user);
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
-        think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
-    r->prompt_text = render_chat_prompt_text_profile(
-        &msgs, NULL, NULL, r->think_mode, r->kat_coder, r->preserve_thinking);
+        think_mode_from_enabled(thinking_enabled,
+            think_mode_from_budget(r, reasoning_effort)), ctx_size);
+    r->prompt_text = render_chat_prompt_text_model(
+        &msgs, NULL, NULL, r->think_mode, r->kat_coder, r->qwen38,
+        r->preserve_thinking);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     return true;
@@ -4719,7 +4770,6 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
@@ -4729,8 +4779,6 @@ static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = q36_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning =
-        q36_think_mode_enabled(r->think_mode) && r->has_tools;
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -5435,26 +5483,6 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -5873,7 +5901,6 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    bool guard_second_reasoning;
     bool sent_thinking;
     bool sent_text;
 } anthropic_stream;
@@ -5896,8 +5923,6 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = q36_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
-    st->guard_second_reasoning =
-        q36_think_mode_enabled(r->think_mode) && r->has_tools;
     return ok;
 }
 
@@ -6092,29 +6117,6 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
     }
 
     if (st->mode == ANTH_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos) {
-                    if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
-                    if (!anthropic_sse_delta_live(fd, st, ANTH_BLOCK_THINKING,
-                                                  raw + st->emit_pos,
-                                                  limit - st->emit_pos)) return false;
-                    st->sent_thinking = true;
-                }
-                if (!anthropic_sse_close_block_live(fd, id, st)) return false;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -8312,12 +8314,13 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\npreserve_thinking: %d\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\npresence_penalty: %.3f\nfrequency_penalty: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nthinking_budget: %d\npreserve_thinking: %d\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\npresence_penalty: %.3f\nfrequency_penalty: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
             j->req.has_tools ? 1 : 0,
             q36_think_mode_name(j->req.think_mode),
+            j->req.thinking_budget,
             j->req.preserve_thinking ? 1 : 0,
             j->req.prompt.len,
             effective_prompt_tokens,
@@ -9455,6 +9458,13 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    int think_close_id = -1;
+    if (j->req.thinking_budget > 0) {
+        q36_tokens close = {0};
+        q36_tokenize_rendered_chat(s->engine, "</think>", &close);
+        if (close.len == 1) think_close_id = close.v[0];
+        q36_tokens_free(&close);
+    }
     const bool thinking_gates_tool_markers = q36_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -9484,10 +9494,23 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             presence_penalty = 0.0f;
             frequency_penalty = 0.0f;
         }
-        int token = q36_session_sample_penalized(
-            slot->session, temperature, top_k, top_p, min_p,
-            generated_tokens.v, generated_tokens.len,
-            presence_penalty, frequency_penalty, &rng);
+        int close_rank = 0;
+        if (think_close_id >= 0 && q36_session_in_think(slot->session)) {
+            int limit = q36_think_close_rank_limit(completion, j->req.thinking_budget);
+            if (limit > 0 && completion == j->req.thinking_budget)
+                trace_event(s, trace_id, "thinking closure ranking starts at token=%d",
+                            completion);
+            if (limit > 0)
+                close_rank = q36_session_token_rank(slot->session, think_close_id, limit);
+        }
+        int token = close_rank > 0 ? think_close_id :
+            q36_session_sample_penalized(
+                slot->session, temperature, top_k, top_p, min_p,
+                generated_tokens.v, generated_tokens.len,
+                presence_penalty, frequency_penalty, &rng);
+        if (close_rank > 0)
+            trace_event(s, trace_id, "closing thinking at token=%d rank=%d",
+                        completion, close_rank);
         if (j->req.ignore_eos && token == q36_token_eos(s->engine))
             token = q36_session_argmax_penalized_excluding(slot->session, q36_token_eos(s->engine),
                 generated_tokens.v, generated_tokens.len, presence_penalty, frequency_penalty);
@@ -9938,9 +9961,11 @@ static int job_slot_score(server_slot *slot, const job *j) {
     if (!slot || !j) return INT_MIN;
     if (slot->busy || slot->assigned) return INT_MIN;
     if (slot_pending_matches(slot, &j->req)) return INT_MAX;
+    int common = q36_session_common_prefix(slot->session, &j->req.prompt);
+    if (common && !q36_session_vision_prefix_matches(
+            slot->session, j->req.images, j->req.image_count)) common = 0;
     return job_slot_score_values(
-            false, false,
-            q36_session_common_prefix(slot->session, &j->req.prompt),
+            false, false, common,
             q36_session_pos(slot->session));
 }
 
@@ -10536,7 +10561,9 @@ static void usage(FILE *fp) {
         "\n"
         "Thinking and sampling:\n"
         "  ignore_eos=true requires explicit temperature=0; stop strings and context limits still apply.\n"
-        "  Chat requests default to thinking mode with high effort.\n"
+        "  Chat requests default to thinking mode (xhigh on Qwen3.8).\n"
+        "  Numeric reasoning_effort strings: 0 off; 1..33 low; 34..66 medium; 67..100 xhigh.\n"
+        "  thinking.budget_tokens starts adaptive thinking closure and selects dense effort at 8k/16k/24k.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max requires --ctx >= 98304; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, chat_template_kwargs.enable_thinking=false, or a -nothink model alias selects non-thinking mode.\n"
@@ -11285,7 +11312,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     close(sv[1]);
 }
 
-static void test_openai_stream_reroutes_second_reasoning_pass(void) {
+static void test_openai_qwen_tool_stream_sends_answer_before_finish(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -11299,20 +11326,18 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
 
     openai_stream st;
     openai_stream_start(&r, &st);
-    const char *partial = "<think>first pass</think>escaped draft";
+    const char *partial = "<think>first pass</thi";
     TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_second_think",
                                          &st, partial, strlen(partial), false));
-    const char *complete =
-        "<think>first pass</think>escaped draft</think>final answer";
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
-                                       &st, complete, strlen(complete), NULL,
-                                       "stop", 5, 9));
+    const char *complete = "<think>first pass</think>first answer chunk";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_second_think",
+                                         &st, complete, strlen(complete), false));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
-    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "\"reasoning_content\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"content\":\"first answer chunk\"") != NULL);
+    TEST_ASSERT(strstr(out, "</thi") == NULL);
+    TEST_ASSERT(strstr(out, "[DONE]") == NULL);
     free(out);
     openai_stream_free(&st);
     request_free(&r);
@@ -11320,7 +11345,7 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     close(sv[1]);
 }
 
-static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
+static void test_anthropic_qwen_tool_stream_sends_answer_before_finish(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     if (sv[0] < 0 || sv[1] < 0) return;
@@ -11334,19 +11359,18 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
 
     anthropic_stream st;
     TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_second_think", 5, &st));
-    const char *partial = "first pass</think>escaped draft";
+    const char *partial = "first pass</thi";
     TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_second_think",
                                             &st, partial, strlen(partial), false));
-    const char *complete = "first pass</think>escaped draft</think>final answer";
-    TEST_ASSERT(anthropic_sse_finish_live(sv[0], &r, "msg_second_think",
-                                          &st, complete, strlen(complete), NULL,
-                                          "stop", 9));
+    const char *complete = "first pass</think>first answer chunk";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], &r, "msg_second_think",
+                                            &st, complete, strlen(complete), false));
     shutdown(sv[0], SHUT_WR);
     char *out = read_socket_text(sv[1]);
-    TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"thinking\":\"escaped draft\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"text\":\"final answer\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"text\":\"escaped draft") == NULL);
+    TEST_ASSERT(strstr(out, "\"thinking\":") != NULL);
+    TEST_ASSERT(strstr(out, "\"text\":\"first answer chunk\"") != NULL);
+    TEST_ASSERT(strstr(out, "</thi") == NULL);
+    TEST_ASSERT(strstr(out, "message_stop") == NULL);
     free(out);
     request_free(&r);
     close(sv[0]);
@@ -11742,12 +11766,28 @@ static void test_reasoning_effort_mapping(void) {
     q36_think_mode mode = Q36_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == Q36_THINK_NONE);
     TEST_ASSERT(think_mode_from_enabled(true, mode) == Q36_THINK_NONE);
-    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == Q36_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == Q36_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == Q36_THINK_MEDIUM);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == Q36_THINK_HIGH);
-    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == Q36_THINK_HIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == Q36_THINK_XHIGH);
     TEST_ASSERT(parse_reasoning_effort_name("max", &mode) && mode == Q36_THINK_MAX);
+    TEST_ASSERT(parse_reasoning_effort_name("0", &mode) && mode == Q36_THINK_NONE);
+    TEST_ASSERT(parse_reasoning_effort_name("1", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("33", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("34", &mode) && mode == Q36_THINK_MEDIUM);
+    TEST_ASSERT(parse_reasoning_effort_name("50", &mode) && mode == Q36_THINK_MEDIUM);
+    TEST_ASSERT(parse_reasoning_effort_name("66", &mode) && mode == Q36_THINK_MEDIUM);
+    TEST_ASSERT(parse_reasoning_effort_name("67", &mode) && mode == Q36_THINK_XHIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("100", &mode) && mode == Q36_THINK_XHIGH);
+    TEST_ASSERT(parse_reasoning_effort_name("001", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(think_mode_from_enabled(false, mode) == Q36_THINK_NONE);
     TEST_ASSERT(!parse_reasoning_effort_name("banana", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("101", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("-1", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("1.5", &mode));
+    TEST_ASSERT(!parse_reasoning_effort_name("99999999999999999999", &mode));
     uint32_t min_ctx = q36_think_max_min_context();
     TEST_ASSERT(min_ctx == 98304);
     TEST_ASSERT(q36_think_mode_for_context(Q36_THINK_MAX, (int)min_ctx - 1) == Q36_THINK_HIGH);
@@ -11756,12 +11796,18 @@ static void test_reasoning_effort_mapping(void) {
 
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
+    int budget = 0;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
     TEST_ASSERT(!enabled);
+    TEST_ASSERT(budget == 1024);
     thinking = "true";
-    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
+    TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled, &budget));
     TEST_ASSERT(enabled);
+    thinking = "{\"budget_tokens\":8000.5}";
+    TEST_ASSERT(!parse_thinking_control_value(&thinking, &enabled, &budget));
+    thinking = "{\"budget_tokens\":-1}";
+    TEST_ASSERT(!parse_thinking_control_value(&thinking, &enabled, &budget));
 
     q36_think_mode mode = Q36_THINK_HIGH;
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
@@ -11771,10 +11817,62 @@ static void test_api_thinking_controls_parse(void) {
     const char *openai_effort = "\"xhigh\"";
     mode = Q36_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
-    TEST_ASSERT(mode == Q36_THINK_HIGH);
+    TEST_ASSERT(mode == Q36_THINK_XHIGH);
+    openai_effort = "\"50\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
+    TEST_ASSERT(mode == Q36_THINK_MEDIUM);
+    openai_effort = "\"0\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
+    TEST_ASSERT(mode == Q36_THINK_NONE);
     const char *responses_effort = "{\"effort\":\"none\"}";
     TEST_ASSERT(parse_responses_reasoning(&responses_effort, &mode));
     TEST_ASSERT(mode == Q36_THINK_NONE);
+    responses_effort = "{\"effort\":\"100\"}";
+    TEST_ASSERT(parse_responses_reasoning(&responses_effort, &mode));
+    TEST_ASSERT(mode == Q36_THINK_XHIGH);
+
+    request r = {.qwen38 = true, .thinking_budget = 8000};
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_HIGH) == Q36_THINK_LOW);
+    r.thinking_budget = 16000;
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_HIGH) == Q36_THINK_MEDIUM);
+    r.thinking_budget = 24000;
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_HIGH) == Q36_THINK_HIGH);
+    r.thinking_budget = 24001;
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_HIGH) == Q36_THINK_XHIGH);
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_NONE) == Q36_THINK_NONE);
+    r.qwen38 = false;
+    TEST_ASSERT(think_mode_from_budget(&r, Q36_THINK_HIGH) == Q36_THINK_HIGH);
+}
+
+static void test_qwen38_effort_prompt(void) {
+    chat_msgs msgs = {0};
+    chat_msgs_push(&msgs, (chat_msg){.role = xstrdup("system"),
+                                     .content = xstrdup("Be precise.")});
+    chat_msgs_push(&msgs, (chat_msg){.role = xstrdup("user"),
+                                     .content = xstrdup("Hello")});
+    char *low = render_chat_prompt_text_model(&msgs, NULL, NULL,
+        Q36_THINK_LOW, false, true, true);
+    char *medium = render_chat_prompt_text_model(&msgs, NULL, NULL,
+        Q36_THINK_MEDIUM, false, true, true);
+    char *xhigh = render_chat_prompt_text_model(&msgs, NULL, NULL,
+        Q36_THINK_XHIGH, false, true, true);
+    char *off = render_chat_prompt_text_model(&msgs, NULL, NULL,
+        Q36_THINK_NONE, false, true, true);
+    char *moe = render_chat_prompt_text_model(&msgs, NULL, NULL,
+        Q36_THINK_LOW, false, false, true);
+    TEST_ASSERT(strstr(low, "<|im_start|>system\nReasoning effort is set to low.") == low);
+    TEST_ASSERT(strstr(low, "\n\nBe precise.<|im_end|>") != NULL);
+    TEST_ASSERT(strstr(medium, "Reasoning effort is set to") == NULL);
+    TEST_ASSERT(strstr(xhigh, "<|im_start|>system\nReasoning effort is set to xhigh.") == xhigh);
+    TEST_ASSERT(strstr(off, "Reasoning effort is set to") == NULL);
+    TEST_ASSERT(strstr(off, "<think>\n\n</think>\n\n") != NULL);
+    TEST_ASSERT(strstr(moe, "Reasoning effort is set to") == NULL);
+    free(low);
+    free(medium);
+    free(xhigh);
+    free(off);
+    free(moe);
+    chat_msgs_free(&msgs);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -14306,6 +14404,7 @@ static void q36_server_unit_tests_run(void) {
     test_request_defaults_match_qwen_api();
     test_explicit_sampling_wins_in_thinking_mode();
     test_reasoning_effort_mapping();
+    test_qwen38_effort_prompt();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
@@ -14324,10 +14423,10 @@ static void q36_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_anthropic_live_stream_sends_incremental_blocks();
-    test_anthropic_stream_reroutes_second_reasoning_pass();
+    test_anthropic_qwen_tool_stream_sends_answer_before_finish();
     test_openai_tool_stream_sends_incremental_text();
     test_openai_chat_stream_splits_reasoning_without_tools();
-    test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_qwen_tool_stream_sends_answer_before_finish();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();

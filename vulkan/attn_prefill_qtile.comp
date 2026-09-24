@@ -298,10 +298,6 @@ void main(void) {
         for (uint j = 0u; j < hn; j++) {
             if (span == span_first) {
                 sh_gacc[j * 256u + tid] = acc[j];
-                if (tid == 0u) {
-                    sh_gm[j] = m[j];
-                    sh_gl[j] = l[j];
-                }
             } else {
                 float n = max(sh_gm[j], m[j]);
                 float r = exp(sh_gm[j] - n);
@@ -309,9 +305,18 @@ void main(void) {
                 sh_gacc[j * 256u + tid] =
                     sh_gacc[j * 256u + tid] * r + acc[j] * rs;
                 if (tid == 0u) {
-                    sh_gl[j] = sh_gl[j] * r + l[j] * rs;
-                    sh_gm[j] = n;
+                    l[j] = sh_gl[j] * r + l[j] * rs;
+                    m[j] = n;
                 }
+            }
+        }
+        /* Every wave must consume the old maxima before lane 0 publishes
+         * the next ones. Keep the new metadata private until that point. */
+        barrier();
+        if (tid == 0u) {
+            for (uint j = 0u; j < hn; j++) {
+                sh_gm[j] = m[j];
+                sh_gl[j] = l[j];
             }
         }
         barrier();

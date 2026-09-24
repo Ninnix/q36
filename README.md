@@ -414,9 +414,20 @@ Start the agent in the current directory, another project, or one-shot mode:
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
-Adaptive thinking closure starts after 50000 thinking tokens by default. Use
-`--thinking-budget N` to change that threshold independently of the `--tokens`
-hard output limit.
+Adaptive thinking closure starts after 50000 thinking tokens by default. For
+budgets of at least 8000, its allowed `</think>` rank rises to the top 64 over
+the next `min(N/2, 8192)` tokens, where `N` is `--thinking-budget`. Smaller
+budgets keep the previous ranking schedule. The rank can rise further if
+thinking continues. This is a soft budget; `--tokens` is the hard output limit.
+
+With Qwen3.8-27B, `--thinking-budget` also selects the starting effort:
+up to 8000 tokens is `low`, up to 16000 is `medium`, up to 24000 is `high`,
+and larger budgets use `xhigh`. The default is `xhigh` with a 50000-token
+closure target. `high` uses Qwen3.8's native `xhigh` instruction. Explicit
+`--think-low`, `--think-medium`, `--think`, or `--think-xhigh` overrides the
+starting mode without changing the budget. At an empty idle agent prompt,
+Tab cycles `low → medium → high → xhigh` for Qwen3.8 and `off ↔ on` for
+Qwen3.6. Tab leaves the closure budget unchanged; the footer shows both.
 
 Agent user and system messages accept `<|think_on|>` and `<|think_off|>`.
 The marker is removed before rendering and remains in effect for later turns.
@@ -466,6 +477,9 @@ The session ID remains stable across later saves. `/del <sha>` removes a saved
 session. `/strip <sha>` keeps its transcript and title but removes the KV
 payload; switching to a stripped session rebuilds the KV cache by prefilling
 the saved text. `/compact` compacts the current context immediately.
+Exiting during generation stops the worker before asking whether to save.
+Sessions containing images cannot be saved yet; declining to exit after a save
+failure returns to the current chat.
 
 ## Benchmarking
 
@@ -889,11 +903,18 @@ Mapping of API thinking controls to prompt rendering:
 
 - Anthropic `thinking: {"type":"enabled"}` → thinking on (default).
 - Anthropic `thinking: {"type":"disabled"}` → thinking off.
-- OpenAI `reasoning_effort=low|medium|high|xhigh` → all map to thinking on
-  with a soft budget hint. Qwen3.6 does not expose distinct reasoning
-  levels at the model layer; the budget controls when the server stops
-  feeding thinking tokens, not how the model decides to reason.
-- `reasoning_effort=minimal` or omitted with no thinking flag → thinking on.
+- Qwen3.8-27B supports `low`, `medium`, and `xhigh` in its chat template.
+  `high` and the default select `xhigh`; `minimal` selects `low`.
+- Qwen3.6-35B-A3B has only thinking on or off. Positive efforts all enable
+  thinking without a model-specific effort instruction.
+- Numeric effort strings map `"0"` to thinking off, `"1"`–`"33"` to `low`,
+  `"34"`–`"66"` to `medium`, and `"67"`–`"100"` to `xhigh`. On Qwen3.6,
+  all positive values enable the same thinking mode. Only `"max"` selects
+  QuarkStar Think Max.
+- `thinking.budget_tokens` on chat or Anthropic messages starts adaptive
+  `</think>` ranking at that token count. On Qwen3.8 it also selects `low`
+  through 8000, `medium` through 16000, `high` through 24000, and `xhigh`
+  above 24000. Explicit `none` and `max` efforts keep their mode.
 - Explicit non-thinking: `thinking:{"type":"disabled"}`, `think:false`, or
   `chat_template_kwargs:{"enable_thinking":false}`. Both profiles use the
   `<think>\n\n</think>\n\n` non-thinking prefix.

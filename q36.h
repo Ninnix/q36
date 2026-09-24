@@ -31,6 +31,9 @@ typedef enum {
     Q36_THINK_NONE,
     Q36_THINK_HIGH,
     Q36_THINK_MAX,
+    Q36_THINK_LOW,
+    Q36_THINK_MEDIUM,
+    Q36_THINK_XHIGH,
 } q36_think_mode;
 
 typedef enum {
@@ -160,7 +163,11 @@ int q36_engine_power(q36_engine *e);
 int q36_engine_set_power(q36_engine *e, int power_percent);
 const char *q36_engine_model_name(q36_engine *e);
 int q36_engine_model_id(q36_engine *e);
+bool q36_engine_is_qwen38(q36_engine *e);
 bool q36_engine_is_kat_coder(q36_engine *e);
+const char *q36_qwen38_effort_instruction(q36_think_mode mode);
+q36_think_mode q36_qwen38_mode_for_budget(int budget);
+int q36_think_close_rank_limit(int think_tokens, int start_tokens);
 bool q36_engine_has_vision(q36_engine *e);
 int q36_engine_vision_encode_file(q36_engine *e, const char *path,
                                   q36_vision_embedding *out,

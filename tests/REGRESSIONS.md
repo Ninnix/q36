@@ -16,6 +16,9 @@ python3 tests/test_server_vision.py --pi /usr/bin/pi --output /tmp/q36-pi-vision
 python3 tests/test_agent_compaction.py \
   --model gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf \
   --ctx 8192 --tokens 2400 --output /tmp/q36-compaction-check
+python3 tests/test_agent_sessions.py \
+  --vision gguf/Qwen3.6-35B-A3B-mmproj-F16.gguf \
+  --output /tmp/q36-session-check
 Q36_TEST_THREADS=16 ./q36_test --gpu-cpu-parity --ssd-streaming-parity --case short
 ```
 
@@ -41,5 +44,10 @@ after compaction, compiles 120 generated C functions across a generation boundar
 the carried output budget, rejects an oversized user input, and checks recovery.
 `Q36_AGENT_CACHE_DIR` isolates its session cache without changing the user's home.
 Terminal ANSI and model traces remain in its output directory for inspection.
+
+The session test saves and restores a chat, exits during generation, checks
+idle CPU use at the save prompt, and verifies that cancelling an unsupported
+image-session save returns to a usable chat. `--web` additionally permits
+browser startup and checks Google result links and a real page visit.
 
 The two image fixtures contain synthetic ticket text and colored geometric shapes.
