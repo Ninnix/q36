@@ -247,7 +247,12 @@ inputs; imatrix collection still uses the optional llama.cpp tooling.
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF for Qwen 3.6 MoE. It can be used with the `q2-imatrix` and
 `q2-q4-imatrix` main models, but must be enabled explicitly with `--mtp`. The
-current MTP/speculative decoding path is still experimental: it is
+MTP block can also be embedded in a 41-block MoE GGUF. Pass the same path to
+`-m` and `--mtp` to use it. With `--mtp` omitted, q36 runs the 40-block trunk
+and excludes block 40 from the resident GPU weight cache. The embedded form
+keeps the shared embedding and output tensors in one copy.
+
+The current MTP/speculative decoding path is still experimental: it is
 correctness-gated and currently provides at most a slight speedup, not a
 meaningful generation-speed win.
 

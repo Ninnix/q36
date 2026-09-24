@@ -19,17 +19,22 @@ On the local Qwen3.6 model this resolves to layers `34..39`.
 
 For community fine-tunes or abliterated models that retain the 41st speculative MTP
 layer (e.g. `blk.40.*`), `--strip-nextn` (or `--strip-mtp`) strips those tensors,
-drops `nextn_predict_layers` KV metadata, and safely adjusts `block_count` from 41 to 40
-so the quantized GGUF conforms to Q36's 40-layer MoE runtime.
+drops `nextn_predict_layers` KV metadata, and adjusts `block_count` from 41 to 40.
+Omit the flag to keep the MTP block for use with q36's `--mtp` option.
 
 Shared experts, router/gating tensors, embeddings, output heads, norms,
 attention, SSM tensors, and other non-routed tensors are explicit keep-list
 entries in `qwen36-quantize.c`. Unknown tensor names fail the dry-run.
+The quantizer also retains the Qwen3.6 MTP block (`blk.40.*`) and its nextn
+weights when they are present. Existing Q4_K MTP experts stay Q4_K; BF16,
+F16, and Q8_0 MTP experts follow the same IQ2_XXS/Q2_K recipe as the trunk.
+`--q4-expert-last` counts only trunk layers 0..39.
 
 ## Build
 
 ```sh
 make -C gguf-tools
+make -C gguf-tools test
 ```
 
 `qwen36-quantize` is plain C. It mmaps the input GGUF and decodes converted

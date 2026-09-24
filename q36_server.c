@@ -10501,7 +10501,7 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
+        "      MTP support GGUF, or the same path as -m for an embedded block.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"

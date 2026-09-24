@@ -89,7 +89,7 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
+        "      MTP support GGUF, or the same path as -m for an embedded block.\n"
         "  --prefix-file FILE\n"
         "      Preload complete USER:/ASSISTANT: conversation pairs.\n"
         "  --vision FILE\n"
@@ -1384,7 +1384,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                     user_prompt = trim_inplace(end + 1);
                 }
             } else {
-                char *sep = strchr(args, ' ');
+                char *sep = strpbrk(args, " \t\r\n\v\f");
                 if (sep) {
                     *sep = '\0';
                     user_prompt = trim_inplace(sep + 1);

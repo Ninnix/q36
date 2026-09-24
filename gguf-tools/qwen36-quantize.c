@@ -75,6 +75,7 @@ typedef struct gguf {
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
+    uint64_t original_n_tensors;
     bytes kv;
     size_t alignment;
     size_t data_offset;
@@ -438,6 +439,7 @@ static gguf gguf_open(const char *path, bool strip_nextn) {
     p += 4;
     g.version = pull_u32(g.map, g.size, &p);
     g.n_tensors = pull_u64(g.map, g.size, &p);
+    g.original_n_tensors = g.n_tensors;
     g.n_kv = pull_u64(g.map, g.size, &p);
     g.alignment = Q36_GGUF_ALIGNMENT;
     if (g.n_kv > (g.size - p) / 12 || g.n_kv > (SIZE_MAX - 1) / 2)
@@ -596,10 +598,14 @@ static gguf gguf_open_many(char **paths, int n, bool strip_nextn) {
         if (s->split_no != i || s->split_count != n || s->split_tensors < 0) {
             die("GGUF shards are missing, duplicated, or out of order");
         }
+        if (g.original_n_tensors > UINT64_MAX - s->original_n_tensors)
+            die("GGUF shard tensor count overflow");
+        g.original_n_tensors += s->original_n_tensors;
         if (g.n_tensors > UINT64_MAX - s->n_tensors) die("GGUF shard tensor count overflow");
         g.n_tensors += s->n_tensors;
     }
-    if ((uint64_t)first->split_tensors != g.n_tensors) die("GGUF shard tensor count mismatch");
+    if ((uint64_t)first->split_tensors != g.original_n_tensors)
+        die("GGUF shard tensor count mismatch");
     if (g.n_tensors > INT_MAX || g.n_tensors > SIZE_MAX / sizeof(g.tensors[0]))
         die("too many tensors across GGUF shards");
 
@@ -832,6 +838,8 @@ static const char *keep_reason(const char *name) {
         "ffn_up_shexp.weight", "post_attention_norm.weight", "ssm_a",
         "ssm_alpha.weight", "ssm_beta.weight", "ssm_conv1d.weight",
         "ssm_dt.bias", "ssm_norm.weight", "ssm_out.weight",
+        "nextn.eh_proj.weight", "nextn.enorm.weight",
+        "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
     };
     for (size_t i = 0; i < sizeof(top) / sizeof(top[0]); i++) {
         if (!strcmp(name, top[i])) return "top-level Q8/output/embed/norm keep-list";
@@ -852,6 +860,10 @@ static decision classify_tensor(const tensor *t, const params *pa, q36q_type *ty
     int layer = -1;
     char kind[32];
     if (parse_routed(t->name, &layer, kind, sizeof(kind))) {
+        if (layer == 40 && t->type == Q36Q_TYPE_Q4_K && !q4_layer(pa, layer)) {
+            *why = "MTP routed experts already quantized";
+            return DEC_KEEP;
+        }
         if (q4_layer(pa, layer)) {
             *type = Q36Q_TYPE_Q4_K;
             *why = "routed expert q4 window";
@@ -882,7 +894,8 @@ static int max_routed_layer(const gguf *in) {
     for (uint64_t i = 0; i < in->n_tensors; i++) {
         int layer = -1;
         char kind[32];
-        if (parse_routed(in->tensors[i].name, &layer, kind, sizeof(kind)) && layer > max) max = layer;
+        if (parse_routed(in->tensors[i].name, &layer, kind, sizeof(kind)) &&
+            layer < 40 && layer > max) max = layer;
     }
     if (max < 0) die("no routed expert tensors found");
     return max;
