@@ -10447,6 +10447,32 @@ static int listen_on(const char *host, int port) {
     return fd;
 }
 
+/* Launches the OS default browser at the chat UI URL. Runs xdg-open (Linux)
+ * or open (macOS) in a detached child; SIGCHLD is ignored so it is reaped
+ * without the server having to wait on it. */
+static void open_browser_at(const char *host, int port) {
+    const char *display_host = strcmp(host, "0.0.0.0") ? host : "127.0.0.1";
+    char url[320];
+    snprintf(url, sizeof(url), "http://%s:%d/", display_host, port);
+    signal(SIGCHLD, SIG_IGN);
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_RDWR);
+        if (nullfd >= 0) {
+            dup2(nullfd, STDOUT_FILENO);
+            dup2(nullfd, STDERR_FILENO);
+            if (nullfd > 2) close(nullfd);
+        }
+#ifdef __APPLE__
+        execlp("open", "open", url, (char *)NULL);
+#else
+        execlp("xdg-open", "xdg-open", url, (char *)NULL);
+#endif
+        _exit(127);
+    }
+}
+
 static void configure_client_socket(int fd) {
     struct timeval tv;
     tv.tv_sec = Q36_SERVER_IO_TIMEOUT_SEC;
@@ -10478,6 +10504,7 @@ typedef struct {
     bool mtp_opportunistic;
     int tool_memory_max_ids;
     bool enable_cors;
+    bool open_browser;
     int batched_sessions;
     int mixed_prefill_quantum;
 } server_config;
@@ -10638,6 +10665,8 @@ static void usage(FILE *fp) {
         "      Prefill tokens per scheduling turn while generation is active. Default: 128\n"
         "  --cors\n"
         "      Add Access-Control-Allow-* headers and answer browser preflight requests.\n"
+        "  --open-browser\n"
+        "      Open the chat UI (http://HOST:PORT/) in the default browser once the server starts listening.\n"
         "\n"
         "Thinking and sampling:\n"
         "  ignore_eos=true requires explicit temperature=0; stop strings and context limits still apply.\n"
@@ -10785,6 +10814,8 @@ static server_config parse_options(int argc, char **argv) {
             c.mixed_prefill_quantum = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+        } else if (!strcmp(arg, "--open-browser")) {
+            c.open_browser = true;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -11041,6 +11072,7 @@ int main(int argc, char **argv) {
     }
     g_listen_fd = lfd;
     server_log(Q36_LOG_DEFAULT, "q36-server: listening on http://%s:%d", cfg.host, cfg.port);
+    if (cfg.open_browser) open_browser_at(cfg.host, cfg.port);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);

@@ -748,6 +748,10 @@ On an 8 GB Mac, reduce context and use the bounded Metal cache:
   Markdown/JSON export and JSON import. Sampling parameters, system prompt,
   light/dark theme, English/Russian UI and keyboard shortcuts (`?` lists them)
   are in Settings.
+- Pass `--open-browser` to have the server launch your default browser at the
+  UI URL (`xdg-open`/`open`) as soon as it starts listening, the same way
+  llama.cpp's server does; it is off by default so headless/remote servers
+  don't try to pop a browser.
 
 The UI resends each conversation verbatim, including `reasoning_content`, so
 the server's live KV prefix reuse keeps working across turns. Chat titles are
