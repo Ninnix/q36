@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Preview</title>
+<style>html,body{margin:0;height:100%;font-family:system-ui,sans-serif;color:#666;display:grid;place-items:center}</style>
+</head>
+<body>Loading preview…
+<script>
+/* Runs inside a sandboxed iframe (opaque origin). The parent posts the HTML to
+   show; nothing here can reach the chat app's storage. */
+window.addEventListener('message', function (e) {
+  if (e.source !== window.parent || !e.data || typeof e.data.q36Preview !== 'string') return;
+  document.open();
+  document.write(e.data.q36Preview);
+  document.close();
+});
+</script>
+</body>
+</html>

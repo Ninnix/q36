@@ -42,3 +42,5 @@ TODO.md
 /tests/test_prompt_prefix
 /tests/test_quality_api
 /speed-bench/session_concurrency_bench
+/q36_webui.inc
+/webui/embed

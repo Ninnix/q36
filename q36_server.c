@@ -43,6 +43,8 @@ static volatile sig_atomic_t g_stop_requested = 0;
 static volatile sig_atomic_t g_listen_fd = -1;
 static bool g_enable_cors = false;
 
+#include "q36_webui.inc"
+
 #define Q36_SERVER_IO_TIMEOUT_SEC 10
 #define Q36_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
@@ -4581,6 +4583,40 @@ static bool http_error(int fd, int code, const char *msg) {
     bool ok = http_response(fd, code, "application/json", b.ptr);
     buf_free(&b);
     return ok;
+}
+
+/* The browser UI is compiled into the binary (see webui/embed.c), so serving it
+ * needs no filesystem access and cannot be steered to read arbitrary paths.
+ * The main app gets a strict CSP because it renders model output.  Generated
+ * HTML previews run in a sandboxed iframe that loads /preview.html; that page
+ * must stay free of CSP so the previewed document can use inline scripts. */
+static bool http_webui_asset(int fd, const char *path) {
+    for (size_t i = 0; i < WEBUI_ASSET_COUNT; i++) {
+        if (strcmp(webui_assets[i].path, path)) continue;
+        bool preview = !strncmp(path, "/preview.", 9);
+        buf h = {0};
+        buf_printf(&h,
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "X-Content-Type-Options: nosniff\r\n",
+            webui_assets[i].mime, webui_assets[i].len);
+        if (!preview) {
+            buf_puts(&h,
+                "Content-Security-Policy: default-src 'self'; "
+                "img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+                "frame-src 'self'; object-src 'none'; base-uri 'none'; "
+                "form-action 'none'\r\n"
+                "Referrer-Policy: no-referrer\r\n");
+        }
+        buf_puts(&h, "Connection: close\r\n\r\n");
+        bool ok = send_all(fd, h.ptr, h.len) &&
+                  send_all(fd, (const char *)webui_assets[i].data, webui_assets[i].len);
+        buf_free(&h);
+        return ok;
+    }
+    return false;
 }
 
 static const char *context_length_error_param(const request *r) {
@@ -10247,6 +10283,22 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_props(server *s, int fd) {
+    buf b = {0};
+    buf_puts(&b, "{\"model\":");
+    json_escape(&b, q36_engine_model_name(s->engine));
+    buf_printf(&b,
+        ",\"n_ctx\":%d,\"default_max_tokens\":%d,\"vision\":%s,"
+        "\"slots\":%d,\"qwen38\":%s}\n",
+        q36_session_ctx(s->session), s->default_tokens,
+        q36_engine_has_vision(s->engine) ? "true" : "false",
+        s->batched_mode && s->slot_count > 1 ? s->slot_count : 1,
+        q36_engine_is_qwen38(s->engine) ? "true" : "false");
+    bool ok = http_response(fd, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -10272,6 +10324,23 @@ static void *client_main(void *arg) {
         http_response(fd, 200, "text/plain", "");
         http_request_free(&hr);
         goto done;
+    }
+
+    if (!strcmp(hr.method, "GET")) {
+        if (http_webui_asset(fd, hr.path)) {
+            http_request_free(&hr);
+            goto done;
+        }
+        if (!strcmp(hr.path, "/health")) {
+            http_response(fd, 200, "application/json", "{\"status\":\"ok\"}\n");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (!strcmp(hr.path, "/props")) {
+            send_props(s, fd);
+            http_request_free(&hr);
+            goto done;
+        }
     }
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
@@ -10614,6 +10683,7 @@ static void usage(FILE *fp) {
         "  ./q36-server --ctx 100000 --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
+        "  Open http://HOST:PORT/ in a browser for the built-in chat UI.\n"
         "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
@@ -14552,7 +14622,44 @@ static void test_server_image_embedding_cache(void) {
     TEST_ASSERT(cache.bytes == 0);
 }
 
+static char *webui_test_fetch(const char *path, size_t *len) {
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    char *out = NULL;
+    if (http_webui_asset(fileno(f), path)) {
+        long n = ftell(f);
+        out = xmalloc((size_t)n + 1);
+        rewind(f);
+        *len = fread(out, 1, (size_t)n, f);
+        out[*len] = '\0';
+    }
+    fclose(f);
+    return out;
+}
+
+static void test_webui_assets(void) {
+    size_t len = 0;
+    char *page = webui_test_fetch("/", &len);
+    TEST_ASSERT(page != NULL);
+    if (page) {
+        TEST_ASSERT(!strncmp(page, "HTTP/1.1 200 OK\r\n", 17));
+        TEST_ASSERT(strstr(page, "Content-Type: text/html"));
+        TEST_ASSERT(strstr(page, "Content-Security-Policy: default-src 'self'"));
+        TEST_ASSERT(strstr(page, "\r\n\r\n<!doctype html>"));
+    }
+    free(page);
+    char *js = webui_test_fetch("/js/app.js", &len);
+    TEST_ASSERT(js && strstr(js, "Content-Type: text/javascript"));
+    free(js);
+    char *preview = webui_test_fetch("/preview.html", &len);
+    TEST_ASSERT(preview && !strstr(preview, "Content-Security-Policy"));
+    free(preview);
+    TEST_ASSERT(webui_test_fetch("/js/../../etc/passwd", &len) == NULL);
+    TEST_ASSERT(webui_test_fetch("/v1/chat/completions", &len) == NULL);
+}
+
 static void q36_server_unit_tests_run(void) {
+    test_webui_assets();
     test_openai_inline_image_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
