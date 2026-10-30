@@ -722,7 +722,7 @@ q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h q36_ssd.h $(METAL_SRCS)
 q36_cli.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_cli.c
 
-q36_server.o: q36_server.c q36.h rax.h q36_tool_text.h
+q36_server.o: q36_server.c q36.h rax.h q36_tool_text.h q36_webui.inc
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_server.c
 
 q36_bench.o: q36_bench.c q36.h
@@ -746,10 +746,10 @@ q36_ssd.o: q36_ssd.c q36_ssd.h
 q36_web.o: q36_web.c q36_web.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_webui.inc
 	$(CC) $(GPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
-q36_test_metal.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_test_metal.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_webui.inc
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_test.c
 
 gguf-tools/quality-testing/score_openrouter.o: gguf-tools/quality-testing/score_openrouter.c q36.h q36_ssd.h q36_prompt_prefix.h
@@ -816,7 +816,7 @@ q36_image.o: q36_image.c q36_image.h third_party/iris/jpeg.h third_party/iris/pn
 q36_cli_cpu.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_cli.c
 
-q36_server_cpu.o: q36_server.c q36.h rax.h q36_tool_text.h
+q36_server_cpu.o: q36_server.c q36.h rax.h q36_tool_text.h q36_webui.inc
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_server.c
 
 q36_bench_cpu.o: q36_bench.c q36.h
@@ -840,7 +840,7 @@ q36_ssd_cpu.o: q36_ssd.c q36_ssd.h
 q36_web_cpu.o: q36_web.c q36_web.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_tool_text.h
+q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_tool_text.h q36_webui.inc
 	$(CC) $(CPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
 q36_sampling_test_core.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
@@ -1061,7 +1061,7 @@ test-long: q36_test
 		-o $@ tests/test-vectors/llama_qwen_logprobs_capture.c \
 		$(LLAMA_LIBS) $(LDLIBS) $(LLAMA_LDLIBS)
 
-q36_llama_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_llama_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_webui.inc
 	$(CC) $(CPU_CFLAGS) $(LLAMA_INCLUDE) -DQ36_WITH_LLAMA -Wno-unused-function -c -o $@ tests/q36_test.c
 
 q36_llama_test: q36_llama_test.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS)
@@ -1084,7 +1084,20 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 
 clean:
 	rm -f speed-bench/session_concurrency_bench
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36_webui.inc webui/embed q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+
+# Browser chat UI: webui/ is compiled into q36-server as a generated include.
+WEBUI_SRCS := $(wildcard webui/*.html webui/*.css webui/*.svg webui/*.js webui/js/*.js)
+
+webui/embed: webui/embed.c
+	$(CC) -O1 -o $@ webui/embed.c
+
+q36_webui.inc: webui/embed $(WEBUI_SRCS)
+	./webui/embed $@ webui $(patsubst webui/%,%,$(WEBUI_SRCS))
+
+.PHONY: test-webui
+test-webui:
+	node --test tests/webui/*.test.mjs
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_prompt_prefix.c

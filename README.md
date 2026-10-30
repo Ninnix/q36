@@ -730,6 +730,34 @@ On an 8 GB Mac, reduce context and use the bounded Metal cache:
   --ssd-streaming-cache-experts 512 --ctx 4096
 ```
 
+### Web UI
+
+`q36-server` serves a chat web UI at `http://HOST:PORT/` (default
+`http://127.0.0.1:8000/`). It is built into the binary at compile time from
+`webui/`, so there is nothing to deploy and no Node.js build step.
+
+- Streaming Markdown with syntax-highlighted code, tables, LaTeX math, copy and
+  wrap buttons, and a sandboxed live preview for `html`/`svg` code blocks.
+- Collapsible reasoning ("Thought for ...") with a thinking-mode picker
+  (default, off, low, medium, high, xhigh, max).
+- Branching conversations: editing a prompt or regenerating a reply keeps the
+  old version and adds a `< 2/3 >` switcher.
+- Image attachments (needs `--vision`), text/code file attachments, paste and
+  drag-and-drop, a context-usage meter, per-reply tok/s and cached-prompt stats.
+- Chats are stored in the browser (IndexedDB) with search, pinning, rename,
+  Markdown/JSON export and JSON import. Sampling parameters, system prompt,
+  light/dark theme, English/Russian UI and keyboard shortcuts (`?` lists them)
+  are in Settings.
+- Pass `--open-browser` to have the server launch your default browser at the
+  UI URL (`xdg-open`/`open`) as soon as it starts listening, the same way
+  llama.cpp's server does; it is off by default so headless/remote servers
+  don't try to pop a browser.
+
+The UI resends each conversation verbatim, including `reasoning_content`, so
+the server's live KV prefix reuse keeps working across turns. Chat titles are
+derived locally; model-written titles are an opt-in setting because they would
+evict that cache.
+
 Without extra options the server keeps one mutable backend/KV checkpoint and
 uses the original single graph worker. Stateless clients that resend a longer
 version of the same prompt can reuse that prefix instead of pre-filling from
@@ -1414,6 +1442,7 @@ make test-metal           # Metal unit and isolated numeric kernel coverage
 make test-metal-model     # Metal generation, CPU parity, state, and streaming
 make test-session-batch   # Vulkan 1/2/4/8-session full-logit/state oracle
 make test-server-live     # live HTTP, CORS and Responses API smoke test
+make test-webui           # Web UI unit tests (Node.js, no model needed)
 make test-server-live-metal # live Metal HTTP/CORS/Responses smoke test
 make test-server-live-metal-ssd # same live Metal surface through SSD streaming
 make test-server-batching # concurrent requests against one 4-slot server
