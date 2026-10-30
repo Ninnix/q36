@@ -906,6 +906,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+For connecting a separate UI through the server, see [UI integration](docs/UI.md).
+
 ### Agent Client Usage
 
 `q36-server` can be used by local coding agents that speak OpenAI-compatible
