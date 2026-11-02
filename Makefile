@@ -1093,7 +1093,7 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 
 clean:
 	rm -f speed-bench/session_concurrency_bench
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api tests/test_distributed tests/test_distributed_model dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api tests/test_distributed tests/test_distributed_model tests/test_distributed_mtp dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_prompt_prefix.c
@@ -1125,4 +1125,7 @@ test-distributed: tests/test_distributed
 q36_gpu_core.o q36_cpu.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o q36_cli.o q36_cli_cpu.o q36_cli_metal.o q36_server.o q36_server_cpu.o q36_agent.o q36_agent_cpu.o q36_bench.o q36_bench_cpu.o q36_eval.o q36_eval_cpu.o: q36_distributed.h
 
 tests/test_distributed_model: tests/test_distributed_model.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
+	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
+
+tests/test_distributed_mtp: tests/test_distributed_mtp.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)

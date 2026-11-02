@@ -2,7 +2,8 @@
  * Prefix and suffix stages retain independent KV state. The coordinator
  * projects the final hidden row, avoiding vocabulary-sized return packets.
  * Prefill sends a bounded window of chunks: stage A can compute the next
- * chunk while stage B consumes the previous one. Decode is necessarily serial. */
+ * chunk while stage B consumes the previous one. MTP verification pipelines
+ * candidate tokens in the same way; plain decode is serial. */
 #include "q36_distributed.h"
 
 #include <arpa/inet.h>
@@ -21,7 +22,7 @@
 #include <unistd.h>
 
 #define DIST_MAGIC UINT32_C(0x51333644)
-#define DIST_VERSION 2u
+#define DIST_VERSION 3u
 #define DIST_MAX_FRAME (64u * 1024u * 1024u)
 #define DIST_HELLO 1u
 #define DIST_ERROR 2u
@@ -30,8 +31,12 @@
 #define DIST_WORK 4u
 #define DIST_RESULT 5u
 #define DIST_FREE 6u
+#define DIST_COMMIT 7u
 #define DIST_RESET 1u
 #define DIST_LOGITS 2u
+#define DIST_ROWS 4u
+#define DIST_SPEC 8u
+#define DIST_BEGIN 16u
 
 struct q36_dist_engine {
     q36_engine *engine;
@@ -48,7 +53,8 @@ struct q36_dist_session {
 };
 
 typedef struct dist_worker_session {
-    uint32_t id, ctx;
+    uint32_t id, ctx, spec_pos;
+    bool spec;
     q36_session *session;
     struct dist_worker_session *next;
 } dist_worker_session;
@@ -204,7 +210,8 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
     q36_dist_model_info *i = &d->info;
     uint32_t words[] = {DIST_VERSION, i->n_layers, i->n_embd, i->n_vocab,
         i->layer_start, i->layer_end, i->context_size, i->prefill_cap,
-        (uint32_t)(i->fingerprint >> 32), (uint32_t)i->fingerprint};
+        (uint32_t)(i->fingerprint >> 32), (uint32_t)i->fingerprint,
+        i->speculation, i->mtp};
     uint8_t hello[sizeof(words)];
     for (size_t k = 0; k < sizeof(words)/sizeof(*words); k++) dist_put(hello + 4*k, words[k]);
     if (dist_send(fd, DIST_HELLO, hello, sizeof(hello), owner)) {
@@ -231,11 +238,12 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
         dist_error(err, errlen, "invalid pipeline hello");
         goto done;
     }
-    uint32_t peer[10];
-    for (int k = 0; k < 10; k++) peer[k] = dist_get(data + 4*k);
+    uint32_t peer[12];
+    for (int k = 0; k < 12; k++) peer[k] = dist_get(data + 4*k);
     if (peer[0] != DIST_VERSION || peer[1] != i->n_layers || peer[2] != i->n_embd ||
         peer[3] != i->n_vocab || peer[8] != words[8] || peer[9] != words[9] ||
-        !peer[6] || peer[6] > Q36_CONTEXT_ALLOC_MAX || !peer[7] || peer[7] > 8192) {
+        !peer[6] || peer[6] > Q36_CONTEXT_ALLOC_MAX || !peer[7] || peer[7] > 8192 ||
+        peer[10] > 1u || peer[11] > 1u) {
         dist_error(err, errlen, "pipeline model, protocol, context or batch mismatch");
         goto done;
     }
@@ -245,9 +253,13 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
         dist_error(err, errlen, "pipeline layer ranges have a gap or overlap");
         goto done;
     }
+    if ((coordinator && peer[11]) || ((i->mtp || peer[11]) && (!i->speculation || !peer[10]))) {
+        dist_error(err, errlen, "pipeline MTP requires resident Vulkan stages and a coordinator MTP head");
+        goto done;
+    }
     d->peer = (q36_dist_model_info){.n_layers=peer[1], .n_embd=peer[2],
         .n_vocab=peer[3], .layer_start=peer[4], .layer_end=peer[5],
-        .context_size=peer[6], .prefill_cap=peer[7]};
+        .context_size=peer[6], .prefill_cap=peer[7], .speculation=peer[10], .mtp=peer[11]};
     rc = 0;
 done:
     free(data);
@@ -279,30 +291,38 @@ static int dist_route(q36_dist_engine *d, q36_session *owner,
     }
 }
 
-static int dist_result(q36_dist_session *s, q36_session *owner, uint32_t pos,
-                       float *logits, char *err, size_t errlen) {
+static int dist_result_rows(q36_dist_session *s, q36_session *owner, uint32_t pos,
+        float *logits, float *hidden, uint32_t rows, char *err, size_t errlen) {
     uint32_t type, bytes;
     uint8_t *data;
     q36_dist_engine *d = s->engine;
     if (dist_recv(d->fd, &type, &data, &bytes, owner, err, errlen)) return 1;
-    uint64_t expected = 8u + (logits ? (uint64_t)d->info.n_embd * 4u : 0);
+    uint64_t values = (uint64_t)rows * d->info.n_embd;
+    uint64_t expected = 8u + values * sizeof(float);
     int rc = 0;
+    bool allocated = !hidden && rows;
     if (type != DIST_RESULT || bytes != expected || dist_get(data) != s->id ||
         dist_get(data + 4) != pos) rc = dist_error(err, errlen, "pipeline result is out of sequence");
-    else if (logits) {
-        float *hidden = malloc((size_t)d->info.n_embd * sizeof(float));
+    else if (rows) {
+        if (allocated) hidden = malloc((size_t)values * sizeof(float));
         if (!hidden) rc = dist_error(err, errlen, "pipeline output allocation failed");
         else {
-            for (uint32_t j = 0; j < d->info.n_embd; j++) {
+            for (uint64_t j = 0; j < values; j++) {
                 uint32_t bits = dist_get(data + 8u + 4u*j);
                 memcpy(hidden + j, &bits, 4);
             }
-            rc = q36_session_project_logits(owner, hidden, logits, err, errlen);
-            free(hidden);
+            if (logits) rc = q36_session_project_logits(owner,
+                hidden + (uint64_t)(rows - 1u) * d->info.n_embd, logits, err, errlen);
         }
     }
+    if (allocated) free(hidden);
     free(data);
     return rc;
+}
+
+static int dist_result(q36_dist_session *s, q36_session *owner, uint32_t pos,
+        float *logits, char *err, size_t errlen) {
+    return dist_result_rows(s, owner, pos, logits, NULL, logits ? 1u : 0u, err, errlen);
 }
 
 static int dist_session_ready(q36_dist_session *s, q36_session *owner,
@@ -334,7 +354,12 @@ int q36_dist_engine_open(q36_dist_engine **out, q36_engine *engine,
     d->info = *info;
     d->listener = d->fd = -1;
     d->next_id = 1;
-    if (pthread_mutex_init(&d->mutex, NULL)) { free(d); return 1; }
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) { free(d); return 1; }
+    int rc = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (!rc) rc = pthread_mutex_init(&d->mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (rc) { free(d); return 1; }
     if (opt->role == Q36_DISTRIBUTED_COORDINATOR) {
         d->listener = dist_endpoint(opt->listen_host, opt->listen_port, true);
         if (d->listener < 0) {
@@ -368,6 +393,9 @@ int q36_dist_session_create(q36_dist_session **out, q36_dist_engine *engine, int
     return 0;
 }
 
+void q36_dist_session_lock(q36_dist_session *s) { pthread_mutex_lock(&s->engine->mutex); }
+void q36_dist_session_unlock(q36_dist_session *s) { pthread_mutex_unlock(&s->engine->mutex); }
+
 void q36_dist_session_free(q36_dist_session *s) {
     if (!s) return;
     q36_dist_engine *d = s->engine;
@@ -382,14 +410,35 @@ void q36_dist_session_free(q36_dist_session *s) {
     free(s);
 }
 
+typedef struct {
+    float *hidden;
+    int tops[Q36_DIST_VERIFY_MAX], excluded, eos;
+    uint32_t count;
+    bool stopped;
+} dist_verify;
+
+typedef struct {
+    int fd, result, error;
+    uint8_t *data;
+    uint32_t bytes;
+} dist_write;
+
+static void *dist_writer(void *opaque) {
+    dist_write *w = opaque;
+    w->result = dist_send(w->fd, DIST_WORK, w->data, w->bytes, NULL);
+    w->error = errno;
+    return NULL;
+}
+
 static int dist_eval_span(q36_dist_session *s, q36_session *owner,
         const int *tokens, uint32_t count, uint32_t pos0, bool report_progress,
-        float *logits, char *err, size_t errlen) {
+        float *logits, dist_verify *verify, char *err, size_t errlen) {
     q36_dist_engine *d = s->engine;
     uint32_t cap = d->info.prefill_cap;
     if (cap > d->peer.prefill_cap) cap = d->peer.prefill_cap;
     if (d->opt.prefill_chunk && cap > d->opt.prefill_chunk) cap = d->opt.prefill_chunk;
     if (cap > count) cap = count;
+    if (verify) cap = 1;
     uint32_t frame_cap = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
     if (cap > frame_cap) cap = frame_cap;
     uint32_t window = d->opt.prefill_window ? d->opt.prefill_window : 2;
@@ -398,7 +447,8 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
     uint8_t *data = malloc((size_t)max_bytes);
     float *hidden = malloc((size_t)cap * d->info.n_embd * sizeof(float));
     if (!data || !hidden) { free(data); free(hidden); return dist_error(err, errlen, "pipeline allocation failed"); }
-    uint32_t pending[64], head = 0, tail = 0, i = 0;
+    struct { uint32_t end, count, index; } pending[64];
+    uint32_t head = 0, tail = 0, i = 0;
     int rc = 0;
     double started = dist_now(), local_seconds = 0, wire_seconds = 0;
     double local_started, wire_started;
@@ -408,6 +458,9 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
             dist_error(err, errlen, "interrupted");
             break;
         }
+        bool receive = false, writing = false;
+        pthread_t writer;
+        dist_write write_job = {.fd=d->fd};
         if (i < count && tail - head < window) {
             uint32_t n = count - i;
             if (n > cap) n = cap;
@@ -421,7 +474,10 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
             dist_put(data, s->id);
             dist_put(data + 4, pos0 + i);
             dist_put(data + 8, n);
-            dist_put(data + 12, (pos0 + i == 0 ? DIST_RESET : 0) | (last ? DIST_LOGITS : 0));
+            uint32_t flags = (pos0 + i == 0 ? DIST_RESET : 0) | (last || verify ? DIST_LOGITS : 0);
+            if (d->info.mtp) flags |= DIST_ROWS;
+            if (verify) flags |= DIST_SPEC | (i == 0 ? DIST_BEGIN : 0);
+            dist_put(data + 12, flags);
             for (uint32_t j = 0; j < n; j++) dist_put(data + 16u + 4u*j, (uint32_t)tokens[i+j]);
             uint64_t values = (uint64_t)n * d->info.n_embd;
             for (uint64_t j = 0; j < values; j++) {
@@ -430,23 +486,63 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
                 dist_put(data + 16u + 4u*n + 4u*j, bits);
             }
             uint32_t bytes = 16u + n * (1u + d->info.n_embd) * 4u;
-            if (dist_send(d->fd, DIST_WORK, data, bytes, owner)) {
+            if (d->info.mtp && head != tail) {
+                /* Large target-row replies must drain while the next frame
+                 * is sent, including when the link has small TCP buffers. */
+                write_job.data = data;
+                write_job.bytes = bytes;
+                int created = pthread_create(&writer, NULL, dist_writer, &write_job);
+                if (created) { rc = dist_error(err, errlen, "pipeline sender: %s", strerror(created)); break; }
+                writing = receive = true;
+            } else if (dist_send(d->fd, DIST_WORK, data, bytes, owner)) {
                 rc = dist_error(err, errlen, "pipeline send: %s", strerror(errno));
                 break;
             }
+            uint32_t slot = tail++ % 64;
+            pending[slot].end = pos0 + i + n;
+            pending[slot].count = n;
+            pending[slot].index = i;
             i += n;
-            pending[tail++ % 64] = pos0 + i;
-        } else {
-            uint32_t end = pending[head++ % 64];
+        } else receive = true;
+        if (receive) {
+            uint32_t slot = head++ % 64;
+            uint32_t end = pending[slot].end, n = pending[slot].count, index = pending[slot].index;
+            float *out = !verify && end == pos0 + count ? logits : NULL;
+            float *rows = verify ? verify->hidden + (uint64_t)index * d->info.n_embd : hidden;
+            uint32_t returned = d->info.mtp ? n : out ? 1u : 0u;
             wire_started = dist_now();
-            if (dist_result(s, owner, end, end == pos0 + count ? logits : NULL, err, errlen)) { rc = 1; break; }
+            if (dist_result_rows(s, owner, end, out, rows, returned, err, errlen) ||
+                (d->info.mtp && !verify && q36_session_pipeline_mtp_catchup(owner,
+                    tokens + index, n, pos0 + index, rows, err, errlen))) rc = 1;
+            if (!rc && verify && !verify->stopped) {
+                int top;
+                rc = q36_session_pipeline_project(owner, rows, verify->excluded,
+                    &top, err, errlen);
+                /* Drain rows already in flight, but stop issuing rejected tails. */
+                if (!rc) {
+                    verify->tops[index] = top;
+                    if (tokens[index] == verify->eos ||
+                        (index + 1u < count && top != tokens[index + 1u])) {
+                        verify->stopped = true;
+                        count = i;
+                    }
+                }
+            }
             wire_seconds += dist_now() - wire_started;
-            if (report_progress)
+            if (!rc && report_progress)
                 q36_session_distributed_progress(owner, (int)end, (int)(pos0 + count));
         }
+        if (writing) {
+            if (rc) shutdown(d->fd, SHUT_RDWR);
+            pthread_join(writer, NULL);
+            if (!rc && write_job.result)
+                rc = dist_error(err, errlen, "pipeline send: %s", strerror(write_job.error));
+        }
+        if (rc) break;
     }
     if (d->opt.debug) fprintf(stderr, "q36: pipeline %u tokens at %u, window %u, %.3f s local=%.3f s remote_wait=%.3f s\n",
                               count, pos0, window, dist_now() - started, local_seconds, wire_seconds);
+    if (verify) verify->count = i;
     free(hidden);
     free(data);
     return rc;
@@ -462,7 +558,7 @@ int q36_dist_session_sync(q36_dist_session *s, q36_session *owner,
     uint32_t start = replay ? 0 : (uint32_t)checkpoint->len;
     if (!rc && start < (uint32_t)prompt->len)
         rc = dist_eval_span(s, owner, prompt->v + start, (uint32_t)prompt->len - start,
-                            start, true, logits, err, errlen);
+                            start, true, logits, NULL, err, errlen);
     if (rc) {
         dist_disconnect(d);
         if (q36_session_distributed_cancelled(owner)) rc = Q36_SESSION_SYNC_INTERRUPTED;
@@ -478,14 +574,67 @@ int q36_dist_session_eval(q36_dist_session *s, q36_session *owner,
     bool replay = d->fd < 0 || s->generation != d->generation;
     int rc = dist_session_ready(s, owner, err, errlen);
     if (!rc && replay && checkpoint->len)
-        rc = dist_eval_span(s, owner, checkpoint->v, (uint32_t)checkpoint->len, 0, true, logits, err, errlen);
-    if (!rc) rc = dist_eval_span(s, owner, &token, 1, (uint32_t)checkpoint->len, false, logits, err, errlen);
+        rc = dist_eval_span(s, owner, checkpoint->v, (uint32_t)checkpoint->len, 0, true, logits, NULL, err, errlen);
+    if (!rc) rc = dist_eval_span(s, owner, &token, 1, (uint32_t)checkpoint->len, false, logits, NULL, err, errlen);
     if (rc) {
         dist_disconnect(d);
         if (q36_session_distributed_cancelled(owner)) rc = Q36_SESSION_SYNC_INTERRUPTED;
     }
     pthread_mutex_unlock(&d->mutex);
     return rc;
+}
+
+/* The wire lock spans verification and commit: another session must never
+ * interleave a transaction's saved recurrent frontier. */
+int q36_dist_session_speculate(q36_dist_session *s, q36_session *owner,
+        const q36_tokens *checkpoint, const int *tokens, uint32_t count,
+        int eos, int excluded, float *logits, char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    if (!d->info.mtp || !tokens || !logits || !checkpoint->len || !count ||
+        count > Q36_DIST_VERIFY_MAX || (uint32_t)checkpoint->len > s->ctx ||
+        count > s->ctx - (uint32_t)checkpoint->len) {
+        dist_error(err, errlen, "invalid pipeline speculative block");
+        return -1;
+    }
+    dist_verify verify = {
+        .hidden = malloc((size_t)count * d->info.n_embd * sizeof(float)),
+        .excluded = excluded, .eos = eos,
+    };
+    if (!verify.hidden) {
+        dist_error(err, errlen, "pipeline verification allocation failed");
+        return -1;
+    }
+    pthread_mutex_lock(&d->mutex);
+    bool replay = d->fd < 0 || s->generation != d->generation;
+    int rc = dist_session_ready(s, owner, err, errlen);
+    uint32_t pos = (uint32_t)checkpoint->len;
+    if (!rc && replay)
+        rc = dist_eval_span(s, owner, checkpoint->v, pos, 0, false, logits, NULL, err, errlen);
+    if (!rc) rc = q36_session_pipeline_spec_begin(owner, err, errlen);
+    if (!rc) rc = dist_eval_span(s, owner, tokens, count, pos, false, NULL, &verify, err, errlen);
+    uint32_t commit = 1;
+    if (!rc) {
+        while (commit < verify.count && tokens[commit - 1u] != eos) {
+            if (verify.tops[commit - 1u] != tokens[commit]) break;
+            commit++;
+        }
+    }
+    if (!rc) {
+        uint8_t data[8];
+        dist_put(data, s->id);
+        dist_put(data + 4, commit);
+        if (dist_send(d->fd, DIST_COMMIT, data, sizeof(data), owner) ||
+            dist_result(s, owner, pos + commit, NULL, err, errlen) ||
+            q36_session_pipeline_spec_commit(owner, commit, err, errlen) ||
+            q36_session_pipeline_mtp_catchup(owner, tokens, commit, pos, verify.hidden, err, errlen) ||
+            q36_session_pipeline_read_logits(owner, logits, err, errlen)) rc = 1;
+    }
+    if (d->opt.debug && !rc) fprintf(stderr, "q36: pipeline MTP drafted=%u verified=%u committed=%u\n",
+                                    count, verify.count, commit);
+    if (rc) dist_disconnect(d);
+    pthread_mutex_unlock(&d->mutex);
+    free(verify.hidden);
+    return rc ? -1 : (int)commit;
 }
 
 static int dist_worker_result(int fd, uint32_t id, uint32_t pos,
@@ -509,6 +658,7 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
     dist_worker_session *sessions = NULL;
     int rc = 0;
     for (;;) {
+        if (err && errlen) err[0] = '\0';
         struct pollfd idle = {fd, POLLIN, 0};
         int ready;
         do { ready = poll(&idle, 1, -1); } while (ready < 0 && errno == EINTR);
@@ -541,17 +691,31 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
             q36_session_free(s->session);
             free(s);
             rc = dist_worker_result(fd, id, 0, NULL, 0);
+        } else if (type == DIST_COMMIT && bytes == 8 && s && s->spec) {
+            uint32_t count = dist_get(data + 4);
+            rc = q36_session_pipeline_spec_commit(s->session, count, err, errlen);
+            if (!rc) {
+                s->spec = false;
+                rc = dist_worker_result(fd, id, s->spec_pos + count, NULL, 0);
+            }
         } else if (type == DIST_WORK && bytes >= 16 && s) {
             uint32_t pos = dist_get(data + 4), n = dist_get(data + 8), flags = dist_get(data + 12);
             uint64_t expected = 16u + (uint64_t)n * (1u + d->info.n_embd) * 4u;
             if (!n || n > d->info.prefill_cap || expected != bytes ||
-                pos > s->ctx || n > s->ctx - pos || flags & ~(DIST_RESET | DIST_LOGITS) ||
-                ((flags & DIST_RESET) && pos)) rc = dist_error(err, errlen, "invalid pipeline work shape");
+                pos > s->ctx || n > s->ctx - pos ||
+                flags & ~(DIST_RESET | DIST_LOGITS | DIST_ROWS | DIST_SPEC | DIST_BEGIN) ||
+                ((flags & DIST_RESET) && pos) ||
+                ((flags & DIST_ROWS) && !d->peer.mtp) ||
+                ((flags & DIST_BEGIN) && (!(flags & DIST_SPEC) || s->spec || !pos)) ||
+                ((flags & DIST_SPEC) && (!d->peer.mtp || !d->info.speculation || n != 1u ||
+                    !(flags & DIST_ROWS) || (flags & DIST_RESET) || (!(flags & DIST_BEGIN) && !s->spec))) ||
+                (s->spec && !(flags & DIST_SPEC))) rc = dist_error(err, errlen, "invalid pipeline work shape");
             else {
                 int *tokens = malloc((size_t)n * sizeof(int));
                 float *hidden = malloc((size_t)n * d->info.n_embd * sizeof(float));
-                float *result = flags & DIST_LOGITS ? malloc((size_t)d->info.n_embd * sizeof(float)) : NULL;
-                if (!tokens || !hidden || ((flags & DIST_LOGITS) && !result)) rc = dist_error(err, errlen, "worker allocation failed");
+                uint32_t returned = flags & DIST_ROWS ? n : flags & DIST_LOGITS ? 1u : 0u;
+                float *result = returned ? malloc((size_t)returned * d->info.n_embd * sizeof(float)) : NULL;
+                if (!tokens || !hidden || (returned && !result)) rc = dist_error(err, errlen, "worker allocation failed");
                 else {
                     for (uint32_t j = 0; j < n; j++) tokens[j] = (int)dist_get(data + 16u + 4u*j);
                     for (uint64_t j = 0; j < (uint64_t)n * d->info.n_embd; j++) {
@@ -559,11 +723,17 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
                         memcpy(hidden + j, &bits, 4);
                     }
                     if (flags & DIST_RESET) rc = q36_session_layer_slice_reset(s->session, err, errlen);
+                    if (!rc && (flags & DIST_BEGIN)) {
+                        rc = q36_session_pipeline_spec_begin(s->session, err, errlen);
+                        if (!rc) { s->spec = true; s->spec_pos = pos; }
+                    }
                     if (!rc) rc = q36_session_eval_layer_slice(s->session, tokens, n, pos,
                             d->info.layer_start, d->info.layer_end, hidden, NULL,
                             false, NULL, err, errlen);
-                    if (!rc && result) rc = q36_session_read_final_hidden(s->session, n, result, err, errlen);
-                    if (!rc) rc = dist_worker_result(fd, id, pos + n, result, d->info.n_embd);
+                    if (!rc && result) rc = flags & DIST_ROWS ?
+                        q36_session_read_final_rows(s->session, n, result, err, errlen) :
+                        q36_session_read_final_hidden(s->session, n, result, err, errlen);
+                    if (!rc) rc = dist_worker_result(fd, id, pos + n, result, returned * d->info.n_embd);
                 }
                 free(result);
                 free(hidden);
@@ -572,7 +742,8 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
         } else rc = dist_error(err, errlen, "invalid pipeline operation or session");
         free(data);
         if (rc) {
-            dist_send(fd, DIST_ERROR, err, (uint32_t)strlen(err), NULL);
+            char *message = err && errlen && err[0] ? err : "worker response failed";
+            dist_send(fd, DIST_ERROR, message, (uint32_t)strlen(message), NULL);
             break;
         }
     }

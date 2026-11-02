@@ -614,6 +614,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const int eos = q36_token_eos(engine);
+    const bool spec = (cfg.temperature <= 0.0f || cfg.mtp_opportunistic) &&
+                      q36_engine_mtp_draft_tokens(engine) > 1 &&
+                      getenv("Q36_MTP_SPEC_DISABLE") == NULL;
     if (cfg.warmup) {
         char warm_err[256] = {0};
         double started = bench_now_sec();
@@ -626,13 +630,21 @@ int main(int argc, char **argv) {
                 q36_session_free(session); q36_tokens_free(&prompt); q36_engine_close(engine);
                 return 1;
             }
-            for (int i = 0; i < 8 && q36_session_pos(session) + 1 < cfg.ctx_alloc; i++) {
-                int token = q36_session_argmax_excluding(session, q36_token_eos(engine));
-                if (token < 0 || q36_session_eval(session, token, warm_err, sizeof(warm_err))) {
+            for (int i = 0; i < 8 && q36_session_pos(session) + 1 < cfg.ctx_alloc;) {
+                int token = q36_session_argmax_excluding(session, eos);
+                int accepted[16], n = 1;
+                int limit = cfg.ctx_alloc - q36_session_pos(session) - 1;
+                if (limit > 8 - i) limit = 8 - i;
+                if (token >= 0 && spec)
+                    n = q36_session_eval_speculative_argmax_excluding(session, token,
+                        limit, eos, accepted, 16, warm_err, sizeof(warm_err));
+                else if (token < 0 || q36_session_eval(session, token, warm_err, sizeof(warm_err))) n = -1;
+                if (n < 1) {
                     fprintf(stderr, "q36-bench: warm-up decode failed: %s\n", warm_err);
                     q36_session_free(session); q36_tokens_free(&prompt); q36_engine_close(engine);
                     return 1;
                 }
+                i += n;
             }
             if (frontier >= cfg.ctx_max) break;
         }
@@ -658,10 +670,6 @@ int main(int argc, char **argv) {
     fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
     fflush(out);
 
-    const int eos = q36_token_eos(engine);
-    const bool spec = (cfg.temperature <= 0.0f || cfg.mtp_opportunistic) &&
-                      q36_engine_mtp_draft_tokens(engine) > 1 &&
-                      getenv("Q36_MTP_SPEC_DISABLE") == NULL;
     q36_session_snapshot snap = {0};
     char err[256];
     int previous = 0;

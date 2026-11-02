@@ -124,9 +124,9 @@ Activations use lossless FP32 transport in network byte order. For the final
 token of a prefill span or decode call, the worker returns one normalized hidden
 row. The coordinator projects it to full logits for sampling and logprobs.
 This keeps the return transfer proportional to the hidden width rather than
-the vocabulary size. Protocol version 2 rejects older full-logit peers.
+the vocabulary size. Protocol version 3 negotiates speculative verification support; rebuild both stages when upgrading.
 
-Decode of one conversation remains serial: the next token depends on both
+Without MTP, decode of one conversation remains serial: the next token depends on both
 stages finishing the current one. Throughput depends on both machines, the
 layer split, memory/storage mode, bandwidth, latency, and network congestion.
 Wi-Fi and routed links can have different throughput and jitter from a direct
@@ -134,6 +134,40 @@ Ethernet link. Measure on the network you intend to use.
 
 `--debug` reports route and timing information. Its `remote_wait` time includes
 the coordinator's vocabulary projection after receiving the final row.
+
+## Distributed MTP
+
+Enable the existing MTP option on the coordinator only:
+
+```sh
+./q36 --vulkan -m "$MODEL" --mtp --mtp-draft 4 --mtp-margin 0 \
+  --role coordinator --layers 0:19 --listen 0.0.0.0 9911 \
+  --ctx 8192 --prefill-chunk 32 -ctk q8_0 -ctv q4_0
+```
+
+Start the worker with its matching suffix range as above, without `--mtp`.
+Both stages must use resident Vulkan inference. The coordinator owns the MTP
+block, embeddings, and vocabulary head; the worker does not need a duplicate
+MTP head. Existing sampled opportunistic MTP, confidence margins, draft limits,
+and generation boundaries apply to the pipeline too.
+
+The coordinator proposes a short continuation. Its prefix stage can verify
+candidate token N+1 while the suffix stage verifies token N. Each stage uses
+ordinary single-token arithmetic and keeps a recurrent rollback point. Only
+the matching target prefix is committed on both machines. Rejected tails are
+rolled back using saved recurrent inputs, without rerunning model weights.
+Verification keeps vocabulary logits on the coordinator GPU and reads only
+the top token for each candidate. Once a continuation fails, queued tail rows
+are drained without projecting them. Only the final accepted vocabulary row
+is copied to the CPU for sampling and logprobs.
+
+MTP also needs normalized target rows to maintain its shifted attention
+history. Requests and replies are exchanged concurrently so large hidden-row
+returns cannot block the next request. GPU work remains on the inference
+thread. `--dist-prefill-window` bounds work in flight during prefill and candidate
+verification. Decode gains depend on draft acceptance, the layer split, and
+network latency; compare `--mtp` against plain decode at several context sizes
+before selecting a profile.
 
 ## Sessions and recovery
 
@@ -148,6 +182,8 @@ Pipeline disk payloads use the token-only checkpoint format. Loading one, or
 restoring a snapshot, replays the saved tokens across both stages. A distributed
 checkpoint does not contain a complete single-machine KV cache. Full resident
 KV payloads from a single-machine run cannot be loaded into a pipeline session.
+MTP history is rebuilt during replay as well. Token-only restore follows cold
+prefill arithmetic, which can differ from the earlier decode schedule's rounding.
 
 ## Measure resident throughput
 
@@ -215,11 +251,27 @@ streaming uses FP32. For FP32 reference comparisons, set
 `Q36_VK_DELTA_QKV=0` on both processes. Different hardware and backends can also
 affect floating-point rounding; assess correctness on the actual pair.
 
+To check distributed MTP against plain target decoding on the actual pair:
+
+```sh
+make tests/test_distributed_mtp
+./tests/test_distributed_mtp --model "$MODEL" \
+  --role coordinator --layers 0:19 --listen 0.0.0.0 9911
+```
+
+Use a worker with `--ctx 1024 --prefill-chunk 32` and matching KV/recurrent
+settings. The test checks greedy and sampled boundaries on prose, code, and
+reasoning; full logits after accepted blocks; a forced rejection; checkpoint
+replay; and generation boundaries. The Qwen3.6 Q4 path has been validated with
+default Vulkan settings and with FP32 recurrent state and separate
+convolution/QKV operations as described above.
+
 ## Current limits
 
-A route has exactly one prefix coordinator and one suffix worker. MTP, vision,
-directional steering, `--ssd-streaming-full-layers`, and whole-model diagnostic
-flags are unavailable in pipeline mode. CPU and Vulkan stages are supported;
-multi-machine Metal inference has not been validated. The pipeline does not
-add support for model architectures or tensor layouts outside the existing
-runtime.
+A route has exactly one prefix coordinator and one suffix worker. Plain
+pipeline inference supports CPU and Vulkan stages; distributed MTP requires
+resident Vulkan on both. Vision, directional steering,
+`--ssd-streaming-full-layers`, and whole-model diagnostic flags are unavailable
+in pipeline mode. Multi-machine Metal inference has not been validated. The
+pipeline does not add support for model architectures or tensor layouts outside
+the existing runtime.
