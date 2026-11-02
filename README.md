@@ -302,6 +302,8 @@ tables, dense-model charts, Metal results, measurement conditions, and commands.
 - [Metal](docs/METAL.md): Apple Silicon setup, memory, and compatibility.
 - [Models and vision](docs/MODELS.md): downloads, quantization, and encoders.
 - [Native agent](docs/AGENT.md): sessions, thinking, context, and tools.
+- [Distributed inference](docs/DISTRIBUTED.md): split a supported model across two
+  Linux machines over Ethernet, Wi-Fi, or other TCP networks.
 - [SSD streaming](docs/SSD_STREAMING.md): run the MoE model with a bounded expert cache.
 - [Speculative decoding](docs/SPECULATIVE_DECODING.md): MTP verification and sampling.
 - [Serving](docs/SERVER.md): APIs, images, and multiple sessions.

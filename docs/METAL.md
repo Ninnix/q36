@@ -44,7 +44,8 @@ memory is tight, and check the startup estimate.
 A normal local Metal process uses `MTLCreateSystemDefaultDevice`.
 Apple Silicon exposes its unified GPU as one logical Metal device, so Q36 does
 not require or expose a device list for M1, M2, M3, M4, or later families.
-There is no layer split or multi-Mac distributed mode: one Q36 process owns one
+The [two-stage pipeline](DISTRIBUTED.md) is validated on CPU/Vulkan; multi-Mac
+Metal pipelines have not been validated. The usual Metal configuration owns one
 default local Metal device and one model. Run only one large model process at a
 time when validating memory and performance.
 

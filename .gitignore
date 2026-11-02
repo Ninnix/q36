@@ -42,3 +42,6 @@ TODO.md
 /tests/test_prompt_prefix
 /tests/test_quality_api
 /speed-bench/session_concurrency_bench
+
+/tests/test_distributed
+/tests/test_distributed_model

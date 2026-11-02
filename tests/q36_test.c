@@ -817,7 +817,12 @@ static q36_engine *test_open_backend_engine(const char *model_path,
      * a captured CPU trajectory on machines that cannot use residency. */
     if (backend == Q36_BACKEND_VULKAN && stream && stream[0] && atoi(stream)) {
         const char *cache_mb = getenv("Q36_TEST_SSD_STREAM_CACHE_MB");
+        const char *full_layers = getenv("Q36_TEST_SSD_FULL_LAYERS");
         opt.ssd_streaming = true;
+        if (full_layers && full_layers[0]) {
+            opt.ssd_streaming_full_layers = (uint32_t)atoi(full_layers);
+            opt.ssd_streaming_full_layers_set = true;
+        }
         if (cache_mb && cache_mb[0] && atoi(cache_mb) > 0)
             opt.ssd_streaming_cache_bytes = (uint64_t)atoi(cache_mb) << 20;
     }
@@ -2155,11 +2160,11 @@ cleanup:
 #endif
 }
 
-static void test_vulkan_rms_norm_rope(void) {
+static void test_vulkan_rms_norm_rope_one(uint32_t n_head) {
 #ifdef Q36_NO_GPU
+    (void)n_head;
     test_skip("vulkan-kernels", "CPU-only build");
 #else
-    const uint32_t n_head = 16;
     const uint32_t head_dim = 256;
     const uint32_t src_stride = 512;
     const uint32_t n_tok = 2;
@@ -2196,7 +2201,7 @@ static void test_vulkan_rms_norm_rope(void) {
     }
     TEST_ASSERT(q36_gpu_tensor_write(src, 0, src_host, src_floats * sizeof(float)) != 0);
     TEST_ASSERT(q36_gpu_set_model_map(weights_raw, weight_alloc) != 0);
-    TEST_ASSERT(q36_gpu_extract_full_attn_q_tensor(sep, src, n_tok) != 0);
+    TEST_ASSERT(q36_gpu_extract_full_attn_q_tensor(sep, src, n_head, head_dim, n_tok) != 0);
     TEST_ASSERT(q36_gpu_rms_norm_weight_rows_tensor(sep, sep, weights_raw, weight_alloc,
                                                     0, head_dim, rows, 1.0e-6f) != 0);
     TEST_ASSERT(q36_gpu_rope_qwen_rows_tensor(sep, n_head, 19, n_tok) != 0);
@@ -2231,6 +2236,11 @@ done:
     free(fused_host);
     free(weights_raw);
 #endif
+}
+
+static void test_vulkan_rms_norm_rope(void) {
+    test_vulkan_rms_norm_rope_one(16);
+    test_vulkan_rms_norm_rope_one(24);
 }
 
 static void test_vulkan_rms_norm_rope_kv(void) {
@@ -2692,12 +2702,13 @@ done:
 #endif
 }
 
-static void test_vulkan_delta_qkv(void) {
+static void test_vulkan_delta_qkv_one(uint32_t n_heads) {
 #ifdef Q36_NO_GPU
+    (void)n_heads;
     test_skip("vulkan-kernels", "CPU-only build");
 #else
-    const uint32_t n_heads = 32, n_groups = 16, state_dim = 128;
-    const uint32_t conv_stride = 8192, n_tok = 3;
+    const uint32_t n_groups = 16, state_dim = 128;
+    const uint32_t conv_stride = (2u * n_groups + n_heads) * state_dim, n_tok = 3;
     const uint64_t conv_bytes = (uint64_t)n_tok * conv_stride * sizeof(float);
     const uint64_t out_bytes = (uint64_t)n_tok * n_heads * state_dim * sizeof(float);
     float *host = malloc((size_t)conv_bytes);
@@ -2721,7 +2732,7 @@ static void test_vulkan_delta_qkv(void) {
     TEST_ASSERT(q36_gpu_tensor_write(conv, 0, host, conv_bytes) != 0);
     TEST_ASSERT(q36_gpu_delta_qk_l2_norm_tensor(qa, ka, conv, n_heads, n_groups,
                                                 state_dim, conv_stride, n_tok, 1.0e-6f) != 0);
-    TEST_ASSERT(q36_gpu_extract_recurrent_v_tensor(va, conv, n_tok) != 0);
+    TEST_ASSERT(q36_gpu_extract_recurrent_v_tensor(va, conv, conv_stride, n_heads * state_dim, n_tok) != 0);
     TEST_ASSERT(q36_gpu_delta_qkv_l2_norm_tensor(qb, kb, vb, conv, n_heads, n_groups,
                                                  state_dim, conv_stride, n_tok, 1.0e-6f) != 0);
 #define TEST_SAME_TENSOR(old, fused) do { \
@@ -2732,6 +2743,22 @@ static void test_vulkan_delta_qkv(void) {
     TEST_SAME_TENSOR(qa, qb);
     TEST_SAME_TENSOR(ka, kb);
     TEST_SAME_TENSOR(va, vb);
+    for (uint32_t tok = 0; tok < n_tok; tok++) {
+        TEST_ASSERT(memcmp(a + (uint64_t)tok * n_heads * state_dim,
+            host + (uint64_t)tok * conv_stride + 2u * n_groups * state_dim,
+            (size_t)n_heads * state_dim * sizeof(float)) == 0);
+    }
+#ifndef Q36_METAL
+    const char *env = getenv("Q36_VK_GPU_RECURRENT");
+    char *saved = env ? test_strdup(env) : NULL;
+    setenv("Q36_VK_GPU_RECURRENT", "0", 1);
+    TEST_ASSERT(q36_gpu_extract_recurrent_v_tensor(va, conv, conv_stride,
+                    n_heads * state_dim, n_tok) != 0);
+    if (saved) setenv("Q36_VK_GPU_RECURRENT", saved, 1);
+    else unsetenv("Q36_VK_GPU_RECURRENT");
+    free(saved);
+    TEST_SAME_TENSOR(va, vb);
+#endif
 #undef TEST_SAME_TENSOR
 
 done:
@@ -2746,6 +2773,11 @@ done:
     free(a);
     free(b);
 #endif
+}
+
+static void test_vulkan_delta_qkv(void) {
+    test_vulkan_delta_qkv_one(32);
+    test_vulkan_delta_qkv_one(48);
 }
 
 static void test_vulkan_shared_ffn_decode(void) {
@@ -3947,29 +3979,32 @@ static float test_swiglu_ref(float gate, float up) {
 }
 
 #ifndef Q36_NO_GPU
-static void test_vulkan_moe_q4_one(bool streaming) {
+static void test_vulkan_moe_q4_one(bool streaming, uint32_t gate_type, uint32_t n_tok,
+                                    uint32_t n_expert, uint32_t blocks, bool scaled) {
     enum {
-        in_dim = TEST_QK_K,
         mid_dim = TEST_QK_K,
         out_dim = 11,
-        n_expert = 3,
         n_used = 2,
-        n_tok = 2,
     };
-    const uint64_t row_bytes = sizeof(test_block_q4_K);
+    const uint32_t in_dim = blocks * TEST_QK_K;
+    const uint64_t block_bytes = gate_type == 23 ? 136 : sizeof(test_block_q4_K);
+    const uint64_t row_bytes = blocks * block_bytes;
+    const uint64_t down_row_bytes = sizeof(test_block_q4_K);
     const uint64_t gate_stride = row_bytes * mid_dim;
-    const uint64_t down_stride = row_bytes * out_dim;
+    const uint64_t down_stride = down_row_bytes * out_dim;
     const uint64_t gate_offset = 0;
     const uint64_t up_offset = gate_offset + gate_stride * n_expert;
     const uint64_t down_offset = up_offset + gate_stride * n_expert;
-    const uint64_t model_bytes = down_offset + down_stride * n_expert;
+    const uint64_t scale_offset = down_offset + down_stride * n_expert;
+    const uint64_t model_bytes = scale_offset + 3u * n_expert * sizeof(float);
     const uint64_t model_alloc = test_round_up_u64(model_bytes, (uint64_t)getpagesize());
+    uint32_t selected_host[n_tok * n_used];
+    float weights_host[n_tok * n_used];
     void *model = NULL;
     float *x_host = NULL;
     float *out_host = NULL;
     float *want = NULL;
     float *mid = NULL;
-    test_block_q8_K *xq = NULL;
     test_block_q8_K *midq = NULL;
     q36_gpu_tensor *x = NULL;
     q36_gpu_tensor *qx = NULL;
@@ -3984,67 +4019,87 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     memset(model, 0, (size_t)model_alloc);
 
     for (uint32_t expert = 0; expert < n_expert; expert++) {
-        for (uint32_t row = 0; row < mid_dim; row++) {
-            test_fill_q4_k((test_block_q4_K *)((uint8_t *)model + gate_offset + expert * gate_stride + row * row_bytes),
-                           (1u + expert * 1000u + row) % 89u);
-            test_fill_q4_k((test_block_q4_K *)((uint8_t *)model + up_offset + expert * gate_stride + row * row_bytes),
-                           (2u + expert * 1000u + row) % 89u);
+        for (uint32_t row = 0; row < mid_dim * blocks; row++) {
+            uint8_t *g = (uint8_t *)model + gate_offset + expert * gate_stride + row * block_bytes;
+            uint8_t *u = (uint8_t *)model + up_offset + expert * gate_stride + row * block_bytes;
+            uint32_t seed = (1u + expert * 1000u + row) % 89u;
+            if (gate_type == 23) {
+                uint16_t d = test_float_to_f16(.0001f * (float)(seed + 1u));
+                for (uint32_t j = 2; j < block_bytes; j++) {
+                    g[j] = (uint8_t)(seed * 17u + j * 7u);
+                    u[j] = (uint8_t)(seed * 11u + j * 13u);
+                }
+                memcpy(g, &d, sizeof(d));
+                memcpy(u, &d, sizeof(d));
+            } else {
+                test_fill_q4_k((test_block_q4_K *)g, seed);
+                test_fill_q4_k((test_block_q4_K *)u, (seed + 1u) % 89u);
+            }
         }
         for (uint32_t row = 0; row < out_dim; row++) {
-            test_fill_q4_k((test_block_q4_K *)((uint8_t *)model + down_offset + expert * down_stride + row * row_bytes),
+            test_fill_q4_k((test_block_q4_K *)((uint8_t *)model + down_offset + expert * down_stride + row * down_row_bytes),
                            (3u + expert * 1000u + row) % 89u);
         }
     }
+
+    float *scales = (float *)((uint8_t *)model + scale_offset);
+    for (uint32_t i = 0; i < 3u * n_expert; i++)
+        scales[i] = 0.5f + (float)(i % 7u) * 0.125f;
 
     x_host = malloc((size_t)n_tok * in_dim * sizeof(*x_host));
     out_host = malloc((size_t)n_tok * out_dim * sizeof(*out_host));
     want = calloc((size_t)n_tok * out_dim, sizeof(*want));
     mid = malloc((size_t)n_tok * n_used * mid_dim * sizeof(*mid));
-    xq = malloc((size_t)n_tok * sizeof(*xq));
     midq = malloc((size_t)n_tok * n_used * sizeof(*midq));
-    TEST_ASSERT(x_host && out_host && want && mid && xq && midq);
-    if (!x_host || !out_host || !want || !mid || !xq || !midq) goto done;
+    TEST_ASSERT(x_host && out_host && want && mid && midq);
+    if (!x_host || !out_host || !want || !mid || !midq) goto done;
 
     for (uint32_t t = 0; t < n_tok; t++) {
         for (uint32_t i = 0; i < in_dim; i++) {
             x_host[(uint64_t)t * in_dim + i] =
                 (float)((int)((t * 13u + i * 7u) % 31u) - 15) / 1900.0f;
         }
-        test_quantize_q8_k(x_host + (uint64_t)t * in_dim, &xq[t]);
     }
 
-    uint32_t selected_host[n_tok * n_used];
-    float weights_host[n_tok * n_used];
     for (uint32_t t = 0; t < n_tok; t++) {
-        selected_host[t * n_used] = t % n_expert;
-        selected_host[t * n_used + 1u] = (t + 2u) % n_expert;
+        selected_host[t * n_used] = (t * 13u + n_expert - 1u) % n_expert;
+        selected_host[t * n_used + 1u] = (selected_host[t * n_used] + 2u) % n_expert;
         weights_host[t * n_used] = 0.25f + 0.05f * (float)(t % 6u);
         weights_host[t * n_used + 1u] =
             1.0f - weights_host[t * n_used];
     }
 
     for (uint32_t t = 0; t < n_tok; t++) {
+        /* CPU q8_K omits the Vulkan layout's dmin padding word. */
+        uint8_t cpu_q8[blocks * sizeof(test_block_q8_K)];
+        q36_quant_q8_k(x_host + (uint64_t)t * in_dim, cpu_q8, in_dim);
         for (uint32_t u = 0; u < n_used; u++) {
             uint32_t expert = selected_host[t * n_used + u];
             for (uint32_t row = 0; row < mid_dim; row++) {
                 const uint8_t *g = (const uint8_t *)model + gate_offset + expert * gate_stride + row * row_bytes;
                 const uint8_t *up = (const uint8_t *)model + up_offset + expert * gate_stride + row * row_bytes;
-                float gv = test_dot_q4_k_q8_k((const test_block_q4_K *)g, &xq[t]);
-                float uv = test_dot_q4_k_q8_k((const test_block_q4_K *)up, &xq[t]);
+                float gv, uv;
+                TEST_ASSERT(q36_quant_dot_q8_k(gate_type, g, cpu_q8, in_dim, &gv));
+                TEST_ASSERT(q36_quant_dot_q8_k(gate_type, up, cpu_q8, in_dim, &uv));
+                if (scaled) {
+                    gv *= scales[expert];
+                    uv *= scales[n_expert + expert];
+                }
                 mid[((uint64_t)t * n_used + u) * mid_dim + row] = test_swiglu_ref(gv, uv);
             }
             test_quantize_q8_k(mid + ((uint64_t)t * n_used + u) * mid_dim,
                                &midq[t * n_used + u]);
             for (uint32_t row = 0; row < out_dim; row++) {
-                const uint8_t *down = (const uint8_t *)model + down_offset + expert * down_stride + row * row_bytes;
+                const uint8_t *down = (const uint8_t *)model + down_offset + expert * down_stride + row * down_row_bytes;
                 float dv = test_dot_q4_k_q8_k((const test_block_q4_K *)down, &midq[t * n_used + u]);
+                if (scaled) dv *= scales[2u * n_expert + expert];
                 want[(uint64_t)t * out_dim + row] += dv * weights_host[t * n_used + u];
             }
         }
     }
 
     x = q36_gpu_tensor_alloc((uint64_t)n_tok * in_dim * sizeof(float));
-    qx = q36_gpu_tensor_alloc((uint64_t)n_tok * sizeof(test_block_q8_K));
+    qx = q36_gpu_tensor_alloc((uint64_t)n_tok * blocks * sizeof(test_block_q8_K));
     selected = q36_gpu_tensor_alloc(sizeof(selected_host));
     weights = q36_gpu_tensor_alloc(sizeof(weights_host));
     out = q36_gpu_tensor_alloc((uint64_t)n_tok * out_dim * sizeof(float));
@@ -4060,9 +4115,9 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     TEST_ASSERT(q36_gpu_tensor_write(weights, 0, weights_host, sizeof(weights_host)) != 0);
     TEST_ASSERT(q36_gpu_quantize_q8_k_tensor(qx, x, in_dim, n_tok) != 0);
 
-    q36_gpu_moe_weight gate = { gate_offset, 12, 0, false };
-    q36_gpu_moe_weight up = { up_offset, 12, 0, false };
-    q36_gpu_moe_weight down = { down_offset, 12, 0, false };
+    q36_gpu_moe_weight gate = { gate_offset, gate_type, scale_offset, scaled };
+    q36_gpu_moe_weight up = { up_offset, gate_type, scale_offset + n_expert * sizeof(float), scaled };
+    q36_gpu_moe_weight down = { down_offset, 12, scale_offset + 2u * n_expert * sizeof(float), scaled };
     ok = q36_gpu_moe_ffn_q8_tensor(out, model, model_alloc,
                                    &gate, &up, &down,
                                    selected, weights, 0, n_used, qx, n_tok,
@@ -4074,6 +4129,7 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     float max_rel = 0.0f;
     uint32_t max_i = 0;
     for (uint32_t i = 0; i < n_tok * out_dim; i++) {
+        TEST_ASSERT(isfinite(out_host[i]));
         float err = fabsf(out_host[i] - want[i]);
         float den = fabsf(want[i]) > 1.0f ? fabsf(want[i]) : 1.0f;
         float rel = err / den;
@@ -4085,8 +4141,8 @@ static void test_vulkan_moe_q4_one(bool streaming) {
     }
     if (max_abs >= 5.0e-2f && max_rel >= 5.0e-5f) {
         fprintf(stderr,
-                "q36-test: routed q4 %s max_abs=%g max_rel=%g idx=%u got=%g want=%g\n",
-                streaming ? "stream" : "resident",
+                "q36-test: routed q4 %s type=%u tokens=%u scaled=%d max_abs=%g max_rel=%g idx=%u got=%g want=%g\n",
+                streaming ? "stream" : "resident", gate_type, n_tok, scaled,
                 (double)max_abs,
                 (double)max_rel,
                 max_i,
@@ -4094,6 +4150,28 @@ static void test_vulkan_moe_q4_one(bool streaming) {
                 (double)want[max_i]);
     }
     TEST_ASSERT(max_abs < 5.0e-2f || max_rel < 5.0e-5f);
+#ifndef Q36_METAL
+    if (gate_type == 23) {
+        const char *env = getenv("Q36_VK_MOE_GATE_UP");
+        char *saved = env ? test_strdup(env) : NULL;
+        float *fallback = malloc((size_t)n_tok * out_dim * sizeof(float));
+        TEST_ASSERT(fallback != NULL);
+        setenv("Q36_VK_MOE_GATE_UP", "0", 1);
+        TEST_ASSERT(q36_gpu_moe_ffn_q8_tensor(out, model, model_alloc,
+                        &gate, &up, &down, selected, weights, 0, n_used, qx,
+                        n_tok, in_dim, mid_dim, out_dim, n_expert) != 0);
+        if (fallback) {
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, fallback,
+                            (uint64_t)n_tok * out_dim * sizeof(float)) != 0);
+            TEST_ASSERT(memcmp(out_host, fallback,
+                            (size_t)n_tok * out_dim * sizeof(float)) == 0);
+        }
+        if (saved) setenv("Q36_VK_MOE_GATE_UP", saved, 1);
+        else unsetenv("Q36_VK_MOE_GATE_UP");
+        free(saved);
+        free(fallback);
+    }
+#endif
 
 done:
     q36_gpu_set_ssd_streaming(false);
@@ -4105,7 +4183,6 @@ done:
     q36_gpu_tensor_free(qx);
     q36_gpu_tensor_free(x);
     free(midq);
-    free(xq);
     free(mid);
     free(want);
     free(out_host);
@@ -4119,8 +4196,33 @@ static void test_vulkan_moe_q4(void) {
     test_skip("vulkan-kernels", "CPU-only build");
     return;
 #else
-    test_vulkan_moe_q4_one(false);
-    test_vulkan_moe_q4_one(true);
+#ifndef Q36_METAL
+    const uint32_t batches[] = {1, 2, 3, 8, 32, 33};
+#endif
+    for (int stream = 0; stream < 2; stream++) {
+        test_vulkan_moe_q4_one(stream, 12, 1, 3, 1, false);
+        test_vulkan_moe_q4_one(stream, 12, 2, 3, 1, false);
+#ifndef Q36_METAL
+        test_vulkan_moe_q4_one(stream, 23, 1, 3, 1, false);
+        test_vulkan_moe_q4_one(stream, 23, 2, 3, 1, false);
+        for (size_t i = 0; i < sizeof(batches) / sizeof(batches[0]); i++) {
+            for (int scaled = 0; scaled < 2; scaled++) {
+                test_vulkan_moe_q4_one(stream, 12, batches[i], 64, 2, scaled);
+                test_vulkan_moe_q4_one(stream, 23, batches[i], 64, 2, scaled);
+            }
+        }
+#endif
+    }
+#endif
+}
+
+static void test_routed_q4_quants(void) {
+#ifndef Q36_NO_GPU
+    if (!q36_gpu_init()) { test_skip("routed-q4-quants", "GPU unavailable"); return; }
+#endif
+    test_vulkan_moe_q4();
+#ifndef Q36_NO_GPU
+    q36_gpu_cleanup();
 #endif
 }
 
@@ -6806,18 +6908,28 @@ static void test_sampling_controls(void) {
         test_skip("sampling-controls", "model file not found");
         return;
     }
-    q36_engine *engine = test_get_engine();
+    /* Replace host logits in a CPU session. Avoid worker threads here:
+     * the later server rejection tests fork. */
+    q36_engine *engine = test_open_runtime_engine(test_model_path(), 1);
+    TEST_ASSERT(engine != NULL);
     if (!engine) return;
-    if (!test_require_session_backend("sampling-controls", engine, 16)) return;
 
     q36_session *session = NULL;
     TEST_ASSERT(q36_session_create(&session, engine, 16) == 0);
-    if (!session) return;
+    if (!session) goto done;
+    q36_tokens seed = {0};
+    char err[160] = {0};
+    q36_tokens_push(&seed, 17);
+    int rc = q36_session_sync(session, &seed, err, sizeof(err));
+    q36_tokens_free(&seed);
+    TEST_ASSERT(rc == 0);
+    if (rc) goto done;
 
     int n_vocab = 0;
     float *logits = (float *)q36_session_logits(session, &n_vocab);
     TEST_ASSERT(logits != NULL);
     TEST_ASSERT(n_vocab > 4);
+    if (!logits || n_vocab <= 4) goto done;
 
     for (int i = 0; i < n_vocab; i++) logits[i] = Q36_NEG_INF;
     logits[0] = 0.0f;
@@ -6854,7 +6966,9 @@ static void test_sampling_controls(void) {
     rng = 19;
     TEST_ASSERT(q36_session_sample(session, 1.0f, 0, 1.0f, 0.95f, &rng) == 0);
 
+done:
     q36_session_free(session);
+    q36_engine_close(engine);
 }
 
 static void test_kv_cache_save_restore(void) {
@@ -8411,6 +8525,7 @@ typedef struct {
 } q36_test_entry;
 
 static const q36_test_entry test_entries[] = {
+    {"--routed-q4-quants", "routed-q4-quants", "resident and streaming Q4_K/IQ4_XS routed experts", test_routed_q4_quants},
     {"--quant-primitives", "quant-primitives", "Q36 half and activation quantization", test_quant_primitives},
     {"--ssd-cache-shrink", "ssd-cache-shrink", "SSD expert cache runtime shrink policy", test_ssd_cache_shrink},
     {"--long-context", "long-context", "long-context continuation regression", test_long_security_continuation},
@@ -8473,6 +8588,7 @@ static void test_print_help(const char *prog) {
     puts("  Q36_TEST_LLAMA_VECTOR_FILE=FILE  llama.cpp vector fixture.");
     puts("  Q36_TEST_SSD_STREAMING=1   Open Vulkan test engines with SSD expert streaming.");
     puts("  Q36_TEST_SSD_STREAM_CACHE_MB=N  Cap the streaming expert cache instead of the auto budget.");
+    puts("  Q36_TEST_SSD_FULL_LAYERS=N  Keep a resident prefix when testing streaming kernels.");
     puts("  --hf-template             Use the official HF text-only chat template in special parity modes.");
 }
 

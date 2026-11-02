@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_tool_text.h"
 #include "rax.h"
 
@@ -10664,8 +10665,14 @@ static server_config parse_options(int argc, char **argv) {
     int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        int dist_parse = q36_dist_parse_cli_arg(arg, &i, argc, argv,
+                &c.engine.distributed, dist_err, sizeof(dist_err));
+        if (dist_parse < 0) { fprintf(stderr, "q36: %s\n", dist_err); exit(2); }
+        if (dist_parse > 0) continue;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
+            q36_dist_usage(stdout);
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
@@ -10819,6 +10826,12 @@ static server_config parse_options(int argc, char **argv) {
         c.engine.cache_type_k = q36_default_kv_cache_type_k(c.engine.backend, c.engine.ssd_streaming);
     if (!cache_type_v_set)
         c.engine.cache_type_v = q36_default_kv_cache_type_v(c.engine.backend, c.engine.ssd_streaming);
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&c.engine.distributed, NULL, dist_err, sizeof(dist_err)) ||
+        c.engine.distributed.role == Q36_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "q36: %s\n", dist_err[0] ? dist_err : "run workers with q36");
+        exit(2);
+    }
     return c;
 }
 

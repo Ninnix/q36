@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_ssd.h"
 #ifndef Q36_NO_GPU
 #include "q36_gpu.h"
@@ -25,6 +26,7 @@
 #include <time.h>
 
 typedef struct {
+    q36_dist_options distributed;
     const char *model_path;
     const char *mtp_path;
     const char *prompt_path;
@@ -55,6 +57,7 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool warm_weights;
+    bool warmup;
     const char *dump_frontier_logits_dir;
 } bench_config;
 
@@ -94,6 +97,7 @@ static void usage(FILE *fp) {
         "                         KV cache V type: f16, q8_0, or q4_0.\n"
         "                         Default: Vulkan/Metal resident q4_0, otherwise f16\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
+        "  --warmup               Untimed prefill and 8 decode tokens at every frontier.\n"
         "  --mtp FILE             Optional MTP support GGUF: the greedy decode runs\n"
         "                         the speculative path when --mtp-draft > 1.\n"
         "  --mtp-draft N          Max MTP draft tokens per speculative step. Default: 1\n"
@@ -243,8 +247,14 @@ static bench_config parse_options(int argc, char **argv) {
     bool cache_type_v_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        int dist_parse = q36_dist_parse_cli_arg(arg, &i, argc, argv,
+                &c.distributed, dist_err, sizeof(dist_err));
+        if (dist_parse < 0) { fprintf(stderr, "q36: %s\n", dist_err); exit(2); }
+        if (dist_parse > 0) continue;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
+            q36_dist_usage(stdout);
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
@@ -268,6 +278,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--warmup")) {
+            c.warmup = true;
         } else if (!strcmp(arg, "--csv")) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -404,6 +416,12 @@ static bench_config parse_options(int argc, char **argv) {
         c.cache_type_k = q36_default_kv_cache_type_k(c.backend, c.ssd_streaming);
     if (!cache_type_v_set)
         c.cache_type_v = q36_default_kv_cache_type_v(c.backend, c.ssd_streaming);
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&c.distributed, NULL, dist_err, sizeof(dist_err)) ||
+        c.distributed.role == Q36_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "q36: %s\n", dist_err[0] ? dist_err : "run workers with q36");
+        exit(2);
+    }
     return c;
 }
 
@@ -538,6 +556,7 @@ int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
     q36_engine_options opt = {
+        .distributed = cfg.distributed,
         .context_size = cfg.ctx_alloc,
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
@@ -593,6 +612,36 @@ int main(int argc, char **argv) {
         q36_tokens_free(&prompt);
         q36_engine_close(engine);
         return 1;
+    }
+
+    if (cfg.warmup) {
+        char warm_err[256] = {0};
+        double started = bench_now_sec();
+        /* Intermediate frontiers can select kernels absent at both ends. */
+        for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+            q36_tokens prefix = {.v=prompt.v, .len=frontier, .cap=frontier};
+            q36_session_invalidate(session);
+            if (q36_session_sync(session, &prefix, warm_err, sizeof(warm_err))) {
+                fprintf(stderr, "q36-bench: warm-up prefill failed: %s\n", warm_err);
+                q36_session_free(session); q36_tokens_free(&prompt); q36_engine_close(engine);
+                return 1;
+            }
+            for (int i = 0; i < 8 && q36_session_pos(session) + 1 < cfg.ctx_alloc; i++) {
+                int token = q36_session_argmax_excluding(session, q36_token_eos(engine));
+                if (token < 0 || q36_session_eval(session, token, warm_err, sizeof(warm_err))) {
+                    fprintf(stderr, "q36-bench: warm-up decode failed: %s\n", warm_err);
+                    q36_session_free(session); q36_tokens_free(&prompt); q36_engine_close(engine);
+                    return 1;
+                }
+            }
+            if (frontier >= cfg.ctx_max) break;
+        }
+        q36_session_invalidate(session);
+#ifndef Q36_NO_GPU
+        q36_gpu_prof_reset();
+#endif
+        fprintf(stderr, "q36-bench: warm-up complete in %.3f s; measured run starts now\n",
+                bench_now_sec() - started);
     }
 
     FILE *out = stdout;

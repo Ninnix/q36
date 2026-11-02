@@ -133,6 +133,7 @@ VULKAN_SHADERS := \
 	vulkan/attn_prefill_qtile2_gqa6.spv \
 	vulkan/attn_combine.spv \
 	vulkan/moe_gate_up.spv \
+	vulkan/moe_gate_up_iq4_xs.spv \
 	vulkan/router_topk.spv \
 	vulkan/router_topk_fast.spv \
 	vulkan/moe_tiles.spv \
@@ -155,6 +156,8 @@ VULKAN_SHADERS := \
 	vulkan/moe_gate_up_gemm.spv \
 	vulkan/moe_down_gemm.spv \
 	vulkan/moe_matvec.spv \
+	vulkan/moe_iq4_xs_single.spv \
+	vulkan/moe_q4_k_single.spv \
 	vulkan/moe_matvec_fast.spv \
 	vulkan/dense_iq3_xxs_decode.spv \
 	vulkan/dense_iq3_xxs_verify.spv \
@@ -240,6 +243,12 @@ VULKAN_SHADERS := \
 	vulkan/dense_q5k_decode_dot.spv \
 	vulkan/moe_reduce.spv \
 	vulkan/ffn_tail.spv
+
+vulkan/moe_iq4_xs_single.spv: vulkan/moe_matvec.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_SINGLE_PAIR=1 -DQ36_TYPE=23 -o $@ $<
+
+vulkan/moe_q4_k_single.spv: vulkan/moe_matvec.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_SINGLE_PAIR=1 -DQ36_TYPE=12 -o $@ $<
 
 vulkan/moe_matvec_fast.spv: vulkan/moe_matvec_fast.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -606,9 +615,9 @@ vulkan/attn_prefill_qtile2_gqa6.spv: vulkan/attn_prefill_qtile2.comp
 
 # Vulkan is the default backend. CORE_OBJS holds the GPU engine; CPU_CORE_OBJS
 # is the -DQ36_NO_GPU reference build selected by `make cpu`.
-CORE_OBJS := q36_gpu_core.o q36_vulkan.o q36_image.o
-METAL_CORE_OBJS := q36_gpu_core_metal.o q36_metal.o q36_image.o
-CPU_CORE_OBJS := q36_cpu.o q36_image.o
+CORE_OBJS := q36_distributed.o q36_gpu_core.o q36_vulkan.o q36_image.o
+METAL_CORE_OBJS := q36_distributed.o q36_gpu_core_metal.o q36_metal.o q36_image.o
+CPU_CORE_OBJS := q36_distributed.o q36_cpu.o q36_image.o
 
 .PHONY: test-quality all help cpu gpu vulkan vulkan-generic vulkan-bc250 metal q36-quality-score test test-metal test-metal-model test-qwen27b-metal-parity test-qwen27b-vulkan-parity test-qwen27b-llama-parity test-quick test-all test-unit test-vulkan test-streaming test-mtp test-model test-session-batch test-server-live test-server-live-metal test-server-live-metal-ssd test-server-batching test-server-batching-metal test-server-batching-metal-ssd test-release release-build-check release-build-check-metal benchmark-gate benchmark-session-batch benchmark-qwen27b benchmark-qwen27b-gate benchmark-qwen27b-metal-gate benchmark-qwen27b-vulkan benchmark-qwen27b-metal benchmark-qwen27b-llama test-reference test-reference-local test-vectors-local reference-openrouter test-llama test-llama-long test-llama-batch test-llama-all clean
 
@@ -849,7 +858,7 @@ q36_sampling_test_core.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h 
 tests/test_sampling.o: tests/test_sampling.c q36.h
 	$(CC) $(CPU_CFLAGS) -DQ36_TEST_HOOKS -I. -c -o $@ $<
 
-$(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o q36_prompt_prefix.o q36_image.o
+$(SAMPLING_TEST): tests/test_sampling.o q36_sampling_test_core.o q36_ssd_cpu.o q36_prompt_prefix.o q36_image.o q36_distributed.o
 	$(CC) $(LDFLAGS) $(DARWIN_MIN_FLAG) -o $@ $^ $(LDLIBS)
 
 linenoise_cpu.o: linenoise.c linenoise.h
@@ -858,14 +867,14 @@ linenoise_cpu.o: linenoise.c linenoise.h
 rax_cpu.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ rax.c
 
-test: all q36_agent_test $(SAMPLING_TEST) test-quality
+test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed
 	$(MAKE) -C gguf-tools test
 	./q36-eval --self-test-extractors
 	./q36_agent_test
 	python3 tests/test_agent_password.py ./q36_agent_test
 	python3 tests/test_agent_terminal.py ./q36_agent_test
 	./tests/test_sampling
-	./q36_test --mtp-lookup --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
+	./q36_test --mtp-lookup --quant-primitives --routed-q4-quants --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
 
 test-quick: test
 
@@ -1084,7 +1093,7 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 
 clean:
 	rm -f speed-bench/session_concurrency_bench
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api tests/test_distributed tests/test_distributed_model dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_prompt_prefix.c
@@ -1102,3 +1111,18 @@ test-quality: tests/test_prompt_prefix tests/test_quality_api
 
 q36_eval_cases.o: q36_eval_cases.c q36_eval_cases.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_eval_cases.c
+
+q36_distributed.o: q36_distributed.c q36_distributed.h q36.h
+	$(CC) $(CPU_CFLAGS) -c -o $@ $<
+
+tests/test_distributed: tests/test_distributed.c q36_distributed.c q36_distributed.h q36.h
+	$(CC) $(CPU_CFLAGS) -I. -o $@ $< $(LDLIBS)
+
+.PHONY: test-distributed
+test-distributed: tests/test_distributed
+	./tests/test_distributed
+
+q36_gpu_core.o q36_cpu.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o q36_cli.o q36_cli_cpu.o q36_cli_metal.o q36_server.o q36_server_cpu.o q36_agent.o q36_agent_cpu.o q36_bench.o q36_bench_cpu.o q36_eval.o q36_eval_cpu.o: q36_distributed.h
+
+tests/test_distributed_model: tests/test_distributed_model.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
+	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)

@@ -1,0 +1,100 @@
+#version 460
+#extension GL_ARB_gpu_shader_int64 : require
+
+/* One routed pair per workgroup: share activation loads across gate/up,
+ * retaining the original eight FMA chains and reduction order. */
+layout(local_size_x=64) in;
+layout(set=0,binding=0) readonly buffer Gate { uint gw[]; };
+layout(set=0,binding=1) readonly buffer Up { uint uw[]; };
+layout(set=0,binding=2) readonly buffer Input { uint q8[]; };
+layout(set=0,binding=3) readonly buffer Selected { uint selected[]; };
+layout(set=0,binding=4) readonly buffer GateScales { float gate_scales[]; };
+layout(set=0,binding=5) readonly buffer UpScales { float up_scales[]; };
+layout(set=0,binding=6) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    uint row_bytes;
+    uint expert_stride;
+    uint n_used;
+    uint has_gate_scales;
+    uint has_up_scales;
+} pc;
+shared uint sh_q8[74];
+shared float sh_gate[64];
+shared float sh_up[64];
+
+int iq4_value(uint code) {
+    uint values = code < 8u ? (code < 4u ? 0xbfad9881u : 0xf6eaddcfu)
+                            : (code < 12u ? 0x26190d01u : 0x71594535u);
+    return bitfieldExtract(int(values), int((code & 3u) * 8u), 8);
+}
+int dot4(uint codes, uint q) {
+    return iq4_value(codes & 15u) * bitfieldExtract(int(q), 0, 8)
+         + iq4_value((codes >> 8u) & 15u) * bitfieldExtract(int(q), 8, 8)
+         + iq4_value((codes >> 16u) & 15u) * bitfieldExtract(int(q), 16, 8)
+         + iq4_value((codes >> 24u) & 15u) * bitfieldExtract(int(q), 24, 8);
+}
+float fma32(float a, float b, float c) {
+    double p = double(a) * double(b);
+    double s = p + double(c);
+    double bv = s - p;
+    double e = (p - (s - bv)) + (double(c) - bv);
+    if (e != 0.0LF) {
+        uint64_t bits = doubleBitsToUint64(s);
+        if ((bits & 1UL) == 0UL) {
+            if (s > 0.0LF) bits += (e > 0.0LF) ? 1UL : -1UL;
+            else if (s < 0.0LF) bits += (e < 0.0LF) ? 1UL : -1UL;
+            s = uint64BitsToDouble(bits);
+        }
+    }
+    return float(s);
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.x * 8u + (lid >> 3u);
+    uint lane = lid & 7u;
+    uint pair = gl_WorkGroupID.y;
+    uint expert = selected[pair];
+    uint row_base = expert * pc.expert_stride + (row < pc.out_dim ? row : 0u) * pc.row_bytes;
+    uint qbase = (pair / pc.n_used) * pc.blocks * 74u;
+    float gate_acc = 0.0, up_acc = 0.0;
+    for (uint b = 0u; b < pc.blocks; b++) {
+        for (uint w = lid; w < 74u; w += 64u) sh_q8[w] = q8[qbase + b * 74u + w];
+        barrier();
+        if (row < pc.out_dim) {
+            uint base = row_base + b * 136u;
+            uint gm = gw[base >> 2u], um = uw[base >> 2u];
+            uint gs = gw[(base + 4u) >> 2u], us = uw[(base + 4u) >> 2u];
+            int gate_dot = 0, up_dot = 0;
+            for (uint ib = 0u; ib < 8u; ib++) {
+                int gscale = int(((gs >> (4u * ib)) & 15u) | (((gm >> (16u + 2u * ib)) & 3u) << 4u)) - 32;
+                int uscale = int(((us >> (4u * ib)) & 15u) | (((um >> (16u + 2u * ib)) & 3u) << 4u)) - 32;
+                uint off = (base + 8u + ib * 16u + ((4u * lane) & 15u)) >> 2u;
+                uint gc = gw[off] >> (lane < 4u ? 0u : 4u);
+                uint uc = uw[off] >> (lane < 4u ? 0u : 4u);
+                uint q = sh_q8[2u + ib * 8u + lane];
+                gate_dot += gscale * dot4(gc, q);
+                up_dot += uscale * dot4(uc, q);
+            }
+            float yd = uintBitsToFloat(sh_q8[0]);
+            gate_acc = fma32(unpackHalf2x16(gm).x * yd, float(gate_dot), gate_acc);
+            up_acc = fma32(unpackHalf2x16(um).x * yd, float(up_dot), up_acc);
+        }
+        barrier();
+    }
+    sh_gate[lid] = gate_acc;
+    sh_up[lid] = up_acc;
+    barrier();
+    if (row < pc.out_dim && lane == 0u) {
+        uint i = lid;
+        float g = ((sh_gate[i] + sh_gate[i+4u]) + (sh_gate[i+2u] + sh_gate[i+6u]))
+                + ((sh_gate[i+1u] + sh_gate[i+5u]) + (sh_gate[i+3u] + sh_gate[i+7u]));
+        float u = ((sh_up[i] + sh_up[i+4u]) + (sh_up[i+2u] + sh_up[i+6u]))
+                + ((sh_up[i+1u] + sh_up[i+5u]) + (sh_up[i+3u] + sh_up[i+7u]));
+        if (pc.has_gate_scales != 0u) g *= gate_scales[expert];
+        if (pc.has_up_scales != 0u) u *= up_scales[expert];
+        y[pair * pc.out_dim + row] = (g / (1.0f + exp(-g))) * u;
+    }
+}

@@ -2246,17 +2246,24 @@ static int q36_copy_rows(q36_gpu_tensor *dst, const q36_gpu_tensor *src,
 
 int q36_gpu_extract_full_attn_q_tensor(q36_gpu_tensor *dst,
                                         const q36_gpu_tensor *qg,
+                                        uint32_t n_head,
+                                        uint32_t head_dim,
                                         uint32_t tokens) {
+    if (!n_head || !head_dim || !tokens || head_dim > UINT32_MAX / 2u ||
+        (uint64_t)tokens * n_head > UINT32_MAX) return 0;
     return q36_copy_rows(dst, qg, (q36_copy_rows_args){
-        512u, 256u, 0u, 256u, tokens * 16u
+        head_dim * 2u, head_dim, 0u, head_dim, tokens * n_head
     });
 }
 
 int q36_gpu_extract_recurrent_v_tensor(q36_gpu_tensor *dst,
                                         const q36_gpu_tensor *conv,
+                                        uint32_t conv_dim,
+                                        uint32_t v_dim,
                                         uint32_t tokens) {
+    if (!tokens || !v_dim || v_dim > conv_dim) return 0;
     return q36_copy_rows(dst, conv, (q36_copy_rows_args){
-        8192u, 4096u, 4096u, 4096u, tokens
+        conv_dim, v_dim, conv_dim - v_dim, v_dim, tokens
     });
 }
 

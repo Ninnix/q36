@@ -83,7 +83,30 @@ typedef bool (*q36_token_boundary_fn)(void *ud, int token);
 
 #define Q36_SESSION_SYNC_INTERRUPTED 2
 
+typedef enum {
+    Q36_DISTRIBUTED_NONE = 0,
+    Q36_DISTRIBUTED_COORDINATOR,
+    Q36_DISTRIBUTED_WORKER,
+} q36_distributed_role;
+
 typedef struct {
+    uint32_t start, end;
+    bool has_output, set;
+} q36_distributed_layers;
+
+typedef struct {
+    q36_distributed_role role;
+    q36_distributed_layers layers;
+    const char *listen_host;
+    int listen_port;
+    const char *coordinator_host;
+    int coordinator_port;
+    uint32_t prefill_chunk, prefill_window;
+    bool debug;
+} q36_distributed_options;
+
+typedef struct {
+    q36_distributed_options distributed;
     const char *model_path;
     const char *mtp_path;
     const char *vision_path;

@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_eval_cases.h"
 #include "q36_help.h"
 
@@ -1171,6 +1172,7 @@ typedef struct {
 } style_buf;
 
 typedef struct {
+    q36_dist_options distributed;
     const char *model_path;
     const char *mtp_path;
     const char *trace_path;
@@ -1610,10 +1612,16 @@ static eval_config parse_options(int argc, char **argv) {
     bool cache_type_v_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        int dist_parse = q36_dist_parse_cli_arg(arg, &i, argc, argv,
+                &c.distributed, dist_err, sizeof(dist_err));
+        if (dist_parse < 0) { fprintf(stderr, "q36: %s\n", dist_err); exit(2); }
+        if (dist_parse > 0) continue;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            q36_dist_usage(stdout);
             exit(0);
         }
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
@@ -1687,10 +1695,7 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = Q36_BACKEND_CPU;
-        } else if (!strcmp(arg, "--cuda") ||
-                   !strcmp(arg, "--rocm") || !strcmp(arg, "--role") ||
-                   !strcmp(arg, "--layers") || !strcmp(arg, "--listen") ||
-                   !strcmp(arg, "--coordinator")) {
+        } else if (!strcmp(arg, "--cuda") || !strcmp(arg, "--rocm")) {
             fprintf(stderr, "q36-eval: %s is not supported in this q36 port\n", arg);
             exit(2);
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -1788,6 +1793,12 @@ static eval_config parse_options(int argc, char **argv) {
         fprintf(stderr,
                 "q36-eval: --soft-limit-reply-budget (%d) must be >= --hard-limit-reply-budget (%d)\n",
                 c.soft_limit_reply_budget, c.hard_limit_reply_budget);
+        exit(2);
+    }
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&c.distributed, NULL, dist_err, sizeof(dist_err)) ||
+        c.distributed.role == Q36_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "q36: %s\n", dist_err[0] ? dist_err : "run workers with q36");
         exit(2);
     }
     return c;
@@ -4704,6 +4715,7 @@ int main(int argc, char **argv) {
     }
 
     q36_engine_options opt = {
+        .distributed = cfg.distributed,
         .context_size = cfg.ctx_size,
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,

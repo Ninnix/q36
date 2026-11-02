@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_tool_text.h"
 #include "q36_prompt_prefix.h"
 #include "q36_help.h"
@@ -675,10 +676,16 @@ static agent_config parse_options(int argc, char **argv) {
     int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        int dist_parse = q36_dist_parse_cli_arg(arg, &i, argc, argv,
+                &c.engine.distributed, dist_err, sizeof(dist_err));
+        if (dist_parse < 0) { fprintf(stderr, "q36: %s\n", dist_err); exit(2); }
+        if (dist_parse > 0) continue;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
             usage(stdout, topic);
+            q36_dist_usage(stdout);
             exit(0);
         }
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
@@ -776,9 +783,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.backend = Q36_BACKEND_METAL;
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = Q36_BACKEND_CPU;
-        } else if (!strcmp(arg, "--cuda") ||
-                   !strcmp(arg, "--role") || !strcmp(arg, "--layers") ||
-                   !strcmp(arg, "--listen") || !strcmp(arg, "--coordinator")) {
+        } else if (!strcmp(arg, "--cuda")) {
             fprintf(stderr, "q36-agent: %s is not supported in this q36 port\n", arg);
             exit(2);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -870,6 +875,12 @@ static agent_config parse_options(int argc, char **argv) {
         c.engine.cache_type_k = q36_default_kv_cache_type_k(c.engine.backend, c.engine.ssd_streaming);
     if (!cache_type_v_set)
         c.engine.cache_type_v = q36_default_kv_cache_type_v(c.engine.backend, c.engine.ssd_streaming);
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&c.engine.distributed, NULL, dist_err, sizeof(dist_err)) ||
+        c.engine.distributed.role == Q36_DISTRIBUTED_WORKER) {
+        fprintf(stderr, "q36: %s\n", dist_err[0] ? dist_err : "run workers with q36");
+        exit(2);
+    }
     return c;
 }
 

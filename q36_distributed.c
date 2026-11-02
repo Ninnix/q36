@@ -1,0 +1,709 @@
+/* Layer pipelines follow DwarfStar's coordinator/worker model and CLI.
+ * Prefix and suffix stages retain independent KV state. The coordinator
+ * projects the final hidden row, avoiding vocabulary-sized return packets.
+ * Prefill sends a bounded window of chunks: stage A can compute the next
+ * chunk while stage B consumes the previous one. Decode is necessarily serial. */
+#include "q36_distributed.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DIST_MAGIC UINT32_C(0x51333644)
+#define DIST_VERSION 2u
+#define DIST_MAX_FRAME (64u * 1024u * 1024u)
+#define DIST_HELLO 1u
+#define DIST_ERROR 2u
+#define DIST_TRANSPORT_ERROR 2
+#define DIST_CREATE 3u
+#define DIST_WORK 4u
+#define DIST_RESULT 5u
+#define DIST_FREE 6u
+#define DIST_RESET 1u
+#define DIST_LOGITS 2u
+
+struct q36_dist_engine {
+    q36_engine *engine;
+    q36_dist_options opt;
+    q36_dist_model_info info, peer;
+    pthread_mutex_t mutex;
+    int listener, fd;
+    uint32_t next_id, generation;
+};
+
+struct q36_dist_session {
+    q36_dist_engine *engine;
+    uint32_t id, generation, ctx;
+};
+
+typedef struct dist_worker_session {
+    uint32_t id, ctx;
+    q36_session *session;
+    struct dist_worker_session *next;
+} dist_worker_session;
+
+static int dist_error(char *err, size_t len, const char *fmt, ...) {
+    if (err && len) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(err, len, fmt, ap);
+        va_end(ap);
+    }
+    return 1;
+}
+
+static double dist_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+/* Bound every stalled transfer, and let the frontend cancel a waiting route.
+ * SIGPIPE is suppressed per socket/send, never by changing process handlers. */
+static int dist_io(int fd, void *buffer, size_t len, bool write,
+                   q36_session *owner) {
+    unsigned char *p = buffer;
+    double deadline = dist_now() + 120;
+    while (len) {
+        if (owner && q36_session_distributed_cancelled(owner)) {
+            errno = ECANCELED;
+            return 1;
+        }
+        struct pollfd pollfd = {fd, write ? POLLOUT : POLLIN, 0};
+        int ready = poll(&pollfd, 1, 100);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) return 1;
+        if (!ready) {
+            if (dist_now() < deadline) continue;
+            errno = ETIMEDOUT;
+            return 1;
+        }
+        ssize_t n;
+        if (write) {
+#ifdef MSG_NOSIGNAL
+            n = send(fd, p, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+#else
+            n = send(fd, p, len, MSG_DONTWAIT);
+#endif
+        } else n = recv(fd, p, len, MSG_DONTWAIT);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (n <= 0) {
+            if (!n) errno = ECONNRESET;
+            return 1;
+        }
+        p += n;
+        len -= (size_t)n;
+        deadline = dist_now() + 120;
+    }
+    return 0;
+}
+
+static void dist_socket_options(int fd) {
+    /* Agent shell tools must not keep the route or listener alive after exit. */
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+}
+
+static int dist_endpoint(const char *host, int port, bool listen_socket) {
+    char service[16];
+    struct addrinfo hints = {0}, *list = NULL;
+    snprintf(service, sizeof(service), "%d", port);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = listen_socket ? AI_PASSIVE : 0;
+    if (getaddrinfo(host, service, &hints, &list)) return -1;
+    int fd = -1;
+    for (struct addrinfo *a = list; a; a = a->ai_next) {
+        fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (fd < 0) continue;
+        dist_socket_options(fd);
+        if (listen_socket) {
+            int one = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            if (!bind(fd, a->ai_addr, a->ai_addrlen) && !listen(fd, 8)) break;
+        } else if (!connect(fd, a->ai_addr, a->ai_addrlen)) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(list);
+    return fd;
+}
+
+/* All words, including float bit patterns, use network byte order. */
+static void dist_put(uint8_t *p, uint32_t value) {
+    value = htonl(value);
+    memcpy(p, &value, 4);
+}
+
+static uint32_t dist_get(const uint8_t *p) {
+    uint32_t value;
+    memcpy(&value, p, 4);
+    return ntohl(value);
+}
+
+static int dist_send(int fd, uint32_t type, void *data, uint32_t bytes,
+                     q36_session *owner) {
+    uint32_t h[3] = {htonl(DIST_MAGIC), htonl(type), htonl(bytes)};
+    return dist_io(fd, h, sizeof(h), true, owner) ||
+           dist_io(fd, data, bytes, true, owner);
+}
+
+static int dist_recv(int fd, uint32_t *type, uint8_t **data, uint32_t *bytes,
+                     q36_session *owner, char *err, size_t errlen) {
+    uint32_t h[3];
+    *data = NULL;
+    if (dist_io(fd, h, sizeof(h), false, owner)) {
+        dist_error(err, errlen, "pipeline receive: %s", strerror(errno));
+        return DIST_TRANSPORT_ERROR;
+    }
+    *type = ntohl(h[1]);
+    *bytes = ntohl(h[2]);
+    if (ntohl(h[0]) != DIST_MAGIC || *bytes > DIST_MAX_FRAME)
+        return dist_error(err, errlen, "invalid pipeline frame");
+    *data = malloc((size_t)*bytes + 1u);
+    if (!*data) return dist_error(err, errlen, "pipeline allocation failed");
+    if (dist_io(fd, *data, *bytes, false, owner)) {
+        free(*data);
+        *data = NULL;
+        dist_error(err, errlen, "pipeline payload: %s", strerror(errno));
+        return DIST_TRANSPORT_ERROR;
+    }
+    (*data)[*bytes] = 0;
+    if (*type == DIST_ERROR) {
+        dist_error(err, errlen, "worker: %.*s", (int)(*bytes > 255 ? 255 : *bytes), *data);
+        free(*data);
+        *data = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+static void dist_disconnect(q36_dist_engine *d) {
+    if (d->fd >= 0) close(d->fd);
+    d->fd = -1;
+}
+
+static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
+                      char *err, size_t errlen) {
+    q36_dist_model_info *i = &d->info;
+    uint32_t words[] = {DIST_VERSION, i->n_layers, i->n_embd, i->n_vocab,
+        i->layer_start, i->layer_end, i->context_size, i->prefill_cap,
+        (uint32_t)(i->fingerprint >> 32), (uint32_t)i->fingerprint};
+    uint8_t hello[sizeof(words)];
+    for (size_t k = 0; k < sizeof(words)/sizeof(*words); k++) dist_put(hello + 4*k, words[k]);
+    if (dist_send(fd, DIST_HELLO, hello, sizeof(hello), owner)) {
+        dist_error(err, errlen, "pipeline hello: %s", strerror(errno));
+        return DIST_TRANSPORT_ERROR;
+    }
+    /* A coordinator accepts the route on its first inference request. An idle
+     * REPL may wait arbitrarily long before that request, so workers wait too. */
+    if (d->opt.role == Q36_DISTRIBUTED_WORKER) {
+        struct pollfd p = {fd, POLLIN, 0};
+        int ready;
+        do { ready = poll(&p, 1, -1); } while (ready < 0 && errno == EINTR);
+        if (ready < 0) {
+            dist_error(err, errlen, "pipeline hello poll: %s", strerror(errno));
+            return DIST_TRANSPORT_ERROR;
+        }
+    }
+    uint32_t type, bytes;
+    uint8_t *data;
+    int received = dist_recv(fd, &type, &data, &bytes, owner, err, errlen);
+    if (received) return received;
+    int rc = 1;
+    if (type != DIST_HELLO || bytes != sizeof(hello)) {
+        dist_error(err, errlen, "invalid pipeline hello");
+        goto done;
+    }
+    uint32_t peer[10];
+    for (int k = 0; k < 10; k++) peer[k] = dist_get(data + 4*k);
+    if (peer[0] != DIST_VERSION || peer[1] != i->n_layers || peer[2] != i->n_embd ||
+        peer[3] != i->n_vocab || peer[8] != words[8] || peer[9] != words[9] ||
+        !peer[6] || peer[6] > Q36_CONTEXT_ALLOC_MAX || !peer[7] || peer[7] > 8192) {
+        dist_error(err, errlen, "pipeline model, protocol, context or batch mismatch");
+        goto done;
+    }
+    bool coordinator = d->opt.role == Q36_DISTRIBUTED_COORDINATOR;
+    if ((coordinator && (peer[4] != i->layer_end + 1u || peer[5] + 1u != i->n_layers)) ||
+        (!coordinator && (peer[4] != 0 || peer[5] + 1u != i->layer_start))) {
+        dist_error(err, errlen, "pipeline layer ranges have a gap or overlap");
+        goto done;
+    }
+    d->peer = (q36_dist_model_info){.n_layers=peer[1], .n_embd=peer[2],
+        .n_vocab=peer[3], .layer_start=peer[4], .layer_end=peer[5],
+        .context_size=peer[6], .prefill_cap=peer[7]};
+    rc = 0;
+done:
+    free(data);
+    return rc;
+}
+
+static int dist_route(q36_dist_engine *d, q36_session *owner,
+                      char *err, size_t errlen) {
+    if (d->fd >= 0) return 0;
+    fprintf(stderr, "q36: waiting for pipeline worker on %s:%d\n",
+            d->opt.listen_host, d->opt.listen_port);
+    for (;;) {
+        if (q36_session_distributed_cancelled(owner))
+            return dist_error(err, errlen, "interrupted waiting for pipeline worker");
+        struct pollfd p = {d->listener, POLLIN, 0};
+        int n = poll(&p, 1, 100);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return dist_error(err, errlen, "pipeline accept: %s", strerror(errno));
+        if (!n) continue;
+        int fd = accept(d->listener, NULL, NULL);
+        if (fd < 0) continue;
+        dist_socket_options(fd);
+        if (dist_hello(d, fd, owner, err, errlen)) { close(fd); return 1; }
+        d->fd = fd;
+        d->generation++;
+        fprintf(stderr, "q36: pipeline ready: layers %u:%u -> %u:output, FP32 activations, coordinator output head\n",
+                d->info.layer_start, d->info.layer_end, d->peer.layer_start);
+        return 0;
+    }
+}
+
+static int dist_result(q36_dist_session *s, q36_session *owner, uint32_t pos,
+                       float *logits, char *err, size_t errlen) {
+    uint32_t type, bytes;
+    uint8_t *data;
+    q36_dist_engine *d = s->engine;
+    if (dist_recv(d->fd, &type, &data, &bytes, owner, err, errlen)) return 1;
+    uint64_t expected = 8u + (logits ? (uint64_t)d->info.n_embd * 4u : 0);
+    int rc = 0;
+    if (type != DIST_RESULT || bytes != expected || dist_get(data) != s->id ||
+        dist_get(data + 4) != pos) rc = dist_error(err, errlen, "pipeline result is out of sequence");
+    else if (logits) {
+        float *hidden = malloc((size_t)d->info.n_embd * sizeof(float));
+        if (!hidden) rc = dist_error(err, errlen, "pipeline output allocation failed");
+        else {
+            for (uint32_t j = 0; j < d->info.n_embd; j++) {
+                uint32_t bits = dist_get(data + 8u + 4u*j);
+                memcpy(hidden + j, &bits, 4);
+            }
+            rc = q36_session_project_logits(owner, hidden, logits, err, errlen);
+            free(hidden);
+        }
+    }
+    free(data);
+    return rc;
+}
+
+static int dist_session_ready(q36_dist_session *s, q36_session *owner,
+                              char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    if (dist_route(d, owner, err, errlen)) return 1;
+    if (s->generation == d->generation) return 0;
+    if (s->ctx > d->peer.context_size)
+        return dist_error(err, errlen, "worker --ctx is smaller than the coordinator session");
+    uint8_t create[8];
+    dist_put(create, s->id);
+    dist_put(create + 4, s->ctx);
+    if (dist_send(d->fd, DIST_CREATE, create, sizeof(create), owner) ||
+        dist_result(s, owner, 0, NULL, err, errlen)) return 1;
+    s->generation = d->generation;
+    return 0;
+}
+
+bool q36_dist_enabled(const q36_dist_options *opt) {
+    return opt && opt->role != Q36_DISTRIBUTED_NONE;
+}
+
+int q36_dist_engine_open(q36_dist_engine **out, q36_engine *engine,
+        const q36_dist_options *opt, const q36_dist_model_info *info) {
+    q36_dist_engine *d = calloc(1, sizeof(*d));
+    if (!d) return 1;
+    d->engine = engine;
+    d->opt = *opt;
+    d->info = *info;
+    d->listener = d->fd = -1;
+    d->next_id = 1;
+    if (pthread_mutex_init(&d->mutex, NULL)) { free(d); return 1; }
+    if (opt->role == Q36_DISTRIBUTED_COORDINATOR) {
+        d->listener = dist_endpoint(opt->listen_host, opt->listen_port, true);
+        if (d->listener < 0) {
+            fprintf(stderr, "q36: cannot listen for pipeline worker at %s:%d\n", opt->listen_host, opt->listen_port);
+            q36_dist_engine_close(d);
+            return 1;
+        }
+    }
+    *out = d;
+    return 0;
+}
+
+void q36_dist_engine_close(q36_dist_engine *d) {
+    if (!d) return;
+    dist_disconnect(d);
+    if (d->listener >= 0) close(d->listener);
+    pthread_mutex_destroy(&d->mutex);
+    free(d);
+}
+
+int q36_dist_session_create(q36_dist_session **out, q36_dist_engine *engine, int ctx) {
+    q36_dist_session *s = calloc(1, sizeof(*s));
+    if (!s) return 1;
+    s->engine = engine;
+    s->ctx = (uint32_t)ctx;
+    pthread_mutex_lock(&engine->mutex);
+    s->id = engine->next_id++;
+    pthread_mutex_unlock(&engine->mutex);
+    if (!s->id) { free(s); return 1; }
+    *out = s;
+    return 0;
+}
+
+void q36_dist_session_free(q36_dist_session *s) {
+    if (!s) return;
+    q36_dist_engine *d = s->engine;
+    pthread_mutex_lock(&d->mutex);
+    if (d->fd >= 0 && s->generation == d->generation) {
+        uint8_t data[4];
+        dist_put(data, s->id);
+        if (dist_send(d->fd, DIST_FREE, data, sizeof(data), NULL) ||
+            dist_result(s, NULL, 0, NULL, NULL, 0)) dist_disconnect(d);
+    }
+    pthread_mutex_unlock(&d->mutex);
+    free(s);
+}
+
+static int dist_eval_span(q36_dist_session *s, q36_session *owner,
+        const int *tokens, uint32_t count, uint32_t pos0, bool report_progress,
+        float *logits, char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    uint32_t cap = d->info.prefill_cap;
+    if (cap > d->peer.prefill_cap) cap = d->peer.prefill_cap;
+    if (d->opt.prefill_chunk && cap > d->opt.prefill_chunk) cap = d->opt.prefill_chunk;
+    if (cap > count) cap = count;
+    uint32_t frame_cap = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    if (cap > frame_cap) cap = frame_cap;
+    uint32_t window = d->opt.prefill_window ? d->opt.prefill_window : 2;
+    uint64_t max_bytes = 16u + (uint64_t)cap * (1u + d->info.n_embd) * 4u;
+    if (max_bytes > DIST_MAX_FRAME) return dist_error(err, errlen, "pipeline chunk exceeds frame limit");
+    uint8_t *data = malloc((size_t)max_bytes);
+    float *hidden = malloc((size_t)cap * d->info.n_embd * sizeof(float));
+    if (!data || !hidden) { free(data); free(hidden); return dist_error(err, errlen, "pipeline allocation failed"); }
+    uint32_t pending[64], head = 0, tail = 0, i = 0;
+    int rc = 0;
+    double started = dist_now(), local_seconds = 0, wire_seconds = 0;
+    double local_started, wire_started;
+    while (i < count || head != tail) {
+        if (q36_session_distributed_cancelled(owner)) {
+            rc = Q36_SESSION_SYNC_INTERRUPTED;
+            dist_error(err, errlen, "interrupted");
+            break;
+        }
+        if (i < count && tail - head < window) {
+            uint32_t n = count - i;
+            if (n > cap) n = cap;
+            bool last = i + n == count;
+            if (pos0 + i == 0 && q36_session_layer_slice_reset(owner, err, errlen)) { rc = 1; break; }
+            local_started = dist_now();
+            if (q36_session_eval_layer_slice(owner, tokens + i, n, pos0 + i,
+                    d->info.layer_start, d->info.layer_end, NULL, hidden,
+                    false, NULL, err, errlen)) { rc = 1; break; }
+            local_seconds += dist_now() - local_started;
+            dist_put(data, s->id);
+            dist_put(data + 4, pos0 + i);
+            dist_put(data + 8, n);
+            dist_put(data + 12, (pos0 + i == 0 ? DIST_RESET : 0) | (last ? DIST_LOGITS : 0));
+            for (uint32_t j = 0; j < n; j++) dist_put(data + 16u + 4u*j, (uint32_t)tokens[i+j]);
+            uint64_t values = (uint64_t)n * d->info.n_embd;
+            for (uint64_t j = 0; j < values; j++) {
+                uint32_t bits;
+                memcpy(&bits, hidden + j, 4);
+                dist_put(data + 16u + 4u*n + 4u*j, bits);
+            }
+            uint32_t bytes = 16u + n * (1u + d->info.n_embd) * 4u;
+            if (dist_send(d->fd, DIST_WORK, data, bytes, owner)) {
+                rc = dist_error(err, errlen, "pipeline send: %s", strerror(errno));
+                break;
+            }
+            i += n;
+            pending[tail++ % 64] = pos0 + i;
+        } else {
+            uint32_t end = pending[head++ % 64];
+            wire_started = dist_now();
+            if (dist_result(s, owner, end, end == pos0 + count ? logits : NULL, err, errlen)) { rc = 1; break; }
+            wire_seconds += dist_now() - wire_started;
+            if (report_progress)
+                q36_session_distributed_progress(owner, (int)end, (int)(pos0 + count));
+        }
+    }
+    if (d->opt.debug) fprintf(stderr, "q36: pipeline %u tokens at %u, window %u, %.3f s local=%.3f s remote_wait=%.3f s\n",
+                              count, pos0, window, dist_now() - started, local_seconds, wire_seconds);
+    free(hidden);
+    free(data);
+    return rc;
+}
+
+int q36_dist_session_sync(q36_dist_session *s, q36_session *owner,
+        const q36_tokens *checkpoint, const q36_tokens *prompt, float *logits,
+        char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    pthread_mutex_lock(&d->mutex);
+    bool replay = d->fd < 0 || s->generation != d->generation;
+    int rc = dist_session_ready(s, owner, err, errlen);
+    uint32_t start = replay ? 0 : (uint32_t)checkpoint->len;
+    if (!rc && start < (uint32_t)prompt->len)
+        rc = dist_eval_span(s, owner, prompt->v + start, (uint32_t)prompt->len - start,
+                            start, true, logits, err, errlen);
+    if (rc) {
+        dist_disconnect(d);
+        if (q36_session_distributed_cancelled(owner)) rc = Q36_SESSION_SYNC_INTERRUPTED;
+    }
+    pthread_mutex_unlock(&d->mutex);
+    return rc;
+}
+
+int q36_dist_session_eval(q36_dist_session *s, q36_session *owner,
+        const q36_tokens *checkpoint, int token, float *logits, char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    pthread_mutex_lock(&d->mutex);
+    bool replay = d->fd < 0 || s->generation != d->generation;
+    int rc = dist_session_ready(s, owner, err, errlen);
+    if (!rc && replay && checkpoint->len)
+        rc = dist_eval_span(s, owner, checkpoint->v, (uint32_t)checkpoint->len, 0, true, logits, err, errlen);
+    if (!rc) rc = dist_eval_span(s, owner, &token, 1, (uint32_t)checkpoint->len, false, logits, err, errlen);
+    if (rc) {
+        dist_disconnect(d);
+        if (q36_session_distributed_cancelled(owner)) rc = Q36_SESSION_SYNC_INTERRUPTED;
+    }
+    pthread_mutex_unlock(&d->mutex);
+    return rc;
+}
+
+static int dist_worker_result(int fd, uint32_t id, uint32_t pos,
+                              const float *hidden, uint32_t n_embd) {
+    uint32_t bytes = 8u + (hidden ? n_embd * 4u : 0);
+    uint8_t *data = malloc(bytes);
+    if (!data) return 1;
+    dist_put(data, id);
+    dist_put(data + 4, pos);
+    if (hidden) for (uint32_t j = 0; j < n_embd; j++) {
+        uint32_t bits;
+        memcpy(&bits, hidden + j, 4);
+        dist_put(data + 8u + 4u*j, bits);
+    }
+    int rc = dist_send(fd, DIST_RESULT, data, bytes, NULL);
+    free(data);
+    return rc;
+}
+
+static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen) {
+    dist_worker_session *sessions = NULL;
+    int rc = 0;
+    for (;;) {
+        struct pollfd idle = {fd, POLLIN, 0};
+        int ready;
+        do { ready = poll(&idle, 1, -1); } while (ready < 0 && errno == EINTR);
+        if (ready < 0) { rc = dist_error(err, errlen, "worker poll failed"); break; }
+        uint32_t type, bytes;
+        uint8_t *data;
+        if (dist_recv(fd, &type, &data, &bytes, NULL, err, errlen)) { rc = 1; break; }
+        uint32_t id = bytes >= 4 ? dist_get(data) : 0;
+        dist_worker_session **link = &sessions;
+        while (*link && (*link)->id != id) link = &(*link)->next;
+        dist_worker_session *s = *link;
+        if (!id) rc = dist_error(err, errlen, "missing pipeline session id");
+        else if (type == DIST_CREATE && bytes == 8 && !s) {
+            uint32_t ctx = dist_get(data + 4);
+            if (!ctx || ctx > d->info.context_size) rc = dist_error(err, errlen, "worker context exceeded");
+            else {
+                s = calloc(1, sizeof(*s));
+                if (!s || q36_session_create(&s->session, d->engine, (int)ctx)) {
+                    free(s);
+                    rc = dist_error(err, errlen, "cannot create worker session");
+                } else {
+                    s->id = id;
+                    s->ctx = ctx;
+                    *link = s;
+                    rc = dist_worker_result(fd, id, 0, NULL, 0);
+                }
+            }
+        } else if (type == DIST_FREE && bytes == 4 && s) {
+            *link = s->next;
+            q36_session_free(s->session);
+            free(s);
+            rc = dist_worker_result(fd, id, 0, NULL, 0);
+        } else if (type == DIST_WORK && bytes >= 16 && s) {
+            uint32_t pos = dist_get(data + 4), n = dist_get(data + 8), flags = dist_get(data + 12);
+            uint64_t expected = 16u + (uint64_t)n * (1u + d->info.n_embd) * 4u;
+            if (!n || n > d->info.prefill_cap || expected != bytes ||
+                pos > s->ctx || n > s->ctx - pos || flags & ~(DIST_RESET | DIST_LOGITS) ||
+                ((flags & DIST_RESET) && pos)) rc = dist_error(err, errlen, "invalid pipeline work shape");
+            else {
+                int *tokens = malloc((size_t)n * sizeof(int));
+                float *hidden = malloc((size_t)n * d->info.n_embd * sizeof(float));
+                float *result = flags & DIST_LOGITS ? malloc((size_t)d->info.n_embd * sizeof(float)) : NULL;
+                if (!tokens || !hidden || ((flags & DIST_LOGITS) && !result)) rc = dist_error(err, errlen, "worker allocation failed");
+                else {
+                    for (uint32_t j = 0; j < n; j++) tokens[j] = (int)dist_get(data + 16u + 4u*j);
+                    for (uint64_t j = 0; j < (uint64_t)n * d->info.n_embd; j++) {
+                        uint32_t bits = dist_get(data + 16u + 4u*n + 4u*j);
+                        memcpy(hidden + j, &bits, 4);
+                    }
+                    if (flags & DIST_RESET) rc = q36_session_layer_slice_reset(s->session, err, errlen);
+                    if (!rc) rc = q36_session_eval_layer_slice(s->session, tokens, n, pos,
+                            d->info.layer_start, d->info.layer_end, hidden, NULL,
+                            false, NULL, err, errlen);
+                    if (!rc && result) rc = q36_session_read_final_hidden(s->session, n, result, err, errlen);
+                    if (!rc) rc = dist_worker_result(fd, id, pos + n, result, d->info.n_embd);
+                }
+                free(result);
+                free(hidden);
+                free(tokens);
+            }
+        } else rc = dist_error(err, errlen, "invalid pipeline operation or session");
+        free(data);
+        if (rc) {
+            dist_send(fd, DIST_ERROR, err, (uint32_t)strlen(err), NULL);
+            break;
+        }
+    }
+    while (sessions) {
+        dist_worker_session *next = sessions->next;
+        q36_session_free(sessions->session);
+        free(sessions);
+        sessions = next;
+    }
+    return rc;
+}
+
+int q36_dist_run(q36_engine *engine) {
+    q36_dist_engine *d = q36_engine_distributed(engine);
+    if (!d || d->opt.role != Q36_DISTRIBUTED_WORKER) return 1;
+    fprintf(stderr, "q36: pipeline worker layers %u:output, coordinator %s:%d\n",
+            d->info.layer_start, d->opt.coordinator_host, d->opt.coordinator_port);
+    for (;;) {
+        int fd = dist_endpoint(d->opt.coordinator_host, d->opt.coordinator_port, false);
+        if (fd < 0) { struct timespec t = {1, 0}; nanosleep(&t, NULL); continue; }
+        char err[256] = {0};
+        int hello = dist_hello(d, fd, NULL, err, sizeof(err));
+        if (hello) {
+            fprintf(stderr, "q36: %s\n", err);
+            close(fd);
+            if (hello == DIST_TRANSPORT_ERROR) {
+                /* A proxy can accept TCP while its upstream is still down. */
+                struct timespec t = {1, 0};
+                nanosleep(&t, NULL);
+                continue;
+            }
+            return 1;
+        }
+        fprintf(stderr, "q36: pipeline worker connected\n");
+        dist_worker_loop(d, fd, err, sizeof(err));
+        close(fd);
+        fprintf(stderr, "q36: pipeline disconnected: %s; waiting to reconnect\n", err);
+    }
+}
+
+static bool dist_u32(const char *text, uint32_t *value) {
+    if (!text || !*text) return false;
+    uint64_t n = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        n = n * 10u + (unsigned)(*p - '0');
+        if (n > UINT32_MAX) return false;
+    }
+    *value = (uint32_t)n;
+    return true;
+}
+
+void q36_dist_usage(FILE *fp) {
+    fprintf(fp,
+        "\nDistributed inference (two-stage TCP pipeline):\n"
+        "  --role coordinator|worker\n"
+        "  --layers A:B       Inclusive layers; use A:output for the worker.\n"
+        "  --listen HOST PORT Coordinator TCP bind address.\n"
+        "  --coordinator HOST PORT  Worker connects to this IP or hostname.\n"
+        "  --dist-prefill-chunk N   Maximum tokens per pipeline chunk.\n"
+        "  --dist-prefill-window N  Chunks in flight, 1..64 (default 2).\n"
+        "  --debug            Report pipeline timing.\n");
+}
+
+q36_dist_cli_parse_result q36_dist_parse_cli_arg(const char *arg, int *index,
+        int argc, char **argv, q36_dist_options *opt, char *err, size_t errlen) {
+    bool role = !strcmp(arg, "--role"), layers = !strcmp(arg, "--layers");
+    bool listen_arg = !strcmp(arg, "--listen"), coord = !strcmp(arg, "--coordinator");
+    bool chunk = !strcmp(arg, "--dist-prefill-chunk"), window = !strcmp(arg, "--dist-prefill-window");
+    if (!strcmp(arg, "--debug")) { opt->debug = true; return Q36_DIST_CLI_MATCHED; }
+    if (!role && !layers && !listen_arg && !coord && !chunk && !window) return Q36_DIST_CLI_NOT_MATCHED;
+    int needed = listen_arg || coord ? 2 : 1;
+    if (*index + needed >= argc) goto invalid;
+    const char *value = argv[++*index];
+    uint32_t n;
+    if (role) {
+        if (opt->role) goto invalid;
+        if (!strcmp(value, "coordinator")) opt->role = Q36_DISTRIBUTED_COORDINATOR;
+        else if (!strcmp(value, "worker")) opt->role = Q36_DISTRIBUTED_WORKER;
+        else goto invalid;
+    } else if (layers) {
+        const char *colon = strchr(value, ':');
+        char start[16];
+        if (!colon || colon == value || colon-value >= (int)sizeof(start) || opt->layers.set) goto invalid;
+        memcpy(start, value, (size_t)(colon-value));
+        start[colon-value] = 0;
+        if (!dist_u32(start, &opt->layers.start)) goto invalid;
+        opt->layers.has_output = !strcmp(colon + 1, "output");
+        if (!opt->layers.has_output && (!dist_u32(colon + 1, &opt->layers.end) ||
+            opt->layers.end < opt->layers.start)) goto invalid;
+        opt->layers.set = true;
+    } else if (listen_arg || coord) {
+        if (!*value || !dist_u32(argv[++*index], &n) || !n || n > 65535) goto invalid;
+        if (listen_arg) {
+            if (opt->listen_host) goto invalid;
+            opt->listen_host = value; opt->listen_port = (int)n;
+        } else {
+            if (opt->coordinator_host) goto invalid;
+            opt->coordinator_host = value; opt->coordinator_port = (int)n;
+        }
+    } else {
+        if (!dist_u32(value, &n) || !n || n > (window ? 64u : 8192u)) goto invalid;
+        if (chunk) opt->prefill_chunk = n;
+        else opt->prefill_window = n;
+    }
+    return Q36_DIST_CLI_MATCHED;
+invalid:
+    dist_error(err, errlen, "invalid or missing value for %s", arg);
+    return Q36_DIST_CLI_ERROR;
+}
+
+int q36_dist_prepare_engine_options(const q36_dist_options *opt,
+        q36_engine_options *engine, char *err, size_t errlen) {
+    if (!opt) return 0;
+    if (!q36_dist_enabled(opt)) {
+        if (opt->layers.set || opt->listen_host || opt->coordinator_host ||
+            opt->prefill_chunk || opt->prefill_window)
+            return dist_error(err, errlen, "distributed options require --role");
+        return 0;
+    }
+    if (!opt->layers.set || (opt->role != Q36_DISTRIBUTED_COORDINATOR && opt->role != Q36_DISTRIBUTED_WORKER) ||
+        opt->prefill_window > 64 || opt->prefill_chunk > 8192)
+        return dist_error(err, errlen, "pipeline role requires a valid --layers range");
+    if (opt->role == Q36_DISTRIBUTED_COORDINATOR) {
+        if (!opt->listen_host || opt->listen_port < 1 || opt->listen_port > 65535 ||
+            opt->coordinator_host || opt->layers.start || opt->layers.has_output)
+            return dist_error(err, errlen, "coordinator requires --layers 0:N --listen HOST PORT");
+    } else if (!opt->coordinator_host || opt->coordinator_port < 1 || opt->coordinator_port > 65535 ||
+               opt->listen_host || !opt->layers.start || !opt->layers.has_output ||
+               opt->prefill_chunk || opt->prefill_window)
+        return dist_error(err, errlen, "worker requires --layers N:output --coordinator HOST PORT");
+    if (engine) engine->distributed = *opt;
+    return 0;
+}

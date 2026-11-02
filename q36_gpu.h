@@ -440,6 +440,8 @@ int q36_gpu_recurrent_conv_silu_tensor(
 int q36_gpu_extract_full_attn_q_tensor(
         q36_gpu_tensor       *dst,
         const q36_gpu_tensor *qg,
+        uint32_t                n_head,
+        uint32_t                head_dim,
         uint32_t                n_tok);
 
 /* Device-side contiguous f32 copy (dst[0..n) = src[0..n)), so host-staged
@@ -452,6 +454,8 @@ int q36_gpu_copy_f32_tensor(
 int q36_gpu_extract_recurrent_v_tensor(
         q36_gpu_tensor       *dst,
         const q36_gpu_tensor *conv,
+        uint32_t                conv_dim,
+        uint32_t                v_dim,
         uint32_t                n_tok);
 
 int q36_gpu_rope_qwen_rows_tensor(

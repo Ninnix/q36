@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_prompt_prefix.h"
 #include "linenoise.h"
 #include "q36_ssd.h"
@@ -1518,8 +1519,14 @@ static cli_config parse_options(int argc, char **argv) {
     int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        int dist_parse = q36_dist_parse_cli_arg(arg, &i, argc, argv,
+                &c.engine.distributed, dist_err, sizeof(dist_err));
+        if (dist_parse < 0) { fprintf(stderr, "q36: %s\n", dist_err); exit(2); }
+        if (dist_parse > 0) continue;
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             usage(stdout);
+            q36_dist_usage(stdout);
             exit(0);
         } else if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             if (c.gen.prompt) {
@@ -1754,6 +1761,17 @@ static cli_config parse_options(int argc, char **argv) {
         fprintf(stderr, "q36: --prefix-file cannot accompany an already-rendered prompt\n");
         exit(2);
     }
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&c.engine.distributed, &c.engine, dist_err, sizeof(dist_err))) {
+        fprintf(stderr, "q36: %s\n", dist_err);
+        exit(2);
+    }
+    if (q36_dist_enabled(&c.engine.distributed) &&
+        (c.gen.head_test || c.gen.first_token_test || c.gen.vulkan_graph_test ||
+         c.gen.vulkan_graph_full_test || c.gen.vulkan_graph_prompt_test)) {
+        fprintf(stderr, "q36: whole-model diagnostics are unavailable in pipeline mode\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -1797,6 +1815,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     cli_apply_model_sampling_defaults(engine, &cfg.gen);
+    if (!cfg.inspect && cfg.engine.distributed.role == Q36_DISTRIBUTED_WORKER) {
+        int rc = q36_dist_run(engine);
+        q36_engine_close(engine);
+        free(cfg.prompt_owned);
+        return rc;
+    }
     if (!cfg.inspect) {
         log_context_memory(cfg.engine.backend, cfg.gen.ctx_size,
                            cfg.engine.prefill_chunk,

@@ -6,6 +6,7 @@ DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
+Q4_FILE="Qwen3.6-35B-A3B-IQ4XS-Q4K-Q8.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
 VISION_REMOTE="mmproj-F16.gguf"
@@ -26,6 +27,7 @@ QuarkStar GGUF downloader
 
 Usage:
   ./download_model.sh q2 [--token TOKEN]
+  ./download_model.sh q4 [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
@@ -38,6 +40,10 @@ Targets:
        The rest of the tensors are left at higher precision. This model
        fits a BC-250 with 16 GB of unified GDDR6 fully resident.
        Includes a 333 MB MTP head; enable it with --mtp.
+
+  q4
+       Qwen3.6 MoE IQ4_XS gate/up and Q4_K down, about 19.05 GiB.
+       Use SSD streaming on one BC-250, or a two-board layer pipeline.
 
   27b
        Dense Qwen3.8 27B Dynamic 3.0 IQ3_S quant from $DENSE_REPO.
@@ -90,6 +96,7 @@ MODEL_REMOTE=
 
 case "$MODEL" in
     q2) MODEL_FILE=$Q2_FILE ;;
+    q4) MODEL_FILE=$Q4_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
     qwen36-vision)

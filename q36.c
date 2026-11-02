@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "q36.h"
+#include "q36_distributed.h"
 #include "q36_mtp.h"
 #include "q36_image.h"
 #include "q36_gpu.h"
@@ -566,6 +567,9 @@ static const char *q36_dump_names[Q36_DUMP_COUNT] = {
 };
 
 struct q36_engine {
+    q36_dist_options distributed;
+    q36_dist_engine *dist;
+    uint32_t layer_start, layer_end;
     q36_model model;
     q36_model mtp_model;
     bool mtp_embedded;
@@ -622,6 +626,8 @@ struct q36_engine {
 };
 
 struct q36_session {
+    q36_dist_session *dist;
+    uint32_t slice_pos;
     q36_engine *engine;
     int ctx_size;
     q36_tokens checkpoint;
@@ -4339,7 +4345,7 @@ static bool q36_layer_is_full_attention(uint32_t il) {
 static bool tensor_type_is_routed_gate_up(uint32_t type) {
     return type == Q36_TENSOR_Q2_K || type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_IQ2_XXS ||
            type == Q36_TENSOR_IQ2_S || type == Q36_TENSOR_IQ3_S ||
-           type == Q36_TENSOR_Q8_0;
+           type == Q36_TENSOR_IQ4_XS || type == Q36_TENSOR_Q8_0;
 }
 
 static bool tensor_type_is_routed_down(uint32_t type) {
@@ -4945,9 +4951,30 @@ static bool q36_streaming_full_layer_budget(const q36_weights *weights,
 #endif
 
 
+static Q36_MAYBE_UNUSED bool q36_engine_owns_tensor(const q36_engine *e, const q36_tensor *t) {
+    if (!q36_dist_enabled(&e->distributed)) return true;
+    if (t->name.len > 4 && !memcmp(t->name.ptr, "blk.", 4)) {
+        uint32_t layer = 0;
+        uint64_t i = 4;
+        while (i < t->name.len && t->name.ptr[i] >= '0' && t->name.ptr[i] <= '9')
+            layer = layer * 10u + (uint32_t)(t->name.ptr[i++] - '0');
+        if (i == 4 || i >= t->name.len || t->name.ptr[i] != '.') return false;
+        return (layer >= e->layer_start && layer <= e->layer_end) ||
+               (e->layer_end + 1u < Q36_N_LAYER &&
+                t == e->weights.layer[e->layer_end + 1u].attn_norm);
+    }
+    if (t == e->weights.token_embd) return e->layer_start == 0;
+    /* Keep the vocabulary projection beside sampling, so the return link
+     * carries one hidden row instead of the much larger logits vector. */
+    if (t == e->weights.output || t == e->weights.output_scale)
+        return e->distributed.role == Q36_DISTRIBUTED_COORDINATOR;
+    return e->distributed.layers.has_output;
+}
+
 #ifndef Q36_NO_GPU
-static bool q36_weights_streaming_non_routed_bytes(const q36_weights *weights,
+static bool q36_weights_streaming_non_routed_bytes(const q36_engine *e,
                                                    uint64_t *bytes_out) {
+    const q36_weights *weights = &e->weights;
     uint64_t bytes = 0;
     if (bytes_out) *bytes_out = 0;
     if (!weights || !bytes_out) return false;
@@ -5009,7 +5036,7 @@ static bool q36_weights_streaming_non_routed_bytes(const q36_weights *weights,
     for (uint32_t i = 0; i < n; i++) {
         const q36_tensor *t = all[i];
         bool routed = false;
-        if (!t) continue;
+        if (!t || !q36_engine_owns_tensor(e, t)) continue;
         for (uint32_t j = 0; j < n_skip; j++) {
             if (t == skip[j]) {
                 routed = true;
@@ -5083,7 +5110,7 @@ static bool q36_engine_configure_streaming_auto_cache(q36_engine *e) {
     if (!e || !e->ssd_streaming || Q36_MODEL_DENSE) return true;
     uint64_t recommended = q36_gpu_recommended_working_set_size();
     uint64_t fixed = 0, per_expert = 0;
-    if (!recommended || !q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+    if (!recommended || !q36_weights_streaming_non_routed_bytes(e, &fixed) ||
         !q36_streaming_routed_expert_bytes(&e->weights, &per_expert)) return false;
     e->context_hint_bytes = q36_streaming_context_bytes(e, e->context_size);
     if (e->context_hint_bytes > UINT64_MAX / e->planned_sessions) return false;
@@ -5096,7 +5123,7 @@ static bool q36_engine_configure_streaming_auto_cache(q36_engine *e) {
     }
     q36_ssd_cache_plan plan;
     if (!q36_ssd_auto_cache_plan(recommended, 80, e->streaming_model_limit, fixed,
-                                 per_expert, (uint64_t)Q36_N_LAYER * Q36_N_EXPERT, &plan)) return false;
+                                 per_expert, (uint64_t)(e->layer_end - e->layer_start + 1u) * Q36_N_EXPERT, &plan)) return false;
     uint64_t requested = e->ssd_streaming_cache_bytes ?
         e->ssd_streaming_cache_bytes / per_expert : e->ssd_streaming_cache_experts;
     uint32_t fitted = plan.cache_experts;
@@ -5132,7 +5159,7 @@ static bool q36_streaming_reserve_session(q36_engine *e, int ctx, uint64_t *byte
     uint64_t limit = q36_streaming_model_limit(e, contexts);
     uint64_t fixed = 0, resident = 0, per_expert = 0;
     uint32_t slots = 0;
-    if (!q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+    if (!q36_weights_streaming_non_routed_bytes(e, &fixed) ||
         !q36_streaming_routed_expert_bytes(&e->weights, &per_expert) ||
         (e->ssd_streaming_full_layers && !q36_streaming_full_layer_budget(
             &e->weights, e->ssd_streaming_full_layers, &slots, &resident))) return false;
@@ -5279,6 +5306,7 @@ static bool q36_engine_seed_streaming_expert_cache_blind(q36_engine *e,
     uint32_t seeded = 0;
     for (uint32_t il = 0; il < Q36_N_LAYER && remaining != 0; il++) {
         const q36_layer_weights *layer = &e->weights.layer[il];
+        if (il < e->layer_start || il > e->layer_end) continue;
         if (!q36_weights_streaming_layer_experts_uniform(&e->weights, il)) continue;
         q36_gpu_stream_expert_table table = q36_stream_expert_table_make(&e->model, layer, il);
         if (!table.model_map) continue;
@@ -5349,6 +5377,7 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
         if (bias_only) {
             for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
                 const q36_layer_weights *layer = &e->weights.layer[il];
+                if (il < e->layer_start || il > e->layer_end) continue;
                 if (!layer->ffn_gate_exps || !layer->ffn_up_exps ||
                     !layer->ffn_down_exps) continue;
                 if (!q36_weights_streaming_layer_experts_uniform(
@@ -5363,6 +5392,7 @@ static bool q36_engine_seed_streaming_expert_cache(q36_engine *e) {
             uint32_t n = counts[il];
             if (n == 0) continue;
             const q36_layer_weights *layer = &e->weights.layer[il];
+            if (il < e->layer_start || il > e->layer_end) continue;
             if (!q36_weights_streaming_layer_experts_uniform(&e->weights, il)) continue;
             q36_gpu_stream_expert_table table = q36_stream_expert_table_make(&e->model, layer, il);
             if (!table.model_map) continue;
@@ -5436,7 +5466,7 @@ static bool q36_metal_q5_output_cache_candidate(const q36_engine *e,
 
 static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor *t) {
     /* An unused MTP block must not consume the resident model arena. */
-    if (t == e->weights.token_embd || t->bytes == 0 ||
+    if (!q36_engine_owns_tensor(e, t) || t == e->weights.token_embd || t->bytes == 0 ||
         q36_tensor_is_disabled_embedded_mtp(e, t)) return true;
 #ifdef Q36_METAL
     if (q36_metal_q5_output_cache_candidate(e, t)) return true;
@@ -5450,7 +5480,7 @@ static void q36_streaming_lock_static_weights(q36_engine *e) {
     if (!e->ssd_streaming || getenv("Q36_METAL_DISABLE_STREAMING_STATIC_LOCK")) return;
     uint64_t fixed = 0, per_expert = 0, resident = 0;
     uint32_t slots = 0;
-    if (!q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+    if (!q36_weights_streaming_non_routed_bytes(e, &fixed) ||
         !q36_streaming_routed_expert_bytes(&e->weights, &per_expert) ||
         (e->ssd_streaming_full_layers && !q36_streaming_full_layer_budget(
             &e->weights, e->ssd_streaming_full_layers, &slots, &resident))) return;
@@ -5542,8 +5572,12 @@ static void *q36_prewarm_reader_main(void *arg) {
     return NULL;
 }
 
-static void q36_vulkan_prewarm_weights(const q36_engine *e) {
-    if (!e || !q36_vulkan_prewarm_enabled()) return;
+static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
+    if (!e || !q36_vulkan_prewarm_enabled()) return false;
+    bool complete = true;
+    uint64_t resident_bytes = 0;
+    uint32_t resident_tensors = 0;
+    double started = q36_now_sec();
     q36_prewarm_reader reader = { .e = e, .staged = 0 };
     pthread_t reader_thread;
     bool threaded = e->model.fd >= 0 &&
@@ -5551,7 +5585,10 @@ static void q36_vulkan_prewarm_weights(const q36_engine *e) {
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const q36_tensor *t = &e->model.tensors[i];
         if (q36_vulkan_prewarm_skip_tensor(e, t)) continue;
-        (void)q36_gpu_cache_model_range(e->model.map, e->model.size, t->abs_offset, t->bytes, NULL);
+        if (q36_gpu_cache_model_range(e->model.map, e->model.size, t->abs_offset, t->bytes, NULL)) {
+            resident_bytes += t->bytes;
+            resident_tensors++;
+        } else complete = false;
         __atomic_add_fetch(&reader.staged, t->bytes, __ATOMIC_RELAXED);
     }
     if (threaded) {
@@ -5577,6 +5614,12 @@ static void q36_vulkan_prewarm_weights(const q36_engine *e) {
             (void)q36_gpu_cache_model_range(e->mtp_model.map, e->mtp_model.size, t->abs_offset, t->bytes, NULL);
         }
     }
+    if (q36_dist_enabled(&e->distributed) && !e->ssd_streaming) {
+        fprintf(stderr, "q36: resident pipeline weights: %.3f GiB, %u tensors, %.2f s, %s\n",
+                resident_bytes / 1073741824.0, resident_tensors,
+                q36_now_sec() - started, complete ? "ready" : "incomplete");
+    }
+    return complete;
 }
 #endif
 
@@ -5722,6 +5765,7 @@ static uint32_t q36_kv_next_cap(uint32_t cap, uint32_t need, uint32_t limit) {
 }
 
 static q36_cpu_runtime *q36_cpu_runtime_create(int ctx_size,
+                                               uint32_t layer_start, uint32_t layer_end,
                                                uint32_t prefill_cap,
                                                q36_kv_cache_type cache_type_k,
                                                q36_kv_cache_type cache_type_v) {
@@ -5768,7 +5812,7 @@ static q36_cpu_runtime *q36_cpu_runtime_create(int ctx_size,
     rt->batch_ffn_shared_out = xmalloc((size_t)prefill_cap * Q36_N_EMBD * sizeof(float));
     rt->batch_ffn_scalar = xmalloc((size_t)prefill_cap * sizeof(float));
     rt->batch_xq = xmalloc((size_t)prefill_cap * Q36_MAX_Q8_K_BYTES);
-    for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         if (q36_layer_is_full_attention(il)) {
             rt->full[il].cap = full_cap;
             rt->full[il].type_k = cache_type_k;
@@ -5794,6 +5838,7 @@ static bool q36_cpu_runtime_reserve_kv(q36_cpu_runtime *rt, uint32_t need,
         uint8_t *k, *v;
         if (!q36_layer_is_full_attention(il)) continue;
         c = &rt->full[il];
+        if (!c->cap) continue;
         if (need <= c->cap) continue;
         cap = q36_kv_next_cap(c->cap, need, limit);
         if (!cap) return false;
@@ -6170,6 +6215,7 @@ static void q36_vulkan_runtime_free(q36_vulkan_runtime *rt) {
 }
 
 static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
+                                               uint32_t layer_start, uint32_t layer_end,
                                                      uint32_t prefill_cap,
                                                      bool enable_mtp,
                                                      bool ssd_streaming,
@@ -6477,7 +6523,7 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         rt->mtp_head_mask = q36_gpu_tensor_alloc(((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t));
         if (!rt->mtp_head_mask) goto fail;
     }
-    for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
         if (q36_layer_is_full_attention(il)) {
             rt->full[il].cap = kv_cap;
             rt->full[il].type_k = cache_type_k;
@@ -6550,6 +6596,7 @@ static bool q36_vulkan_runtime_reserve_kv(q36_vulkan_runtime *rt,
         uint32_t cap;
         if (!q36_layer_is_full_attention(il)) continue;
         c = &rt->full[il];
+        if (!c->cap) continue;
         if (need <= c->cap) continue;
         cap = q36_kv_next_cap(c->cap, need, limit);
         if (!cap || !q36_vulkan_cache_reserve(c, cap, rows)) return false;
@@ -7480,20 +7527,23 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                                    const int *tokens,
                                    uint32_t n_tok,
                                    uint32_t pos0,
-                                   bool compute_logits) {
+                                   bool compute_logits,
+                                   const float *input_hidden, float *output_hidden) {
     q36_engine *e;
     q36_cpu_runtime *rt;
     if (!s || !s->runtime || !tokens || n_tok == 0) return false;
     e = s->engine;
     rt = (q36_cpu_runtime *)s->runtime;
     if (n_tok > rt->prefill_cap) return false;
-    for (uint32_t t = 0; t < n_tok; t++) {
+    if (input_hidden) {
+        memcpy(rt->batch_hidden, input_hidden, (size_t)n_tok * Q36_N_EMBD * sizeof(float));
+    } else for (uint32_t t = 0; t < n_tok; t++) {
         if (!q36_embed_token(e, tokens[t], rt->batch_hidden + (uint64_t)t * Q36_N_EMBD)) {
             fprintf(stderr, "q36: embed failed for token=%d pos=%u\n", tokens[t], pos0 + t);
             return false;
         }
     }
-    for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+    for (uint32_t il = e->layer_start; il <= e->layer_end; il++) {
         const q36_layer_weights *l = &e->weights.layer[il];
         if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_PRE, il, rt->batch_hidden)) return false;
         q36_rms_norm_rows(rt->batch_norm,
@@ -7567,6 +7617,9 @@ static bool q36_forward_tokens_cpu(q36_session *s,
             return false;
         }
     }
+    if (output_hidden) memcpy(output_hidden, rt->batch_hidden,
+                              (size_t)n_tok * Q36_N_EMBD * sizeof(float));
+    if (!compute_logits) return true;
     q36_rms_norm_rows(rt->batch_norm,
                       rt->batch_hidden,
                       (const float *)(e->model.map + e->weights.output_norm->abs_offset),
@@ -7926,7 +7979,8 @@ static bool q36_vulkan_prepare_attn_heads(q36_gpu_tensor *dst,
                                                        pos0, n_tok,
                                                        Q36_RMS_EPS) != 0;
     }
-    if (dst != src && !q36_gpu_extract_full_attn_q_tensor(dst, src, n_tok)) return false;
+    if (dst != src && !q36_gpu_extract_full_attn_q_tensor(
+            dst, src, n_head, Q36_N_HEAD_DIM, n_tok)) return false;
     if (!q36_gpu_rms_norm_weight_rows_tensor(dst, dst,
                                              m->map, m->size, norm->abs_offset,
                                              Q36_N_HEAD_DIM, n_tok * n_head,
@@ -8241,7 +8295,8 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
                                                  Q36_RMS_EPS)) {
                 return false;
             }
-            if (!q36_gpu_extract_recurrent_v_tensor(rt->recur_v, rt->recur_conv, n_tok)) return false;
+            if (!q36_gpu_extract_recurrent_v_tensor(rt->recur_v, rt->recur_conv,
+                    Q36_N_SSM_CONV_DIM, Q36_N_SSM_INNER, n_tok)) return false;
         }
     }
     if (!q36_gpu_delta_net_gates_tensor(
@@ -8398,12 +8453,12 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
      * with their norm; only layer 0's input norm stands alone. */
     if (!q36_gpu_rms_norm_weight_rows_tensor(rt->norm, rt->hidden,
                                              e->model.map, e->model.size,
-                                             e->weights.layer[0].attn_norm->abs_offset,
+                                             e->weights.layer[e->layer_start].attn_norm->abs_offset,
                                              Q36_N_EMBD, n_tok, Q36_RMS_EPS)) {
         return false;
     }
     bool attn_q8 = false;
-    for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+    for (uint32_t il = e->layer_start; il <= e->layer_end; il++) {
         const q36_layer_weights *l = &e->weights.layer[il];
         if (!q36_dump_activation_gpu(s, Q36_DUMP_RESIDUAL_PRE, il, rt->hidden)) return false;
         if (!q36_dump_activation_gpu(s, Q36_DUMP_ATTN_NORM, il, rt->norm)) return false;
@@ -8736,7 +8791,8 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
                     q, k, conv, Q36_N_SSM_DT_RANK, Q36_N_SSM_GROUP,
                     Q36_N_SSM_STATE, Q36_N_SSM_CONV_DIM, 1,
                     Q36_RMS_EPS) != 0 &&
-                 q36_gpu_extract_recurrent_v_tensor(v, conv, 1) != 0;
+                 q36_gpu_extract_recurrent_v_tensor(v, conv,
+                    Q36_N_SSM_CONV_DIM, Q36_N_SSM_INNER, 1) != 0;
         }
         if (ok && !front) {
             ok = q36_gpu_delta_net_gates_tensor(
@@ -10564,6 +10620,12 @@ static bool q36_load_activation_dump(q36_engine *e) {
 int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     q36_engine *e;
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) return 1;
+    *out = NULL;
+    char dist_err[256] = {0};
+    if (q36_dist_prepare_engine_options(&opt->distributed, NULL, dist_err, sizeof(dist_err))) {
+        fprintf(stderr, "q36: %s\n", dist_err);
+        return 1;
+    }
 #ifdef Q36_NO_GPU
     if (q36_backend_uses_graph(opt->backend)) return 1;
 #else
@@ -10581,6 +10643,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     if (q36_backend_uses_graph(opt->backend) && !q36_gpu_init()) return 1;
 #endif
     e = xcalloc(1, sizeof(*e));
+    e->distributed = opt->distributed;
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->vision_model.fd = -1;
@@ -10629,6 +10692,23 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
     config_validate_model(&e->model);
+    e->layer_start = 0;
+    e->layer_end = Q36_N_LAYER - 1u;
+    if (q36_dist_enabled(&e->distributed)) {
+        e->layer_start = e->distributed.layers.start;
+        e->layer_end = e->distributed.layers.has_output ? Q36_N_LAYER - 1u : e->distributed.layers.end;
+        if (e->layer_start > e->layer_end || e->layer_end >= Q36_N_LAYER ||
+            (e->distributed.role == Q36_DISTRIBUTED_COORDINATOR &&
+             (e->layer_start != 0 || e->distributed.layers.has_output || e->layer_end + 1u >= Q36_N_LAYER)) ||
+            (e->distributed.role == Q36_DISTRIBUTED_WORKER &&
+             (e->layer_start == 0 || !e->distributed.layers.has_output)) ||
+            opt->mtp_path || opt->vision_path || opt->directional_steering_file ||
+            opt->ssd_streaming_full_layers) {
+            fprintf(stderr, "q36: pipeline requires a prefix coordinator and suffix/output worker; MTP, vision, steering and full-layer streaming are unavailable\n");
+            q36_engine_close(e);
+            return 1;
+        }
+    }
     e->variant = g_q36_shape.variant;
     /* The vector bank follows the detected model, including the 64 x 5120
      * dense model. Load zero-scale banks too so /steer can enable them later. */
@@ -10871,8 +10951,10 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
             }
         }
 #endif
-        q36_vulkan_prewarm_weights(e);
-        if (!q36_gpu_finish_model_cache()) {
+        bool cached = q36_vulkan_prewarm_weights(e);
+        if ((!cached && q36_dist_enabled(&e->distributed) && !e->ssd_streaming) ||
+            !q36_gpu_finish_model_cache()) {
+            fprintf(stderr, "q36: unable to make assigned model weights resident\n");
             q36_engine_close(e);
             return 1;
         }
@@ -10882,12 +10964,21 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
 #endif
+    if (q36_dist_enabled(&e->distributed)) {
+        q36_dist_model_info info;
+        q36_engine_distributed_info(e, &info);
+        if (q36_dist_engine_open(&e->dist, e, &e->distributed, &info)) {
+            q36_engine_close(e);
+            return 1;
+        }
+    }
     *out = e;
     return 0;
 }
 
 void q36_engine_close(q36_engine *e) {
     if (!e) return;
+    q36_dist_engine_close(e->dist);
 #ifndef Q36_NO_GPU
     q36_gpu_tensor_free(e->directional_steering_gpu);
     q36_gpu_tensor_free(e->activation_dump_gpu);
@@ -11207,7 +11298,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
 #ifdef Q36_NO_GPU
         s->runtime = NULL;
 #else
-        s->runtime = q36_vulkan_runtime_create(ctx_size,
+        s->runtime = q36_vulkan_runtime_create(ctx_size, e->layer_start, e->layer_end,
                                                q36_engine_gpu_prefill_cap(e),
                                                e->mtp_ready,
                                                e->ssd_streaming,
@@ -11215,7 +11306,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
                                                e->cache_type_v);
 #endif
     } else {
-        s->runtime = q36_cpu_runtime_create(ctx_size,
+        s->runtime = q36_cpu_runtime_create(ctx_size, e->layer_start, e->layer_end,
                                             e->cpu_prefill_cap,
                                             e->cache_type_k,
                                             e->cache_type_v);
@@ -11233,15 +11324,25 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         memset(s->mtp_logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->mtp_logits));
 
     }
-    q36_session_reset_runtime(s);
     e->session_bytes += reserved;
     e->live_sessions++;
+    if (e->distributed.role == Q36_DISTRIBUTED_COORDINATOR &&
+        q36_dist_session_create(&s->dist, e->dist, ctx_size)) {
+        q36_session_free(s);
+        return 1;
+    }
+    q36_session_reset_runtime(s);
     *out = s;
     return 0;
 }
 
 void q36_session_free(q36_session *s) {
     if (!s) return;
+    q36_dist_session_free(s->dist);
+#ifndef Q36_NO_GPU
+    if (s->engine->distributed.role == Q36_DISTRIBUTED_WORKER &&
+        getenv("Q36_VK_MEMORY_REPORT")) q36_gpu_print_memory_report("pipeline worker");
+#endif
     s->engine->session_bytes -= s->reserved_context_bytes;
     s->engine->live_sessions--;
     q36_tokens_free(&s->checkpoint);
@@ -11356,6 +11457,18 @@ void q36_session_set_cancel(q36_session *s, q36_session_cancel_fn fn, void *ud) 
  * updates ordered while batching projections and FFN work. */
 static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, int start,
                                      char *err, size_t errlen) {
+    if (s->dist) {
+        int rc = q36_dist_session_sync(s->dist, s, &s->checkpoint, prompt,
+                                       s->logits, err, errlen);
+        if (rc) {
+            s->checkpoint_valid = false;
+            return rc;
+        }
+        if (prompt != &s->checkpoint) q36_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
+        return 0;
+    }
     int i = start;
 #ifndef Q36_NO_GPU
     if (start == 0 && q36_engine_uses_vulkan_runtime(s->engine)) {
@@ -11401,7 +11514,7 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
             ok = !q36_engine_uses_vulkan_runtime(s->engine) &&
                  (n == 1 && rt && rt->prefill_cap == 1
                   ? q36_forward_token_cpu(s, prompt->v[i], (uint32_t)i, compute_logits)
-                  : q36_forward_tokens_cpu(s, prompt->v + i, (uint32_t)n, (uint32_t)i, compute_logits));
+                  : q36_forward_tokens_cpu(s, prompt->v + i, (uint32_t)n, (uint32_t)i, compute_logits, NULL, NULL));
         }
         s->dump_active = false;
         if (!ok) {
@@ -11843,6 +11956,18 @@ static int q36_session_eval_internal(q36_session *s, int token,
         if (err && errlen) snprintf(err, errlen, "context exhausted");
         return 1;
     }
+    if (s->dist) {
+        int rc = q36_dist_session_eval(s->dist, s, &s->checkpoint, token,
+                                       s->logits, err, errlen);
+        if (rc) {
+            s->checkpoint_valid = false;
+            return rc;
+        }
+        q36_tokens_push(&s->checkpoint, token);
+        s->checkpoint_valid = s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
+        return 0;
+    }
     if (!q36_session_reserve_kv(s, (uint32_t)s->checkpoint.len + 1u,
                                 (uint32_t)s->checkpoint.len)) {
         if (err && errlen) snprintf(err, errlen, "failed to grow KV cache");
@@ -11970,7 +12095,7 @@ int q36_sessions_eval_batch(q36_decode_item *items, int count,
     }
 
 #ifndef Q36_NO_GPU
-    if (q36_sessions_eval_batch_vulkan_supported(items, count, e)) {
+    if (!e->dist && q36_sessions_eval_batch_vulkan_supported(items, count, e)) {
         bool ok = q36_sessions_eval_batch_vulkan(items, count);
         if (!ok) {
             for (int i = 0; i < count; i++) q36_session_invalidate(items[i].session);
@@ -12281,6 +12406,7 @@ const float *q36_session_logits(q36_session *s, int *n_vocab) {
 
 static void q36_session_reset_runtime(q36_session *s) {
     if (!s) return;
+    s->slice_pos = 0;
     s->logits_host_valid = false;
     s->gpu_top2_valid = false;
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
@@ -12529,7 +12655,7 @@ static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
 uint64_t q36_session_payload_bytes(q36_session *s) {
     if (!s || s->vision_state) return 0;
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    if (q36_engine_has_mtp(s->engine))
+    if (s->dist || q36_engine_has_mtp(s->engine))
         return sizeof(q36_payload_header) + (uint64_t)rows * sizeof(int32_t);
     bool typed = s->engine &&
         (s->engine->cache_type_k != Q36_KV_CACHE_F16 ||
@@ -12654,8 +12780,8 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         return 1;
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    /* A target-only KV payload cannot reconstruct the shifted MTP history. */
-    if (q36_engine_has_mtp(s->engine)) {
+    /* Partial pipeline KV and shifted MTP history both require token replay. */
+    if (s->dist || q36_engine_has_mtp(s->engine)) {
         q36_payload_header h = {Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_TOKEN_ONLY, rows};
         return q36_payload_write_bytes(fp, &h, sizeof(h), err, errlen) ||
                q36_payload_write_bytes(fp, s->checkpoint.v,
@@ -12804,6 +12930,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         if (rc != 0) return 1;
         s->checkpoint_valid = true;
         return 0;
+    }
+    if (s->dist) {
+        q36_payload_set_err(err, errlen, "pipeline restore requires a token-only checkpoint");
+        return 1;
     }
     if (version != Q36_PAYLOAD_VERSION && version != Q36_PAYLOAD_VERSION_TYPED_KV) {
         if (err && errlen) snprintf(err, errlen, "unsupported session payload version");
@@ -13058,4 +13188,142 @@ int q36_compare_prefill_layers(q36_engine *q36_e,
     (void)q36_logits;
     (void)other_logits;
     return q36_unsupported_runtime(err, errlen);
+}
+
+void q36_engine_distributed_info(q36_engine *e, q36_dist_model_info *info) {
+    memset(info, 0, sizeof(*info));
+    info->n_layers = Q36_N_LAYER;
+    info->n_embd = Q36_N_EMBD;
+    info->n_vocab = Q36_N_VOCAB;
+    info->layer_start = e->layer_start;
+    info->layer_end = e->layer_end;
+    info->prefill_cap = e->backend == Q36_BACKEND_CPU ? e->cpu_prefill_cap : 1;
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(e)) info->prefill_cap = q36_engine_gpu_prefill_cap(e);
+#endif
+    info->context_size = e->context_size;
+    info->fingerprint = hash_bytes(e->model.map, e->model.tensor_data_pos);
+    /* Metadata identifies the layout; bounded samples also distinguish weights
+     * with identical names and quantization, without paging in the whole model. */
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const q36_tensor *t = &e->model.tensors[i];
+        if (t->bytes < 32) continue;
+        info->fingerprint ^= hash_bytes(e->model.map + t->abs_offset, 32);
+        info->fingerprint *= UINT64_C(1099511628211);
+        info->fingerprint ^= hash_bytes(e->model.map + t->abs_offset + t->bytes - 32, 32);
+    }
+}
+
+q36_dist_engine *q36_engine_distributed(q36_engine *e) { return e ? e->dist : NULL; }
+
+bool q36_session_distributed_cancelled(q36_session *s) {
+    return s->cancel && s->cancel(s->cancel_ud);
+}
+
+void q36_session_distributed_progress(q36_session *s, int current, int total) {
+    if (s->progress) s->progress(s->progress_ud, "prefill_chunk", current, total);
+    if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_chunk", current, total);
+}
+
+int q36_session_layer_slice_reset(q36_session *s, char *err, size_t errlen) {
+    if (!s || !s->runtime) {
+        if (err && errlen) snprintf(err, errlen, "missing layer-slice session");
+        return 1;
+    }
+    q36_session_reset_runtime(s);
+    return 0;
+}
+
+int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
+        uint32_t n_tokens, uint32_t pos0, uint32_t layer_start, uint32_t layer_end,
+        const float *input_hidden, float *output_hidden, bool output_logits,
+        float *logits, char *err, size_t errlen) {
+    if (!s || !tokens || !n_tokens || layer_start != s->engine->layer_start ||
+        layer_end != s->engine->layer_end || pos0 != s->slice_pos ||
+        pos0 > (uint32_t)s->ctx_size || n_tokens > (uint32_t)s->ctx_size - pos0 ||
+        (layer_start != 0 && !input_hidden) ||
+        (output_logits && (layer_end + 1u != Q36_N_LAYER || !logits))) goto fail;
+    for (uint32_t i = 0; i < n_tokens; i++)
+        if (tokens[i] < 0 || tokens[i] >= (int)Q36_N_VOCAB) goto fail;
+    if (!q36_session_reserve_kv(s, pos0 + n_tokens, pos0)) goto fail;
+    bool ok = false;
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+        q36_vulkan_runtime *rt = s->runtime;
+        ok = q36_forward_tokens_vulkan_into(s, tokens, input_hidden, NULL,
+                n_tokens, pos0, output_logits ? rt->logits : NULL, false);
+        if (ok && output_hidden) ok = q36_gpu_tensor_read(rt->hidden, 0, output_hidden,
+                (uint64_t)n_tokens * Q36_N_EMBD * sizeof(float));
+        if (ok && output_logits) ok = q36_gpu_tensor_read(rt->logits, 0, logits,
+                (uint64_t)Q36_N_VOCAB * sizeof(float));
+    } else
+#endif
+    {
+        ok = q36_forward_tokens_cpu(s, tokens, n_tokens, pos0, output_logits,
+                                    input_hidden, output_hidden);
+        if (ok && output_logits) memcpy(logits, s->logits, (size_t)Q36_N_VOCAB * sizeof(float));
+    }
+    if (!ok) goto fail;
+    s->slice_pos += n_tokens;
+    return 0;
+fail:
+    if (err && errlen) snprintf(err, errlen, "layer slice failed at position %u", pos0);
+    return 1;
+}
+
+/* The terminal layer already computes this normalization in its fused GPU
+ * tail. Transfer that exact row, rather than normalizing it again elsewhere. */
+int q36_session_read_final_hidden(q36_session *s, uint32_t n_tokens,
+        float *hidden, char *err, size_t errlen) {
+    if (!s || !s->runtime || !hidden || !n_tokens ||
+        s->engine->layer_end + 1u != Q36_N_LAYER) goto fail;
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+        q36_vulkan_runtime *rt = s->runtime;
+        if (n_tokens > rt->prefill_cap ||
+            !q36_vulkan_update_last_h(rt, n_tokens - 1u) ||
+            !q36_gpu_tensor_read(rt->last_h, 0, hidden,
+                (uint64_t)Q36_N_EMBD * sizeof(float))) goto fail;
+    } else
+#endif
+    {
+        q36_cpu_runtime *rt = s->runtime;
+        if (n_tokens > rt->prefill_cap) goto fail;
+        q36_ref_rms_norm(hidden, rt->batch_hidden + (uint64_t)(n_tokens - 1u) * Q36_N_EMBD,
+                (const float *)(s->engine->model.map + s->engine->weights.output_norm->abs_offset),
+                Q36_N_EMBD, Q36_RMS_EPS);
+        if (!q36_all_finite(hidden, Q36_N_EMBD)) goto fail;
+    }
+    return 0;
+fail:
+    if (err && errlen) snprintf(err, errlen, "pipeline output normalization failed");
+    return 1;
+}
+
+int q36_session_project_logits(q36_session *s, const float *hidden,
+        float *logits, char *err, size_t errlen) {
+    if (!s || !s->runtime || !hidden || !logits) goto fail;
+    q36_engine *e = s->engine;
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(e)) {
+        q36_vulkan_runtime *rt = s->runtime;
+        if (!q36_gpu_tensor_write(rt->last_h, 0, hidden, (uint64_t)Q36_N_EMBD * sizeof(float)) ||
+            !q36_gpu_tensor_matmul_scaled(&e->model, e->weights.output, rt->last_h, rt->logits,
+                Q36_N_EMBD, Q36_N_VOCAB, 1,
+                q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f)) ||
+            !q36_gpu_tensor_read(rt->logits, 0, logits, (uint64_t)Q36_N_VOCAB * sizeof(float))) goto fail;
+    } else
+#endif
+    {
+        q36_cpu_runtime *rt = s->runtime;
+        if (!q36_tensor_matvec(e, e->weights.output, hidden, logits, rt->work1,
+                Q36_N_EMBD, Q36_N_VOCAB)) goto fail;
+        q36_scale_inplace(logits, Q36_N_VOCAB,
+                q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f));
+        if (!q36_all_finite(logits, Q36_N_VOCAB)) goto fail;
+    }
+    return 0;
+fail:
+    if (err && errlen) snprintf(err, errlen, "pipeline output projection failed");
+    return 1;
 }

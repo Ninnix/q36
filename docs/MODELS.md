@@ -12,6 +12,7 @@ below; `./download_model.sh --help` lists filenames and options.
 | Target | Model | File size | Use |
 | --- | --- | --- | --- |
 | `q2` | Qwen3.6-35B-A3B IQ2_XXS/Q2_K | About 12.1 GB | Default MoE model for 16 GB machines |
+| `q4` | Qwen3.6-35B-A3B IQ4_XS/Q4_K | 19.05 GiB | Vulkan SSD streaming or a [two-machine pipeline](DISTRIBUTED.md) |
 | `27b` | Qwen3.8-27B UD-IQ3_S | 11.21 GiB | Higher-quality dense weights |
 | `27b-iq3-xxs` | Qwen3.8-27B GSQ-RCO IQ3_XXS | 9.73 GiB | Smaller dense weights, leaving more memory for context |
 
@@ -32,7 +33,7 @@ is `gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf`, so pass `-m FILE` to select a
 dense model or another supported release GGUF. The binaries do not follow
 the legacy link automatically.
 
-All three downloads include an MTP head. Enable it with `--mtp`; see
+All main-model downloads include an MTP head. Enable it with `--mtp`; see
 [speculative decoding](SPECULATIVE_DECODING.md) for sampling and backend limits.
 
 ## Qwen3.6-35B-A3B
