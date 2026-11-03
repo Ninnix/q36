@@ -299,6 +299,7 @@ tables, dense-model charts, Metal results, measurement conditions, and commands.
 
 - [BC-250](docs/BC250.md): Linux, RADV, UMA memory, governor, and build setup.
 - [Vulkan](docs/VULKAN.md): requirements, native builds, and device validation.
+- [PS5 port](docs/PS5.md): experimental native title build and one-prompt console test.
 - [Metal](docs/METAL.md): Apple Silicon setup, memory, and compatibility.
 - [Models and vision](docs/MODELS.md): downloads, quantization, and encoders.
 - [Native agent](docs/AGENT.md): sessions, thinking, context, and tools.

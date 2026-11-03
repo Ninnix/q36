@@ -1,0 +1,2 @@
+#!/bin/sh
+PS5_CLANG=${PS5_CLANG_C:-clang} exec sh "$PS5_VULKAN_ROOT/tooling/prospero-clang18" "$@"

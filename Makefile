@@ -657,6 +657,17 @@ help:
 
 gpu: vulkan-generic
 
+.PHONY: ps5
+ps5:
+	bash ps5/build.sh
+
+.PHONY: test-ps5
+test-ps5:
+	mkdir -p build/ps5/host-test
+	python3 ps5/gen_dispatch.py q36_vulkan.c build/ps5/host-test
+	$(CC) -std=c11 -Wall -Wextra -Ibuild/ps5/host-test tests/ps5_dispatch_test.c ps5/dispatch.c -o build/ps5/host-test/dispatch_test
+	build/ps5/host-test/dispatch_test
+
 vulkan: vulkan-generic
 
 vulkan-generic:
