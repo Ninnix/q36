@@ -11470,8 +11470,7 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
             return rc;
         }
         if (prompt != &s->checkpoint) q36_tokens_copy(&s->checkpoint, prompt);
-        s->checkpoint_valid = s->logits_host_valid = true;
-        s->gpu_top2_valid = false;
+        s->checkpoint_valid = true;
         return 0;
     }
     int i = start;
@@ -11970,8 +11969,7 @@ static int q36_session_eval_internal(q36_session *s, int token,
             return rc;
         }
         q36_tokens_push(&s->checkpoint, token);
-        s->checkpoint_valid = s->logits_host_valid = true;
-        s->gpu_top2_valid = false;
+        s->checkpoint_valid = true;
         return 0;
     }
     if (!q36_session_reserve_kv(s, (uint32_t)s->checkpoint.len + 1u,
@@ -13371,12 +13369,8 @@ int q36_session_project_logits(q36_session *s, const float *hidden,
         if (!q36_gpu_tensor_write(input, 0, hidden, (uint64_t)Q36_N_EMBD * sizeof(float)) ||
             !q36_gpu_tensor_matmul_scaled(&e->model, e->weights.output, input, rt->logits,
                 Q36_N_EMBD, Q36_N_VOCAB, 1,
-                q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f)) ||
-            (logits && !q36_gpu_tensor_read(rt->logits, 0, logits,
-                (uint64_t)Q36_N_VOCAB * sizeof(float)))) goto fail;
-        if (e->mtp_ready && !s->slice_spec_active &&
-            q36_gpu_top2_tensor(rt->top2, rt->logits, Q36_N_VOCAB))
-            q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask, rt->logits, rt->top2, Q36_N_VOCAB, 1u);
+                q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f))) goto fail;
+        if (logits && q36_session_pipeline_read_logits(s, logits, err, errlen)) goto fail;
     } else
 #endif
     {
@@ -13386,6 +13380,8 @@ int q36_session_project_logits(q36_session *s, const float *hidden,
         q36_scale_inplace(logits, Q36_N_VOCAB,
                 q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f));
         if (!q36_all_finite(logits, Q36_N_VOCAB)) goto fail;
+        s->logits_host_valid = true;
+        s->gpu_top2_valid = false;
     }
     return 0;
 fail:
@@ -13505,20 +13501,25 @@ fail:
 int q36_session_pipeline_read_logits(q36_session *s, float *logits,
         char *err, size_t errlen) {
 #ifndef Q36_NO_GPU
-    if (s && s->engine->mtp_ready && logits) {
+    if (s && q36_engine_uses_vulkan_runtime(s->engine) && logits) {
         q36_vulkan_runtime *rt = s->runtime;
         uint64_t bytes = (uint64_t)Q36_N_VOCAB * sizeof(float);
         bool gpu_top = q36_gpu_top2_tensor(rt->top2, rt->logits, Q36_N_VOCAB);
-        if (gpu_top) q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask, rt->logits,
-            rt->top2, Q36_N_VOCAB, 1u);
-        if (!q36_gpu_tensor_read(rt->logits, 0, logits, bytes)) goto fail;
         if (gpu_top) {
+            if (s->engine->mtp_ready) q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask,
+                rt->logits, rt->top2, Q36_N_VOCAB, 1u);
             if (!q36_gpu_tensor_read(rt->top2, 0, s->gpu_top2, sizeof(s->gpu_top2))) goto fail;
+            if (logits != s->logits && !q36_gpu_tensor_read(rt->logits, 0, logits, bytes)) goto fail;
+            s->logits_host_valid = false;
         } else {
+            if (!q36_gpu_tensor_read(rt->logits, 0, logits, bytes)) goto fail;
             s->gpu_top2[0] = sample_argmax_margin(logits, Q36_N_VOCAB, -1, NULL);
             s->gpu_top2[1] = sample_argmax_margin(logits, Q36_N_VOCAB, s->gpu_top2[0], NULL);
-            if (!q36_gpu_tensor_write(rt->top2, 0, s->gpu_top2, sizeof(s->gpu_top2))) goto fail;
-            q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask, rt->logits, rt->top2, Q36_N_VOCAB, 1u);
+            if (s->engine->mtp_ready) {
+                if (!q36_gpu_tensor_write(rt->top2, 0, s->gpu_top2, sizeof(s->gpu_top2))) goto fail;
+                q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask, rt->logits, rt->top2, Q36_N_VOCAB, 1u);
+            }
+            s->logits_host_valid = true;
         }
         s->gpu_top2_valid = s->gpu_top2[0] >= 0 && s->gpu_top2[1] >= 0;
         return 0;
@@ -13541,6 +13542,6 @@ int q36_session_verify_pipeline(q36_session *s, const int *tokens, uint32_t coun
         tokens, count, eos, excluded, s->logits, err, errlen);
     if (n < 1) { q36_session_invalidate(s); return -1; }
     for (int i = 0; i < n; i++) q36_tokens_push(&s->checkpoint, tokens[i]);
-    s->checkpoint_valid = s->logits_host_valid = true;
+    s->checkpoint_valid = true;
     return n;
 }

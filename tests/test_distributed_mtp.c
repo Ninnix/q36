@@ -38,14 +38,20 @@ int main(int argc, char **argv) {
     q36_engine_options opt = {.backend=Q36_BACKEND_VULKAN, .context_size=1024,
         .session_count=2, .prefill_chunk=32, .mtp_draft_tokens=4, .mtp_margin=0,
         .cache_type_k=Q36_KV_CACHE_Q8_0, .cache_type_v=Q36_KV_CACHE_Q4_0};
+    int fill = 0;
     for (int i = 1; i < argc; i++) {
         int rc = q36_dist_parse_cli_arg(argv[i], &i, argc, argv, &opt.distributed, error, sizeof(error));
         if (rc < 0) check(1);
         if (rc > 0) continue;
         if (!strcmp(argv[i], "--model") && i+1 < argc) opt.model_path = argv[++i];
+        else if (!strcmp(argv[i], "--prefill-chunk") && i+1 < argc)
+            opt.prefill_chunk = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefill-tokens") && i+1 < argc)
+            fill = atoi(argv[++i]);
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     assert(opt.model_path && opt.distributed.role == Q36_DISTRIBUTED_COORDINATOR);
+    assert(fill >= 0 && fill < opt.context_size);
     opt.mtp_path = opt.model_path;
     q36_engine *e = NULL;
     q36_session *spec = NULL, *plain = NULL;
@@ -62,6 +68,8 @@ int main(int argc, char **argv) {
     for (unsigned c = 0; c < sizeof(prompts)/sizeof(*prompts); c++) {
         q36_tokens prompt = {0};
         q36_encode_chat_prompt(e, "You are a helpful assistant.", prompts[c], Q36_THINK_NONE, &prompt);
+        int original = prompt.len;
+        while (prompt.len < fill) q36_tokens_push(&prompt, prompt.v[prompt.len % original]);
         for (int sampled = 0; sampled < 2; sampled++) {
             q36_session_invalidate(spec); q36_session_invalidate(plain);
             check(q36_session_sync(spec, &prompt, error, sizeof(error)));

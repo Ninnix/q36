@@ -430,30 +430,47 @@ static void *dist_writer(void *opaque) {
     return NULL;
 }
 
-static int dist_eval_span(q36_dist_session *s, q36_session *owner,
+typedef struct {
+    q36_dist_session *session;
+    const int *tokens;
+    float *input, *target;
+    uint32_t count, pos;
+    bool final, done;
+    int result;
+    char error[256];
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+} dist_prefill;
+
+static int dist_eval_span_body(q36_dist_session *s, q36_session *owner,
         const int *tokens, uint32_t count, uint32_t pos0, bool report_progress,
-        float *logits, dist_verify *verify, char *err, size_t errlen) {
+        float *logits, dist_verify *verify, dist_prefill *prepared,
+        char *err, size_t errlen) {
     q36_dist_engine *d = s->engine;
-    uint32_t cap = d->info.prefill_cap;
+    uint32_t cap = verify ? 1u : d->info.prefill_cap;
+    if (cap > count) cap = count;
     if (cap > d->peer.prefill_cap) cap = d->peer.prefill_cap;
     if (d->opt.prefill_chunk && cap > d->opt.prefill_chunk) cap = d->opt.prefill_chunk;
-    if (cap > count) cap = count;
-    if (verify) cap = 1;
     uint32_t frame_cap = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
     if (cap > frame_cap) cap = frame_cap;
+    uint32_t local_cap = prepared ? count : cap;
     uint32_t window = d->opt.prefill_window ? d->opt.prefill_window : 2;
     uint64_t max_bytes = 16u + (uint64_t)cap * (1u + d->info.n_embd) * 4u;
     if (max_bytes > DIST_MAX_FRAME) return dist_error(err, errlen, "pipeline chunk exceeds frame limit");
     uint8_t *data = malloc((size_t)max_bytes);
-    float *hidden = malloc((size_t)cap * d->info.n_embd * sizeof(float));
-    if (!data || !hidden) { free(data); free(hidden); return dist_error(err, errlen, "pipeline allocation failed"); }
+    float *hidden = prepared ? prepared->input : malloc((size_t)local_cap * d->info.n_embd * sizeof(float));
+    if (!data || !hidden) {
+        free(data);
+        if (!prepared) free(hidden);
+        return dist_error(err, errlen, "pipeline allocation failed");
+    }
     struct { uint32_t end, count, index; } pending[64];
-    uint32_t head = 0, tail = 0, i = 0;
+    uint32_t head = 0, tail = 0, i = 0, local_start = 0, local_end = prepared ? count : 0;
     int rc = 0;
     double started = dist_now(), local_seconds = 0, wire_seconds = 0;
     double local_started, wire_started;
     while (i < count || head != tail) {
-        if (q36_session_distributed_cancelled(owner)) {
+        if (owner && q36_session_distributed_cancelled(owner)) {
             rc = Q36_SESSION_SYNC_INTERRUPTED;
             dist_error(err, errlen, "interrupted");
             break;
@@ -462,15 +479,23 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
         pthread_t writer;
         dist_write write_job = {.fd=d->fd};
         if (i < count && tail - head < window) {
-            uint32_t n = count - i;
+            if (i == local_end) {
+                uint32_t batch = count - i;
+                if (batch > local_cap) batch = local_cap;
+                if (pos0 + i == 0 && q36_session_layer_slice_reset(owner, err, errlen)) { rc = 1; break; }
+                /* Each stage can use its own batch size. Retain prefix rows
+                 * while smaller suffix chunks travel through the window. */
+                local_started = dist_now();
+                if (q36_session_eval_layer_slice(owner, tokens + i, batch, pos0 + i,
+                        d->info.layer_start, d->info.layer_end, NULL, hidden,
+                        false, NULL, err, errlen)) { rc = 1; break; }
+                local_seconds += dist_now() - local_started;
+                local_start = i;
+                local_end = i + batch;
+            }
+            uint32_t n = local_end - i;
             if (n > cap) n = cap;
-            bool last = i + n == count;
-            if (pos0 + i == 0 && q36_session_layer_slice_reset(owner, err, errlen)) { rc = 1; break; }
-            local_started = dist_now();
-            if (q36_session_eval_layer_slice(owner, tokens + i, n, pos0 + i,
-                    d->info.layer_start, d->info.layer_end, NULL, hidden,
-                    false, NULL, err, errlen)) { rc = 1; break; }
-            local_seconds += dist_now() - local_started;
+            bool last = i + n == count && (!prepared || prepared->final);
             dist_put(data, s->id);
             dist_put(data + 4, pos0 + i);
             dist_put(data + 8, n);
@@ -482,7 +507,7 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
             uint64_t values = (uint64_t)n * d->info.n_embd;
             for (uint64_t j = 0; j < values; j++) {
                 uint32_t bits;
-                memcpy(&bits, hidden + j, 4);
+                memcpy(&bits, hidden + (uint64_t)(i - local_start) * d->info.n_embd + j, 4);
                 dist_put(data + 16u + 4u*n + 4u*j, bits);
             }
             uint32_t bytes = 16u + n * (1u + d->info.n_embd) * 4u;
@@ -507,12 +532,14 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
         if (receive) {
             uint32_t slot = head++ % 64;
             uint32_t end = pending[slot].end, n = pending[slot].count, index = pending[slot].index;
-            float *out = !verify && end == pos0 + count ? logits : NULL;
-            float *rows = verify ? verify->hidden + (uint64_t)index * d->info.n_embd : hidden;
-            uint32_t returned = d->info.mtp ? n : out ? 1u : 0u;
+            bool last = end == pos0 + count && (!prepared || prepared->final);
+            float *out = !verify && last ? logits : NULL;
+            float *rows = prepared ? prepared->target + (d->info.mtp ? (uint64_t)index * d->info.n_embd : 0) :
+                verify ? verify->hidden + (uint64_t)index * d->info.n_embd : hidden;
+            uint32_t returned = d->info.mtp ? n : last ? 1u : 0u;
             wire_started = dist_now();
             if (dist_result_rows(s, owner, end, out, rows, returned, err, errlen) ||
-                (d->info.mtp && !verify && q36_session_pipeline_mtp_catchup(owner,
+                (!prepared && d->info.mtp && !verify && q36_session_pipeline_mtp_catchup(owner,
                     tokens + index, n, pos0 + index, rows, err, errlen))) rc = 1;
             if (!rc && verify && !verify->stopped) {
                 int top;
@@ -540,12 +567,130 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
         }
         if (rc) break;
     }
-    if (d->opt.debug) fprintf(stderr, "q36: pipeline %u tokens at %u, window %u, %.3f s local=%.3f s remote_wait=%.3f s\n",
-                              count, pos0, window, dist_now() - started, local_seconds, wire_seconds);
+    if (d->opt.debug && !prepared) fprintf(stderr, "q36: pipeline %u tokens at %u, window %u, local_batch=%u wire_batch=%u, %.3f s local=%.3f s remote_wait=%.3f s\n",
+                              count, pos0, window, local_cap, cap, dist_now() - started, local_seconds, wire_seconds);
     if (verify) verify->count = i;
-    free(hidden);
+    if (!prepared) free(hidden);
     free(data);
     return rc;
+}
+
+static void *dist_prefill_exchange(void *opaque) {
+    dist_prefill *p = opaque;
+    p->result = dist_eval_span_body(p->session, NULL, p->tokens, p->count,
+        p->pos, false, NULL, NULL, p, p->error, sizeof(p->error));
+    pthread_mutex_lock(&p->mutex);
+    p->done = true;
+    pthread_cond_signal(&p->ready);
+    pthread_mutex_unlock(&p->mutex);
+    return NULL;
+}
+
+/* The I/O thread only moves prepared rows. GPU catchup remains on the caller,
+ * after the next prefix batch has been saved in its other host buffer. */
+static int dist_prefill_span(q36_dist_session *s, q36_session *owner,
+        const int *tokens, uint32_t count, uint32_t pos0, uint32_t cap,
+        bool progress, float *logits, char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    uint32_t wire = d->peer.prefill_cap;
+    if (d->opt.prefill_chunk && wire > d->opt.prefill_chunk) wire = d->opt.prefill_chunk;
+    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    if (wire > frame) wire = frame;
+    uint64_t bytes = (uint64_t)cap * d->info.n_embd * sizeof(float);
+    float *current = malloc(bytes), *next = malloc(bytes);
+    float *target = malloc(d->info.mtp ? bytes : (uint64_t)d->info.n_embd * sizeof(float));
+    dist_prefill job = {.session=s, .target=target};
+    int rc = 1;
+    if (!current || !next || !target) { dist_error(err, errlen, "pipeline allocation failed"); goto done; }
+    if (pthread_mutex_init(&job.mutex, NULL)) { dist_error(err, errlen, "pipeline mutex failed"); goto done; }
+    if (pthread_cond_init(&job.ready, NULL)) {
+        pthread_mutex_destroy(&job.mutex);
+        dist_error(err, errlen, "pipeline condition failed");
+        goto done;
+    }
+    double started = dist_now(), local = 0, wait = 0, t;
+    if (!pos0 && q36_session_layer_slice_reset(owner, err, errlen)) goto destroy;
+    t = dist_now();
+    if (q36_session_eval_layer_slice(owner, tokens, cap, pos0,
+            d->info.layer_start, d->info.layer_end, NULL, current, false, NULL, err, errlen)) goto destroy;
+    local += dist_now() - t;
+    rc = 0;
+    for (uint32_t i = 0; i < count;) {
+        uint32_t n = count - i;
+        if (n > cap) n = cap;
+        if (q36_session_distributed_cancelled(owner)) {
+            dist_error(err, errlen, "interrupted"); rc = Q36_SESSION_SYNC_INTERRUPTED; break;
+        }
+        job.tokens = tokens + i; job.input = current;
+        job.count = n; job.pos = pos0 + i; job.final = i + n == count; job.done = false;
+        pthread_t io;
+        int created = pthread_create(&io, NULL, dist_prefill_exchange, &job);
+        if (created) { rc = dist_error(err, errlen, "pipeline exchange: %s", strerror(created)); break; }
+        uint32_t following = count - i - n;
+        if (following > cap) following = cap;
+        t = dist_now();
+        if (following) rc = q36_session_eval_layer_slice(owner, tokens + i + n, following, pos0 + i + n,
+            d->info.layer_start, d->info.layer_end, NULL, next, false, NULL, err, errlen);
+        local += dist_now() - t;
+        t = dist_now();
+        pthread_mutex_lock(&job.mutex);
+        while (!job.done) {
+            pthread_mutex_unlock(&job.mutex);
+            if (q36_session_distributed_cancelled(owner)) {
+                dist_error(err, errlen, "interrupted"); rc = Q36_SESSION_SYNC_INTERRUPTED;
+            }
+            if (rc) shutdown(d->fd, SHUT_RDWR);
+            pthread_mutex_lock(&job.mutex);
+            if (!job.done) {
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                deadline.tv_nsec += 100000000;
+                if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&job.ready, &job.mutex, &deadline);
+            }
+        }
+        pthread_mutex_unlock(&job.mutex);
+        pthread_join(io, NULL);
+        if (!rc && job.result) rc = dist_error(err, errlen, "%s", job.error);
+        if (rc) break;
+        if (d->info.mtp) {
+            for (uint32_t j = 0; !rc && j < n;) {
+                uint32_t rows = n - j;
+                if (rows > wire) rows = wire;
+                rc = q36_session_pipeline_mtp_catchup(owner, tokens + i + j, rows, pos0 + i + j,
+                    target + (uint64_t)j * d->info.n_embd, err, errlen);
+                j += rows;
+            }
+        }
+        if (!rc && job.final) rc = q36_session_project_logits(owner,
+            target + (d->info.mtp ? (uint64_t)(n - 1u) * d->info.n_embd : 0), logits, err, errlen);
+        wait += dist_now() - t;
+        if (rc) break;
+        i += n;
+        if (progress) q36_session_distributed_progress(owner, (int)(pos0 + i), (int)(pos0 + count));
+        float *swap = current; current = next; next = swap;
+    }
+    if (d->opt.debug) fprintf(stderr, "q36: pipeline %u tokens at %u, local_batch=%u wire_batch=%u, overlapped, %.3f s local=%.3f s remote_wait=%.3f s\n",
+        count, pos0, cap, wire, dist_now() - started, local, wait);
+destroy:
+    pthread_cond_destroy(&job.ready);
+    pthread_mutex_destroy(&job.mutex);
+done:
+    free(current); free(next); free(target);
+    return rc;
+}
+
+static int dist_eval_span(q36_dist_session *s, q36_session *owner,
+        const int *tokens, uint32_t count, uint32_t pos0, bool progress,
+        float *logits, dist_verify *verify, char *err, size_t errlen) {
+    q36_dist_engine *d = s->engine;
+    uint32_t cap = d->info.prefill_cap, wire = d->peer.prefill_cap;
+    if (d->opt.prefill_chunk && wire > d->opt.prefill_chunk) wire = d->opt.prefill_chunk;
+    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    if (wire > frame) wire = frame;
+    if (!verify && count > cap && cap > wire)
+        return dist_prefill_span(s, owner, tokens, count, pos0, cap, progress, logits, err, errlen);
+    return dist_eval_span_body(s, owner, tokens, count, pos0, progress, logits, verify, NULL, err, errlen);
 }
 
 int q36_dist_session_sync(q36_dist_session *s, q36_session *owner,
@@ -623,11 +768,12 @@ int q36_dist_session_speculate(q36_dist_session *s, q36_session *owner,
         uint8_t data[8];
         dist_put(data, s->id);
         dist_put(data + 4, commit);
+        /* Rebuild both frontiers concurrently; publish tokens after the ACK. */
         if (dist_send(d->fd, DIST_COMMIT, data, sizeof(data), owner) ||
-            dist_result(s, owner, pos + commit, NULL, err, errlen) ||
             q36_session_pipeline_spec_commit(owner, commit, err, errlen) ||
             q36_session_pipeline_mtp_catchup(owner, tokens, commit, pos, verify.hidden, err, errlen) ||
-            q36_session_pipeline_read_logits(owner, logits, err, errlen)) rc = 1;
+            q36_session_pipeline_read_logits(owner, logits, err, errlen) ||
+            dist_result(s, owner, pos + commit, NULL, err, errlen)) rc = 1;
     }
     if (d->opt.debug && !rc) fprintf(stderr, "q36: pipeline MTP drafted=%u verified=%u committed=%u\n",
                                     count, verify.count, commit);

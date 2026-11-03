@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--cpu")) opt.backend = Q36_BACKEND_CPU;
         else if (!strcmp(argv[i], "--ssd-streaming")) opt.ssd_streaming = true;
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) opt.model_path = argv[++i];
+        else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc)
+            opt.prefill_chunk = (uint32_t)atoi(argv[++i]);
         else if ((!strcmp(argv[i], "--record") || !strcmp(argv[i], "--reference")) && i + 1 < argc) {
             reference = !strcmp(argv[i], "--reference"); path = argv[++i];
         } else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
@@ -94,6 +96,15 @@ int main(int argc, char **argv) {
     check(q36_sessions_eval_batch(items, 2, error, sizeof(error)));
     compare(a, fp, reference, "ordered decode A");
     compare(b, fp, reference, "ordered decode B");
+    q36_dist_model_info info;
+    q36_engine_distributed_info(e, &info);
+    float *hidden = calloc(info.n_embd, sizeof(float));
+    float *output = malloc((size_t)info.n_vocab * sizeof(float));
+    assert(hidden && output);
+    for (uint32_t i = 0; i < info.n_vocab; i++) output[i] = 1;
+    check(q36_session_project_logits(a, hidden, output, error, sizeof(error)));
+    for (uint32_t i = 0; i < info.n_vocab; i++) assert(output[i] == 0);
+    free(hidden); free(output);
     if (reference) assert(fgetc(fp) == EOF);
     fclose(fp); fclose(payload);
     q36_session_snapshot_free(&snapshot);

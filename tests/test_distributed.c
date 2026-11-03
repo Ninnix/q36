@@ -11,12 +11,12 @@ struct q36_session {
     q36_engine *engine;
     uint32_t pos, ctx;
     float state;
-    int progress;
+    int progress, cancel_after;
     bool cancel, spec;
     uint32_t spec_pos, spec_n, mtp_pos;
     float history[Q36_DIST_VERIFY_MAX], rows[64];
     float candidate_logits[3];
-    unsigned projections;
+    unsigned projections, batches, largest_batch;
 };
 
 q36_dist_engine *q36_engine_distributed(q36_engine *e) { return e->dist; }
@@ -24,6 +24,7 @@ bool q36_session_distributed_cancelled(q36_session *s) { return s->cancel; }
 void q36_session_distributed_progress(q36_session *s, int current, int total) {
     assert(current <= total);
     s->progress = current;
+    if (s->cancel_after && current >= s->cancel_after) s->cancel = true;
 }
 int q36_session_create(q36_session **out, q36_engine *e, int ctx) {
     *out = calloc(1, sizeof(**out));
@@ -49,6 +50,8 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
     assert(!output_logits);
     if (pos != s->pos || !n || pos + n > s->ctx)
         return dist_error(err, errlen, "fake stage position mismatch");
+    s->batches++;
+    if (n > s->largest_batch) s->largest_batch = n;
     for (uint32_t i = 0; i < n; i++) {
         if (tokens[i] < 0) return dist_error(err, errlen, "invalid token");
         float value = first ? input[i * 2] : (float)tokens[i];
@@ -198,6 +201,7 @@ static void test_pipeline(uint32_t window) {
     char err[256];
     assert(!q36_dist_session_sync(a, &owner, &empty, &prompt, logits, err, sizeof(err)));
     assert(logits[0] == 84 && logits[1] == -84 && owner.pos == 7 && owner.progress == 7);
+    assert(owner.batches == 3 && owner.largest_batch == 3);
     assert(!q36_dist_session_eval(a, &owner, &prompt, 8, logits, err, sizeof(err)));
     assert(logits[0] == 120 && owner.pos == 8 && owner.progress == 7);
     assert(!q36_dist_session_sync(b, &other, &empty, &prompt, logits, err, sizeof(err)));
@@ -225,9 +229,10 @@ static void test_pipeline(uint32_t window) {
     assert(!q36_dist_session_sync(b, &other, &prompt, &prompt, logits, err, sizeof(err)));
     assert(logits[0] == 35);
     q36_dist_session_free(b);
-    owner.cancel = true;
-    assert(q36_dist_session_eval(a, &owner, &prompt, 7, logits, err, sizeof(err)) == Q36_SESSION_SYNC_INTERRUPTED);
-    assert(coord.fd == -1);
+    owner.cancel_after = 3;
+    owner.progress = 0;
+    assert(q36_dist_session_sync(a, &owner, &empty, &prompt, logits, err, sizeof(err)) == Q36_SESSION_SYNC_INTERRUPTED);
+    assert(coord.fd == -1 && owner.progress == 3);
     q36_dist_session_free(a);
     pthread_join(thread, NULL);
     pthread_mutex_destroy(&coord.mutex);
@@ -251,11 +256,12 @@ static void test_speculation(uint32_t window) {
     q36_dist_session *session;
     assert(!q36_dist_session_create(&session, &coord, 32));
     q36_session owner = {.ctx=32};
-    int history[32] = {1, 2, 3};
-    q36_tokens empty = {0}, checkpoint = {.v=history, .len=3};
+    int history[32] = {1, 2, 3, 4, 5, 6, 7};
+    q36_tokens empty = {0}, checkpoint = {.v=history, .len=7};
     float logits[3]; char err[256];
     assert(!q36_dist_session_sync(session, &owner, &empty, &checkpoint, logits, err, sizeof(err)));
-    assert(owner.mtp_pos == 3);
+    assert(owner.mtp_pos == 7);
+    assert(owner.batches == 3 && owner.largest_batch == 3);
     int cases[][3] = {{1,0,0}, {1,0,2}, {1,2,2}, {1,0,0}, {1,2,2}};
     int accepted[] = {3,2,1,2,3};
     for (unsigned c = 0; c < sizeof(cases)/sizeof(*cases); c++) {

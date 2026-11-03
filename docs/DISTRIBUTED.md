@@ -113,8 +113,14 @@ affects loading, while streaming can also make drive speed part of inference.
 
 ## Prefill and network performance
 
-`--dist-prefill-chunk N` caps the coordinator's chunk size. The actual size is
-bounded by both stages' prefill capacities. `--dist-prefill-window N` controls
+`--dist-prefill-chunk N` caps each transmitted chunk. Its size is bounded by
+both stages' prefill capacities. The coordinator can evaluate a larger local
+batch and split its residual rows into smaller worker chunks. This lets each
+stage use its own `--prefill-chunk` capacity without reducing the larger stage
+to the smaller stage's batch size. A bounded I/O exchange overlaps the worker
+with computation of the next local batch; GPU work and progress/cancellation
+callbacks remain on the inference thread. Short spans keep the smaller batch
+to avoid an extra pipeline fill. `--dist-prefill-window N` controls
 the number of chunks in flight, from 1 to 64; the default is 2. A window larger
 than one lets the coordinator compute the next chunk while the worker processes
 the previous chunk. These controls work with any network transport supported
@@ -131,6 +137,16 @@ stages finishing the current one. Throughput depends on both machines, the
 layer split, memory/storage mode, bandwidth, latency, and network congestion.
 Wi-Fi and routed links can have different throughput and jitter from a direct
 Ethernet link. Measure on the network you intend to use.
+
+When prefill is limited by the prefix stage, try increasing only the
+coordinator's `--prefill-chunk`, keeping worker chunks and the window small.
+Larger local batches can use more efficient GPU kernels, at the cost of more
+scratch memory and startup latency. Different batch shapes can change
+floating-point rounding; compare logits and memory as well as throughput.
+
+Vulkan coordinators retain projected logits on the GPU. Greedy decode reads
+only the top token ids; sampling, logprobs, and the full-logits API read the
+vocabulary row when needed. CPU stages keep their logits in host memory.
 
 `--debug` reports route and timing information. Its `remote_wait` time includes
 the coordinator's vocabulary projection after receiving the final row.
@@ -158,8 +174,8 @@ the matching target prefix is committed on both machines. Rejected tails are
 rolled back using saved recurrent inputs, without rerunning model weights.
 Verification keeps vocabulary logits on the coordinator GPU and reads only
 the top token for each candidate. Once a continuation fails, queued tail rows
-are drained without projecting them. Only the final accepted vocabulary row
-is copied to the CPU for sampling and logprobs.
+are drained without projecting them. The final accepted vocabulary row stays
+on the GPU until sampling, logprobs, or an API caller needs it on the CPU.
 
 MTP also needs normalized target rows to maintain its shifted attention
 history. Requests and replies are exchanged concurrently so large hidden-row
@@ -265,6 +281,10 @@ reasoning; full logits after accepted blocks; a forced rejection; checkpoint
 replay; and generation boundaries. The Qwen3.6 Q4 path has been validated with
 default Vulkan settings and with FP32 recurrent state and separate
 convolution/QKV operations as described above.
+
+To exercise unequal stage capacities, use a smaller worker capacity and add
+`--prefill-chunk 128 --prefill-tokens 256` to the MTP test above. Its padded
+prompts cover multiple local batches, smaller worker chunks, and partial tails.
 
 ## Current limits
 
