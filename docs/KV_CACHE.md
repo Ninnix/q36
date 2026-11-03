@@ -37,6 +37,12 @@ Enable it with:
 ./q36-server --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192
 ```
 
+Hermes Agent can send background requests, such as session title generation,
+between turns. With one live session, those requests replace the conversation
+in memory. Enable disk caching to restore its saved prefix on the next turn.
+The cache contains prompt text, so choose a directory with suitable access
+permissions.
+
 The cache key is the SHA1 of the rendered byte prefix, and files are named
 `<sha1>.kv`. The Q36 payload still stores the exact token IDs and graph
 state for that prefix. This matters for continued chats: the model may have
@@ -157,11 +163,11 @@ replay can survive server restarts even when the matching KV snapshot is
 not the one ultimately used for the rendered-prefix hit.
 
 The current Q36 session payload starts with fourteen little-endian `u32`
-fields for version 2, or sixteen fields for typed-KV version 3:
+fields for version 2, or sixteen fields for typed-KV versions 3 and 4:
 
 ```text
 0   magic = "Q36 "
-1   payload version = 2 (f16 KV) or 3 (typed KV)
+1   payload version = 2 (f16 KV), 3 (typed KV), or 4 (typed KV with MTP)
 2   saved context size
 3   prefill chunk size
 4   checkpoint token count
@@ -174,8 +180,8 @@ fields for version 2, or sixteen fields for typed-KV version 3:
 11  recurrent convolution dimension
 12  recurrent state dimension
 13  recurrent dt rank
-14  K cache type (version 3 only)
-15  V cache type (version 3 only)
+14  K cache type (versions 3 and 4)
+15  V cache type (versions 3 and 4)
 ```
 
 Then it stores:
@@ -188,15 +194,16 @@ Then it stores:
   state tensors.
 
 Version 1 stores tokens and rebuilds runtime state by prefilling the saved
-sequence. MTP sessions write this version so loading reconstructs both the
-target state and the shifted MTP history. Other sessions write version 2 or
-3 and persist the complete Qwen full-attention and recurrent state.
+sequence. Older MTP checkpoints use this format. Version 4 adds MTP K and V
+rows, the last target hidden state, and the draft head mask to the target
+state. Other sessions write version 2 or 3.
+An older token-only checkpoint still needs a full replay when loaded; use a
+new cache directory to avoid loading those files after upgrading.
 
 The logits are raw IEEE-754 `float32` values from the host `q36_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution
-without running one extra decode step. MTP draft logits/state are not
-persisted; an MTP checkpoint rebuilds both models from its saved tokens.
+without running one extra decode step.
 
 The tensor payload is q36-specific KV/session state, not a generic
 inference graph dump. It is expected to be portable only across compatible

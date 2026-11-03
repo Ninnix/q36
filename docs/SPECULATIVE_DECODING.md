@@ -20,6 +20,11 @@ these defaults regardless of argument order. The embedding and output weights
 remain shared. With `--mtp` omitted, the runtime excludes the extra block from
 the resident GPU weight cache.
 
+The server uses ordinary decoding for requests that include tools. A tool call
+can end or change sampling inside a speculative block, and restoring that
+boundary currently requires replaying the context. Other server requests can
+still use MTP.
+
 The MoE build `gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf` retains the
 Antirez target tensors and embeds a 332.78 MB MTP block quantized from
 Unsloth's original BF16 weights. Its draft gate/up experts use IQ2_XXS,

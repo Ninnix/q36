@@ -829,6 +829,7 @@ enum {
     Q36_PAYLOAD_VERSION_TOKEN_ONLY = 1,
     Q36_PAYLOAD_VERSION = 2,
     Q36_PAYLOAD_VERSION_TYPED_KV = 3,
+    Q36_PAYLOAD_VERSION_MTP = 4,
     Q36_PAYLOAD_U32_FIELDS = 14,
     Q36_PAYLOAD_U32_FIELDS_TYPED_KV = 16,
 };
@@ -11744,7 +11745,8 @@ q36_session_rewrite_result q36_session_rewrite_from_common(q36_session *s, const
         return Q36_SESSION_REWRITE_ERROR;
     }
     if (q36_session_rewrite_requires_rebuild(s->checkpoint.len, prompt->len, common)) {
-        return q36_session_sync(s, prompt, err, errlen) == 0 ? Q36_SESSION_REWRITE_OK : Q36_SESSION_REWRITE_ERROR;
+        if (err && errlen) snprintf(err, errlen, "checkpoint suffix cannot be rewound");
+        return Q36_SESSION_REWRITE_REBUILD_NEEDED;
     }
     if (common == s->checkpoint.len && common == prompt->len) return Q36_SESSION_REWRITE_OK;
     s->checkpoint.len = common;
@@ -12686,12 +12688,13 @@ static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
 uint64_t q36_session_payload_bytes(q36_session *s) {
     if (!s || s->vision_state) return 0;
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    if (s->dist || q36_engine_has_mtp(s->engine))
+    if (s->dist)
         return sizeof(q36_payload_header) + (uint64_t)rows * sizeof(int32_t);
     bool typed = s->engine &&
         (s->engine->cache_type_k != Q36_KV_CACHE_F16 ||
          s->engine->cache_type_v != Q36_KV_CACHE_F16);
-    uint64_t bytes = (uint64_t)(typed ? Q36_PAYLOAD_U32_FIELDS_TYPED_KV : Q36_PAYLOAD_U32_FIELDS) * sizeof(uint32_t);
+    bool mtp = q36_engine_has_mtp(s->engine);
+    uint64_t bytes = (uint64_t)((typed || mtp) ? Q36_PAYLOAD_U32_FIELDS_TYPED_KV : Q36_PAYLOAD_U32_FIELDS) * sizeof(uint32_t);
     bytes += (uint64_t)rows * sizeof(int32_t);
     bytes += (uint64_t)Q36_N_VOCAB * sizeof(float);
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
@@ -12703,6 +12706,10 @@ uint64_t q36_session_payload_bytes(q36_session *s) {
             bytes += q36_recurrent_conv_bytes() + q36_recurrent_state_bytes();
         }
     }
+    if (mtp) bytes += q36_full_k_bytes(rows, s->engine->cache_type_k) +
+                      q36_full_v_bytes(rows, s->engine->cache_type_v) +
+                      (uint64_t)Q36_N_EMBD * sizeof(float) +
+                      ((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t);
     return bytes;
 }
 
@@ -12811,8 +12818,8 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         return 1;
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    /* Partial pipeline KV and shifted MTP history both require token replay. */
-    if (s->dist || q36_engine_has_mtp(s->engine)) {
+    /* Partial pipeline KV requires token replay. */
+    if (s->dist) {
         q36_payload_header h = {Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_TOKEN_ONLY, rows};
         return q36_payload_write_bytes(fp, &h, sizeof(h), err, errlen) ||
                q36_payload_write_bytes(fp, s->checkpoint.v,
@@ -12821,9 +12828,10 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
     bool typed = s->engine &&
         (s->engine->cache_type_k != Q36_KV_CACHE_F16 ||
          s->engine->cache_type_v != Q36_KV_CACHE_F16);
+    bool mtp = q36_engine_has_mtp(s->engine);
     uint32_t h[Q36_PAYLOAD_U32_FIELDS_TYPED_KV] = {
         Q36_PAYLOAD_MAGIC,
-        typed ? Q36_PAYLOAD_VERSION_TYPED_KV : Q36_PAYLOAD_VERSION,
+        mtp ? Q36_PAYLOAD_VERSION_MTP : (typed ? Q36_PAYLOAD_VERSION_TYPED_KV : Q36_PAYLOAD_VERSION),
         (uint32_t)s->ctx_size,
         s->engine && s->engine->backend == Q36_BACKEND_CPU ?
             ((q36_cpu_runtime *)s->runtime)->prefill_cap :
@@ -12845,7 +12853,7 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         s->engine ? (uint32_t)s->engine->cache_type_k : 0,
         s->engine ? (uint32_t)s->engine->cache_type_v : 0,
     };
-    uint32_t nfields = typed ? Q36_PAYLOAD_U32_FIELDS_TYPED_KV : Q36_PAYLOAD_U32_FIELDS;
+    uint32_t nfields = (typed || mtp) ? Q36_PAYLOAD_U32_FIELDS_TYPED_KV : Q36_PAYLOAD_U32_FIELDS;
     for (uint32_t i = 0; i < nfields; i++) {
         if (q36_payload_write_u32(fp, h[i], err, errlen) != 0) return 1;
     }
@@ -12912,6 +12920,10 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
                 return 1;
         }
     }
+    if (mtp && (q36_payload_write_tensor(fp, rt->mtp_full.k, q36_full_k_bytes(rows, rt->mtp_full.type_k), err, errlen) ||
+                q36_payload_write_tensor(fp, rt->mtp_full.v, q36_full_v_bytes(rows, rt->mtp_full.type_v), err, errlen) ||
+                q36_payload_write_tensor(fp, rt->last_h, (uint64_t)Q36_N_EMBD * sizeof(float), err, errlen) ||
+                q36_payload_write_tensor(fp, rt->mtp_head_mask, ((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t), err, errlen))) return 1;
     return 0;
 #endif
 }
@@ -12966,12 +12978,12 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         q36_payload_set_err(err, errlen, "pipeline restore requires a token-only checkpoint");
         return 1;
     }
-    if (version != Q36_PAYLOAD_VERSION && version != Q36_PAYLOAD_VERSION_TYPED_KV) {
+    if (version != Q36_PAYLOAD_VERSION && version != Q36_PAYLOAD_VERSION_TYPED_KV && version != Q36_PAYLOAD_VERSION_MTP) {
         if (err && errlen) snprintf(err, errlen, "unsupported session payload version");
         return 1;
     }
 
-    uint32_t nfields = version == Q36_PAYLOAD_VERSION_TYPED_KV ?
+    uint32_t nfields = version != Q36_PAYLOAD_VERSION ?
         Q36_PAYLOAD_U32_FIELDS_TYPED_KV : Q36_PAYLOAD_U32_FIELDS;
     uint32_t h[Q36_PAYLOAD_U32_FIELDS_TYPED_KV] = {0};
     h[0] = magic;
@@ -12995,9 +13007,9 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         q36_payload_set_err(err, errlen, "KV checkpoint was written for a different q36 layout");
         return 1;
     }
-    q36_kv_cache_type payload_type_k = version == Q36_PAYLOAD_VERSION_TYPED_KV ?
+    q36_kv_cache_type payload_type_k = version != Q36_PAYLOAD_VERSION ?
         (q36_kv_cache_type)h[14] : Q36_KV_CACHE_F16;
-    q36_kv_cache_type payload_type_v = version == Q36_PAYLOAD_VERSION_TYPED_KV ?
+    q36_kv_cache_type payload_type_v = version != Q36_PAYLOAD_VERSION ?
         (q36_kv_cache_type)h[15] : Q36_KV_CACHE_F16;
     if (payload_type_k > Q36_KV_CACHE_Q4_0 || payload_type_v > Q36_KV_CACHE_Q4_0 ||
         !s->engine ||
@@ -13008,6 +13020,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
 
+    if (version == Q36_PAYLOAD_VERSION_MTP && !q36_engine_has_mtp(s->engine)) {
+        q36_payload_set_err(err, errlen, "MTP checkpoint requires MTP support");
+        return 1;
+    }
     q36_session_reset_runtime(s);
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
@@ -13080,6 +13096,11 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
                     return 1;
             }
         }
+        if (version == Q36_PAYLOAD_VERSION_MTP &&
+            (q36_payload_read_tensor(rt->mtp_full.k, fp, q36_full_k_bytes(n_tokens, rt->mtp_full.type_k), &remaining, err, errlen) ||
+             q36_payload_read_tensor(rt->mtp_full.v, fp, q36_full_v_bytes(n_tokens, rt->mtp_full.type_v), &remaining, err, errlen) ||
+             q36_payload_read_tensor(rt->last_h, fp, (uint64_t)Q36_N_EMBD * sizeof(float), &remaining, err, errlen) ||
+             q36_payload_read_tensor(rt->mtp_head_mask, fp, ((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t), &remaining, err, errlen))) return 1;
 #endif
     }
     if (remaining != 0) {
@@ -13087,7 +13108,7 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         q36_session_invalidate(s);
         return 1;
     }
-    if (q36_engine_has_mtp(s->engine)) {
+    if (q36_engine_has_mtp(s->engine) && version != Q36_PAYLOAD_VERSION_MTP) {
         q36_tokens prompt = {0};
         q36_tokens_copy(&prompt, &s->checkpoint);
         s->checkpoint.len = 0;

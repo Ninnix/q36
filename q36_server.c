@@ -7744,12 +7744,13 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
 static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
-                                         int quant_bits, int ctx_size) {
+                                         int quant_bits, int ctx_size, uint64_t payload_bytes) {
     if (access(path, F_OK) != 0) return false;
     kv_entry e = {0};
     if (!kv_read_entry_file(path, sha, &e)) return false;
     bool compatible = (!kc->reject_different_quant || e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
+                      e.payload_bytes == payload_bytes &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     kv_entry_free(&e);
     if (!compatible) {
@@ -7845,7 +7846,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
     char *path = kv_path_for_sha(kc, sha);
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
-                                     quant_bits, q36_session_ctx(slot->session))) {
+                                     quant_bits, q36_session_ctx(slot->session), payload_bytes)) {
         kv_cache_rewrite_tool_map(s, path, text);
         free(text);
         free(path);
@@ -9534,7 +9535,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         int toks[17];
         int ntok = 0;
         const int block_start = q36_session_pos(slot->session);
+        /* Tool parsing can stop or change sampling inside a draft block.
+         * Rewinding that block otherwise rebuilds the entire recurrent state. */
         if (!multimodal && !s->batched_mode &&
+            !j->req.has_tools &&
             (temperature <= 0.0f || s->mtp_opportunistic) &&
             presence_penalty == 0.0f && frequency_penalty == 0.0f &&
             q36_engine_mtp_draft_tokens(s->engine) > 1 &&

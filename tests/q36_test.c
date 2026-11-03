@@ -7341,6 +7341,11 @@ static void test_session_sync_resume_matches_cold_rebuild(void) {
     }
 
     TEST_ASSERT(q36_session_sync(warm, &prefix, err, sizeof(err)) == 0);
+    int before_rewrite = q36_session_argmax(warm);
+    TEST_ASSERT(q36_session_rewrite_from_common(warm, &full, prefix.len - 1,
+                                                err, sizeof(err)) == Q36_SESSION_REWRITE_REBUILD_NEEDED);
+    TEST_ASSERT(q36_session_pos(warm) == prefix.len);
+    TEST_ASSERT(q36_session_argmax(warm) == before_rewrite);
     TEST_ASSERT(q36_session_sync(warm, &full, err, sizeof(err)) == 0);
     TEST_ASSERT(q36_session_sync(cold, &full, err, sizeof(err)) == 0);
 
@@ -8197,6 +8202,7 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     int multi = 0;
     int partial = 0;
     int longest = 0;
+    bool restored_generated = false;
     float worst_gap = 0.0f, worst_logits = 0.0f;
 
     TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
@@ -8228,6 +8234,7 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     TEST_ASSERT(payload != NULL);
     if (payload) {
         uint64_t bytes = q36_session_payload_bytes(spec);
+        TEST_ASSERT(bytes > sizeof(int32_t) * (uint64_t)prompt.len + 1024);
         TEST_ASSERT(q36_session_save_payload(spec, payload, err, sizeof(err)) == 0);
         TEST_ASSERT((uint64_t)ftell(payload) == bytes);
         rewind(payload);
@@ -8307,6 +8314,18 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
             fprintf(stderr, "q36-test: MTP boundary pos=%d n=%d max_diff=%g\n",
                     q36_session_pos(spec), n, diff);
         TEST_ASSERT(diff <= 1.0e-6f);
+        if (!restored_generated && committed >= 8 && committed < limit) {
+            FILE *saved = tmpfile();
+            TEST_ASSERT(saved != NULL);
+            if (saved) {
+                uint64_t bytes = q36_session_payload_bytes(spec);
+                TEST_ASSERT(q36_session_save_payload(spec, saved, err, sizeof(err)) == 0);
+                rewind(saved);
+                TEST_ASSERT(q36_session_load_payload(spec, saved, bytes, err, sizeof(err)) == 0);
+                fclose(saved);
+            }
+            restored_generated = true;
+        }
     }
 
     fprintf(stderr,
