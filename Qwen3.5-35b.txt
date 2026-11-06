@@ -1,0 +1,2 @@
+./q36-server -m gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf --vulkan --mtp --ctx 32768 \
+  --kv-disk-dir /tmp/q36-kv --kv-disk-space-mb 8192 --port 9080 --open-browser
