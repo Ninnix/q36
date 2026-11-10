@@ -183,7 +183,7 @@ ordinary first GGUF shard, without the n-gram shard. If its model drive is too
 slow, stage only the suffix weights directly into its resident GPU cache:
 
 ```sh
-MODEL=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-down-00001-of-00002.gguf
+MODEL=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf
 
 python3 tools/flash_next_worker.py --model "$MODEL" --ssh root@moraine \
   --remote-dir /root/q36-flash-next \

@@ -174,10 +174,14 @@ Keep both GGUF files in the same directory. The loader accepts the differing
 filenames in this pack when exactly one compatible second shard is present.
 
 ```sh
-model=gguf/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-down-00001-of-00002.gguf
+./download_model.sh flash-next
+model=gguf/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf
 ./q36 -m "$model" --cpu --ssd-streaming --ctx 4096 --nothink -p "Hello"
 ./q36 -m "$model" --vulkan --ssd-streaming --ctx 4096 --nothink -p "Hello"
 ```
+
+The complete download is about 50.8 GB: 22.0 GB of transformer weights and
+28.8 GB of disk-backed n-grams. Both shards come from the same model pack.
 
 N-gram rows are read with `pread`. Vulkan also streams dense weights and selected
 experts through two alternating 8 MiB banks in a shared 16 MiB slab. Parallel

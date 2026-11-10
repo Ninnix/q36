@@ -4,11 +4,14 @@ set -e
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
 DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
+FLASH_REPO="Ninnix96/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-gguf"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 Q4_FILE="Qwen3.6-35B-A3B-IQ4XS-Q4K-Q8.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
+FLASH_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf"
+FLASH_NGRAM_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00002-of-00002.gguf"
 VISION_REMOTE="mmproj-F16.gguf"
 VISION_FILE="Qwen3.6-35B-A3B-mmproj-F16.gguf"
 DENSE_VISION_FILE="Qwen3.8-27B-mmproj-F16.gguf"
@@ -30,6 +33,7 @@ Usage:
   ./download_model.sh q4 [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
+  ./download_model.sh flash-next [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
 
@@ -52,6 +56,12 @@ Targets:
        Dense Qwen3.8 27B GSQ-RCO IQ3_XXS from $DENSE_SMALL_REPO.
        Smaller weights leave more memory for context. Includes an embedded
        MTP head; enable it with --mtp. Uses the qwen38-vision projector.
+
+  flash-next (also qwen38-flash-next)
+       Qwen3.8 Flash Next GSQ-RCO Coder from $FLASH_REPO.
+       Downloads both required GGUF shards, about 50.8 GB in total.
+       Keep them together and pass the first shard with -m. The n-gram
+       shard stays on the coordinator in distributed mode. No MTP head.
 
   qwen36-vision
        Qwen3.6 35B A3B F16 vision projector from $VISION_REPO.
@@ -93,12 +103,18 @@ shift
 LINK_MODEL=1
 MODEL_REPO=$REPO
 MODEL_REMOTE=
+MODEL_EXTRA_FILE=
 
 case "$MODEL" in
     q2) MODEL_FILE=$Q2_FILE ;;
     q4) MODEL_FILE=$Q4_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
+    flash-next|qwen38-flash-next)
+        MODEL_REPO=$FLASH_REPO
+        MODEL_FILE=$FLASH_FILE
+        MODEL_EXTRA_FILE=$FLASH_NGRAM_FILE
+        ;;
     qwen36-vision)
         MODEL_REPO=$VISION_REPO
         MODEL_REMOTE=$VISION_REMOTE
@@ -187,6 +203,9 @@ download_one() {
 }
 
 download_one "$MODEL_REPO" "$MODEL_REMOTE" "$MODEL_FILE"
+if [ -n "$MODEL_EXTRA_FILE" ]; then
+    download_one "$MODEL_REPO" "$MODEL_EXTRA_FILE" "$MODEL_EXTRA_FILE"
+fi
 
 if [ "$MODEL" = "qwen36-vision" ]; then
     echo
@@ -203,6 +222,9 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     if [ "$MODEL" = "q2" ] || [ "$MODEL" = "27b-iq3-xxs" ]; then
         echo "Enable the embedded MTP head with:"
         echo "  ./q36 -m $OUT_DIR/$MODEL_FILE --mtp"
+    elif [ -n "$MODEL_EXTRA_FILE" ]; then
+        echo "Both GGUF shards are required. Run using the first shard:"
+        echo "  ./q36 -m \"$OUT_DIR/$MODEL_FILE\" --vulkan --ssd-streaming"
     fi
 fi
 
