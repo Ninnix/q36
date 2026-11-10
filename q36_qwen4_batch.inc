@@ -65,7 +65,7 @@ static bool q36_q4_gpu_attention_batch(q36_q4_gpu *g, const q36_model *m,
     uint32_t blocks=(pos+g->tokens)/4;
     bool sparse=blocks>512;
     if (sparse) {
-        if (blocks>16384 || !Q4_MM(l->indexer_q_proj,Q4_TMP,Q4_X) ||
+        if (!Q4_MM(l->indexer_q_proj,Q4_TMP,Q4_X) ||
             !q36_q4_gpu_weight(g,m,l->indexer_q_norm) ||
             !q36_q4_gpu_op(g,11,128,4,g->v[Q4_Q],g->v[Q4_TMP],g->weight,NULL,NULL,NULL,0,pos,0,1) ||
             !q36_q4_gpu_weight(g,m,l->indexer_k_norm) ||
@@ -86,7 +86,7 @@ static bool q36_q4_gpu_attention_batch(q36_q4_gpu *g, const q36_model *m,
             for (uint32_t i=0; i<=pos+t; i++) selected[count++]=i;
         } else {
             memset(taken,0,complete*sizeof(bool));
-            ok=q36_gpu_tensor_read(g->scores,(uint64_t)t*65536,score,complete*4);
+            ok=q36_gpu_tensor_read(g->scores,(uint64_t)t*g->score_stride,score,complete*4);
             if (!ok) break;
             q36_q4_gpu_select_blocks(score,complete,taken);
             for (uint32_t i=0; i<complete; i++) if (taken[i])

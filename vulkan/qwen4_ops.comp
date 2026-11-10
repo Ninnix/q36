@@ -53,11 +53,13 @@ uint offset_a, offset_b, offset_c, offset_d, offset_e, offset_f;
 #define F(i) f[offset_f+(i)]
 uint row_offset(uint binding, uint token) {
     if (binding==0 && OP==20 && p.aux!=0) return token*p.aux;
+    /* Score rows grow with context; p.type carries their stride in floats. */
+    if (((p.cap>>(16+binding))&1u)!=0) return token*p.type;
     return ((p.cap >> binding) & 1u) != 0 ? token * (((p.cap >> (8+binding)) & 1u) != 0 ? 32768u : 16384u) : 0;
 }
 void main() {
     uint lane = gl_LocalInvocationID.x;
-    uint group = p.cap != 0 ? gl_WorkGroupID.x : gl_WorkGroupID.x + gl_WorkGroupID.y * 65535;
+    uint group = gl_WorkGroupID.x + (p.cap != 0 ? gl_WorkGroupID.z : gl_WorkGroupID.y) * 65535;
     uint i = group * gl_WorkGroupSize.x + lane, token = p.cap != 0 ? gl_WorkGroupID.y : 0;
     offset_a=row_offset(0,token); offset_b=row_offset(1,token); offset_c=row_offset(2,token);
     offset_d=row_offset(3,token); offset_e=row_offset(4,token); offset_f=row_offset(5,token);

@@ -187,7 +187,7 @@ MODEL=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf
 
 python3 tools/flash_next_worker.py --model "$MODEL" --ssh root@moraine \
   --remote-dir /root/q36-flash-next \
-  --coordinator 10.36.0.1 --ctx 4096 --bulk-host 10.36.0.2
+  --coordinator 10.36.0.1 --ctx 100000 --bulk-host 10.36.0.2
 ```
 
 The example uses the existing dedicated USB Ethernet subnet. Replace the SSH
@@ -211,10 +211,19 @@ executable filesystem; `/dev/shm` may be mounted with `noexec`.
 Leave that helper running. On the main machine, start any existing frontend:
 
 ```sh
-Q36_THREADS=16 ./q36 -m "$MODEL" --vulkan --ctx 4096 -t 16 \
+Q36_THREADS=16 ./q36 -m "$MODEL" --vulkan --ctx 100000 -t 16 \
   --role coordinator --layers 0:23 --listen 10.36.0.1 9911 \
   --temp 0 --nothink -p 'Say hello.' -n 16
 ```
+
+Both boards need the same logical context window: the worker's `--ctx` must
+be at least the coordinator session size. The agent defaults to 100,000 tokens;
+context capacity is not divided by the number of boards. Each stage keeps KV
+only for its own attention layers. Distributed Flash Next prefill supports
+batches through the full supported context range; configuring 100K does not
+force single-token prefill. Use `--debug` to check the actual `local_batch` and
+`wire_batch` values. Flash Next checkpoints contain tokens, so loading one
+replays its prompt through the pipeline.
 
 The current QSA implementation transforms each completed four-token key block
 once, retaining it in the first raw-key row of that block. Partial blocks keep
@@ -247,6 +256,50 @@ and invalidation clears exposed logits. Fresh 16-thread CPU/Vulkan tests pass
 all unchanged top-1 through top-64 gates. Regression and kernel tests pass.
 These measurements use resident experts with PLE on the main SSD. Flash Next
 MTP remains unavailable; the 150/30 t/s targets are not met at long contexts.
+
+
+With both boards configured for 100,000 tokens, Flash Next now retains batch
+32 prefill. Score rows use their allocated context-dependent stride, including
+the CPU heap-selection readback, and QSA dispatch covers the 65,536th block at
+256K context. The earlier context-capacity guard forced batch 1 even when the
+actual prompt was short.
+
+The 24/24, 16-thread comparison below uses `Q36_VK_FLASH_BATCH=1` on the
+coordinator as the serial control. Both boards run the same updated code;
+that override restricts transmitted chunks to one token and reproduces the
+previous fallback. The other arm uses the default batch 32. Both use
+`--ctx-alloc 100000 --prefill-chunk 32 --gen-tokens 16 --warmup` and
+`tests/long_context_story_prompt.txt` with the shared `q36-bench` executable.
+
+| Context | Serial prefill t/s | Batch 32 prefill t/s | Serial decode t/s | Batch 32 decode t/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 61.10 | 154.62 | 28.74 | 28.71 |
+| 2,048 | 52.42 | 155.61 | 22.20 | 22.03 |
+| 3,968 | 45.35 | 127.60 | 22.01 | 21.71 |
+
+The 2K control prefills 2,048 tokens from an empty session; the batched sweep
+extends the 128-token prefix by 1,920 tokens. At 128 and 3,968, the measured
+token counts match: prefill improves 2.53x and 2.81x respectively. All three
+complete frontier-logit vectors are identical. Nine short-prompt checks against
+unchanged 16-thread CPU captures pass all existing strict parity gates. Generic
+and specialized score kernels match serial results bit for bit at 64K, 100K
+and 256K, including row-padding guards. The unit suite passes.
+
+Main GPU tensor peak rises from 10,697.67 to 10,744.30 MiB, an additional
+46.63 MiB for batching. Maximum main-board GPU temperatures were 81 C for the
+long serial sweep and 82 C for batch 32; CPU maxima were 83 C and 81.5 C.
+
+A cold-cache, headless agent check with the same 100K capacity and a
+2,607-token system prompt reduces startup-prompt processing from 51.72 to
+18.41 seconds. Total launch-to-reply time, including weight loading and a
+66-token user prompt, falls from 74.14 to 38.40 seconds. Both arms use
+`--nothink --temp 0 --tokens 8` with fresh cache directories and reply `OK`.
+The coordinator command is unchanged; deploy the same runtime and shaders
+on the worker and retain `--ctx 100000` there.
+
+These are 100K-capacity sessions with prompts through 3,968 tokens, not a
+full 100K-token throughput measurement. Decode arithmetic is unchanged and
+this change does not add Flash Next MTP.
 
 ## Distributed MTP
 

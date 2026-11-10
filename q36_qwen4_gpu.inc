@@ -10,14 +10,14 @@ typedef struct {
     q36_gpu_tensor *v[Q4_NBUF], *base[Q4_NBUF], *row[32][Q4_NBUF];
     q36_gpu_tensor *state[48], *hist[48], *k[48], *value[48], *index[48];
     q36_gpu_tensor *ple_hist, *scores, *weight;
-    uint32_t cap, first, last, row_cap, tokens, batch_cap;
+    uint32_t cap, first, last, row_cap, tokens, batch_cap, score_stride;
     bool resident, input_q8, batch, cache_index, radix_select;
 } q36_q4_gpu;
 
 static uint32_t q36_q4_gpu_prefill_cap(const q36_engine *e) {
     const char *batch = getenv("Q36_VK_FLASH_BATCH");
     const char *experts = getenv("Q36_VK_FLASH_EXPERTS");
-    if (e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming || e->context_size > 65536 ||
+    if (e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming ||
         !q36_dist_enabled(&e->distributed) || !q36_gpu_qwen4_native() ||
         (experts && !strcmp(experts,"0"))) return 1;
     uint32_t cap = batch ? (uint32_t)atoi(batch) : e->prefill_cap_override ? e->prefill_cap_override : 32;
@@ -66,7 +66,11 @@ static bool q36_q4_gpu_op(q36_q4_gpu *g, uint32_t op, uint32_t n, uint32_t group
     uint32_t p[8] = {op,n,rows,pos,0,aux,0,mode};
     if (g && g->batch) {
         for (uint32_t j = 0; j < 6; j++) {
-            if (t[j] == g->scores) { p[4] |= 1u<<j; continue; }
+            if (t[j] == g->scores) {
+                p[4] |= (1u<<j) | (1u<<(16+j));
+                p[6]=g->score_stride/sizeof(float);
+                continue;
+            }
             for (uint32_t i = 0; i < Q4_NBUF; i++) if (i != Q4_W && i != Q4_LOGITS && t[j] == g->v[i]) {
                 p[4] |= 1u<<j;
                 if (i == Q4_BLOCK) p[4] |= 1u<<(j+8);
@@ -351,7 +355,9 @@ static bool q36_q4_gpu_reserve(q36_q4_gpu *g, uint32_t cap, uint32_t rows) {
         }
     }
     q36_gpu_tensor_free(g->scores);
-    g->scores = q36_gpu_tensor_alloc_uninitialized((((uint64_t)cap / 4 + 1) * 4 > 65536 ? ((uint64_t)cap / 4 + 1) * 4 : 65536) * (g->batch_cap ? g->batch_cap : 1));
+    g->score_stride=(cap/4+1)*sizeof(float);
+    if (g->score_stride<65536) g->score_stride=65536;
+    g->scores = q36_gpu_tensor_alloc_uninitialized((uint64_t)g->score_stride * (g->batch_cap ? g->batch_cap : 1));
     g->cap = cap;
     return g->scores != NULL;
 }

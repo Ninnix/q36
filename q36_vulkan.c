@@ -6255,7 +6255,9 @@ int q36_gpu_qwen4_op_rows(q36_gpu_tensor *const tensors[6], const uint32_t param
     kernel->write_mask=params[0]==6 || params[0]==7 || params[0]==31 ? 9u : params[0]==8 ? 3u : 1u;
     static const char *names[32]={"q4_norm","q4_hc_silu","q4_hc_mix","q4_inject","q4_residual","q4_ple_gate","q4_ple_conv","q4_gdn_conv","q4_qk_norm","q4_gdn_controls","q4_gdn_norm","q4_rope","q4_attention","q4_silu_mul","q4_expert_sum","q4_shared_gate","q4_qsa_scores","q4_kv_store","q4_zero","q4_embedding","q4_quantize","q4_bf16_reduce","q4_experts_sum","q4_router","q4_qsa_pool","q4_k_store","q4_k_resize","q4_dense_select","q4_qsa_select","q4_hc_inject","q4_unused","q4_hc_norm"};
     const char *name=params[0]<32 ? names[params[0]] : "qwen4";
-    int ok = q36_vk_run_unlocked(name,kernel, bindings, params, 32, groups > 65535 ? 65535 : groups, rows > 1 ? rows : (groups + 65534) / 65535, 1);
+    uint32_t slices=(groups+65534)/65535;
+    int ok = q36_vk_run_unlocked(name,kernel, bindings, params, 32,
+        groups>65535 ? 65535 : groups,rows>1 ? rows : slices,rows>1 ? slices : 1);
     pthread_mutex_unlock(&q36_vk_mu);
     return ok;
 }

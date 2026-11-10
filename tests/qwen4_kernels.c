@@ -1,5 +1,50 @@
 #include "../q36.c"
 
+static bool context_scores(void) {
+    const uint32_t counts[]={16384,25000,65536};
+    const char *setting=getenv("Q36_VK_FLASH_OPS");
+    char *saved=setting ? strdup(setting) : NULL;
+    bool ok=true;
+    for (uint32_t test=0; ok && test<6; test++) {
+        setenv("Q36_VK_FLASH_OPS",test<3 ? "0" : "1",1);
+        uint32_t n=counts[test%3], stride=(n+1)*4;
+        if (stride<65536) stride=65536;
+        uint64_t key_bytes=(uint64_t)n*512*4, score_bytes=(uint64_t)3*stride;
+        float *data=xmalloc(key_bytes), *got=xmalloc(score_bytes), *want=xmalloc(n*4);
+        for (uint64_t i=0; i<key_bytes/4; i++) data[i]=(int)(i%97)*.003f-.1f;
+        q36_q4_gpu g={.batch=true,.tokens=3,.score_stride=stride};
+        q36_gpu_tensor *keys=q36_gpu_tensor_alloc(key_bytes), *single=q36_gpu_tensor_alloc(n*4);
+        g.base[Q4_Q]=g.v[Q4_Q]=q36_gpu_tensor_alloc(3*65536);
+        g.scores=q36_gpu_tensor_alloc(score_bytes);
+        ok=keys && single && g.v[Q4_Q] && g.scores &&
+            q36_gpu_tensor_write(keys,0,data,key_bytes);
+        for (uint64_t i=0; i<score_bytes/4; i++) got[i]=-123.0f;
+        ok=ok && q36_gpu_tensor_write(g.scores,0,got,score_bytes);
+        for (uint32_t t=0; ok && t<3; t++) {
+            for (uint32_t i=0; i<512; i++) data[i]=(int)(i%41)*.02f-.2f+t*.1f;
+            ok=q36_gpu_tensor_write(g.v[Q4_Q],(uint64_t)t*65536,data,512*4);
+        }
+        if (ok) ok=q36_q4_gpu_op(&g,16,128,n,g.scores,keys,g.v[Q4_Q],keys,keys,keys,n,n*4-1,0,1) &&
+            q36_gpu_tensor_read(g.scores,0,got,score_bytes);
+        for (uint32_t t=0; ok && t<3; t++) {
+            q36_gpu_tensor *query=q36_gpu_tensor_view(g.v[Q4_Q],(uint64_t)t*65536,512*4);
+            ok=query && q36_q4_gpu_op(NULL,16,128,n,single,keys,query,keys,keys,keys,n,n*4-1+t,0,1) &&
+                q36_gpu_tensor_read(single,0,want,n*4) &&
+                !memcmp((uint8_t *)got+(uint64_t)t*stride,want,n*4);
+            for (uint32_t i=n; ok && i<stride/4; i++)
+                ok=got[(uint64_t)t*stride/4+i]==-123.0f;
+            q36_gpu_tensor_free(query);
+        }
+        q36_gpu_tensor_free(keys); q36_gpu_tensor_free(single);
+        q36_gpu_tensor_free(g.v[Q4_Q]); q36_gpu_tensor_free(g.scores);
+        free(data); free(got); free(want);
+    }
+    if (saved) { setenv("Q36_VK_FLASH_OPS",saved,1); free(saved); }
+    else unsetenv("Q36_VK_FLASH_OPS");
+    fprintf(stderr,"64K/100K/256K batched QSA scores match serial scores bit for bit: %s\n",ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool resident_stream_errors(void) {
     uint8_t map[64] = {0}, frame[32] = {0};
     q36_gpu_tensor *out = q36_gpu_tensor_alloc(16);
@@ -416,7 +461,7 @@ int main(int argc, char **argv) {
         tested++;
         }
     }
-    if (!gpu_router() || !batched_layers(&m) || !batched_matrices(&m) || !routed_experts(&m) || !sparse_selection() || !streamed_head(&m) || !sparse_scores() || !resident_stream_errors() || !suffix_cache_growth()) return 1;
+    if (!context_scores() || !gpu_router() || !batched_layers(&m) || !batched_matrices(&m) || !routed_experts(&m) || !sparse_selection() || !streamed_head(&m) || !sparse_scores() || !resident_stream_errors() || !suffix_cache_growth()) return 1;
     q36_gpu_cleanup(); model_close(&m);
     printf("%u streamed matrix type/shape comparisons passed\n",tested);
     return 0;
