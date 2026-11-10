@@ -17,6 +17,7 @@ typedef enum {
 
 typedef struct {
     uint32_t n_layers, n_embd, n_vocab, prefill_cap, context_size;
+    uint32_t n_hidden; /* Residual wire width; zero uses n_embd. */
     uint32_t layer_start, layer_end;
     bool speculation, mtp;
     uint64_t fingerprint;

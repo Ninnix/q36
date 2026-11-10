@@ -1,0 +1,444 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#ifdef Q36_ROUTER_SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+#include "reference_math.glsl"
+#include "expf.glsl"
+#ifndef Q36_LOCAL_SIZE
+#define Q36_LOCAL_SIZE 256
+#endif
+layout(local_size_x = Q36_LOCAL_SIZE) in;
+layout(constant_id = 0) const uint OP_KIND=0;
+layout(binding = 0) buffer A { float a[]; };
+layout(binding = 1) buffer B { float b[]; };
+layout(binding = 2) buffer C { float c[]; };
+layout(binding = 3) buffer D { float d[]; };
+layout(binding = 4) buffer E { float e[]; };
+layout(binding = 5) buffer F { float f[]; };
+layout(push_constant) uniform Push { uint op, n, rows, pos, cap, aux, type, mode; } p;
+#define OP (OP_KIND==0 ? p.op : OP_KIND-1)
+shared double sums[256];
+shared float norm_scale[2];
+shared double attention_denom;
+shared float attention_max;
+shared float vals[OP_KIND!=0 && OP_KIND!=13 && OP_KIND!=29 ? 256 : 2052];
+shared uint ids[256];
+shared uint qsa_score, qsa_index, qsa_mask, qsa_rank, qsa_nan;
+uint qsa_key(float score) {
+    uint bits=floatBitsToUint(score==0 ? 0.0 : score);
+    return (bits & 0x80000000u)!=0 ? ~bits : bits ^ 0x80000000u;
+}
+float sig(float v) { return q36_sigmoid(v); }
+float silu(float v) { return q36_silu(v); }
+double reduce(double v) {
+    uint l = gl_LocalInvocationID.x;
+    sums[l] = v; barrier();
+    for (uint j = 128; j > 0; j /= 2) { if (l < j) sums[l] += sums[l + j]; barrier(); }
+    double result = sums[0];
+    barrier();
+    return result;
+}
+float bf16(float v) {
+    uint u = floatBitsToUint(v);
+    return uintBitsToFloat((u + 32767u + ((u >> 16) & 1u)) & 0xffff0000u);
+}
+uint offset_a, offset_b, offset_c, offset_d, offset_e, offset_f;
+#define A(i) a[offset_a+(i)]
+#define B(i) b[offset_b+(i)]
+#define C(i) c[offset_c+(i)]
+#define D(i) d[offset_d+(i)]
+#define E(i) e[offset_e+(i)]
+#define F(i) f[offset_f+(i)]
+uint row_offset(uint binding, uint token) {
+    if (binding==0 && OP==20 && p.aux!=0) return token*p.aux;
+    return ((p.cap >> binding) & 1u) != 0 ? token * (((p.cap >> (8+binding)) & 1u) != 0 ? 32768u : 16384u) : 0;
+}
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = p.cap != 0 ? gl_WorkGroupID.x : gl_WorkGroupID.x + gl_WorkGroupID.y * 65535;
+    uint i = group * gl_WorkGroupSize.x + lane, token = p.cap != 0 ? gl_WorkGroupID.y : 0;
+    offset_a=row_offset(0,token); offset_b=row_offset(1,token); offset_c=row_offset(2,token);
+    offset_d=row_offset(3,token); offset_e=row_offset(4,token); offset_f=row_offset(5,token);
+    if (OP == 23) {
+#ifdef Q36_ROUTER_SUBGROUP
+        /* Only each wave's top ten can reach the global top ten. Rank that
+         * small candidate set, retaining the expert-index tie break. */
+        float score=B(lane);
+        for (uint k=0; k<10; k++) {
+            float maximum=subgroupMax(score);
+            uint selected=subgroupMin(score==maximum ? lane : 0xffffffffu);
+            if (subgroupElect()) { uint at=gl_SubgroupID*10+k; vals[at]=maximum; ids[at]=selected; }
+            if (lane==selected) score=-1.0/0.0;
+        }
+        barrier();
+        uint candidates=gl_NumSubgroups*10;
+        score=lane<candidates ? vals[lane] : 0;
+        uint id=lane<candidates ? ids[lane] : 0, rank=0;
+        if (lane<candidates) for (uint j=0; j<candidates; j++)
+            if (vals[j]>score || (vals[j]==score && ids[j]<id)) rank++;
+        barrier();
+        if (lane<candidates && rank<10) { vals[rank]=score; ids[rank]=id; }
+#else
+        if (p.n<=256) {
+            if (lane<p.n) vals[lane]=B(lane);
+            barrier();
+            float score=lane<p.n ? vals[lane] : 0;
+            uint rank=0;
+            /* Rank cached scores before reusing the same array for the top ten. */
+            if (lane<p.n) {
+                for (uint j=0; j<p.n; j++) {
+                    float other=vals[j];
+                    if (other>score || (other==score && j<lane)) rank++;
+                }
+            }
+            barrier();
+            if (lane<p.n && rank<10) { vals[rank]=score; ids[rank]=lane; }
+        } else {
+            for (uint expert=lane; expert<p.n; expert+=256) {
+                float v=B(expert); uint rank=0;
+                for (uint j=0; j<p.n; j++) {
+                    float other=B(j);
+                    if (other>v || (other==v && j<expert)) rank++;
+                }
+                if (rank<10) { vals[rank]=v; ids[rank]=expert; }
+            }
+        }
+#endif
+        barrier();
+        if (lane==0) vals[10]=vals[0];
+        barrier();
+        if (lane<10) vals[lane]=lane<8 ? q36_router_vector_exp(vals[lane]-vals[10]) :
+                                       q36_router_exp(vals[lane]-vals[10]);
+        barrier();
+        if (lane==0) {
+            precise float first=((vals[0]+vals[4])+(vals[2]+vals[6]))+
+                                ((vals[1]+vals[5])+(vals[3]+vals[7]));
+            precise double total=double(first);
+            total+=double(vals[8]);
+            total+=double(vals[9]);
+            sums[0]=1.0/total;
+        }
+        barrier();
+        if (lane<10) {
+            A(lane)=uintBitsToFloat(ids[lane]);
+            A(64+lane)=vals[lane]*float(sums[0]);
+        }
+    } else if (OP == 0 || OP == 10 || OP == 11 || OP == 31) {
+        uint n = p.n, base = group * n;
+        uint stride = OP == 11 && p.mode == 0 ? 2 * n : n;
+        double ss = 0;
+        for (uint j = lane; j < n; j += 256) { float v = B(group * stride + j); ss += double(v * v); }
+        ss=reduce(ss);
+        if (lane==0) norm_scale[0]=q36_rsqrt(float(ss/double(n))+1e-6);
+        barrier();
+        float scale=norm_scale[0];
+        for (uint j = lane; j < n; j += 256) {
+            float v = B(group * stride + j) * scale * C(((OP == 0 || OP == 31) && p.mode == 0) ? base + j : j);
+            if (OP == 10) v *= sig(D(base + j));
+            A(base + j) = v;
+            if (OP==31) D(base+j)=bf16(v);
+        }
+        if (OP == 11) {
+            memoryBarrierBuffer(); barrier();
+            if (lane < 32) {
+                uint k = base + lane;
+                float theta = float(p.pos + token) * pow(1e7, -float(2 * lane) / 64.0);
+                float x = A(k), y = A(k + 32);
+                A(k) = x * cos(theta) - y * sin(theta);
+                A(k + 32) = x * sin(theta) + y * cos(theta);
+            }
+        }
+    } else if (OP == 1) { if (i < p.n) A(i) = silu(A(i) * 0.25); }
+    else if (OP == 2) {
+        if (i < p.n) { float v = 0; for (uint s = 0; s < 4; s++) v = fma(B(s * p.n + i),sig(C(s * p.n + i)),v); A(i) = v * 0.25; }
+    } else if (OP == 3) { if (i < 4) A(i) = 2 * sig(A(i) * 0.25); }
+    else if (OP == 4) { if (i < 4 * p.n) A(i) += B(i % p.n) * C(i / p.n); }
+    else if (OP == 5) {
+        uint base = group * p.n;
+        double dot = 0;
+        for (uint j = lane; j < p.n; j += 256) dot += double(B(base + j)) * C(base + j);
+        float v = float(reduce(dot) / sqrt(double(p.n)));
+        float gate = sig(sign(v) * sqrt(max(abs(v), 1e-6)));
+        for (uint j = lane; j < p.n; j += 256) A(base + j) = gate * D(j);
+    } else if (OP == 6) {
+        if (i < p.n) {
+            double v = 0;
+            for (uint tap = 0; tap < 4; tap++) {
+                uint back = (3 - tap) * 3;
+                v += double(E(4 * i + tap)) * (back == 0 ? C(i) : D((9 - back) * p.n + i));
+            }
+            A(i) += B(i) + silu(float(v));
+            for (uint j = 0; j < 8; j++) D(j * p.n + i) = D((j + 1) * p.n + i);
+            D(8 * p.n + i) = C(i);
+        }
+    } else if (OP == 7) {
+        if (i < p.n) {
+            float history[3]=float[3](D(i),D(p.n+i),D(2*p.n+i));
+            /* Each channel owns its history. Keep token order in registers
+             * instead of launching one convolution for every prompt token. */
+            for (uint t=0; t<max(1u,p.mode); t++) {
+                uint at=t*16384u+i;
+                double v=double(C(4*i+3))*B(at);
+                for (uint tap=0; tap<3; tap++) v+=double(C(4*i+tap))*history[tap];
+                A(at)=silu(float(v));
+                history[0]=history[1]; history[1]=history[2]; history[2]=B(at);
+            }
+            for (uint tap=0; tap<3; tap++) D(tap*p.n+i)=history[tap];
+        }
+    } else if (OP == 8) {
+        uint kh = group % 16, n = 128;
+        double q = 0, k = 0;
+        if (lane < n) { q = double(C(kh * n + lane) * C(kh * n + lane)); k = double(C(2048 + kh * n + lane) * C(2048 + kh * n + lane)); }
+        q=reduce(q); k=reduce(k);
+        if (lane==0) { norm_scale[0]=q36_rsqrt(float(q)+1e-6); norm_scale[1]=q36_rsqrt(float(k)+1e-6); }
+        barrier();
+        float qs=norm_scale[0], ks=norm_scale[1];
+        if (lane < n) {
+            float q=C(kh*n+lane)*qs, k=C(2048+kh*n+lane)*ks;
+            uint count=p.mode==1 ? 3 : 1;
+            for (uint j=0; j<count; j++) { A((group+j*16)*n+lane)=q; B((group+j*16)*n+lane)=k; }
+        }
+    } else if (OP == 9) {
+        if (i < 48) { float v = C(i) + E(i); A(i) = exp(D(i) * (v > 20 ? v : log(1 + exp(v)))); A(48 + i) = sig(B(i)); }
+    } else if (OP == 12) {
+        uint qbase = group * 256, kvhead = group / 12;
+        uint count = p.cap != 0 ? floatBitsToUint(F(4096)) : p.rows;
+        for (uint t = lane; t < count; t += 256) {
+            uint idx = floatBitsToUint(F(t));
+            double dot = 0;
+            for (uint j=0; j<256; j+=8) {
+                float query[8], key[8];
+                [[unroll]] for (uint k=0; k<8; k++) {
+                    query[k]=B(qbase+j+k);
+                    key[k]=C((kvhead*256+j+k)*p.aux+idx);
+                }
+                [[unroll]] for (uint k=0; k<8; k++) dot+=double(query[k])*key[k];
+            }
+            vals[t] = float(dot) * 0.0625;
+        }
+        barrier();
+        if (lane==0) {
+            float mx=-1.0/0.0;
+            for (uint t=0; t<count; t++) mx=max(mx,vals[t]);
+            attention_max=mx;
+        }
+        barrier();
+        for (uint t = lane; t < count; t += 256) vals[t] = exp(vals[t] - attention_max);
+        barrier();
+        if (lane==0) {
+            double denom=0;
+            for (uint t=0; t<count; t++) denom+=vals[t];
+            attention_denom=denom;
+        }
+        barrier();
+        double sum = 0;
+        uint aligned=count&~7u;
+        for (uint t=0; t<aligned; t+=8) {
+            float weight[8], value[8];
+            [[unroll]] for (uint k=0; k<8; k++) {
+                weight[k]=vals[t+k];
+                value[k]=D(floatBitsToUint(F(t+k))*512+kvhead*256+lane);
+            }
+            [[unroll]] for (uint k=0; k<8; k++) sum+=double(weight[k])*value[k];
+        }
+        for (uint t=aligned; t<count; t++) sum+=double(vals[t])*D(floatBitsToUint(F(t))*512+kvhead*256+lane);
+        A(qbase + lane) = float(sum / attention_denom) * sig(E(group * 512 + 256 + lane));
+    } else if (OP == 13) { if (i < p.n) A(i) = silu(B(i)) * C(i); }
+    else if (OP == 14) { if (i < p.n) A(i) += B(i) * uintBitsToFloat(p.aux); }
+    else if (OP == 15) { if (i < p.n) A(i) += B(i) * sig(C(0)); }
+    else if (OP == 16 || OP == 24) {
+        if (OP==24) group+=p.aux;
+        if (group >= (p.cap != 0 ? (p.pos+token+1)/4 : p.rows)) return;
+        if (OP==16 && p.mode==1) {
+            if (lane<128) vals[lane]=B(group*512+lane);
+            barrier();
+        } else {
+        float pooled = 0;
+        if (lane < 128) for (uint t = 0; t < 4; t++) pooled += B((group * 4 + t) * 128 + lane) * 0.25;
+        double ss=reduce(double(pooled)*pooled);
+        if (lane==0) norm_scale[0]=q36_rsqrt(float(ss/128.0)+1e-6);
+        barrier();
+        float scale=norm_scale[0];
+        if (lane < 128) vals[lane] = pooled * scale * D(lane);
+        barrier();
+        if (lane < 32) {
+            float theta = float(group * 4) * pow(1e7, -float(2 * lane) / 64.0);
+            float x = vals[lane], y = vals[lane + 32];
+            vals[lane] = x * cos(theta) - y * sin(theta); vals[lane + 32] = x * sin(theta) + y * cos(theta);
+        }
+        barrier();
+        }
+        if (OP==24) {
+            if (lane<128) A(group*512+lane)=vals[lane];
+            return;
+        }
+        double total = 0;
+        for (uint head = 0; head < 4; head++) {
+            double dot = lane < 128 ? double(vals[lane]) * C(head * 128 + lane) : 0;
+            total += max(0.0LF, reduce(dot));
+        }
+        if (lane == 0) A(group) = float(total);
+    } else if (OP == 27) {
+        uint count=p.pos+token+1;
+        if (i<count) A(i)=uintBitsToFloat(i);
+        if (i==0) A(4096)=uintBitsToFloat(count);
+    } else if (OP == 28) {
+        uint count=p.pos+token+1, blocks=count/4, chunk=(blocks+255)/256;
+        if (p.mode==1 && blocks<=512) {
+            for (uint k=lane; k<count; k+=256) A(k)=uintBitsToFloat(k);
+            if (lane==0) A(4096)=uintBitsToFloat(count);
+            return;
+        }
+        if (lane==0) qsa_nan=0;
+        for (uint k=lane; k<blocks; k+=256) {
+            if (blocks<=2048) vals[k]=B(k);
+            if (isnan(B(k))) atomicOr(qsa_nan,1);
+        }
+        barrier();
+        if (p.mode==1 && blocks>512 && qsa_nan==0) {
+            if (lane==0) { qsa_score=0; qsa_index=0; qsa_mask=0; qsa_rank=511; }
+            barrier();
+            /* Select the 512th (score, reverse index) key. Radix passes avoid
+             * ranking every block against the full context, including ties. */
+            for (int pass=11; pass>=0; pass--) {
+                if (lane<16) ids[lane]=0;
+                barrier();
+                uint shift=uint(pass>=4 ? pass-4 : pass)*4;
+                for (uint j=0; j<chunk; j++) {
+                    uint block=lane*chunk+j;
+                    if (block>=blocks) break;
+                    uint key=qsa_key(blocks<=2048 ? vals[block] : B(block));
+                    bool match=pass>=4 ? (key&qsa_mask)==qsa_score :
+                        key==qsa_score && (((16383u-block)&qsa_mask)==qsa_index);
+                    if (match) atomicAdd(ids[((pass>=4 ? key : 16383u-block)>>shift)&15u],1);
+                }
+                barrier();
+                if (lane==0) {
+                    for (int digit=15; digit>=0; digit--) {
+                        if (qsa_rank>=ids[digit]) qsa_rank-=ids[digit];
+                        else {
+                            if (pass>=4) qsa_score|=uint(digit)<<shift;
+                            else qsa_index|=uint(digit)<<shift;
+                            break;
+                        }
+                    }
+                    qsa_mask|=15u<<shift;
+                    if (pass==4) qsa_mask=0;
+                }
+                barrier();
+            }
+            uint cutoff=16383u-qsa_index, total=0;
+            for (uint j=0; j<chunk; j++) {
+                uint block=lane*chunk+j;
+                if (block>=blocks) break;
+                uint key=qsa_key(blocks<=2048 ? vals[block] : B(block));
+                if (key>qsa_score || (key==qsa_score && block<=cutoff)) total++;
+            }
+            ids[lane]=total;
+            barrier();
+            for (uint step=1; step<256; step*=2) {
+                uint add=lane>=step ? ids[lane-step] : 0;
+                barrier(); ids[lane]+=add; barrier();
+            }
+            uint offset=ids[lane]-total;
+            for (uint j=0; j<chunk; j++) {
+                uint block=lane*chunk+j;
+                if (block>=blocks) break;
+                uint key=qsa_key(blocks<=2048 ? vals[block] : B(block));
+                if (key>qsa_score || (key==qsa_score && block<=cutoff)) {
+                    for (uint k=0; k<4; k++) A(offset*4+k)=uintBitsToFloat(block*4+k);
+                    offset++;
+                }
+            }
+            if (lane<count%4) A(min(blocks,512u)*4+lane)=uintBitsToFloat(blocks*4+lane);
+            if (lane==0) A(4096)=uintBitsToFloat(min(blocks,512u)*4+count%4);
+            return;
+        }
+        uint keep[8], total=0;
+        for (uint j=0; j<chunk; j++) {
+            uint block=lane*chunk+j, rank=0;
+            if (block<blocks) {
+                float score=vals[block];
+                for (uint k=0; k<blocks; k++) {
+                    float other=vals[k];
+                    if (other>score || (other==score && k<block)) rank++;
+                }
+            }
+            keep[j]=block<blocks && rank<512 ? 1 : 0;
+            total+=keep[j];
+        }
+        ids[lane]=total;
+        barrier();
+        for (uint step=1; step<256; step*=2) {
+            uint add=lane>=step ? ids[lane-step] : 0;
+            barrier();
+            ids[lane]+=add;
+            barrier();
+        }
+        uint offset=ids[lane]-total;
+        for (uint j=0; j<chunk; j++) if (keep[j]!=0) {
+            for (uint k=0; k<4; k++) A(offset*4+k)=uintBitsToFloat((lane*chunk+j)*4+k);
+            offset++;
+        }
+        if (lane< count%4) A(min(blocks,512u)*4+lane)=uintBitsToFloat(blocks*4+lane);
+        if (lane==0) A(4096)=uintBitsToFloat(min(blocks,512u)*4+count%4);
+    } else if (OP == 29) {
+        vals[lane]=lane<32 ? B(256+group*32+lane) : 0;
+        barrier();
+        for (uint step=16; step>0; step/=2) {
+            if (lane<step) vals[lane]+=vals[lane+step];
+            barrier();
+        }
+        if (lane==0) A(group)=2*sig(vals[0]*0.25);
+    } else if (OP == 25) { if (i<p.n) A(i*p.aux+p.pos+token)=B(i); }
+    else if (OP == 26) { if (i<p.n*p.rows) A((i/p.rows)*p.aux+i%p.rows)=B((i/p.rows)*p.pos+i%p.rows); }
+    else if (OP == 17) { if (i < p.n) A((p.pos+token)*p.n+i)=B(i); }
+    else if (OP == 18) { if (i < p.n) A(i) = 0; }
+    else if (OP == 19) { if (i < p.n * 4) A(i) = B(i % p.n); }
+    else if (OP == 22) {
+        if (i < p.n) {
+            float sum = 0;
+            for (uint k = 0; k < 10; k++) sum += B(k*p.n+i) * C(64+k);
+            A(i) = sum;
+        }
+    }
+    else if (OP == 21) {
+        vals[lane] = lane < 32 ? B(group * 32 + lane) : 0;
+        barrier();
+        for (uint j = 16; j > 0; j /= 2) {
+            if (lane < j) vals[lane] += vals[lane + j];
+            barrier();
+        }
+        if (lane == 0) A(p.pos + group) = vals[0];
+    } else if (OP == 20) {
+        if (p.type == 30) { if (i < p.n) A(i) = bf16(B(i)); return; }
+        uint width = (p.type == 42 || p.type == 20 || p.type == 8) ? 32 : 256;
+        if (p.type == 0 || p.type == 1) { if (i < p.n) A(i) = B(i); return; }
+        uint base = group * width;
+        float v = lane < width && base + lane < p.n ? B(base + lane) : 0;
+        vals[lane] = abs(v); ids[lane] = lane; barrier();
+        for (uint j = 128; j > 0; j /= 2) {
+            if (lane < j && (vals[lane + j] > vals[lane] || (vals[lane + j] == vals[lane] && ids[lane + j] < ids[lane]))) { vals[lane] = vals[lane + j]; ids[lane] = ids[lane + j]; }
+            barrier();
+        }
+        float inv = vals[0] == 0 ? 0 : width == 32 ? q36_div(127.0,vals[0]) : q36_div(-127.0,B(base + ids[0]));
+        float d0 = width == 32 ? q36_div(vals[0],127.0) : inv == 0 ? 0 : q36_div(1.0,inv);
+        float quant = roundEven(v * inv);
+        float scale = width == 32 ? unpackHalf2x16(q36_half(d0)).x : d0;
+        if (p.mode == 1) {
+            if (lane == 0) A(group*9) = uintBitsToFloat(q36_half(d0));
+            if (lane < 8) {
+                uint packed = 0;
+                for (uint j = 0; j < 4; j++) {
+                    int q = int(clamp(roundEven(B(base+lane*4+j)*inv),-128,127));
+                    packed |= (uint(q)&255u) << (j*8);
+                }
+                A(group*9+1+lane) = uintBitsToFloat(packed);
+            }
+            return;
+        }
+        if (lane < width && base + lane < p.n) A(base + lane) = clamp(quant,-128,127) * scale;
+    }
+}

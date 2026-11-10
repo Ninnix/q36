@@ -78,17 +78,47 @@ void init_signs(void) {
 }
 #endif
 
+#ifdef Q36_ROUTED
+layout(set = 0, binding = 4) readonly buffer Selected { uint selected[]; };
+uint route_token, route_rank, route_expert;
+void init_route(void) {
+    route_token=gl_WorkGroupID.z; route_rank=gl_WorkGroupID.y;
+    route_expert=selected[route_token*16384u+route_rank];
+}
+#define Q36_INIT_ROUTE init_route();
+#else
+#define Q36_INIT_ROUTE
+#endif
+uint input_word(uint off) {
+#ifdef Q36_ROUTED
+    off += route_token*16384u;
+#endif
+    return q8[off];
+}
+void store_output(uint token, uint row, float value) {
+#ifdef Q36_ROUTED
+    y[route_token*16384u+route_rank*pc.out_dim+row]=value;
+#else
+    y[token * pc.out_dim + row] = value;
+#endif
+}
+
+uint weight_offset(uint off) {
+#ifdef Q36_ROUTED
+    off += route_expert*pc.out_dim*pc.row_bytes;
+#endif
+    return off;
+}
 uint load_u8(uint off) {
-    return uint(wb[off]);
+    return uint(wb[weight_offset(off)]);
 }
-
 uint load_u16(uint off) {
-    return uint(wb[off]) | (uint(wb[off + 1u]) << 8u);
+    off = weight_offset(off);
+    return uint(wb[off]) | (uint(wb[off+1u]) << 8u);
 }
-
 uint load_u32(uint off) {
-    return uint(wb[off]) | (uint(wb[off + 1u]) << 8u) |
-           (uint(wb[off + 2u]) << 16u) | (uint(wb[off + 3u]) << 24u);
+    off = weight_offset(off);
+    return uint(wb[off]) | (uint(wb[off+1u]) << 8u) | (uint(wb[off+2u]) << 16u) | (uint(wb[off+3u]) << 24u);
 }
 
 uint table_u8(uint off) {
@@ -306,16 +336,16 @@ void iq1_verify(void) {
                 int w1 = int(tables[TAB_IQ1S + 2u * entry + 1u]);
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                     uint qbase = (t * pc.blocks + b) * Q8K_WORDS + 2u + 8u * group + 2u * l;
-                    sum[t] += dotPacked4x8EXT(w0, int(q8[qbase]));
-                    sum[t] += dotPacked4x8EXT(w1, int(q8[qbase + 1u]));
+                    sum[t] += dotPacked4x8EXT(w0, int(input_word(qbase)));
+                    sum[t] += dotPacked4x8EXT(w1, int(input_word(qbase + 1u)));
                 }
             }
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                 uint qb = (t * pc.blocks + b) * Q8K_WORDS;
-                uint bs = q8[qb + 66u + group];
+                uint bs = input_word(qb + 66u + group);
                 int qsum = bitfieldExtract(int(bs), 0, 16) + bitfieldExtract(int(bs), 16, 16);
                 float value = d * (float(sum[t]) + delta * float(qsum));
-                acc[t][r] = fma(uintBitsToFloat(q8[qb]), value, acc[t][r]);
+                acc[t][r] = fma(uintBitsToFloat(input_word(qb)), value, acc[t][r]);
             }
         }
     }
@@ -323,7 +353,7 @@ void iq1_verify(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             if (lid == 0u && first_row + r < pc.out_dim)
-                y[t * pc.out_dim + first_row + r] = total * pc.scale;
+                store_output(t,first_row+r,total * pc.scale);
         }
     }
 }
@@ -333,6 +363,7 @@ void iq1_verify(void) {
 /* Decode each weight group once, but keep every token's scaled sum local
  * so the compiler retains the ordinary decode contraction order. */
 void main(void) {
+    Q36_INIT_ROUTE
     init_signs();
     uint lid=gl_LocalInvocationID.x,group=lid&7u;
     uint first=gl_WorkGroupID.x*ROWS;
@@ -366,10 +397,10 @@ void main(void) {
                 uint qbase=(t*pc.blocks+b)*Q8K_WORDS+2u+8u*group;
                 float sum=0.0;
                 UNROLL for(uint l=0u;l<4u;l++) {
-                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].x,int(q8[qbase+2u*l])));
-                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].y,int(q8[qbase+2u*l+1u])));
+                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].x,int(input_word(qbase+2u*l))));
+                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].y,int(input_word(qbase+2u*l+1u))));
                 }
-                float yd=uintBitsToFloat(q8[(t*pc.blocks+b)*Q8K_WORDS]);
+                float yd=uintBitsToFloat(input_word((t*pc.blocks+b)*Q8K_WORDS));
                 acc[t][r]=fma(yd,sum,acc[t][r]);
             }
         }
@@ -377,13 +408,14 @@ void main(void) {
     UNROLL for(uint t=0u;t<N_TOKENS;t++) {
         UNROLL for(uint r=0u;r<ROWS;r++) {
             float value=subgroupAdd(acc[t][r]);
-            if(lid==0u)y[t*pc.out_dim+first+r]=value*pc.scale;
+            if(lid==0u)store_output(t,first+r,value*pc.scale);
         }
     }
 }
 #elif Q36_TOKENS > 1 && defined(Q36_TYPE) && Q36_TYPE == 16
 
 void main(void) {
+    Q36_INIT_ROUTE
     init_signs();
     uint lid = gl_LocalInvocationID.x, group = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
@@ -408,12 +440,12 @@ void main(void) {
                 int w1 = signed_bytes(tables[table + 2u * entry + 1u], signs >> 4u);
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                     uint qbase = (t * pc.blocks + b) * Q8K_WORDS + 2u + 8u * group + 2u * l;
-                    sum[t] += dotPacked4x8EXT(w0, int(q8[qbase]));
-                    sum[t] += dotPacked4x8EXT(w1, int(q8[qbase + 1u]));
+                    sum[t] += dotPacked4x8EXT(w0, int(input_word(qbase)));
+                    sum[t] += dotPacked4x8EXT(w1, int(input_word(qbase + 1u)));
                 }
             }
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
-                float yd = uintBitsToFloat(q8[(t * pc.blocks + b) * Q8K_WORDS]);
+                float yd = uintBitsToFloat(input_word((t * pc.blocks + b) * Q8K_WORDS));
                 float v = float(sum[t]);
                 v *= unpackHalf2x16(load_u16(base)).x * (0.5 + float(scales >> 28u)) * 0.25;
                 acc[t][r] = fma(yd, v, acc[t][r]);
@@ -424,13 +456,14 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;
-            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+            if (lid == 0u && row < pc.out_dim) store_output(t,row,total * pc.scale);
         }
     }
 }
 
 #else
 void main(void) {
+    Q36_INIT_ROUTE
 #if Q36_TOKENS > 1 && !defined(Q36_TYPE)
     if (QTYPE == IQ1_S) {
         iq1_verify();
@@ -451,9 +484,9 @@ void main(void) {
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint token_offset = t * pc.blocks * Q8K_WORDS;
             uint qbase = b * Q8K_WORDS + 2u + 8u * lane8;
-            float yd = uintBitsToFloat(q8[token_offset + b * Q8K_WORDS]);
+            float yd = uintBitsToFloat(input_word(token_offset + b * Q8K_WORDS));
             int qv[8];
-            UNROLL for (uint i = 0u; i < 8u; i++) qv[i] = int(q8[token_offset + qbase + i]);
+            UNROLL for (uint i = 0u; i < 8u; i++) qv[i] = int(input_word(token_offset + qbase + i));
             UNROLL for (uint r = 0u; r < ROWS; r++) {
                 uint row = first_row + r;
                 if (row >= pc.out_dim) continue;
@@ -467,7 +500,7 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;
-            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+            if (lid == 0u && row < pc.out_dim) store_output(t,row,total * pc.scale);
         }
     }
 }

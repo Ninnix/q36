@@ -71,9 +71,15 @@ void main(void) {
 
     float norm = inversesqrt(float(N));
     for (uint tok = 0u; tok < pc.n_tok; tok++) {
-        uint vec = tok * pc.n_heads * N + h * N;
-        float decay = gb[tok * 2u * pc.n_heads + h];
-        float beta = gb[tok * 2u * pc.n_heads + pc.n_heads + h];
+#ifdef Q36_STRIDED
+        uint vec=tok*16384u+h*N, value_offset=4096u;
+        uint control=tok*16384u;
+#else
+        uint vec=tok*pc.n_heads*N+h*N, value_offset=0;
+        uint control=tok*2u*pc.n_heads;
+#endif
+        float decay=gb[control+h];
+        float beta=gb[control+pc.n_heads+h];
         float qr[ROWS];
         float kr[ROWS];
         float sk = 0.0;
@@ -88,7 +94,7 @@ void main(void) {
             sk = fma(state[r], kr[r], sk);
         }
         sk = subgroupClusteredAdd(sk, LANES);
-        float d = (v[vec + j] - sk) * beta;
+        float d = (v[vec + value_offset + j] - sk) * beta;
         float outj = 0.0;
         for (uint r = 0u; r < ROWS; r++) {
             state[r] = fma(kr[r], d, state[r]);

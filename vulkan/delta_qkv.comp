@@ -35,8 +35,8 @@ void main(void) {
         float kv = conv[conv_base + (pc.n_groups + g) * pc.state_dim + i];
         sh_q[i] = qv;
         sh_k[i] = kv;
-        sq_q += double(qv) * double(qv);
-        sq_k += double(kv) * double(kv);
+        sq_q += double(qv * qv);
+        sq_k += double(kv * kv);
         vout[q_base + i] = conv[conv_base + 2u * pc.n_groups * pc.state_dim + h * pc.state_dim + i];
     }
     sh_sq_q[lid] = sq_q;
@@ -49,10 +49,12 @@ void main(void) {
         }
         barrier();
     }
-    float scale_q = 1.0f / max(sqrt(float(sh_sq_q[0])), pc.eps);
-    float scale_k = 1.0f / max(sqrt(float(sh_sq_k[0])), pc.eps);
+    float n = float(pc.state_dim);
+    float scale_q = 1.0f / sqrt(float(sh_sq_q[0] / double(n)) + pc.eps / n);
+    float scale_k = 1.0f / sqrt(float(sh_sq_k[0] / double(n)) + pc.eps / n);
+    float scale = 1.0f / sqrt(n);
     for (uint i = lid; i < pc.state_dim; i += 64u) {
-        qout[q_base + i] = sh_q[i] * scale_q;
-        kout[q_base + i] = sh_k[i] * scale_k;
+        qout[q_base + i] = (sh_q[i] * scale_q) * scale;
+        kout[q_base + i] = (sh_k[i] * scale_k) * scale;
     }
 }

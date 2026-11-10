@@ -22,6 +22,60 @@ python3 tests/test_agent_sessions.py \
 Q36_TEST_THREADS=16 ./q36_test --gpu-cpu-parity --ssd-streaming-parity --case short
 ```
 
+After changing shared CPU arithmetic, also run the optional live reference:
+
+```sh
+model=gguf/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf
+make q36_llama_test LLAMA_BUILD_DIR=llama.cpp/build-q36-cpu
+Q36_TEST_THREADS=16 ./q36_llama_test --llama-quant-dots --model "$model"
+Q36_TEST_THREADS=16 ./q36_llama_test --llama-parity-seq --model "$model" --case short
+```
+
+On November 10, 2026, `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` matched llama.cpp
+`351025ec532f825c7eb6c7ae1017d8e6d46d0cc9` exactly at all nine short-suite
+positions with 16 CPU threads. This covers the Italian top-5 failure against
+the updated reference. The fix aligns GDN epsilon placement, BF16 activations,
+quantized reductions, SiLU, RoPE and attention probability normalization.
+The existing parity gates and prompts are unchanged. llama.cpp remains an
+optional test/reference dependency.
+
+The same model also passes all nine CPU/Vulkan positions with the default
+Q8_0 key and Q4_0 value caches. Vulkan norms round their squares to F32 before
+accumulating in double, matching the reference; host fallbacks reuse the CPU
+norm and activation routines.
+
+`Qwen3.8-27B-UD-IQ3_S.gguf` also passes both nine-position comparisons.
+The Qwen3.6 35B IQ2XXS/Q2K/Q8 and IQ4XS/Q4K/Q8 models also match the same
+llama.cpp revision exactly at all nine positions. Both pass CPU/Vulkan parity;
+the IQ4 model uses SSD streaming. F32 router projections, Q8 dot reductions
+and routing normalization preserve the reference rounding boundaries.
+Flash Next passes both comparisons in SSD streaming; its updated results
+are recorded in [the model measurements](../speed-bench/qwen38-flash-next/README.md#correctness).
+Its GPU router preserves the CPU vector exponential, reduction order and
+ties-to-even conversion. Ordered ties, 64 batched router cases and the
+real-weight routed-expert comparisons pass without relaxing their exact checks.
+
+Resident Vulkan speed was checked against `c29767c` on the BC-250 at 128,
+2,048, 3,968 and 4,096 tokens, with chunk 128 and warm-up at every frontier.
+The two dense models and IQ2 MoE retain identical Vulkan allocation peaks.
+The initial IQ3_S 4K slowdown did not reproduce in the targeted repeats:
+
+| IQ3_S at 4K | Prefill t/s before → after | Plain decode t/s before → after |
+| --- | ---: | ---: |
+| Initial 128-token extension, 16 decode tokens | 125.14 → 107.30 | 24.99 → 19.38 |
+| Repeated 128-token extension, 64 decode tokens | 127.07 → 129.97 | 24.85 → 24.92 |
+| Fresh 4,096-token prefill, 64 decode tokens | 144.41 → 149.83 | 25.15 → 25.13 |
+
+The old and corrected IQ3_S builds produce different 4K logits, including
+top-1; reference parity was checked on the short suite above. Within each
+build, fresh prefill and snapshot restore reproduce the entire 4K vector
+byte for byte. This distinguishes the numerical changes from restore drift.
+
+The full unit suite, SSD cache/fusion/queue checks, dense and MoE session/tool
+checks, greedy and sampled MTP, live and batched HTTP server, dense and MoE
+vision, agent save/restore/cancellation and 8K agent compaction all passed.
+Raw captures, timings, temperatures and hashes stay outside the repository.
+
 `--pi-api openai-responses` selects an individual Pi API; `--ctx` sets the
 vision server context. Use `--resident` for dense models, which have no routed
 expert cache. The compaction driver accepts `--prefix-file FILE` to

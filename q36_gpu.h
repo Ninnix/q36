@@ -19,6 +19,43 @@ typedef struct q36_gpu_tensor q36_gpu_tensor;
 int q36_gpu_init(void);
 void q36_gpu_cleanup(void);
 
+/* Bounded disk-backed matrix multiplication; activations stay on device. */
+int q36_gpu_stream_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
+    int fd, uint64_t offset, uint32_t type, uint32_t width,
+    uint32_t rows, uint32_t row_bytes);
+/* Optional prepared_q8 holds this same input in Q8_K form. Other paths
+ * ignore it; it must remain unchanged until the matrix dispatches finish. */
+int q36_gpu_cached_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
+    const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
+    uint64_t row_offset, uint32_t type, uint32_t width, uint32_t rows, uint32_t row_bytes,
+    const q36_gpu_tensor *prepared_q8);
+/* Borrowed immutable cache entry; never free or write through this pointer. */
+q36_gpu_tensor *q36_gpu_cached_tensor(const void *model_map, uint64_t model_size,
+    uint64_t offset, uint64_t bytes);
+/* Resident Flash Next experts, using the existing query/gate scratch buffers. */
+int q36_gpu_qwen4_experts(q36_gpu_tensor *const tensors[7], const void *model_map,
+    uint64_t model_size, const uint64_t offsets[3], const uint64_t bytes[3],
+    const uint32_t types[3], uint32_t tokens);
+int q36_gpu_cached_copy(q36_gpu_tensor *out, uint64_t out_offset,
+    const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes);
+int q36_gpu_cache_model_range_from_fd(const void *model_map, uint64_t model_size,
+    uint64_t offset, uint64_t bytes, int fd);
+int q36_gpu_qwen4_op_rows(q36_gpu_tensor *const tensors[6],
+    const uint32_t params[8], uint32_t groups, uint32_t rows);
+int q36_gpu_cached_matmul(q36_gpu_tensor *out, const q36_gpu_tensor *x,
+    const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
+    uint64_t row_offset, uint32_t type, uint32_t width, uint32_t rows,
+    uint32_t row_bytes, uint32_t tokens, uint32_t out_stride, const q36_gpu_tensor *prepared_q8);
+int q36_gpu_qwen4_native(void);
+uint32_t q36_gpu_submit_limit(uint32_t count);
+int q36_gpu_qwen4_delta(q36_gpu_tensor *const tensors[6], uint32_t tokens);
+int q36_gpu_qwen4_hc_down(q36_gpu_tensor *out, q36_gpu_tensor *inject,
+    const q36_gpu_tensor *x, const void *model_map, uint64_t model_size,
+    uint64_t down_offset, uint64_t down_bytes, uint64_t inject_offset, uint64_t inject_bytes);
+int q36_gpu_qwen4_quantize(q36_gpu_tensor *out, const q36_gpu_tensor *x, uint32_t tokens);
+int q36_gpu_qwen4_op(q36_gpu_tensor *const tensors[6],
+    const uint32_t params[8], uint32_t groups);
+
 /* Host-side row splitter for Vulkan parity ops. Each callback must preserve
  * the serial arithmetic order inside every row/token it handles. */
 typedef void (*q36_gpu_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
@@ -26,6 +63,13 @@ void q36_gpu_parallel_for_rows(uint64_t n_rows,
                                uint64_t min_parallel_rows,
                                q36_gpu_parallel_fn fn,
                                void *ctx);
+
+/* Host fallbacks share the CPU core's arithmetic and compiler settings. */
+void q36_gpu_host_rms_norm(float *dst, const float *src, const float *weight,
+                            uint32_t n, float eps);
+void q36_gpu_host_l2_norm(float *x, uint32_t n, float eps);
+float q36_gpu_host_silu(float x);
+float q36_gpu_host_softplus(float x);
 
 q36_gpu_tensor *q36_gpu_tensor_alloc(uint64_t bytes);
 /* Persistent storage whose rows are written before use. */
@@ -110,6 +154,11 @@ typedef struct q36_gpu_stream_expert_table {
     bool has_up_scales;
     bool has_down_scales;
 } q36_gpu_stream_expert_table;
+
+struct q36_ssd_prefetch;
+uint64_t q36_gpu_stream_hint_experts(const q36_gpu_stream_expert_table *table,
+                                    struct q36_ssd_prefetch *reader,
+                                    const uint32_t *ids, uint32_t count);
 
 void q36_gpu_stream_expert_cache_reset_route_hotness(void);
 void q36_gpu_stream_expert_cache_note_tokens(uint32_t n_tokens);

@@ -1,0 +1,82 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W { uint w[]; };
+layout(binding = 1) readonly buffer X { uint x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push { uint width, rows, row_bytes, flags, out_offset; } pc;
+shared float dots[64], scales[64];
+#ifdef Q36_ROUTED
+layout(binding = 3) readonly buffer Selected { uint selected[]; };
+uint route_token, route_rank, route_expert;
+void init_route(void) {
+    route_token=gl_WorkGroupID.z; route_rank=gl_WorkGroupID.y;
+    route_expert=selected[route_token*16384u+route_rank];
+}
+#endif
+
+uint byte_at(uint off) {
+#ifdef Q36_ROUTED
+    off += route_expert*pc.rows*pc.row_bytes;
+#endif
+    return (w[off/4] >> ((off&3)*8)) & 255u; }
+float half_at(uint off) { return unpackHalf2x16(byte_at(off) | (byte_at(off+1)<<8)).x; }
+uint word_at(uint off) {
+#ifdef Q36_ROUTED
+    off+=route_expert*pc.rows*pc.row_bytes;
+#endif
+    uint shift=(off&3)*8, low=w[off/4];
+    return shift==0 ? low : (low>>shift)|(w[off/4+1]<<(32-shift));
+}
+
+uint expand_q2(uint c) {
+    uint p=(c|(c<<12))&0x000f000fu;
+    p=(p|(p<<6))&0x03030303u;
+    /* Add within each byte, without carries, to produce signed -1..2. */
+    return (p+0x7f7f7f7fu)^0x80808080u;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x, block = lane & 15;
+    uint row = gl_WorkGroupID.x * 4 + lane / 16;
+    uint blocks = pc.width / 64, input_base = 0, output_base = pc.out_offset;
+#ifdef Q36_ROUTED
+    init_route();
+    input_base=route_token*16384u+route_rank*(pc.width/32)*9u;
+    output_base=route_token*32768u+route_rank*pc.rows;
+#endif
+    float part = 0, scale = 0;
+    if (row < pc.rows && block < blocks) {
+        uint base = row*pc.row_bytes + block*18;
+        for (uint g = 0; g < 2; g++) {
+            int acc = 0;
+            if (pc.flags==1) {
+                uint low=word_at(base+2+g*8), high=word_at(base+6+g*8);
+                [[unroll]] for (uint j=0; j<8; j++) {
+                    uint codes=((j<4 ? low : high)>>((j&3)*8))&255u;
+                    acc+=dotPacked4x8EXT(int(expand_q2(codes)),int(x[input_base+(block*2+g)*9+1+j]));
+                }
+            } else {
+                for (uint j = 0; j < 8; j++) {
+                    uint codes = byte_at(base+2+g*8+j), packed = 0;
+                    for (uint k = 0; k < 4; k++)
+                        packed |= (uint(int((codes>>(k*2))&3u)-1)&255u) << (k*8);
+                    acc += dotPacked4x8EXT(int(packed),int(x[input_base+(block*2+g)*9+1+j]));
+                }
+            }
+            float dx = unpackHalf2x16(x[input_base+(block*2+g)*9]).x;
+            part = fma(dx,float(acc),part);
+        }
+        scale = half_at(base);
+    }
+    dots[lane] = part; scales[lane] = scale;
+    barrier();
+    if (block == 0 && row < pc.rows) {
+        float sum = 0;
+        for (uint b = 0; b < blocks; b++)
+            sum = fma(scales[lane+b],dots[lane+b],sum);
+        y[output_base+row] = sum;
+    }
+}

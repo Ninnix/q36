@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,87 @@
 #endif
 
 static const uint64_t Q36_GIB = 1024ull * 1024ull * 1024ull;
+
+/* Only the latest prediction matters. Replacing the pending batch cancels
+ * stale guesses without waiting for already-issued kernel read-ahead. */
+struct q36_ssd_prefetch {
+    int fd;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t ready;
+    q36_ssd_range ranges[12];
+    uint64_t generation;
+    uint32_t count;
+    bool stop;
+};
+
+static void *q36_ssd_prefetch_worker(void *opaque) {
+    q36_ssd_prefetch *p = opaque;
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        while (!p->count && !p->stop) pthread_cond_wait(&p->ready,&p->mu);
+        if (p->stop) { pthread_mutex_unlock(&p->mu); break; }
+        q36_ssd_range ranges[12];
+        uint32_t count = p->count;
+        uint64_t generation = p->generation;
+        memcpy(ranges,p->ranges,count*sizeof(*ranges));
+        p->count = 0;
+        pthread_mutex_unlock(&p->mu);
+        for (uint32_t i = 0; i < count; i++) {
+            pthread_mutex_lock(&p->mu);
+            bool current = !p->stop && generation == p->generation;
+            pthread_mutex_unlock(&p->mu);
+            if (!current) break;
+#ifdef POSIX_FADV_WILLNEED
+            (void)posix_fadvise(p->fd,ranges[i].offset,ranges[i].bytes,POSIX_FADV_WILLNEED);
+#endif
+        }
+    }
+    return NULL;
+}
+
+q36_ssd_prefetch *q36_ssd_prefetch_create(int fd) {
+    q36_ssd_prefetch *p = calloc(1,sizeof(*p));
+    if (!p) return NULL;
+    p->fd = fcntl(fd,F_DUPFD_CLOEXEC,0);
+    if (p->fd < 0) { free(p); return NULL; }
+    if (pthread_mutex_init(&p->mu,NULL)) { close(p->fd); free(p); return NULL; }
+    if (pthread_cond_init(&p->ready,NULL)) {
+        pthread_mutex_destroy(&p->mu); close(p->fd); free(p); return NULL;
+    }
+    if (pthread_create(&p->thread,NULL,q36_ssd_prefetch_worker,p)) {
+        pthread_cond_destroy(&p->ready); pthread_mutex_destroy(&p->mu);
+        close(p->fd); free(p); return NULL;
+    }
+    return p;
+}
+
+uint64_t q36_ssd_prefetch_submit(q36_ssd_prefetch *p, const q36_ssd_range *ranges,
+                                uint32_t count) {
+    if (!p || count > 12 || (count && !ranges)) return 0;
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < count; i++) bytes += ranges[i].bytes;
+    pthread_mutex_lock(&p->mu);
+    if (count) memcpy(p->ranges,ranges,count*sizeof(*ranges));
+    p->generation++;
+    p->count = count;
+    if (count) pthread_cond_signal(&p->ready);
+    pthread_mutex_unlock(&p->mu);
+    return bytes;
+}
+
+void q36_ssd_prefetch_free(q36_ssd_prefetch *p) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mu);
+    p->stop = true;
+    pthread_cond_signal(&p->ready);
+    pthread_mutex_unlock(&p->mu);
+    pthread_join(p->thread,NULL);
+    pthread_cond_destroy(&p->ready);
+    pthread_mutex_destroy(&p->mu);
+    close(p->fd);
+    free(p);
+}
 
 bool q36_parse_gib_arg(const char *s, uint64_t *bytes) {
     if (bytes) *bytes = 0;

@@ -3,10 +3,10 @@
 </p>
 
 **QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B**,
-**Qwen3.8-27B**.
+**Qwen3.8-27B**, and **Qwen3.8 Flash Next**.
 It is self-contained and deliberately narrow, not a general GGUF runner.
 Use the GGUF files the project provides; they are part of the project itself.
-The main paths are `qwen35moe`-specific Vulkan and Metal graph executors with
+The main paths are model-specific Vulkan and Metal graph executors with
 Q36-specific loading, prompt rendering, tool calls, KV state, HTTP server,
 and coding agent. The repository also includes tools and data for GGUF,
 imatrix, quality, and speed.
@@ -165,6 +165,127 @@ Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
 Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.
+
+## Qwen3.8 Flash Next
+
+The `qwen4exp` text model runs on CPU and Vulkan. The GSQ-RCO Coder pack with
+256 experts uses Q2_0 down projections and its original IQ4_NL n-gram shard.
+Keep both GGUF files in the same directory. The loader accepts the differing
+filenames in this pack when exactly one compatible second shard is present.
+
+```sh
+model=gguf/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-down-00001-of-00002.gguf
+./q36 -m "$model" --cpu --ssd-streaming --ctx 4096 --nothink -p "Hello"
+./q36 -m "$model" --vulkan --ssd-streaming --ctx 4096 --nothink -p "Hello"
+```
+
+N-gram rows are read with `pread`. Vulkan also streams dense weights and selected
+experts through two alternating 8 MiB banks in a shared 16 MiB slab. Parallel
+reads overlap GPU execution; packed projections reuse the existing K/IQ decode
+kernels. Activations and recurrent state stay on the GPU. CPU projections reuse
+the existing quantizers and thread pool. SSD-streaming prefill processes one
+token at a time; resident Vulkan supports batches. Attention caches use F32. Checkpoints
+reuse the token-replay format, which restores n-gram history as well as GDN and
+attention state. The existing [two-board pipeline](docs/DISTRIBUTED.md#qwen38-flash-next)
+supports this model, with PLE/n-grams only on the coordinator and resident suffix
+weights on the worker. MTP, vision, steering and Metal are not implemented for
+this architecture.
+
+The graph follows [DS4](https://github.com/antirez/ds4/blob/b3f50180ec2c7324892be1f50bc83555ccb8d5e7/ds4.c).
+Its current loader requires BF16 n-grams and does not directly accept this
+quantized/pruned pack. Comparisons were rechecked November 10, 2026, against
+[llama.cpp](https://github.com/ggml-org/llama.cpp/tree/351025ec532f825c7eb6c7ae1017d8e6d46d0cc9).
+On the BC-250, both strict parity suites pass with 16 CPU threads and all three
+short prompts (Italian fact, code and reasoning), as required by `SPEEDUP.md`:
+
+| Comparison | Checked positions | Top-1 matches | Strict gates |
+| --- | ---: | ---: | --- |
+| CPU vs llama.cpp CPU | 9 | 9/9 | PASS |
+| CPU vs Vulkan, SSD streaming | 9 | 9/9 | PASS |
+
+The existing gates are unchanged: identical top-1, at least 4/5, 15/20 and 40/64
+top-k overlap, and at most 8.0 absolute error on reference top-20 logits. Norms,
+BF16 reductions and quantized activation rounding follow the reference operation
+order. Quantized matrix products retain integer dot products until scale
+application. Metrics and validation results are retained in the
+[benchmark summary](speed-bench/qwen38-flash-next/README.md#correctness).
+Raw logs are generated locally and excluded from the repository.
+
+```sh
+Q36_TEST_THREADS=16 ./q36_llama_test --llama-parity-seq --model "$reference_model" --case short
+Q36_TEST_THREADS=16 Q36_TEST_SSD_STREAMING=1 ./q36_test --gpu-cpu-parity --model "$model" --case short
+```
+
+Build `q36_llama_test` against the llama.cpp revision above. For that loader,
+`reference_model` must name the same weights through matching split filenames;
+the recorded run used symlinks `model-00001-of-00002.gguf` and
+`model-00002-of-00002.gguf` to the two original files.
+
+Short SSD-mode benchmarks on the BC-250, with 16 threads and 16 generated
+tokens, compare the original parity-correct streaming path with these changes:
+
+| Prompt tokens | Original prefill | Current prefill | Original decode | Current decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 0.74 t/s | 2.49 t/s | 0.68 t/s | 2.37 t/s |
+| 128 | 0.65 t/s | 2.43 t/s | 0.60 t/s | 2.24 t/s |
+
+The 128-token decode gain is 3.7x. At 32 tokens, process peak RSS changed from
+123.4 to 124.3 MiB; the Vulkan allocation peak stayed at 144.6 MiB. The shared
+weight slab remains 16 MiB. OS page cache was not controlled, so these numbers
+do not establish sustained cold-SSD throughput. The final runs stayed between
+43.6 and 47.8 C. Long 2K/4K benchmarks are deferred at the user's request.
+See the [SSD measurements](speed-bench/qwen38-flash-next/README.md#ssd-streaming-on-one-board).
+
+The resident two-BC-250 pipeline defaults to a 50/50 layer split, with any odd
+remaining layer on the coordinator. This model has 48 layers: main `0:23`,
+worker `24:output`. The launcher makes no hardware-based split decisions.
+It measures 160.01 t/s prefill and 30.09 t/s plain decode at 128 tokens;
+133.40/22.96 t/s at 3,968 tokens; and 130.06/22.71 t/s at 7,808 tokens.
+Decode stays near 23 t/s from 2K through 8K: the matched control fell from
+22.88 to 16.17 t/s. QSA caches completed key transforms in existing storage
+and uses radix selection instead of quadratic ranking. Prompt resets reuse
+GPU buffers, and Vulkan sessions avoid unused CPU KV mirrors. GPU tensor
+peak is unchanged; worker peak RSS falls from 354.95 to 71.37 MiB.
+Longer prefill points measure 1,920-token extensions with an 8,192-token
+allocation. Both stages retain their weights; only main gathers PLE/n-grams
+from SSD. All five full-vocabulary frontier vectors and nine long-context
+session/replay checks are bit-identical to the control. CPU/Vulkan parity
+passes all existing gates. The 150/30 t/s targets remain unmet at long
+contexts. Flash Next MTP is unavailable. See
+[launch commands](docs/DISTRIBUTED.md#qwen38-flash-next), the
+[current context-scaling results](speed-bench/qwen38-flash-next/README.md#resident-distributed-pipeline).
+
+Use the shared benchmark for a short SSD-mode check:
+
+```sh
+Q36_THREADS=16 ./q36-bench -m "$model" --vulkan -t 16 --ssd-streaming \
+  --prompt-file tests/long_context_story_prompt.txt \
+  --ctx-start 32 --ctx-max 128 --step-incr 96 --ctx-alloc 256 \
+  --gen-tokens 16 --warmup
+```
+
+The optional next-layer router experiment follows
+[DwarfStar's Kimi K3 prefetch design](https://github.com/antirez/ds4/blob/bc9334c7c75fe346ab0fec0e1b6defe71a5003c1/docs/KIMI_K3.md).
+`Q36_SSD_ROUTE_PREFETCH=4` predicts four experts and queues cancellable SSD hints
+while the current FFN runs. The actual router still selects every expert.
+It supports Flash Next and Qwen3.6 MoE and remains off by default: final short
+trials showed no consistent gain. Flash Next reached 3.79 t/s with hints versus
+3.93 t/s in the final warm control; Qwen3.6 controls were 5.40/5.60 t/s versus
+4.57/5.64 t/s with hints. Cache warming strongly affected the first Flash Next
+control. Hint-on/off logit vectors were bit-identical at all four checked token
+positions on both models. Set `Q36_SSD_ROUTE_PROFILE=1` for prediction counters;
+measure performance separately with profiling disabled. The prediction omits
+the intervening FFN and attention updates, and Flash Next also omits the next
+HC mix. Correct membership in the active expert set is different from matching
+the top four by score. These are architectural approximations, not the same
+prediction accuracy measured for DwarfStar's AttnRes model.
+
+`make test-qwen4` tests Q2_0 packing, disk n-gram reads, EOS history and sparse
+attention selection beyond 2048 tokens. Build `tests/qwen4_kernels` for Vulkan
+matrix, batching, QSA and cache-growth checks. Use the shared parity commands
+above and [distributed session/replay tests](docs/DISTRIBUTED.md#validation)
+for full-model validation; `make test-ssd-prefetch` checks read-ahead queue
+cancellation, descriptor ownership and shutdown.
 
 ## Everyday Use
 

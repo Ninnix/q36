@@ -33,7 +33,7 @@ void main(void) {
     uint src = row * pc.src_stride;
     uint dst = row * 256u;
     float input_value = x[src + lid];
-    double ss = double(input_value) * double(input_value);
+    double ss = double(input_value * input_value);
     sh_sum[lid] = ss;
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {

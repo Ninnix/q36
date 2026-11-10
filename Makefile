@@ -46,6 +46,32 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 METAL_LDFLAGS := $(LDFLAGS) $(DARWIN_MIN_FLAG)
 METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
+	vulkan/flash_silu_q8.spv \
+	vulkan/flash_copy.spv \
+	vulkan/flash_quantize_compact.spv \
+	vulkan/flash_bf16_batch.spv \
+	vulkan/flash_bf16_pair.spv \
+	vulkan/flash_hc_down_pair.spv \
+	vulkan/flash_hc_down.spv \
+	vulkan/flash_delta.spv \
+	vulkan/flash_bf16_r4.spv \
+	vulkan/qwen4_ops64.spv \
+	vulkan/qwen4_router.spv \
+	vulkan/flash_matvec_batch.spv \
+	vulkan/flash_q8_batch.spv \
+	vulkan/flash_quantize.spv \
+	vulkan/flash_iq2.spv \
+	vulkan/flash_iq2_s.spv \
+	vulkan/flash_q2.spv \
+	vulkan/flash_iq4_nl_tile.spv \
+	vulkan/stream_q8_dot_tile.spv \
+	vulkan/flash_iq4_nl.spv \
+	vulkan/stream_q8_dot.spv \
+	vulkan/stream_q2_0.spv \
+	vulkan/stream_bf16.spv \
+	vulkan/stream_bf16_split.spv \
+	vulkan/stream_matvec.spv \
+	vulkan/qwen4_ops.spv \
 	vulkan/gdn_front.spv \
 	vulkan/gdn_front_bf16.spv \
 	vulkan/matmul_f16.spv \
@@ -773,6 +799,15 @@ rax.o: rax.c rax.h rax_malloc.h
 vulkan/%.spv: vulkan/%.comp
 	$(GLSLC) -O -o $@ $<
 
+vulkan/stream_bf16.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/stream_q2_0.spv: vulkan/stream_q2_0.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/stream_q8_dot.spv: vulkan/stream_q8_dot.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
 vulkan/add_rms_norm_q8_k.spv: vulkan/add_rms_norm.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q8=1 -o $@ $<
 
@@ -867,7 +902,7 @@ linenoise_cpu.o: linenoise.c linenoise.h
 rax_cpu.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ rax.c
 
-test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed
+test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed test-qwen4 test-ssd-prefetch
 	$(MAKE) -C gguf-tools test
 	./q36-eval --self-test-extractors
 	./q36_agent_test
@@ -1093,7 +1128,7 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 
 clean:
 	rm -f speed-bench/session_concurrency_bench
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api tests/test_distributed tests/test_distributed_model tests/test_distributed_mtp dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api tests/test_distributed tests/test_distributed_model tests/test_distributed_mtp tests/test_qwen4 tests/qwen4_kernels tests/test_ssd_prefetch dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_prompt_prefix.c
@@ -1129,3 +1164,86 @@ tests/test_distributed_model: tests/test_distributed_model.c q36_distributed.h q
 
 tests/test_distributed_mtp: tests/test_distributed_mtp.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
+
+q36_cpu.o q36_gpu_core.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o: q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc
+
+tests/test_qwen4: tests/test_qwen4.c q36.c q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc q36_distributed.o q36_image.o q36_ssd_cpu.o q36_prompt_prefix.o
+	$(CC) $(CPU_CFLAGS) -I. -o $@ $< q36_distributed.o q36_image.o q36_ssd_cpu.o q36_prompt_prefix.o $(LDLIBS)
+
+.PHONY: test-qwen4
+test-qwen4: tests/test_qwen4
+	./tests/test_qwen4
+
+tests/qwen4_kernels: tests/qwen4_kernels.c q36.c q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc q36_distributed.o q36_image.o q36_vulkan.o q36_ssd.o q36_prompt_prefix.o
+	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -I. -o $@ $< q36_distributed.o q36_image.o q36_vulkan.o q36_ssd.o q36_prompt_prefix.o $(GPU_LDLIBS)
+
+vulkan/qwen4_ops.spv: vulkan/reference_math.glsl vulkan/expf.glsl
+
+vulkan/delta_gates.spv vulkan/gdn_front.spv vulkan/gdn_front_bf16.spv: vulkan/reference_math.glsl
+
+vulkan/qwen4_ops64.spv: vulkan/qwen4_ops.comp vulkan/reference_math.glsl vulkan/expf.glsl
+	$(GLSLC) -O -DQ36_LOCAL_SIZE=64 -o $@ $<
+
+vulkan/qwen4_router.spv: vulkan/qwen4_ops.comp vulkan/reference_math.glsl vulkan/expf.glsl
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTER_SUBGROUP=1 -o $@ $<
+
+vulkan/flash_delta.spv: vulkan/delta_net_decode_reg.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STRIDED=1 -o $@ $<
+
+vulkan/flash_bf16_r4.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16_ROWS=4 -o $@ $<
+
+tests/test_ssd_prefetch: tests/test_ssd_prefetch.c q36_ssd.c q36_ssd.h
+	$(CC) $(CPU_CFLAGS) -I. -o $@ $< $(LDLIBS)
+
+.PHONY: test-ssd-prefetch
+test-ssd-prefetch: tests/test_ssd_prefetch
+	./tests/test_ssd_prefetch
+
+vulkan/stream_bf16_split.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16_SPLIT=1 -o $@ $<
+
+vulkan/flash_hc_down.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_HC=1 -o $@ $<
+
+vulkan/flash_bf16_pair.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16_PAIR=1 -o $@ $<
+
+vulkan/flash_hc_down_pair.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16_PAIR=1 -DQ36_HC=1 -o $@ $<
+
+vulkan/flash_iq2.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTED=1 -DQ36_INT_DOT=1 -o $@ $<
+
+vulkan/flash_iq2_s.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTED=1 -DQ36_TYPE=22 -DQ36_INT_DOT=1 -o $@ $<
+
+vulkan/flash_q2.spv: vulkan/stream_q2_0.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTED=1 -o $@ $<
+
+vulkan/flash_quantize.spv: vulkan/quantize_q8_k.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STRIDED=1 -o $@ $<
+
+vulkan/flash_iq4_nl.spv: vulkan/stream_q8_dot.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTED=1 -o $@ $<
+
+vulkan/flash_iq4_nl_tile.spv: vulkan/stream_q8_dot.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROUTED=1 -DQ36_ROWS=16 -DQ36_BLOCK_LANES=20 -DQ36_MAX_BLOCKS=20 -o $@ $<
+
+vulkan/stream_q8_dot_tile.spv: vulkan/stream_q8_dot.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=16 -DQ36_BLOCK_LANES=20 -DQ36_MAX_BLOCKS=20 -o $@ $<
+
+vulkan/flash_bf16_batch.spv: vulkan/stream_bf16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BATCH=1 -o $@ $<
+
+vulkan/flash_matvec_batch.spv: vulkan/stream_matvec.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BATCH=1 -o $@ $<
+
+vulkan/flash_q8_batch.spv: vulkan/stream_q8_dot.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BATCH=1 -o $@ $<
+
+vulkan/flash_quantize_compact.spv: vulkan/quantize_q8_k.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INPUT_STRIDED=1 -o $@ $<
+
+vulkan/flash_silu_q8.spv: vulkan/flash_silu_q8.comp vulkan/reference_math.glsl
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

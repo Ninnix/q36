@@ -15,7 +15,7 @@ void add_square(uint base, uint i, inout double ss) {
 #else
     float v = a[base + i];
 #endif
-    ss += double(v) * double(v);
+    ss += double(v * v);
 }
 
 /* Eight groups share the original 256 strided sums. Each lane keeps its

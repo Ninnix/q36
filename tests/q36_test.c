@@ -2718,8 +2718,10 @@ static void test_vulkan_delta_qkv_one(uint32_t n_heads) {
     q36_gpu_tensor *qb = NULL, *kb = NULL, *vb = NULL;
     TEST_ASSERT(host && a && b);
     if (!host || !a || !b) goto done;
-    for (uint64_t i = 0; i < conv_bytes / sizeof(float); i++)
-        host[i] = (float)((int)((i * 17u + 5u) % 101u) - 50) / 61.0f;
+    for (uint64_t i = 0; i < conv_bytes / sizeof(float); i++) {
+        float scale = i / conv_stride == 0 ? 1 : i / conv_stride == 1 ? 1e-7f : 0;
+        host[i] = (float)((int)((i * 17u + 5u) % 101u) - 50) / 61.0f * scale;
+    }
     conv = q36_gpu_tensor_alloc(conv_bytes);
     qa = q36_gpu_tensor_alloc(out_bytes);
     ka = q36_gpu_tensor_alloc(out_bytes);
@@ -2742,6 +2744,24 @@ static void test_vulkan_delta_qkv_one(uint32_t n_heads) {
     } while (0)
     TEST_SAME_TENSOR(qa, qb);
     TEST_SAME_TENSOR(ka, kb);
+    for (uint32_t kind = 0; kind < 2; kind++) {
+        TEST_ASSERT(q36_gpu_tensor_read(kind ? ka : qa, 0, a, out_bytes) != 0);
+        for (uint32_t tok = 0; tok < n_tok; tok++) {
+            for (uint32_t h = 0; h < n_heads; h++) {
+                const float *src = host + (uint64_t)tok * conv_stride +
+                    (kind * n_groups + h % n_groups) * state_dim;
+                const float *dst = a + ((uint64_t)tok * n_heads + h) * state_dim;
+                double ss = 0, norm = 0;
+                for (uint32_t i = 0; i < state_dim; i++) {
+                    TEST_ASSERT(isfinite(dst[i]));
+                    ss += (double)src[i] * src[i];
+                    norm += (double)dst[i] * dst[i];
+                }
+                double expected = ss / (ss + 1e-6);
+                TEST_ASSERT(fabs(norm - expected) <= 1e-6 * expected + 1e-12);
+            }
+        }
+    }
     TEST_SAME_TENSOR(va, vb);
     for (uint32_t tok = 0; tok < n_tok; tok++) {
         TEST_ASSERT(memcmp(a + (uint64_t)tok * n_heads * state_dim,
@@ -6513,7 +6533,7 @@ done:
 }
 
 static void test_llama_quant_dots(q36_engine *engine) {
-    static const uint32_t types[] = {10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29};
+    static const uint32_t types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 42};
     ggml_cpu_init();
     for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
         uint32_t type = types[ti], n;
@@ -6522,25 +6542,44 @@ static void test_llama_quant_dots(q36_engine *engine) {
         if (q36_engine_debug_first_tensor_of_type(engine, type, name, sizeof(name), &n) != 0) continue;
         TEST_ASSERT(q36_engine_debug_tensor_row_packed(engine, name, 0, NULL, 0,
                                                       &row_bytes, NULL, NULL) == 0);
-        size_t qbytes = ggml_row_size(GGML_TYPE_Q8_K, n);
+        enum ggml_type activation_type = ggml_get_type_traits_cpu(type)->vec_dot_type;
+        TEST_ASSERT(activation_type == GGML_TYPE_Q8_K || activation_type == GGML_TYPE_Q8_0 ||
+                    activation_type == GGML_TYPE_BF16);
+        size_t qbytes = ggml_row_size(activation_type, n);
         float *input = test_xcalloc(n, sizeof(float));
         void *weights = test_xcalloc(1, row_bytes);
         void *activation = test_xcalloc(1, qbytes);
         void *reference = test_xcalloc(1, qbytes);
         for (uint32_t i = 0; i < n; i++) input[i] = sinf(i * 0.017f) * cosf(i * 0.03f);
-        q36_quant_q8_k(input, activation, n);
-        ggml_get_type_traits_cpu(GGML_TYPE_Q8_K)->from_float(input, reference, n);
-        TEST_ASSERT(memcmp(activation, reference, qbytes) == 0);
+        if (activation_type == GGML_TYPE_Q8_0) q36_quant_q8_0_activation(input,activation,n);
+        else if (activation_type == GGML_TYPE_Q8_K) q36_quant_q8_k(input,activation,n);
+        ggml_get_type_traits_cpu(activation_type)->from_float(input, reference, n);
+        if (activation_type != GGML_TYPE_BF16) TEST_ASSERT(memcmp(activation, reference, qbytes) == 0);
         for (uint32_t row = 0; row < 8; row++) {
             float got, want = 0.0f;
             TEST_ASSERT(q36_engine_debug_tensor_row_packed(engine, name, row, weights,
                                                           row_bytes, NULL, NULL, NULL) == 0);
-            TEST_ASSERT(q36_quant_dot_q8_k(type, weights, activation, n, &got));
+            if (activation_type == GGML_TYPE_BF16) got = q36_quant_dot_bf16(weights,input,n);
+            else TEST_ASSERT(activation_type == GGML_TYPE_Q8_0 ?
+                q36_quant_dot_q8_0_type(type,weights,activation,n,&got) :
+                q36_quant_dot_q8_k(type, weights, activation, n, &got));
             ggml_get_type_traits_cpu(type)->vec_dot(n, &want, 0, weights, 0, reference, 0, 1);
             TEST_ASSERT(isfinite(got) && fabsf(got - want) <= 2.0e-5f + 1.0e-5f * fabsf(want));
         }
         free(input); free(weights); free(activation); free(reference);
     }
+}
+
+static void test_llama_quant_kernels(void) {
+    if (!test_model_available(test_model_path())) {
+        test_skip("llama-quant-dots", "model file not found");
+        return;
+    }
+    q36_engine *engine = test_open_runtime_engine(test_model_path(), test_reference_threads());
+    TEST_ASSERT(engine != NULL);
+    if (!engine) return;
+    test_llama_quant_dots(engine);
+    q36_engine_close(engine);
 }
 
 static void test_llama_parity_seq(void) {
@@ -8567,6 +8606,7 @@ static const q36_test_entry test_entries[] = {
     {"--vector-fixtures", "vector-fixtures", "llama.cpp fixture consistency check", test_vector_fixtures},
     {"--logprob-vectors", "logprob-vectors", "reference top-logprob vector comparison", test_logprob_vectors},
 #ifdef Q36_WITH_LLAMA
+    {"--llama-quant-dots", "llama-quant-dots", "quantized weight rows against optional llama.cpp kernels", test_llama_quant_kernels},
     {"--llama-parity-seq", "llama-parity-seq", "HF-template Q36 parity against live sequential llama.cpp", test_llama_parity_seq},
     {"--llama-parity-seq-long", "llama-parity-seq-long", "HF-template Q36 parity on long prompts against live sequential llama.cpp", test_llama_parity_seq_long},
     {"--llama-parity-batch-loose", "llama-parity-batch-loose", "HF-template loose Q36 parity against live batch llama.cpp", test_llama_parity_batch_loose},

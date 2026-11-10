@@ -16,6 +16,16 @@ typedef struct {
     uint32_t cache_experts;
 } q36_ssd_cache_plan;
 
+typedef struct q36_ssd_prefetch q36_ssd_prefetch;
+typedef struct {
+    uint64_t offset, bytes;
+} q36_ssd_range;
+
+q36_ssd_prefetch *q36_ssd_prefetch_create(int fd);
+uint64_t q36_ssd_prefetch_submit(q36_ssd_prefetch *p, const q36_ssd_range *ranges,
+                                uint32_t count);
+void q36_ssd_prefetch_free(q36_ssd_prefetch *p);
+
 bool q36_parse_gib_arg(const char *s, uint64_t *bytes);
 bool q36_parse_streaming_cache_experts_arg(const char *s,
                                            uint32_t   *experts,

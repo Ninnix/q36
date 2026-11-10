@@ -20,6 +20,7 @@
 /dir-steering/tools/probe
 /llama.cpp/
 tests/__pycache__/
+__pycache__/
 *.o
 *.spv
 *.json
@@ -47,3 +48,12 @@ TODO.md
 /tests/test_distributed_model
 
 /tests/test_distributed_mtp
+/tests/test_qwen4
+/tests/qwen4_kernels
+
+/tests/test_ssd_prefetch
+/speed-bench/qwen38-flash-next/current/
+/speed-bench/qwen38-flash-next/**/*.csv
+/speed-bench/qwen38-flash-next/**/*.log
+/speed-bench/qwen38-flash-next/**/*.log-*
+/speed-bench/qwen38-flash-next/**/*.jsonl

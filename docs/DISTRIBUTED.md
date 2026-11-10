@@ -21,7 +21,9 @@ working Vulkan installation for GPU inference. CPU stages are also supported
 for reference and debugging. Building locally accommodates different C libraries,
 drivers, and CPU instruction sets; the executables need not be identical.
 
-Use the same model file on both machines. Local paths may differ. Download a
+Use the same model file on both machines. Flash Next also supports the
+[resident worker staging](#qwen38-flash-next) path without copying its n-gram
+shard or a second full GGUF. Local paths may differ. Download a
 supported model on each host, or copy the completed GGUF and compare its
 `sha256sum`. For example:
 
@@ -68,6 +70,12 @@ The following example splits a 40-layer model into layers `0:19` and
 layers and final normalization. The normalized state returns to the coordinator
 for the vocabulary projection. Adjust the ranges for your supported model and
 each machine's available memory.
+
+For Qwen3.6 35B Q4, this is a 50/50 split: 20 target layers per board. Its
+GGUF reports 41 blocks because the last block is the optional MTP head, which
+stays on the coordinator and is not part of the target layer split. Layer
+ranges are explicit frontend options; they are not selected from GPU clocks
+or CU counts.
 
 On the worker, replace `coordinator.example` with the coordinator's reachable
 hostname or IP address, and set the local model path:
@@ -130,7 +138,9 @@ Activations use lossless FP32 transport in network byte order. For the final
 token of a prefill span or decode call, the worker returns one normalized hidden
 row. The coordinator projects it to full logits for sampling and logprobs.
 This keeps the return transfer proportional to the hidden width rather than
-the vocabulary size. Protocol version 3 negotiates speculative verification support; rebuild both stages when upgrading.
+the vocabulary size. Protocol version 4 also negotiates the residual width
+independently of the embedding width, so HC models retain every stream. Rebuild
+both stages when upgrading; older protocols are rejected.
 
 Without MTP, decode of one conversation remains serial: the next token depends on both
 stages finishing the current one. Throughput depends on both machines, the
@@ -151,7 +161,102 @@ vocabulary row when needed. CPU stages keep their logits in host memory.
 `--debug` reports route and timing information. Its `remote_wait` time includes
 the coordinator's vocabulary projection after receiving the final row.
 
+## Qwen3.8 Flash Next
+
+Flash Next uses the same coordinator/worker options, framing, session recovery
+and resident weight arena. Its forward transfer contains all four HC streams
+(10,240 FP32 values per token). The suffix runs the final HC mixer and returns
+one 2,560-value row; the vocabulary head stays beside sampling on the
+coordinator. Layer 1 and its PLE history must belong to the coordinator. Only
+that machine opens the n-gram shard.
+
+The default split gives each machine half the transformer layers, with an odd
+remaining layer assigned to the coordinator. This 48-layer model uses `0:23`
+on the main BC-250 and `24:output` on the worker. The staging helper reads the
+layer count from the GGUF and prints both ranges before loading weights.
+It does not detect clocks or CU counts. Both stages can be resident while the
+main machine gathers n-grams from its SSD. No MTP head is implemented for
+Flash Next.
+
+Build the same source and shaders on both hosts first. The worker can use the
+ordinary first GGUF shard, without the n-gram shard. If its model drive is too
+slow, stage only the suffix weights directly into its resident GPU cache:
+
+```sh
+MODEL=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-down-00001-of-00002.gguf
+
+python3 tools/flash_next_worker.py --model "$MODEL" --ssh root@moraine \
+  --remote-dir /root/q36-flash-next \
+  --coordinator 10.36.0.1 --ctx 4096 --bulk-host 10.36.0.2
+```
+
+The example uses the existing dedicated USB Ethernet subnet. Replace the SSH
+destination, paths and addresses for your hosts. The helper uses ordinary SSH
+authentication; `--control-path` and repeated `--ssh-option` arguments support
+an existing SSH connection. `--bulk-host` sends the weight payload over the
+trusted direct link, accepting only the coordinator address; omit it to carry
+the payload through SSH instead. Ports default to 9911 for inference and 9912
+for the temporary weight transfer.
+
+The helper creates a sparse `.q36-resident` descriptor in `/dev/shm`, containing
+the original tensor catalogue and handshake fingerprint samples. It occupies
+about 14.7 MiB even though its logical size matches the original shard. This is
+not a complete GGUF: the engine rejects it without the resident weight stream.
+Tensor offsets and sizes are checked while data enters the existing GPU arena;
+inference has no demand-upload fallback. No full weight file or PLE/n-gram shard
+is stored on the worker. Restart the helper after a worker reboot or process
+exit to stage the weights again. Install the executable and shaders on an
+executable filesystem; `/dev/shm` may be mounted with `noexec`.
+
+Leave that helper running. On the main machine, start any existing frontend:
+
+```sh
+Q36_THREADS=16 ./q36 -m "$MODEL" --vulkan --ctx 4096 -t 16 \
+  --role coordinator --layers 0:23 --listen 10.36.0.1 9911 \
+  --temp 0 --nothink -p 'Say hello.' -n 16
+```
+
+The current QSA implementation transforms each completed four-token key block
+once, retaining it in the first raw-key row of that block. Partial blocks keep
+their raw rows until complete. Radix selection replaces quadratic ranking of
+all key blocks; it preserves score ties, signed zeros and natural block order.
+Dense rows at the sparse-transition boundary directly retain every token.
+Neither optimization allocates another GPU cache. Contexts beyond 2,048 key
+blocks retain the existing CPU heap-selection fallback.
+
+Prompt reset clears recurrent/PLE state and exposed outputs in place while
+retaining existing GPU KV and batch buffers. New context growth does not copy
+unused CPU KV mirrors for Vulkan sessions. CPU inference keeps its existing
+state allocation and arithmetic.
+
+The matched 24/24 sweep uses 16 threads, batch 32, context allocation 8,192,
+complete warm-up at every frontier and eight greedy tokens per point. At
+7,808 tokens, QSA caching/radix selection and buffer reuse improve plain
+decode from 16.17 to 22.71 t/s and prefill from 123.64 to 130.06 t/s.
+Longer prefill points measure 1,920-token extensions. Main GPU tensor peak
+is unchanged; worker high-water RSS falls from 354.95 to 71.37 MiB.
+See the [benchmark summary](../speed-bench/qwen38-flash-next/README.md)
+for the full context sweep, memory breakdown, temperatures and commands
+using the shared `q36-bench` executable. Use `--ctx 8192` on the worker.
+
+All five complete 248,320-logit frontier vectors are byte-identical to the
+control. Nine additional checks with a 2,083-token prefix cover prefill,
+decode completing a partial block, isolated sessions, divergent prompts,
+snapshots, payload replay and prefix extension. These remain bit-identical,
+and invalidation clears exposed logits. Fresh 16-thread CPU/Vulkan tests pass
+all unchanged top-1 through top-64 gates. Regression and kernel tests pass.
+These measurements use resident experts with PLE on the main SSD. Flash Next
+MTP remains unavailable; the 150/30 t/s targets are not met at long contexts.
+
 ## Distributed MTP
+
+This section applies to the model families with an implemented MTP graph.
+Flash Next still rejects MTP. Its supplied shards contain no nextn head;
+[published shared heads](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/main/MTP/README.md)
+exist, but need a separate graph, target-tensor borrowing, full final HC
+residual transfer and speculative state rollback. The checked shared head has
+512 experts, independent of this target's pruned 256-expert layers. No Flash
+Next MTP performance is claimed here.
 
 Enable the existing MTP option on the coordinator only:
 
@@ -257,6 +362,10 @@ Start a worker with the matching suffix range, `--ctx 512 --prefill-chunk 8
   --role coordinator --layers 0:19 --listen 0.0.0.0 9911 \
   --reference /tmp/q36-reference.bin
 ```
+
+For Flash Next, use `0:23` / `24:output`. Add `--prefill-tokens 2083` to both
+the recording and comparison commands to exercise sparse attention and a
+partial key block, and give the worker at least `--ctx 2115`.
 
 The test compares complete logits for prefill, decode, a second session,
 divergent prompts, snapshots, disk checkpoint restore, prefix extension, and

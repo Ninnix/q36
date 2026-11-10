@@ -1,4 +1,6 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
+#include "reference_math.glsl"
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -38,7 +40,7 @@ float sigmoid_stable(float x) {
 
 float softplus(float x) {
     if (x > 20.0f) return x;
-    return log(1.0f + exp(x));
+    return q36_log1p(exp(x));
 }
 
 void main(void) {

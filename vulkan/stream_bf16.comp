@@ -1,0 +1,221 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer W { uint w[]; };
+layout(binding = 1) readonly buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push { uint width, rows, row_bytes, type, out_offset; } pc;
+#ifdef Q36_HC
+layout(binding = 3) readonly buffer Inject { uint inject[]; };
+layout(binding = 4) writeonly buffer Partial { float partial[]; };
+shared float hc_weights[1024], hc_inputs[512];
+#endif
+
+#if defined(Q36_BF16_ROWS)
+void main() {
+    uint lane=gl_LocalInvocationID.x&31u, local_row=gl_LocalInvocationID.x/32;
+    uint row=gl_WorkGroupID.x*Q36_BF16_ROWS+local_row;
+    float acc[Q36_BF16_ROWS/2];
+    [[unroll]] for (uint r=0; r<Q36_BF16_ROWS/2; r++) acc[r]=0;
+    for (uint i=lane; i<pc.width; i+=256) {
+        float weights[Q36_BF16_ROWS/2][8], inputs[8];
+        [[unroll]] for (uint j=0; j<8; j++) if (i+j*32<pc.width) inputs[j]=x[i+j*32];
+        [[unroll]] for (uint r=0; r<Q36_BF16_ROWS/2; r++) if (row+r*2<pc.rows)
+            [[unroll]] for (uint j=0; j<8; j++) if (i+j*32<pc.width) {
+                uint off=(row+r*2)*pc.row_bytes+2*(i+j*32);
+                weights[r][j]=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+            }
+        [[unroll]] for (uint j=0; j<8; j++) if (i+j*32<pc.width)
+            [[unroll]] for (uint r=0; r<Q36_BF16_ROWS/2; r++) if (row+r*2<pc.rows)
+                acc[r]=fma(weights[r][j],inputs[j],acc[r]);
+    }
+    [[unroll]] for (uint r=0; r<Q36_BF16_ROWS/2; r++) {
+        float sum=acc[r];
+        sum+=subgroupShuffleXor(sum,16); sum+=subgroupShuffleXor(sum,8);
+        sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+        if (lane==0 && row+r*2<pc.rows) y[pc.out_offset+row+r*2]=sum;
+    }
+}
+#elif defined(Q36_BATCH)
+layout(constant_id = 0) const uint TOKENS = 8;
+void main() {
+    uint lane = gl_LocalInvocationID.x & 31u;
+    bool wide = pc.width >= 4096 && pc.width % 64 == 0 && gl_SubgroupSize == 64;
+    uint index = gl_LocalInvocationID.x;
+    uint token_base=gl_WorkGroupID.y*TOKENS;
+    uint row = wide ? gl_WorkGroupID.x : gl_WorkGroupID.x*2 + index/32;
+    if (wide) {
+        const uint half_tokens=(TOKENS+1)/2;
+        uint first=index/32*half_tokens;
+        float acc[16];
+        [[unroll]] for (uint t=0; t<half_tokens; t++) acc[t]=0;
+        /* Both half-waves retain the same 32 FMA chains, for different
+         * tokens. This halves the live accumulators and uses every lane. */
+        for (uint i=index; i<pc.width; i+=64) {
+            uint off=row*pc.row_bytes+i*2;
+            float w0=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+            float w1=subgroupShuffleXor(w0,32);
+            float lo=index<32 ? w0 : w1, hi=index<32 ? w1 : w0;
+            uint column=(i&~63u)+lane;
+            [[unroll]] for (uint t=0; t<half_tokens; t++) if (first+t<TOKENS) {
+                acc[t]=fma(lo,x[(token_base+first+t)*pc.width+column],acc[t]);
+                acc[t]=fma(hi,x[(token_base+first+t)*pc.width+column+32],acc[t]);
+            }
+        }
+        [[unroll]] for (uint t=0; t<half_tokens; t++) {
+            float sum=acc[t];
+            sum+=subgroupShuffleXor(sum,16); sum+=subgroupShuffleXor(sum,8);
+            sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+            if (lane==0 && first+t<TOKENS) y[(token_base+first+t)*pc.rows+row]=sum;
+        }
+        return;
+    }
+    float sums[32];
+    [[unroll]] for (uint t = 0; t < TOKENS; t++) sums[t] = 0;
+    if (row < pc.rows) for (uint i = lane; i < pc.width; i += 32) {
+        uint off = row*pc.row_bytes + i*2;
+        float weight = uintBitsToFloat(((w[off/4] >> ((off&2)*8)) & 65535u) << 16);
+        [[unroll]] for (uint t = 0; t < TOKENS; t++) sums[t] = fma(weight,x[(token_base+t)*pc.width+i],sums[t]);
+    }
+    [[unroll]] for (uint t = 0; t < TOKENS; t++) {
+        float sum = sums[t];
+        sum += subgroupShuffleXor(sum,16); sum += subgroupShuffleXor(sum,8);
+        sum += subgroupShuffleXor(sum,4); sum += subgroupShuffleXor(sum,2); sum += subgroupShuffleXor(sum,1);
+        if ((wide ? index : lane) == 0 && row < pc.rows) y[(token_base+t)*pc.rows+row] = sum;
+    }
+}
+#elif defined(Q36_BF16_SPLIT)
+shared float weights[1024], inputs[512];
+
+void main() {
+    uint index = gl_LocalInvocationID.x, lane = index & 31;
+    uint local_row = index / 32, row = gl_WorkGroupID.x * 2 + local_row;
+    uint column = gl_WorkGroupID.y, count = pc.width / 32;
+    for (uint i = lane; i < count; i += 32) {
+        uint off = row * pc.row_bytes + 2 * (column + i * 32);
+        uint bits = row < pc.rows ? (w[off/4] >> ((off&2)*8)) & 65535u : 0;
+        weights[local_row*512+i] = uintBitsToFloat(bits << 16);
+        if (local_row == 0) inputs[i] = x[column + i*32];
+    }
+    barrier();
+    /* Stage the strided loads cooperatively, then retain every lane's
+     * original FMA sequence. The second dispatch applies the same tree. */
+    if (lane == 0 && row < pc.rows) {
+        float sum = 0;
+        for (uint i = 0; i < count; i++) sum = fma(weights[local_row*512+i],inputs[i],sum);
+        y[row*32+column] = sum;
+    }
+}
+#else
+void main() {
+    uint index = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
+#ifdef Q36_HC
+    uint hc_groups=pc.rows;
+#ifdef Q36_BF16_PAIR
+    hc_groups=(pc.rows+1)/2;
+#endif
+    if (gl_WorkGroupID.x>=hc_groups) {
+        uint tile=gl_WorkGroupID.x-hc_groups, lane=index&31;
+        uint local_row=index/32, row=tile/32*2+local_row, column=tile%32;
+        uint count=pc.width/32;
+        for (uint i=lane; i<count; i+=32) {
+            uint off=row*pc.row_bytes+2*(column+i*32);
+            hc_weights[local_row*512+i]=uintBitsToFloat(((inject[off/4]>>((off&2)*8))&65535u)<<16);
+            if (local_row==0) hc_inputs[i]=x[column+i*32];
+        }
+        barrier();
+        if (lane==0) {
+            float sum=0;
+            for (uint i=0; i<count; i++) sum=fma(hc_weights[local_row*512+i],hc_inputs[i],sum);
+            partial[256+row*32+column]=sum;
+        }
+        return;
+    }
+#endif
+#ifdef Q36_BF16_PAIR
+    uint lane=index&31, first=gl_WorkGroupID.x*2, row=first+index/32;
+    float sum=0;
+    /* Each half-wave evaluates one row using the same 32 FMA chains.
+     * Both rows still load whole cache lines cooperatively. */
+    for (uint i=index; i<pc.width; i+=512) {
+        float low[8], high[8], values[16];
+        [[unroll]] for (uint j=0; j<8; j++) {
+            uint off=first*pc.row_bytes+2*(i+j*64);
+            float a=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+            off+=pc.row_bytes;
+            float b=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+            float ah=subgroupShuffleXor(a,32), bl=subgroupShuffleXor(b,32);
+            low[j]=index<32 ? a : bl;
+            high[j]=index<32 ? ah : b;
+        }
+        [[unroll]] for (uint j=0; j<16; j++) values[j]=x[(i&~63u)+lane+j*32];
+        [[unroll]] for (uint j=0; j<8; j++) {
+            sum=fma(low[j],values[j*2],sum);
+            sum=fma(high[j],values[j*2+1],sum);
+        }
+    }
+    sum+=subgroupShuffleXor(sum,16); sum+=subgroupShuffleXor(sum,8);
+    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+    if (lane==0 && row<pc.rows) y[pc.out_offset+row]=sum;
+#else
+    bool wide = pc.type == 64 || pc.type == 80;
+    uint step = wide ? 64 : 32;
+    uint row = wide ? gl_WorkGroupID.x : gl_WorkGroupID.x * 2 + index / 32;
+    uint lane = index % step;
+    float sum = 0;
+    /* Each half-wave loads the next operand for the same 32 FMA chains. */
+    if (pc.type==80) {
+        for (uint i=lane; i<pc.width; i+=512) {
+            float weights[8], high[8], values[16];
+            [[unroll]] for (uint j=0; j<8; j++) {
+                uint off=row*pc.row_bytes+2*(i+j*64);
+                weights[j]=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+                high[j]=subgroupShuffleXor(weights[j],32);
+            }
+            if (lane<32) {
+                [[unroll]] for (uint j=0; j<16; j++) values[j]=x[i+j*32];
+                [[unroll]] for (uint j=0; j<8; j++) {
+                    sum=fma(weights[j],values[j*2],sum);
+                    sum=fma(high[j],values[j*2+1],sum);
+                }
+            }
+        }
+    } else if (wide) {
+        for (uint i = lane; i < pc.width; i += 64) {
+            uint off = row * pc.row_bytes + 2 * i;
+            uint bits = (w[off / 4] >> ((off & 2) * 8)) & 65535u;
+            float w0 = uintBitsToFloat(bits << 16);
+            float w1 = subgroupShuffleXor(w0,32);
+            if (lane < 32) {
+                sum = fma(w0,x[i],sum);
+                sum = fma(w1,x[i + 32],sum);
+            }
+        }
+    } else if (pc.type==48 && row<pc.rows) {
+        for (uint i=lane; i<pc.width; i+=256) {
+            float weights[8], inputs[8];
+            [[unroll]] for (uint j=0; j<8; j++) if (i+j*32<pc.width) {
+                uint off=row*pc.row_bytes+2*(i+j*32);
+                weights[j]=uintBitsToFloat(((w[off/4]>>((off&2)*8))&65535u)<<16);
+                inputs[j]=x[i+j*32];
+            }
+            [[unroll]] for (uint j=0; j<8; j++) if (i+j*32<pc.width)
+                sum=fma(weights[j],inputs[j],sum);
+        }
+    } else if (row < pc.rows) for (uint i = lane; i < pc.width; i += 32) {
+        uint off = row * pc.row_bytes + 2 * i;
+        uint bits = (w[off / 4] >> ((off & 2) * 8)) & 65535u;
+        sum = fma(uintBitsToFloat(bits << 16),x[i],sum);
+    }
+    sum += subgroupShuffleXor(sum,16);
+    sum += subgroupShuffleXor(sum,8);
+    sum += subgroupShuffleXor(sum,4);
+    sum += subgroupShuffleXor(sum,2);
+    sum += subgroupShuffleXor(sum,1);
+    if (lane == 0 && row < pc.rows) y[pc.out_offset+row] = sum;
+#endif
+}
+
+#endif

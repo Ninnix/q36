@@ -28,7 +28,7 @@ void main(void) {
     double ss = 0.0;
     for (uint i = lid; i < pc.n; i += 256u) {
         float v = x[base + i];
-        ss += double(v) * double(v);
+        ss += double(v * v);
     }
     sh_sum[lid] = ss;
     barrier();

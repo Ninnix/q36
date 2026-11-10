@@ -9,7 +9,7 @@
 struct q36_engine { q36_dist_engine *dist; };
 struct q36_session {
     q36_engine *engine;
-    uint32_t pos, ctx;
+    uint32_t pos, ctx, width;
     float state;
     int progress, cancel_after;
     bool cancel, spec;
@@ -31,6 +31,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx) {
     assert(*out);
     (*out)->engine = e;
     (*out)->ctx = (uint32_t)ctx;
+    (*out)->width = dist_hidden_width(&e->dist->info);
     return 0;
 }
 void q36_session_free(q36_session *s) { free(s); }
@@ -52,9 +53,12 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
         return dist_error(err, errlen, "fake stage position mismatch");
     s->batches++;
     if (n > s->largest_batch) s->largest_batch = n;
+    uint32_t width = s->width ? s->width : 2;
     for (uint32_t i = 0; i < n; i++) {
         if (tokens[i] < 0) return dist_error(err, errlen, "invalid token");
-        float value = first ? input[i * 2] : (float)tokens[i];
+        float value = first ? input[i * width] : (float)tokens[i];
+        if (first) for (uint32_t j = 1; j < width; j++)
+            assert(input[i*width+j] == -value*j);
         s->state += value;
         s->rows[2u*i] = s->state;
         s->rows[2u*i + 1u] = -s->state;
@@ -63,8 +67,8 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
             s->history[s->spec_n++] = s->state;
         }
         if (output) {
-            output[i * 2] = s->state;
-            output[i * 2 + 1] = -s->state;
+            output[i*width] = s->state;
+            for (uint32_t j = 1; j < width; j++) output[i*width+j] = -s->state*j;
         }
     }
     if (output_logits) {
@@ -178,23 +182,23 @@ static void test_options(void) {
     }
 }
 
-static void test_pipeline(uint32_t window) {
+static void test_pipeline(uint32_t window, uint32_t width) {
     int fds[2];
     assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
     q36_dist_engine coord = {.fd=fds[0], .listener=-1, .next_id=1, .generation=1,
-        .info={.n_layers=4, .n_embd=2, .n_vocab=3, .prefill_cap=3, .layer_start=0, .layer_end=1},
+        .info={.n_layers=4, .n_embd=2, .n_hidden=width, .n_vocab=3, .prefill_cap=3, .layer_start=0, .layer_end=1},
         .peer={.prefill_cap=2, .context_size=32}, .opt={.prefill_window=window}};
     assert(!pthread_mutex_init(&coord.mutex, NULL));
     q36_engine engine = {0};
     q36_dist_engine worker = {.fd=fds[1], .engine=&engine,
-        .info={.n_embd=2, .n_vocab=3, .prefill_cap=2, .context_size=32, .layer_start=2, .layer_end=3}};
+        .info={.n_embd=2, .n_hidden=width, .n_vocab=3, .prefill_cap=2, .context_size=32, .layer_start=2, .layer_end=3}};
     engine.dist = &worker;
     pthread_t thread;
     assert(!pthread_create(&thread, NULL, worker_main, &worker));
     q36_dist_session *a, *b;
     assert(!q36_dist_session_create(&a, &coord, 32));
     assert(!q36_dist_session_create(&b, &coord, 32));
-    q36_session owner = {.ctx=32}, other = {.ctx=32};
+    q36_session owner = {.ctx=32,.width=width}, other = {.ctx=32,.width=width};
     int tokens[] = {1, 2, 3, 4, 5, 6, 7};
     q36_tokens empty = {0}, prompt = {.v=tokens, .len=7};
     float logits[3];
@@ -356,7 +360,7 @@ static void *hello_main(void *opaque) {
 }
 
 static void test_hello(void) {
-    for (int variant = 0; variant < 7; variant++) {
+    for (int variant = 0; variant < 9; variant++) {
         int fds[2];
         assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
         q36_dist_engine coord = {.opt={.role=Q36_DISTRIBUTED_COORDINATOR},
@@ -369,27 +373,29 @@ static void test_hello(void) {
         if (variant == 1) worker.info.fingerprint++;
         if (variant == 2) worker.info.layer_start = 3;
         if (variant == 3) worker.info.n_vocab++;
-        if (variant >= 4) {
+        if (variant >= 4 && variant <= 6) {
             coord.info.mtp = true;
             coord.info.speculation = variant != 6;
             worker.info.speculation = variant != 4;
         }
+        if (variant >= 7) coord.info.n_hidden = 8;
+        if (variant == 8) worker.info.n_hidden = 8;
         hello_job job = {&worker, fds[1], -1};
         pthread_t thread;
         assert(!pthread_create(&thread, NULL, hello_main, &job));
         char err[256];
         int result = dist_hello(&coord, fds[0], NULL, err, sizeof(err));
         pthread_join(thread, NULL);
-        bool bad = variant != 0 && variant != 5;
+        bool bad = variant != 0 && variant != 5 && variant != 8;
         assert((result != 0) == bad);
         assert((job.result != 0) == bad);
         close(fds[0]); close(fds[1]);
     }
 }
 
-/* Full-logit and pre-speculation protocols must both be rejected. */
+/* Older peers cannot negotiate the residual width independently of the head. */
 static void test_legacy_peer(void) {
-    for (uint32_t version = 1; version <= 2; version++) {
+    for (uint32_t version = 1; version <= 3; version++) {
         int fds[2];
         assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
         q36_dist_engine coord = {.opt={.role=Q36_DISTRIBUTED_COORDINATOR},
@@ -488,8 +494,10 @@ int main(void) {
     test_duplex();
     test_hello();
     test_legacy_peer();
-    test_pipeline(1);
-    test_pipeline(3);
+    test_pipeline(1,2);
+    test_pipeline(3,2);
+    test_pipeline(1,8);
+    test_pipeline(3,8);
     test_speculation(1);
     test_speculation(2);
     test_speculation(3);

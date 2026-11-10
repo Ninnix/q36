@@ -1,8 +1,10 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "reference_math.glsl"
 
 layout(local_size_x = 384) in;
 layout(binding=0) buffer History { float history[]; };
@@ -68,21 +70,22 @@ void main() {
     }
     barrier();
     if (tid<64u) {
-        sq[tid]=double(qv[tid])*double(qv[tid])+double(qv[tid+64u])*double(qv[tid+64u]);
-        sk[tid]=double(kv[tid])*double(kv[tid])+double(kv[tid+64u])*double(kv[tid+64u]);
+        sq[tid]=double(qv[tid]*qv[tid])+double(qv[tid+64u]*qv[tid+64u]);
+        sk[tid]=double(kv[tid]*kv[tid])+double(kv[tid+64u]*kv[tid+64u]);
     }
     barrier();
     for (uint s=32u; s>0u; s>>=1u) {
         if (tid<s) { sq[tid]+=sq[tid+s]; sk[tid]+=sk[tid+s]; }
         barrier();
     }
-    float qs=1.0/max(sqrt(float(sq[0])),pc.eps);
-    float ks=1.0/max(sqrt(float(sk[0])),pc.eps);
+    float qs=1.0/sqrt(float(sq[0]/128.0)+pc.eps/128.0);
+    float ks=1.0/sqrt(float(sk[0]/128.0)+pc.eps/128.0);
+    float scale=1.0/sqrt(128.0);
     uint lane=tid%128u;
     for (uint j=tid/128u; j<per; j+=3u) {
         uint row=h+j*pc.groups;
-        qout[row*128u+lane]=qv[lane]*qs;
-        kout[row*128u+lane]=kv[lane]*ks;
+        qout[row*128u+lane]=(qv[lane]*qs)*scale;
+        kout[row*128u+lane]=(kv[lane]*ks)*scale;
         float aa=0.0, ab=0.0;
 #ifdef Q36_BF16
         uint n4 = pc.blocks * 8u;
@@ -114,7 +117,7 @@ void main() {
         if (lane==0u) {
             aa=sa[j*2u]+sa[j*2u+1u]; ab=sb[j*2u]+sb[j*2u+1u];
             float a=aa*pc.alpha_scale+dt[row];
-            float sp=a>20.0 ? a : log(1.0+exp(a));
+            float sp=a>20.0 ? a : q36_log1p(exp(a));
             gb[row]=exp(sp*av[row]);
             gb[pc.heads+row]=sigmoid_stable(ab*pc.beta_scale);
         }

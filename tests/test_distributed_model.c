@@ -43,6 +43,7 @@ int main(int argc, char **argv) {
         .prefill_chunk=8, .session_count=2, .cache_type_k=Q36_KV_CACHE_Q8_0,
         .cache_type_v=Q36_KV_CACHE_Q4_0};
     const char *path = NULL;
+    int prefill_tokens=0;
     bool reference = false;
     for (int i = 1; i < argc; i++) {
         int rc = q36_dist_parse_cli_arg(argv[i], &i, argc, argv, &opt.distributed, error, sizeof(error));
@@ -53,22 +54,28 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--model") && i + 1 < argc) opt.model_path = argv[++i];
         else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc)
             opt.prefill_chunk = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefill-tokens") && i + 1 < argc)
+            prefill_tokens = atoi(argv[++i]);
         else if ((!strcmp(argv[i], "--record") || !strcmp(argv[i], "--reference")) && i + 1 < argc) {
             reference = !strcmp(argv[i], "--reference"); path = argv[++i];
         } else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }
     assert(path && opt.model_path);
+    assert(prefill_tokens>=0 && prefill_tokens<=Q36_CONTEXT_ALLOC_MAX-32);
+    if (prefill_tokens+32>opt.context_size) opt.context_size=prefill_tokens+32;
     check(q36_dist_prepare_engine_options(&opt.distributed, &opt, error, sizeof(error)));
     FILE *fp = fopen(path, reference ? "rb" : "wb");
     assert(fp);
     q36_engine *e = NULL;
     q36_session *a = NULL, *b = NULL;
     check(q36_engine_open(&e, &opt));
-    check(q36_session_create(&a, e, 512));
-    check(q36_session_create(&b, e, 512));
+    check(q36_session_create(&a, e, opt.context_size));
+    check(q36_session_create(&b, e, opt.context_size));
     q36_tokens first = {0}, second = {0};
     q36_encode_chat_prompt(e, "You are a helpful assistant.", "What is 2 + 2?", Q36_THINK_NONE, &first);
     q36_encode_chat_prompt(e, "You are a helpful assistant.", "Name the capital of Italy.", Q36_THINK_NONE, &second);
+    int original=first.len;
+    while (first.len<prefill_tokens) q36_tokens_push(&first,first.v[first.len%original]);
     check(q36_session_sync(a, &first, error, sizeof(error)));
     compare(a, fp, reference, "prefill");
     q36_session_snapshot snapshot = {0};
@@ -98,6 +105,15 @@ int main(int argc, char **argv) {
     compare(b, fp, reference, "ordered decode B");
     q36_dist_model_info info;
     q36_engine_distributed_info(e, &info);
+    if (!info.speculation)
+        assert(q36_session_pipeline_spec_begin(a,error,sizeof(error)) != 0);
+    if (info.n_hidden>info.n_embd && opt.backend==Q36_BACKEND_VULKAN) {
+        q36_session_invalidate(a);
+        int cleared_vocab;
+        const float *cleared=q36_session_logits(a,&cleared_vocab);
+        assert(cleared && cleared_vocab==(int)info.n_vocab);
+        for (int i=0; i<cleared_vocab; i++) assert(cleared[i]==0);
+    }
     float *hidden = calloc(info.n_embd, sizeof(float));
     float *output = malloc((size_t)info.n_vocab * sizeof(float));
     assert(hidden && output);

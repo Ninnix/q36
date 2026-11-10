@@ -73,7 +73,7 @@ void main(void) {
     for (uint i = lid; i < pc.n; i += 256u) {
         float x = a[base + i] + b[base + i];
         s[base + i] = x;
-        ss += double(x) * double(x);
+        ss += double(x * x);
     }
     memoryBarrierBuffer();
     sh_sum[lid] = ss;

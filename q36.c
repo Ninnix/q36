@@ -14,6 +14,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <float.h>
 #include <inttypes.h>
@@ -83,6 +84,7 @@ enum {
 typedef enum {
     Q36_VARIANT_35B_A3B,
     Q36_VARIANT_27B,
+    Q36_VARIANT_FLASH_NEXT,
 } q36_variant;
 
 typedef struct {
@@ -216,8 +218,6 @@ static q36_shape g_q36_shape = {
 #include "q36_streaming_hotlist.inc"
 #endif
 
-static volatile int q36_float_norm_accum_mode = 1;
-
 static const uint32_t Q36_ROPE_SECTIONS[4] = {11, 11, 10, 0};
 
 typedef struct {
@@ -277,6 +277,7 @@ static const gguf_type_info gguf_types[] = {
     [26] = {"i32", 1, 4},
     [29] = {"iq1_m", 256, 56},
     [30] = {"bf16", 1, 2},
+    [42] = {"q2_0", 64, 18},
 };
 
 enum {
@@ -299,6 +300,7 @@ enum {
     Q36_TENSOR_I32 = 26,
     Q36_TENSOR_IQ1_M = 29,
     Q36_TENSOR_BF16 = 30,
+    Q36_TENSOR_Q2_0 = 42,
 };
 
 typedef struct {
@@ -320,6 +322,8 @@ typedef struct {
 
 typedef struct {
     int fd;
+    int ngram_fd;
+    q36_tensor ngram;
     const uint8_t *map;
     uint64_t size;
     uint32_t version;
@@ -489,6 +493,10 @@ typedef enum {
 
 typedef struct {
     q36_layer_kind kind;
+    q36_tensor *hc_attn_norm, *hc_attn_down, *hc_attn_up, *hc_attn_inject;
+    q36_tensor *hc_ffn_norm, *hc_ffn_down, *hc_ffn_up, *hc_ffn_inject;
+    q36_tensor *ple_key, *ple_value, *ple_norm_key, *ple_norm_query, *ple_norm_conv, *ple_conv;
+    q36_tensor *indexer_q_proj, *indexer_k_proj, *indexer_q_norm, *indexer_k_norm;
     q36_tensor *attn_norm;
     q36_tensor *post_attention_norm;
 
@@ -537,6 +545,7 @@ typedef struct {
 
 typedef struct {
     q36_tensor *token_embd;
+    q36_tensor *output_hc_norm, *output_hc_down, *output_hc_up;
     q36_tensor *output_norm;
     q36_tensor *output;
     q36_tensor *output_scale;
@@ -616,6 +625,7 @@ struct q36_engine {
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
     q36_ssd_memory_lock simulated_memory;
+    q36_ssd_prefetch *route_reader;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -655,6 +665,12 @@ struct q36_session {
     void *cancel_ud;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    uint32_t route_layer, route_ids[4];
+#ifndef Q36_NO_GPU
+    q36_gpu_tensor *route_stage, *route_input;
+#endif
+    bool route_pending;
+    uint64_t route_total, route_top4_hits, route_active_hits, route_hint_bytes;
 };
 
 typedef struct {
@@ -1202,7 +1218,7 @@ static bool q36_backend_supports_ssd_streaming(q36_backend backend) {
 
 
 static bool q36_engine_uses_vulkan_runtime(const q36_engine *e) {
-    return e && q36_backend_uses_graph(e->backend);
+    return e && e->variant != Q36_VARIANT_FLASH_NEXT && q36_backend_uses_graph(e->backend);
 }
 
 static void q36_die(const char *msg) {
@@ -1526,6 +1542,17 @@ q36_context_memory q36_context_memory_estimate_configured(
     uint32_t gpu_prefill_cap = q36_default_gpu_prefill_cap();
 #endif
     if (ctx_size <= 0) return m;
+    if (g_q36_shape.variant == Q36_VARIANT_FLASH_NEXT) {
+        m.prefill_cap = 1;
+        m.raw_cap = ctx_size;
+        m.raw_bytes = 12ull * (uint32_t)ctx_size * (512 + 512 + 128) * sizeof(float);
+        m.compressed_bytes = 48ull * 48 * 128 * 128 * sizeof(float) +
+                             48ull * 3 * 10240 * sizeof(float) + 9ull * 10240 * sizeof(float);
+        m.scratch_bytes = 2ull * 248320 * sizeof(float) +
+            (backend == Q36_BACKEND_VULKAN ? (16u << 20) + 22u * 65536 : 10240u * 16);
+        m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+        return m;
+    }
 #ifndef Q36_NO_GPU
     m.prefill_cap = q36_backend_uses_graph(backend) ? gpu_prefill_cap : cpu_prefill_cap;
 #else
@@ -1671,7 +1698,8 @@ uint16_t q36_quant_f32_to_f16(float f) {
 #pragma GCC push_options
 #pragma GCC optimize ("no-fast-math")
 #endif
-void q36_quant_q8_0(const float *x, void *out, int64_t n) {
+static void q36_quant_q8_0_impl(const float *x, void *out, int64_t n,
+                               bool activation) {
     q36_block_q8_0 *y = out;
     int64_t blocks = n / Q36_QK8_0;
     if (!x || !out || n < 0 || n % Q36_QK8_0) return;
@@ -1687,11 +1715,22 @@ void q36_quant_q8_0(const float *x, void *out, int64_t n) {
          * the result correctly rounded, so the GPU twin can match bit for
          * bit. */
         float d = (float)((double)amax / 127.0);
-        float inv = d ? (float)(1.0 / (double)d) : 0.0f;
+        /* GGML activations divide by amax directly. KV caches retain the
+         * inverse of the rounded scale for their existing byte format. */
+        float inv = activation ? (amax ? (float)(127.0 / (double)amax) : 0.0f) :
+                                 (d ? (float)(1.0 / (double)d) : 0.0f);
         y[b].d = q36_quant_f32_to_f16(d);
         for (int j = 0; j < (int)Q36_QK8_0; j++)
             y[b].qs[j] = (int8_t)nearbyintf(x[b * Q36_QK8_0 + j] * inv);
     }
+}
+
+void q36_quant_q8_0(const float *x, void *out, int64_t n) {
+    q36_quant_q8_0_impl(x,out,n,false);
+}
+
+void q36_quant_q8_0_activation(const float *x, void *out, int64_t n) {
+    q36_quant_q8_0_impl(x,out,n,true);
 }
 
 static void q36_quant_q4_0_impl(const float *x, void *out, int64_t n,
@@ -1856,17 +1895,61 @@ void q36_quant_q8_k(const float *x, void *out, int64_t n) {
     }
 }
 
+static float q36_sum8(const float *v) {
+    return ((v[0] + v[4]) + (v[2] + v[6])) +
+           ((v[1] + v[5]) + (v[3] + v[7]));
+}
+
 float q36_quant_dot_q8_0(const void *a, const void *b, int n) {
     const q36_block_q8_0 *x = a;
     const q36_block_q8_0 *y = b;
-    float sum = 0.0f;
+    float sums[8] = {0};
     if (!a || !b || n < 0 || n % Q36_QK8_0) return 0.0f;
     for (int block = 0; block < n / (int)Q36_QK8_0; block++) {
-        int isum = 0;
-        for (int i = 0; i < (int)Q36_QK8_0; i++) isum += x[block].qs[i] * y[block].qs[i];
-        sum += q36_f16_to_f32(x[block].d) * q36_f16_to_f32(y[block].d) * (float)isum;
+        float d = q36_f16_to_f32(x[block].d) * q36_f16_to_f32(y[block].d);
+        for (int i = 0; i < 8; i++) {
+            int dot = 0;
+            for (int j = 0; j < 4; j++) dot += x[block].qs[4 * i + j] * y[block].qs[4 * i + j];
+            sums[i] = fmaf(d,(float)dot,sums[i]);
+        }
     }
-    return sum;
+    return q36_sum8(sums);
+}
+
+/* IQ4_NL and Q2_0 use 32-element activation scales, including when a
+ * weight block spans two activation blocks. Keep the dot integer until
+ * applying those scales, as in the GGUF CPU kernels. */
+bool q36_quant_dot_q8_0_type(uint32_t type, const void *weights,
+                             const void *activation, uint32_t n, float *out) {
+    const uint8_t *w = weights;
+    const q36_block_q8_0 *x = activation;
+    static const int8_t values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    if (!w || !x || !out || n % 32) return false;
+    if (type == Q36_TENSOR_Q8_0) { *out = q36_quant_dot_q8_0(weights,activation,n); return true; }
+    if (type != Q36_TENSOR_IQ4_NL && type != Q36_TENSOR_Q2_0) return false;
+    if (type == Q36_TENSOR_Q2_0 && n % 64) return false;
+    float sum = 0;
+    uint32_t groups = type == Q36_TENSOR_Q2_0 ? 2 : 1;
+    for (uint32_t b = 0; b < n / (32 * groups); b++, w += 18) {
+        uint16_t h;
+        memcpy(&h,w,2);
+        float dot = 0;
+        for (uint32_t g = 0; g < groups; g++) {
+            const q36_block_q8_0 *q = x + b * groups + g;
+            int acc = 0;
+            for (uint32_t j = 0; j < 32; j++) {
+                uint32_t i = g * 32 + j;
+                int v = type == Q36_TENSOR_IQ4_NL ?
+                    values[(w[2 + j % 16] >> (j < 16 ? 0 : 4)) & 15] :
+                    (int)((w[2 + i / 4] >> (2 * (i % 4))) & 3) - 1;
+                acc += v * q->qs[j];
+            }
+            dot += q36_f16_to_f32(q->d) * (float)acc;
+        }
+        sum += q36_f16_to_f32(h) * dot;
+    }
+    *out = sum;
+    return true;
 }
 
 static float q36_ref_rsqrtf(float x) {
@@ -1874,16 +1957,9 @@ static float q36_ref_rsqrtf(float x) {
 }
 
 static void q36_ref_rms_norm(float *dst, const float *src, const float *weight, uint32_t n, float eps) {
-    float scale;
-    if (q36_float_norm_accum_mode) {
-        float ss = 0.0f;
-        for (uint32_t i = 0; i < n; i++) ss += src[i] * src[i];
-        scale = q36_ref_rsqrtf(ss / (float)n + eps);
-    } else {
-        double ss = 0.0;
-        for (uint32_t i = 0; i < n; i++) ss += (double)src[i] * (double)src[i];
-        scale = q36_ref_rsqrtf((float)(ss / (double)n) + eps);
-    }
+    double ss = 0.0;
+    for (uint32_t i = 0; i < n; i++) ss += (double)(src[i] * src[i]);
+    float scale = q36_ref_rsqrtf((float)(ss / (double)n) + eps);
     for (uint32_t i = 0; i < n; i++) {
         float v = src[i] * scale;
         dst[i] = weight ? v * weight[i] : v;
@@ -1903,38 +1979,72 @@ static float q36_sigmoidf(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+/* F32 range reduction and polynomial used by the vector activation kernels. */
+static float q36_vector_expf(float x) {
+    if (!(x >= -80 && x <= 80)) return expf(x);
+    float z = fmaf(x,0x1.715476p0f,0x1.8p23f);
+    float n = z - 0x1.8p23f;
+    float r = fmaf(-n,0x1.7f7d1cp-20f,fmaf(-n,0x1.62e4p-1f,x));
+    uint32_t bits;
+    memcpy(&bits,&z,4);
+    bits = (bits << 23) + 0x3f800000u;
+    float scale;
+    memcpy(&scale,&bits,4);
+    float rr = r * r;
+    float p = fmaf(fmaf(fmaf(0x1.0e4020p-7f,r,0x1.573e2ep-5f),rr,
+                        fmaf(0x1.555e66p-3f,r,0x1.fffdb6p-2f)),rr,0x1.ffffecp-1f * r);
+    return fmaf(p,scale,scale);
+}
+
 static float q36_siluf(float x) {
-    return x / (1.0f + expf(-x));
+    return x / (1.0f + q36_vector_expf(0.0f - x));
 }
 
 static float q36_softplusf(float x) {
     if (x > 20.0f) return x;
-    return logf(1.0f + expf(x));
+    return log1pf(expf(x));
 }
 
 static void q36_l2_norm(float *x, uint32_t n, float eps) {
     double ss = 0.0;
-    for (uint32_t i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
-    if (ss <= 0.0) return;
-    {
-        float scale = 1.0f / fmaxf(sqrtf((float)ss), eps);
-        for (uint32_t i = 0; i < n; i++) x[i] *= scale;
-    }
+    for (uint32_t i = 0; i < n; i++) ss += (double)(x[i] * x[i]);
+    /* GDN uses x / sqrt(sum(x*x) + eps). Keep the reference RMS-then-scale
+     * order, including epsilon inside the root. */
+    float rms = q36_ref_rsqrtf((float)(ss / (double)n) + eps / (float)n);
+    float scale = q36_ref_rsqrtf((float)n);
+    for (uint32_t i = 0; i < n; i++) x[i] = (x[i] * rms) * scale;
 }
+
+#ifndef Q36_NO_GPU
+void q36_gpu_host_rms_norm(float *dst, const float *src, const float *weight,
+                            uint32_t n, float eps) {
+    q36_ref_rms_norm(dst,src,weight,n,eps);
+}
+
+void q36_gpu_host_l2_norm(float *x, uint32_t n, float eps) {
+    q36_l2_norm(x,n,eps);
+}
+
+float q36_gpu_host_silu(float x) { return q36_siluf(x); }
+float q36_gpu_host_softplus(float x) { return q36_softplusf(x); }
+#endif
 
 static void q36_softmax_inplace(float *x, uint32_t n) {
     float maxv = -INFINITY;
     double sum = 0.0;
     for (uint32_t i = 0; i < n; i++) if (x[i] > maxv) maxv = x[i];
-    for (uint32_t i = 0; i < n; i++) {
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        for (uint32_t j = 0; j < 8; j++) x[i + j] = q36_vector_expf(x[i + j] - maxv);
+        sum += q36_sum8(x + i);
+    }
+    for (; i < n; i++) {
         x[i] = expf(x[i] - maxv);
         sum += x[i];
     }
     if (sum == 0.0) return;
-    {
-        float inv = (float)(1.0 / sum);
-        for (uint32_t i = 0; i < n; i++) x[i] *= inv;
-    }
+    float inv = (float)(1.0 / sum);
+    for (i = 0; i < n; i++) x[i] *= inv;
 }
 
 static bool q36_all_finite(const float *x, uint32_t n) {
@@ -2031,8 +2141,55 @@ static float q36_round_bf16(float value) {
     return value;
 }
 
+static float q36_reduce32(const float sums[32], bool adjacent) {
+    /* BF16 and F32 kernels pair their final four lanes differently. */
+    float lanes[8];
+    for (uint32_t j = 0; j < 8; j++)
+        lanes[j] = (sums[j] + sums[j + 16]) + (sums[j + 8] + sums[j + 24]);
+    for (uint32_t j = 0; j < 4; j++) lanes[j] += lanes[j + 4];
+    return adjacent ? (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]) :
+                      (lanes[0] + lanes[2]) + (lanes[1] + lanes[3]);
+}
+
+static float q36_dot_f32_strided(const float *a, uint32_t stride,
+                                  const float *b, uint32_t n) {
+    float sums[32] = {0};
+    uint32_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (uint32_t j = 0; j < 32; j++)
+            sums[j] = fmaf(a[(uint64_t)(i + j) * stride],b[i + j],sums[j]);
+    double sum = q36_reduce32(sums,true);
+    for (; i < n; i++) sum += a[(uint64_t)i * stride] * b[i];
+    return (float)sum;
+}
+
+
+float q36_quant_dot_bf16(const void *weights, const float *x, uint32_t n) {
+    const uint16_t *w = weights;
+    if (!w || !x) return 0;
+    float sums[32] = {0};
+    uint32_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (uint32_t j = 0; j < 32; j++)
+            sums[j] += q36_bf16_to_f32(w[i + j]) * q36_round_bf16(x[i + j]);
+    double sum = q36_reduce32(sums,false);
+    for (; i < n; i++) sum += q36_bf16_to_f32(w[i]) * q36_round_bf16(x[i]);
+    return (float)sum;
+}
+
 static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float *dst, uint32_t n) {
     switch (type) {
+    case Q36_TENSOR_Q2_0: {
+        if (n % 64) return false;
+        for (uint32_t b = 0; b < n / 64; b++, src += 18) {
+            uint16_t h;
+            memcpy(&h, src, sizeof(h));
+            float d = q36_f16_to_f32(h);
+            for (uint32_t j = 0; j < 64; j++)
+                dst[b * 64 + j] = d * ((int)((src[2 + j / 4] >> (2 * (j % 4))) & 3) - 1);
+        }
+        return true;
+    }
     case Q36_TENSOR_F32:
         memcpy(dst, src, (size_t)n * sizeof(*dst));
         return true;
@@ -2598,7 +2755,7 @@ static bool q36_tensor_type_supports_q8k_dot(uint32_t type) {
 }
 
 static bool q36_tensor_type_supports_q8_0_dot(uint32_t type) {
-    return type == Q36_TENSOR_Q8_0;
+    return type == Q36_TENSOR_Q8_0 || type == Q36_TENSOR_IQ4_NL || type == Q36_TENSOR_Q2_0;
 }
 
 static bool q36_tensor_type_supports_prequant_dot(uint32_t type) {
@@ -2616,30 +2773,163 @@ static bool q36_tensor_pair_can_fuse(const q36_tensor *t0,
     return q36_tensor_type_supports_prequant_dot(t0->type);
 }
 
+static float q36_dot_iq1(uint32_t type, const void *packed,
+                           const q36_block_q8_k *x, uint32_t n) {
+    float acc[8] = {0}, delta[8] = {0}, offset = 0;
+    const q36_block_iq1_s *s = packed;
+    const q36_block_iq1_m *m = packed;
+    for (uint32_t b = 0; b < n / Q36_QK_K; b++) {
+        int sums[8] = {0}, shifts[8] = {0}, shift = 0;
+        const uint16_t *sc = type == Q36_TENSOR_IQ1_M ? (const uint16_t *)m[b].scales : NULL;
+        uint16_t h = type == Q36_TENSOR_IQ1_S ? s[b].d :
+            (sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) |
+            ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000);
+        for (uint32_t g = 0; g < 8; g++) {
+            for (uint32_t l = 0; l < 4; l++) {
+                uint32_t idx;
+                int scale, sign;
+                if (type == Q36_TENSOR_IQ1_S) {
+                    uint16_t qh = s[b].qh[g];
+                    idx = s[b].qs[g * 4 + l] | (((qh >> (3 * l)) & 7) << 8);
+                    scale = 2 * ((qh >> 12) & 7) + 1;
+                    sign = qh & 0x8000 ? -1 : 1;
+                } else {
+                    uint8_t qh = m[b].qh[g * 2 + l / 2];
+                    idx = m[b].qs[g * 4 + l] | ((qh << (l & 1 ? 4 : 8)) & 0x700);
+                    scale = 2 * ((sc[g / 2] >> (6 * (g & 1) + 3 * (l / 2))) & 7) + 1;
+                    sign = qh & (l & 1 ? 0x80 : 8) ? -1 : 1;
+                }
+                const int8_t *grid = (const int8_t *)&q36_iq1s_grid[idx];
+                const int8_t *q = x[b].qs + g * 32 + l * 8;
+                for (uint32_t j = 0; j < 2; j++) {
+                    int dot = 0, sum = 0;
+                    for (uint32_t k = 0; k < 4; k++) {
+                        dot += grid[j * 4 + k] * q[j * 4 + k];
+                        sum += q[j * 4 + k];
+                    }
+                    sums[l * 2 + j] += dot * scale;
+                    shifts[l * 2 + j] += sum * sign * scale;
+                    shift += sum * sign * scale;
+                }
+            }
+        }
+        float d = q36_f16_to_f32(h) * x[b].d;
+        for (uint32_t j = 0; j < 8; j++) {
+            acc[j] = fmaf(d,(float)sums[j],acc[j]);
+            if (type == Q36_TENSOR_IQ1_M) delta[j] = fmaf(d,(float)shifts[j],delta[j]);
+        }
+        if (type == Q36_TENSOR_IQ1_S) offset = fmaf(d,(float)shift,offset);
+    }
+    return q36_sum8(acc) + 0.125f * (type == Q36_TENSOR_IQ1_S ? offset : q36_sum8(delta));
+}
+
+static float q36_dot_iq3_xxs(const q36_block_iq3_xxs *w,
+                              const q36_block_q8_k *x, uint32_t n) {
+    /* Keep the eight integer-dot lanes until the final reduction. Folding
+     * each block into one float changes rounding before the next quantizer. */
+    float acc[8] = {0};
+    for (uint32_t b = 0; b < n / Q36_QK_K; b++) {
+        int sums[8] = {0};
+        for (uint32_t g = 0; g < 8; g++) {
+            uint32_t control;
+            memcpy(&control,w[b].qs + 64 + 4 * g,4);
+            int scale = 2 * (control >> 28) + 1;
+            for (uint32_t j = 0; j < 8; j++) {
+                const uint8_t *grid = q36_iq3xxs_grid_at(w[b].qs[g * 8 + j]);
+                uint8_t signs = q36_ksigns_iq2xs[(control >> (7 * (j / 2))) & 127];
+                int dot = 0;
+                for (uint32_t k = 0; k < 4; k++) {
+                    int value = grid[k];
+                    if (signs & (1u << ((j % 2) * 4 + k))) value = -value;
+                    dot += value * x[b].qs[g * 32 + j * 4 + k];
+                }
+                sums[j] += dot * scale;
+            }
+        }
+        float d = q36_f16_to_f32(w[b].d) * x[b].d;
+        for (uint32_t j = 0; j < 8; j++) acc[j] = fmaf(d,(float)sums[j],acc[j]);
+    }
+    for (uint32_t j = 0; j < 4; j++) acc[j] += acc[j + 4];
+    return 0.25f * ((acc[0] + acc[2]) + (acc[1] + acc[3]));
+}
+
+static float q36_dot_q2_q6(bool q2, const void *weights,
+                             const q36_block_q8_k *x, uint32_t n) {
+    const q36_block_q2_k *w2 = weights;
+    const q36_block_q6_k *w6 = weights;
+    float acc[8] = {0};
+    for (uint32_t b = 0; b < n / Q36_QK_K; b++) {
+        int columns[32] = {0};
+        for (uint32_t g = 0; g < 8; g++) {
+            for (uint32_t half = 0; half < 2; half++) {
+                int scale = q2 ? w2[b].scales[2 * g + half] & 15 : w6[b].scales[2 * g + half];
+                for (uint32_t j = half * 16; j < half * 16 + 16; j++) {
+                    int value;
+                    if (q2) {
+                        value = (w2[b].qs[(g / 4) * 32 + j] >> (2 * (g % 4))) & 3;
+                    } else {
+                        uint8_t low = w6[b].ql[(g / 4) * 64 + (g % 2) * 32 + j];
+                        uint8_t high = w6[b].qh[(g / 4) * 32 + j];
+                        value = ((low >> (4 * ((g % 4) / 2))) & 15) |
+                                (((high >> (2 * (g % 4))) & 3) << 4);
+                    }
+                    columns[j] += value * scale * x[b].qs[g * 32 + j];
+                }
+            }
+        }
+        float d = q36_f16_to_f32(q2 ? w2[b].d : w6[b].d) * x[b].d;
+        float dmin = q2 ? -q36_f16_to_f32(w2[b].dmin) * x[b].d : 0;
+        for (uint32_t j = 0; j < 8; j++) {
+            int dot = (columns[4 * j] + columns[4 * j + 1]) +
+                      (columns[4 * j + 2] + columns[4 * j + 3]);
+            if (q2) {
+                int min = (w2[b].scales[2 * j] >> 4) * x[b].bsums[2 * j] +
+                          (w2[b].scales[2 * j + 1] >> 4) * x[b].bsums[2 * j + 1];
+                acc[j] = fmaf(dmin,(float)min,acc[j]);
+            } else {
+                dot -= 32 * (w6[b].scales[2 * j] * x[b].bsums[2 * j] +
+                             w6[b].scales[2 * j + 1] * x[b].bsums[2 * j + 1]);
+            }
+            acc[j] = fmaf(d,(float)dot,acc[j]);
+        }
+    }
+    return q36_sum8(acc);
+}
+
 bool q36_quant_dot_q8_k(uint32_t type, const void *packed, const void *activation,
                          uint32_t n, float *out) {
     const uint8_t *row = packed;
     const q36_block_q8_k *q = activation;
     float weights[Q36_QK_K];
     float acc = 0.0f;
+    float partial[8] = {0};
+    float minimum[4] = {0};
     uint32_t block_bytes;
     if (!row || !q || !out || (n % Q36_QK_K) != 0 || !q36_tensor_type_supports_q8k_dot(type)) return false;
+    if (type == Q36_TENSOR_IQ3_XXS) {
+        *out = q36_dot_iq3_xxs(packed,activation,n);
+        return true;
+    }
+    if (type == Q36_TENSOR_IQ1_S || type == Q36_TENSOR_IQ1_M) {
+        *out = q36_dot_iq1(type,packed,activation,n);
+        return true;
+    }
+    if (type == Q36_TENSOR_Q2_K) {
+        *out = q36_dot_q2_q6(true,packed,activation,n);
+        return true;
+    }
+    if (type == Q36_TENSOR_Q6_K) {
+        *out = q36_dot_q2_q6(false,packed,activation,n);
+        return true;
+    }
     if (type >= sizeof(gguf_types) / sizeof(gguf_types[0]) || !gguf_types[type].block_bytes) return false;
     block_bytes = gguf_types[type].block_bytes * (Q36_QK_K / gguf_types[type].block_elems);
     for (uint32_t block = 0; block < n / Q36_QK_K; block++) {
         const uint8_t *src = row + (uint64_t)block * block_bytes;
         float d = 0.0f, dmin = 0.0f;
         int min_dot = 0;
-        union { q36_block_q2_k q2; q36_block_q4_k q4; q36_block_q5_k q5; } copy;
-        if (type == Q36_TENSOR_Q2_K) {
-            memcpy(&copy.q2, src, sizeof(copy.q2));
-            d = q36_f16_to_f32(copy.q2.d);
-            dmin = q36_f16_to_f32(copy.q2.dmin);
-            copy.q2.dmin = 0;
-            for (uint32_t i = 0; i < 16; i++)
-                min_dot += (copy.q2.scales[i] >> 4) * q[block].bsums[i];
-            src = (const uint8_t *)&copy.q2;
-        } else if (type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_Q5_K) {
+        union { q36_block_q4_k q4; q36_block_q5_k q5; } copy;
+        if (type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_Q5_K) {
             const uint8_t *scales;
             if (type == Q36_TENSOR_Q4_K) {
                 memcpy(&copy.q4, src, sizeof(copy.q4));
@@ -2661,22 +2951,24 @@ bool q36_quant_dot_q8_k(uint32_t type, const void *packed, const void *activatio
                 q36_get_scale_min_k4(i, scales, &scale, &min);
                 min_dot += min * (q[block].bsums[i * 2] + q[block].bsums[i * 2 + 1]);
             }
+            for (uint32_t i = 0; type == Q36_TENSOR_Q4_K && i < 4; i++) {
+                uint8_t scale, min0, min1;
+                q36_get_scale_min_k4(2 * i,scales,&scale,&min0);
+                q36_get_scale_min_k4(2 * i + 1,scales,&scale,&min1);
+                int sum = min0 * (q[block].bsums[4 * i] + q[block].bsums[4 * i + 1]) +
+                          min1 * (q[block].bsums[4 * i + 2] + q[block].bsums[4 * i + 3]);
+                minimum[i] = fmaf(-dmin * q[block].d,(float)sum,minimum[i]);
+            }
+            if (type == Q36_TENSOR_Q5_K)
+                minimum[0] = fmaf(-dmin * q[block].d,(float)min_dot,minimum[0]);
         } else if (type == Q36_TENSOR_Q3_K) {
             d = q36_f16_to_f32(((const q36_block_q3_k *)src)->d);
-        } else if (type == Q36_TENSOR_Q6_K) {
-            d = q36_f16_to_f32(((const q36_block_q6_k *)src)->d);
-        } else if (type == Q36_TENSOR_IQ1_M) {
-            const uint16_t *sc = (const uint16_t *)((const q36_block_iq1_m *)src)->scales;
-            uint16_t h = (sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) |
-                         ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000);
-            d = q36_f16_to_f32(h) * 0.125f;
         } else if (type != Q36_TENSOR_IQ4_NL) {
             uint16_t h;
             memcpy(&h, src, sizeof(h));
             d = q36_f16_to_f32(h);
             if (type == Q36_TENSOR_IQ2_XXS || type == Q36_TENSOR_IQ2_XS ||
-                type == Q36_TENSOR_IQ2_S || type == Q36_TENSOR_IQ1_S) d *= 0.125f;
-            else if (type == Q36_TENSOR_IQ3_XXS) d *= 0.25f;
+                type == Q36_TENSOR_IQ2_S) d *= 0.125f;
         }
         if (!q36_dequantize_row_from_ptr(type, src, weights, Q36_QK_K)) return false;
         if (type == Q36_TENSOR_IQ4_NL) {
@@ -2695,13 +2987,25 @@ bool q36_quant_dot_q8_k(uint32_t type, const void *packed, const void *activatio
             /* Fold the block scales after the integer dot, like the GGUF
              * reference kernels. Per-value float dequantization rounds twice. */
             float inverse = d ? (float)(1.0 / (double)d) : 0.0f;
-            int dot = 0;
-            for (uint32_t i = 0; i < Q36_QK_K; i++) {
-                float coefficient = weights[i] * inverse;
-                dot += (int)(coefficient + copysignf(0.5f, coefficient)) * q[block].qs[i];
+            int sums[8] = {0}, columns[32] = {0};
+            for (uint32_t i = 0; i < Q36_QK_K; i += 32) {
+                for (uint32_t j = 0; j < 32; j++) {
+                    float coefficient = weights[i + j] * inverse;
+                    int value = (int)(coefficient + copysignf(0.5f,coefficient));
+                    columns[j] += value * q[block].qs[i + j];
+                }
             }
-            acc += (d * q[block].d) * (float)dot - (dmin * q[block].d) * (float)min_dot;
+            for (uint32_t j = 0; j < 8; j++)
+                sums[j] = (columns[4 * j] + columns[4 * j + 1]) +
+                          (columns[4 * j + 2] + columns[4 * j + 3]);
+            float scale = d * q[block].d;
+            for (uint32_t j = 0; j < 8; j++) partial[j] = fmaf(scale,(float)sums[j],partial[j]);
         }
+    }
+    if (type != Q36_TENSOR_IQ4_NL) {
+        for (uint32_t j = 0; j < 4; j++) partial[j] += partial[j + 4];
+        acc = ((partial[0] + partial[2]) + (partial[1] + partial[3])) +
+              ((minimum[0] + minimum[2]) + (minimum[1] + minimum[3]));
     }
     *out = acc;
     return true;
@@ -2720,13 +3024,8 @@ static bool q36_tensor_row_dot_q8k_pair(uint32_t type,
 }
 
 static bool q36_tensor_row_dot_prequant(uint32_t type, const uint8_t *row, const uint8_t *xq, uint32_t n, float *out) {
-    float acc = 0.0f;
-    if (type == Q36_TENSOR_Q8_0) {
-        if (!row || !xq || !out || (n % Q36_QK8_0) != 0) return false;
-        acc = q36_quant_dot_q8_0(row, xq, (int)n);
-        *out = acc;
-        return true;
-    }
+    if (q36_tensor_type_supports_q8_0_dot(type))
+        return q36_quant_dot_q8_0_type(type,row,xq,n,out);
     return q36_quant_dot_q8_k(type, row, xq, n, out);
 }
 
@@ -2737,15 +3036,10 @@ static bool q36_tensor_row_dot_prequant_pair(uint32_t type,
                                              uint32_t n,
                                              float *out0,
                                              float *out1) {
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    if (type == Q36_TENSOR_Q8_0) {
+    if (q36_tensor_type_supports_q8_0_dot(type)) {
         if (!row0 || !row1 || !xq || !out0 || !out1 || (n % Q36_QK8_0) != 0) return false;
-        acc0 = q36_quant_dot_q8_0(row0, xq, (int)n);
-        acc1 = q36_quant_dot_q8_0(row1, xq, (int)n);
-        *out0 = acc0;
-        *out1 = acc1;
-        return true;
+        return q36_quant_dot_q8_0_type(type,row0,xq,n,out0) &&
+               q36_quant_dot_q8_0_type(type,row1,xq,n,out1);
     }
     return q36_tensor_row_dot_q8k_pair(type, row0, row1, xq, n, out0, out1);
 }
@@ -2789,7 +3083,7 @@ static uint32_t q36_activation_quant_row_bytes(q36_activation_quant_kind kind, u
 static bool q36_quantize_activation_row(q36_activation_quant_kind kind, const float *x, uint8_t *xq, uint32_t n) {
     if (kind == Q36_ACTIVATION_QUANT_NONE) return true;
     if (!x || !xq || !q36_activation_quant_valid_dim(kind, n)) return false;
-    if (kind == Q36_ACTIVATION_QUANT_Q8_0) q36_quant_q8_0(x, xq, (int64_t)n);
+    if (kind == Q36_ACTIVATION_QUANT_Q8_0) q36_quant_q8_0_activation(x, xq, (int64_t)n);
     else q36_quant_q8_k(x, xq, (int64_t)n);
     return true;
 }
@@ -2948,23 +3242,25 @@ static void q36_matmul_batch_worker(void *opaque, uint64_t row0, uint64_t row1) 
             const float *wr = (const float *)(m->map + ctx->t->abs_offset) + row * ctx->in_dim;
             for (uint32_t t = 0; t < ctx->n_tok; t++) {
                 const float *xr = ctx->x + (uint64_t)t * ctx->in_dim;
-                double acc = 0.0;
-                for (uint32_t i = 0; i < ctx->in_dim; i++) acc += (double)wr[i] * (double)xr[i];
-                ctx->out[(uint64_t)t * ctx->out_dim + row] = (float)acc * ctx->scale;
+                ctx->out[(uint64_t)t * ctx->out_dim + row] =
+                    q36_dot_f32_strided(wr,1,xr,ctx->in_dim) * ctx->scale;
             }
             break;
         }
-        case Q36_TENSOR_F16:
         case Q36_TENSOR_BF16: {
+            const uint16_t *wr = (const uint16_t *)(m->map + ctx->t->abs_offset) + row * ctx->in_dim;
+            for (uint32_t t = 0; t < ctx->n_tok; t++)
+                ctx->out[(uint64_t)t * ctx->out_dim + row] = q36_quant_dot_bf16(
+                    wr,ctx->x + (uint64_t)t * ctx->in_dim,ctx->in_dim) * ctx->scale;
+            break;
+        }
+        case Q36_TENSOR_F16: {
             const uint16_t *wr = (const uint16_t *)(m->map + ctx->t->abs_offset) + row * ctx->in_dim;
             for (uint32_t t = 0; t < ctx->n_tok; t++) {
                 const float *xr = ctx->x + (uint64_t)t * ctx->in_dim;
                 double acc = 0.0;
                 for (uint32_t i = 0; i < ctx->in_dim; i++) {
-                    float w = ctx->t->type == Q36_TENSOR_BF16 ?
-                        q36_bf16_to_f32(wr[i]) : q36_f16_to_f32(wr[i]);
-                    float x = ctx->t->type == Q36_TENSOR_BF16 ? q36_round_bf16(xr[i]) : xr[i];
-                    acc += (double)w * (double)x;
+                    acc += (double)q36_f16_to_f32(wr[i]) * (double)xr[i];
                 }
                 ctx->out[(uint64_t)t * ctx->out_dim + row] = (float)acc * ctx->scale;
             }
@@ -3083,9 +3379,7 @@ static void q36_vector_dot_batch_worker(void *opaque, uint64_t row0, uint64_t ro
     q36_vector_dot_batch_ctx *ctx = (q36_vector_dot_batch_ctx *)opaque;
     for (uint64_t row = row0; row < row1; row++) {
         const float *xr = ctx->x + row * ctx->n;
-        double acc = 0.0;
-        for (uint32_t i = 0; i < ctx->n; i++) acc += (double)ctx->w[i] * (double)xr[i];
-        ctx->out[row] = (float)acc;
+        ctx->out[row] = q36_dot_f32_strided(ctx->w,1,xr,ctx->n);
     }
 }
 
@@ -3125,7 +3419,7 @@ static void q36_swiglu_rows_worker(void *opaque, uint64_t row0, uint64_t row1) {
         const float *grow = ctx->gate + row * ctx->cols;
         const float *urow = ctx->up + row * ctx->cols;
         for (uint32_t i = 0; i < ctx->cols; i++)
-            orow[i] = grow[i] / (1.0f + expf(-grow[i])) * urow[i];
+            orow[i] = q36_siluf(grow[i]) * urow[i];
     }
 }
 
@@ -3797,6 +4091,7 @@ static void model_close(q36_model *m) {
     free(m->tensors);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
+    if (m->ngram_fd > 0) close(m->ngram_fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 }
@@ -3866,6 +4161,7 @@ static void model_open(q36_model *m, const char *path, bool graph_mapping) {
     uint32_t magic = 0;
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+    m->ngram_fd = -1;
     fd = open(path, O_RDONLY);
     if (fd == -1) q36_die_errno("cannot open model", path);
     if (fstat(fd, &st) == -1) q36_die_errno("cannot stat model", path);
@@ -5583,15 +5879,31 @@ static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
     double started = q36_now_sec();
     q36_prewarm_reader reader = { .e = e, .staged = 0 };
     pthread_t reader_thread;
-    bool threaded = e->model.fd >= 0 &&
+    int input_fd = -1;
+#ifndef Q36_METAL
+    if (e->variant == Q36_VARIANT_FLASH_NEXT &&
+        e->distributed.role == Q36_DISTRIBUTED_WORKER && getenv("Q36_RESIDENT_WEIGHT_FD"))
+        input_fd = atoi(getenv("Q36_RESIDENT_WEIGHT_FD"));
+#endif
+    bool threaded = input_fd < 0 && e->model.fd >= 0 &&
                     pthread_create(&reader_thread, NULL, q36_prewarm_reader_main, &reader) == 0;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const q36_tensor *t = &e->model.tensors[i];
         if (q36_vulkan_prewarm_skip_tensor(e, t)) continue;
-        if (q36_gpu_cache_model_range(e->model.map, e->model.size, t->abs_offset, t->bytes, NULL)) {
+        bool cached;
+#ifndef Q36_METAL
+        if (input_fd >= 0) cached = q36_gpu_cache_model_range_from_fd(
+            e->model.map,e->model.size,t->abs_offset,t->bytes,input_fd) != 0;
+        else
+#endif
+        cached = q36_gpu_cache_model_range(e->model.map,e->model.size,t->abs_offset,t->bytes,NULL) != 0;
+        if (cached) {
             resident_bytes += t->bytes;
             resident_tensors++;
-        } else complete = false;
+        } else {
+            complete = false;
+            if (input_fd >= 0) break;
+        }
         __atomic_add_fetch(&reader.staged, t->bytes, __ATOMIC_RELAXED);
     }
     if (threaded) {
@@ -5626,6 +5938,8 @@ static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
 }
 #endif
 
+#include "q36_qwen4_model.inc"
+
 static void config_validate_model(const q36_model *m) {
     char key[128];
     const char *prefix;
@@ -5635,6 +5949,10 @@ static void config_validate_model(const q36_model *m) {
     q36_str arch = required_string(m, "general.architecture");
     q36_str tok_model = required_string(m, "tokenizer.ggml.model");
     q36_str tok_pre = required_string(m, "tokenizer.ggml.pre");
+    if (q36_streq(arch, "qwen4exp")) {
+        q36_q4_config(m);
+        return;
+    }
     if (q36_streq(arch, Q36_SHAPE_35B_A3B.arch)) {
         g_q36_shape = Q36_SHAPE_35B_A3B;
     } else if (q36_streq(arch, Q36_SHAPE_27B.arch)) {
@@ -5724,8 +6042,9 @@ static void model_summary(const q36_model *m) {
     uint64_t params = 0;
     model_get_string(m, "general.name", &name);
     model_get_string(m, "general.architecture", &arch);
-    if (!model_get_u64_compat(m, "qwen35moe.context_length", &ctx_train))
-        model_get_u64_compat(m, "qwen35.context_length", &ctx_train);
+    char ctx_key[128];
+    snprintf(ctx_key,sizeof(ctx_key),"%s.context_length",g_q36_shape.arch);
+    model_get_u64_compat(m,ctx_key,&ctx_train);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
@@ -6642,8 +6961,8 @@ static void q36_apply_rope_axes(float *x, uint32_t head_dim,
             float s = sinf(theta[axis]);
             float x0 = x[pair];
             float x1 = x[pair + half];
-            x[pair] = x0 * c - x1 * s;
-            x[pair + half] = x0 * s + x1 * c;
+            x[pair] = fmaf(x0,c,-x1 * s);
+            x[pair + half] = fmaf(x0,s,x1 * c);
         }
         for (uint32_t i = 0; i < 4; i++) theta[i] *= theta_scale;
     }
@@ -6693,6 +7012,7 @@ static void q36_ssm_conv_apply(const float *window, const float *kernel, float *
     }
 }
 
+
 static void q36_delta_net_decode(float *state, const float *q, const float *k, const float *v,
                                  const float *g, const float *b, float *out) {
     for (uint32_t h = 0; h < Q36_N_SSM_DT_RANK; h++) {
@@ -6708,19 +7028,20 @@ static void q36_delta_net_decode(float *state, const float *q, const float *k, c
             for (uint32_t j = 0; j < Q36_N_SSM_STATE; j++) s[(uint64_t)i * Q36_N_SSM_STATE + j] *= decay;
         }
         for (uint32_t j = 0; j < Q36_N_SSM_STATE; j++) {
-            double acc = 0.0;
-            for (uint32_t i = 0; i < Q36_N_SSM_STATE; i++) acc += (double)s[(uint64_t)i * Q36_N_SSM_STATE + j] * (double)kh[i];
-            sk[j] = (float)acc;
+            sk[j] = q36_dot_f32_strided(s+j,Q36_N_SSM_STATE,kh,Q36_N_SSM_STATE);
             d[j] = (vh[j] - sk[j]) * beta;
         }
         for (uint32_t i = 0; i < Q36_N_SSM_STATE; i++) {
             float ki = kh[i];
-            for (uint32_t j = 0; j < Q36_N_SSM_STATE; j++) s[(uint64_t)i * Q36_N_SSM_STATE + j] += ki * d[j];
+            for (uint32_t j = 0; j < Q36_N_SSM_STATE; j++) {
+                float *value = s + (uint64_t)i * Q36_N_SSM_STATE + j;
+                *value = fmaf(ki,d[j],*value);
+            }
         }
+        float scale = 1.0f / sqrtf((float)Q36_N_SSM_STATE);
         for (uint32_t j = 0; j < Q36_N_SSM_STATE; j++) {
-            double acc = 0.0;
-            for (uint32_t i = 0; i < Q36_N_SSM_STATE; i++) acc += (double)s[(uint64_t)i * Q36_N_SSM_STATE + j] * (double)qh[i];
-            out[(uint64_t)h * Q36_N_SSM_STATE + j] = (float)(acc / sqrt((double)Q36_N_SSM_STATE));
+            float acc = q36_dot_f32_strided(s+j,Q36_N_SSM_STATE,qh,Q36_N_SSM_STATE);
+            out[(uint64_t)h * Q36_N_SSM_STATE + j] = acc * scale;
         }
     }
 }
@@ -6772,8 +7093,8 @@ static bool q36_forward_ffn(const q36_engine *e, const q36_layer_weights *l, con
     {
         double sum = 0.0;
         for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) sum += top_val[i];
-        if (sum < 6.103515625e-5) sum = 6.103515625e-5;
-        for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) top_w[i] = (float)((double)top_val[i] / sum) * e->expert_weights_scale;
+        float denom = fmaxf((float)sum,6.103515625e-5f);
+        for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) top_w[i] = (top_val[i] / denom) * e->expert_weights_scale;
     }
     memset(out, 0, (size_t)Q36_N_EMBD * sizeof(float));
     for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) {
@@ -6843,19 +7164,64 @@ static bool q36_forward_ffn(const q36_engine *e, const q36_layer_weights *l, con
         }
     }
     for (uint32_t j = 0; j < Q36_N_FF_SHARED; j++)
-        mid[j] = gate[j] / (1.0f + expf(-gate[j])) * up[j];
+        mid[j] = q36_siluf(gate[j]) * up[j];
     if (!q36_tensor_matvec(e, l->ffn_down_shexp, mid, gate, rowbuf, Q36_N_FF_SHARED, Q36_N_EMBD)) return false;
     q36_scale_inplace(gate, Q36_N_EMBD,
                       q36_tensor_scalar_or(&e->model, l->ffn_down_shexp_scale, 1.0f));
     if (!q36_tensor_get_plain(&e->model, l->ffn_gate_inp_shexp, rowbuf, Q36_N_EMBD)) return false;
-    {
-        double acc = 0.0;
-        for (uint32_t i = 0; i < Q36_N_EMBD; i++) acc += (double)rowbuf[i] * (double)inp[i];
-        up[0] = (float)acc;
-    }
+    up[0] = q36_dot_f32_strided(rowbuf,1,inp,Q36_N_EMBD);
     shared_gate = q36_sigmoidf(up[0]);
     for (uint32_t j = 0; j < Q36_N_EMBD; j++) out[j] += gate[j] * shared_gate;
     return true;
+}
+
+static float q36_kv_dot(const uint8_t *row, q36_kv_cache_type type,
+                           const float *x, uint32_t n) {
+    float sums[32] = {0}, lanes[8];
+    for (uint32_t i = 0; i < n; i++)
+        sums[i % 32] = fmaf(q36_kv_cache_at(row,type,i),x[i],sums[i % 32]);
+    for (uint32_t i = 0; i < 8; i++)
+        lanes[i] = (sums[i] + sums[i + 8]) + (sums[i + 16] + sums[i + 24]);
+    return q36_sum8(lanes);
+}
+
+/* Normalize the probabilities before the V product. Scaling the final
+ * weighted sum instead changes rounding at the next activation quantizer. */
+static void q36_full_attn_head(float *out, float *scores,
+                                const q36_full_attn_cache *cache,
+                                const float *q, const float *gate,
+                                uint32_t h, uint32_t pos, const float *sinks) {
+    uint32_t kvh = h / (Q36_N_HEAD / Q36_N_HEAD_KV);
+    uint32_t count = pos + 1 < cache->len ? pos + 1 : cache->len;
+    uint32_t kbytes = q36_kv_cache_row_bytes(cache->type_k,Q36_N_HEAD_DIM);
+    uint32_t vbytes = q36_kv_cache_row_bytes(cache->type_v,Q36_N_VALUE_DIM);
+    float scale = 1.0f / sqrtf((float)Q36_N_HEAD_DIM);
+    float max = sinks ? sinks[h] : -INFINITY;
+    for (uint32_t t = 0; t < count; t++) {
+        const uint8_t *k = cache->k + (uint64_t)t * cache->k_row_bytes + (uint64_t)kvh * kbytes;
+        scores[t] = q36_kv_dot(k,cache->type_k,q,Q36_N_HEAD_DIM) * scale;
+        if (scores[t] > max) max = scores[t];
+    }
+    double sum = 0;
+    for (uint32_t t = 0; t < count; t += 8) {
+        float lanes[8] = {0};
+        for (uint32_t j = 0; j < 8 && t + j < count; j++)
+            lanes[j] = scores[t + j] = q36_vector_expf(scores[t + j] - max);
+        sum += q36_sum8(lanes);
+    }
+    if (sinks) sum += expf(sinks[h] - max);
+    float inv = sum > 0 ? (float)(1.0 / sum) : 0;
+    for (uint32_t t = 0; t < count; t++) scores[t] *= inv;
+    for (uint32_t j = 0; j < Q36_N_VALUE_DIM; j++) {
+        float sums[32] = {0}, lanes[8];
+        for (uint32_t t = 0; t < count; t++) {
+            const uint8_t *v = cache->v + (uint64_t)t * cache->v_row_bytes + (uint64_t)kvh * vbytes;
+            sums[t % 32] = fmaf(q36_kv_cache_at(v,cache->type_v,j),scores[t],sums[t % 32]);
+        }
+        for (uint32_t i = 0; i < 8; i++)
+            lanes[i] = (sums[i] + sums[i + 8]) + (sums[i + 16] + sums[i + 24]);
+        out[j] = q36_sum8(lanes) * q36_sigmoidf(gate[j]);
+    }
 }
 
 static bool q36_forward_full_attn(const q36_engine *e, const q36_layer_weights *l, uint32_t il, uint32_t pos,
@@ -6904,35 +7270,11 @@ static bool q36_forward_full_attn(const q36_engine *e, const q36_layer_weights *
     }
     if (l->attn_sinks) have_sinks = q36_tensor_get_plain(&e->model, l->attn_sinks, sinks, Q36_N_HEAD);
     q36_full_attn_cache_store(cache, pos, k, v);
-    for (uint32_t h = 0; h < Q36_N_HEAD; h++) {
-        uint32_t kvh = h / (Q36_N_HEAD / Q36_N_HEAD_KV);
-        float *head_out = acc + (uint64_t)h * Q36_N_VALUE_DIM;
-        float max_score = have_sinks ? sinks[h] : -INFINITY;
-        double denom = 0.0;
-        memset(head_out, 0, (size_t)Q36_N_VALUE_DIM * sizeof(float));
-        for (uint32_t t = 0; t <= pos && t < cache->len; t++) {
-            const uint8_t *kc = cache->k + (uint64_t)t * cache->k_row_bytes + (uint64_t)kvh * q36_kv_cache_row_bytes(cache->type_k, Q36_N_HEAD_DIM);
-            double dot = 0.0;
-            for (uint32_t i = 0; i < Q36_N_HEAD_DIM; i++) dot += (double)q[(uint64_t)h * Q36_N_HEAD_DIM + i] * (double)q36_kv_cache_at(kc, cache->type_k, i);
-            rt->scores[t] = (float)(dot / sqrt((double)Q36_N_HEAD_DIM));
-            if (rt->scores[t] > max_score) max_score = rt->scores[t];
-        }
-        if (have_sinks) denom = exp((double)sinks[h] - (double)max_score);
-        for (uint32_t t = 0; t <= pos && t < cache->len; t++) {
-            const uint8_t *vc = cache->v + (uint64_t)t * cache->v_row_bytes + (uint64_t)kvh * q36_kv_cache_row_bytes(cache->type_v, Q36_N_VALUE_DIM);
-            float w = expf(rt->scores[t] - max_score);
-            denom += w;
-            for (uint32_t i = 0; i < Q36_N_VALUE_DIM; i++) head_out[i] += w * q36_kv_cache_at(vc, cache->type_v, i);
-        }
-        if (denom > 0.0) {
-            float inv = (float)(1.0 / denom);
-            for (uint32_t i = 0; i < Q36_N_VALUE_DIM; i++) head_out[i] *= inv;
-        }
-        for (uint32_t i = 0; i < Q36_N_VALUE_DIM; i++) {
-            uint64_t gate_off = (uint64_t)h * Q36_N_HEAD_DIM * 2u + Q36_N_HEAD_DIM + i;
-            head_out[i] *= q36_sigmoidf(qg[gate_off]);
-        }
-    }
+    for (uint32_t h = 0; h < Q36_N_HEAD; h++)
+        q36_full_attn_head(acc + (uint64_t)h * Q36_N_VALUE_DIM,rt->scores,cache,
+                           q + (uint64_t)h * Q36_N_HEAD_DIM,
+                           qg + (uint64_t)h * Q36_N_HEAD_DIM * 2u + Q36_N_HEAD_DIM,
+                           h,pos,have_sinks ? sinks : NULL);
     if (!q36_tensor_matvec(e, l->attn_output, acc, out, rt->work4, Q36_N_SSM_INNER, Q36_N_EMBD)) {
         fprintf(stderr, "q36: full_attn attn_output failed at layer=%u pos=%u\n", il, pos);
         return false;
@@ -7102,44 +7444,16 @@ static void q36_full_attn_k_rows_worker(void *opaque, uint64_t row0, uint64_t ro
 
 static void q36_full_attn_scores_worker(void *opaque, uint64_t row0, uint64_t row1) {
     q36_full_attn_scores_ctx *ctx = (q36_full_attn_scores_ctx *)opaque;
+    float *scores = xmalloc((size_t)ctx->cache->len * sizeof(float));
     for (uint64_t idx = row0; idx < row1; idx++) {
         uint32_t t = (uint32_t)(idx / Q36_N_HEAD);
         uint32_t h = (uint32_t)(idx % Q36_N_HEAD);
-        uint32_t kvh = h / (Q36_N_HEAD / Q36_N_HEAD_KV);
-        uint32_t pos = ctx->pos0 + t;
-        const float *qh = ctx->q + (uint64_t)t * Q36_N_HEAD * Q36_N_HEAD_DIM + (uint64_t)h * Q36_N_HEAD_DIM;
-        const float *gate = ctx->qg + (uint64_t)t * Q36_N_HEAD * Q36_N_HEAD_DIM * 2u + (uint64_t)h * Q36_N_HEAD_DIM * 2u + Q36_N_HEAD_DIM;
-        float *head_out = ctx->out + ((uint64_t)t * Q36_N_HEAD + h) * Q36_N_VALUE_DIM;
-        float max_score = ctx->have_sinks ? ctx->sinks[h] : -INFINITY;
-        double denom = 0.0;
-        memset(head_out, 0, (size_t)Q36_N_VALUE_DIM * sizeof(float));
-        for (uint32_t i = 0; i <= pos && i < ctx->cache->len; i++) {
-            const uint8_t *kc = ctx->cache->k + (uint64_t)i * ctx->cache->k_row_bytes + (uint64_t)kvh * q36_kv_cache_row_bytes(ctx->cache->type_k, Q36_N_HEAD_DIM);
-            double dot = 0.0;
-            for (uint32_t j = 0; j < Q36_N_HEAD_DIM; j++) dot += (double)qh[j] * (double)q36_kv_cache_at(kc, ctx->cache->type_k, j);
-            {
-                float score = (float)(dot / sqrt((double)Q36_N_HEAD_DIM));
-                if (score > max_score) max_score = score;
-            }
-        }
-        if (ctx->have_sinks) denom = exp((double)ctx->sinks[h] - (double)max_score);
-        for (uint32_t i = 0; i <= pos && i < ctx->cache->len; i++) {
-            const uint8_t *kc = ctx->cache->k + (uint64_t)i * ctx->cache->k_row_bytes + (uint64_t)kvh * q36_kv_cache_row_bytes(ctx->cache->type_k, Q36_N_HEAD_DIM);
-            const uint8_t *vc = ctx->cache->v + (uint64_t)i * ctx->cache->v_row_bytes + (uint64_t)kvh * q36_kv_cache_row_bytes(ctx->cache->type_v, Q36_N_VALUE_DIM);
-            double dot = 0.0;
-            for (uint32_t j = 0; j < Q36_N_HEAD_DIM; j++) dot += (double)qh[j] * (double)q36_kv_cache_at(kc, ctx->cache->type_k, j);
-            {
-                float w = expf((float)(dot / sqrt((double)Q36_N_HEAD_DIM)) - max_score);
-                denom += w;
-                for (uint32_t j = 0; j < Q36_N_VALUE_DIM; j++) head_out[j] += w * q36_kv_cache_at(vc, ctx->cache->type_v, j);
-            }
-        }
-        if (denom > 0.0) {
-            float inv = (float)(1.0 / denom);
-            for (uint32_t j = 0; j < Q36_N_VALUE_DIM; j++) head_out[j] *= inv;
-        }
-        for (uint32_t j = 0; j < Q36_N_VALUE_DIM; j++) head_out[j] *= q36_sigmoidf(gate[j]);
+        q36_full_attn_head(ctx->out + idx * Q36_N_VALUE_DIM,scores,ctx->cache,
+                           ctx->q + ((uint64_t)t * Q36_N_HEAD + h) * Q36_N_HEAD_DIM,
+                           ctx->qg + ((uint64_t)t * Q36_N_HEAD + h) * Q36_N_HEAD_DIM * 2u + Q36_N_HEAD_DIM,
+                           h,ctx->pos0 + t,ctx->have_sinks ? ctx->sinks : NULL);
     }
+    free(scores);
 }
 
 static void q36_ffn_routed_batch_worker(void *opaque, uint64_t row0, uint64_t row1) {
@@ -7162,8 +7476,8 @@ static void q36_ffn_routed_batch_worker(void *opaque, uint64_t row0, uint64_t ro
         {
             double sum = 0.0;
             for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) sum += top_val[i];
-            if (sum < 6.103515625e-5) sum = 6.103515625e-5;
-            for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) top_w[i] = (float)((double)top_val[i] / sum) * ctx->e->expert_weights_scale;
+            float denom = fmaxf((float)sum,6.103515625e-5f);
+            for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) top_w[i] = (top_val[i] / denom) * ctx->e->expert_weights_scale;
         }
         memset(out, 0, (size_t)Q36_N_EMBD * sizeof(float));
         for (uint32_t i = 0; i < Q36_N_EXPERT_USED; i++) {
@@ -7696,6 +8010,8 @@ static void q36_vulkan_rope_rows(void *opaque, uint64_t row0, uint64_t row1) {
     }
 }
 
+#include "q36_ssd_route.inc"
+
 static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
                                          const q36_model *m,
                                          const q36_layer_weights *l,
@@ -7705,7 +8021,8 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
                                          const q36_gpu_tensor *inp,
                                          q36_gpu_tensor *out,
                                          bool session_batch,
-                                         bool inp_q8_ready) {
+                                         bool inp_q8_ready,
+                                         q36_session *route_session) {
     q36_gpu_moe_weight gate;
     q36_gpu_moe_weight up;
     q36_gpu_moe_weight down;
@@ -7804,6 +8121,13 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
      * built and consumed on GPU. When it runs, the q8_K input staging is
      * only needed for k-quant shared-expert projections, which this model
      * does not have. */
+    if (route_session && n_tok == 1 && !session_batch && q36_route_enabled(route_session)) {
+        if (getenv("Q36_SSD_ROUTE_PROFILE")) {
+            const uint32_t *ids = q36_route_read(route_session,rt->ffn_selected,Q36_N_EXPERT_USED*4u);
+            if (ids) q36_route_observe(route_session,il,ids,Q36_N_EXPERT_USED);
+        }
+        q36_route_prefetch(route_session,il,inp,rt->next_hidden);
+    }
     bool routed_done =
         q36_gpu_moe_ffn_f32_tensor(out, m->map, m->size,
                                           &gate, &up, &down,
@@ -7933,7 +8257,7 @@ static bool q36_forward_ffn_vulkan(q36_session *s,
                                         inp,
                                         out,
                                         ((q36_vulkan_runtime *)s->runtime)->spec_verifying,
-                                        inp_q8_ready);
+                                        inp_q8_ready,s);
 }
 
 /* Token row t rotates at absolute position pos0 + t. Explicit positions
@@ -8924,7 +9248,7 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
         if (ok) {
             ok = q36_forward_ffn_vulkan_model(
                     rt, &e->model, l, e->expert_weights_scale, il,
-                    rows, rt->norm, rt->hidden, true, false);
+                    rows, rt->norm, rt->hidden, true, false, NULL);
         }
         if (ok) ok = q36_sessions_steering_vulkan(items, count, rt->hidden, il, false);
         if (ok) {
@@ -9304,7 +9628,7 @@ static bool q36_mtp_forward(q36_session *s, const int *tokens,
                                       n_tok,
                                       rt->norm,
                                       rt->next_hidden,
-                                      false, false)) return false;
+                                      false, false, NULL)) return false;
     if (!q36_gpu_add_tensor(rt->next_hidden, rt->hidden, rt->next_hidden, n_tok * Q36_N_EMBD)) return false;
     if (!q36_gpu_rms_norm_weight_rows_tensor(rt->norm,
                                              rt->next_hidden,
@@ -9375,7 +9699,10 @@ static bool q36_mtp_pick(q36_session *s, int excluded_id, int *token, float *mar
 
 #endif
 
+#include "q36_qwen4.inc"
+
 static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool compute_logits) {
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) return q36_q4_forward(s, token, pos, compute_logits);
     q36_engine *e;
     q36_cpu_runtime *rt;
     if (!s || !s->runtime) return false;
@@ -10754,6 +11081,65 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         e->vision_ready = true;
         fprintf(stderr, "q36: vision sidecar mapped from disk: %s\n", opt->vision_path);
     }
+    if (e->variant == Q36_VARIANT_FLASH_NEXT) {
+        const char *weight_fd = getenv("Q36_RESIDENT_WEIGHT_FD");
+        if (weight_fd) {
+            char *end;
+            long fd = strtol(weight_fd,&end,10);
+            if (!weight_fd[0] || *end || fd < 0 || fd > INT32_MAX ||
+                e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming ||
+                e->distributed.role != Q36_DISTRIBUTED_WORKER) {
+                fprintf(stderr,"q36: resident weight input requires a resident Vulkan worker and a valid fd\n");
+                q36_engine_close(e);
+                return 1;
+            }
+        } else if (strstr(opt->model_path,".q36-resident")) {
+            fprintf(stderr,"q36: worker metadata requires its resident weight stream\n");
+            q36_engine_close(e);
+            return 1;
+        }
+        if (e->backend == Q36_BACKEND_METAL || opt->mtp_path || opt->vision_path ||
+            opt->directional_steering_file) {
+            fprintf(stderr, "q36: Flash Next supports CPU/Vulkan text inference; MTP, vision and steering are unavailable\n");
+            q36_engine_close(e);
+            return 1;
+        }
+        if (q36_dist_enabled(&e->distributed) &&
+            ((e->layer_start == 0 && e->layer_end < 1) ||
+             (e->layer_start > 0 && e->layer_start <= 1))) {
+            fprintf(stderr,"q36: Flash Next PLE layer 1 must belong to the coordinator\n");
+            q36_engine_close(e);
+            return 1;
+        }
+        e->cpu_prefill_cap = 1;
+        vocab_load(&e->vocab, &e->model);
+        q36_q4_bind(&e->weights, &e->model);
+        if (e->layer_start == 0) q36_q4_open_ngrams(&e->model, opt->model_path);
+        e->routed_quant_bits = q36_quant_bits_from_type(e->weights.layer[0].ffn_gate_exps->type);
+        e->expert_weights_scale = 1.0f;
+        g_q36_q4_threads = e->n_threads;
+        g_q36_q4_streaming = e->ssd_streaming;
+        q36_cpu_threads_reserve(e->n_threads);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend == Q36_BACKEND_VULKAN && q36_dist_enabled(&e->distributed) &&
+            !e->ssd_streaming && (!q36_vulkan_set_model_spans(e) ||
+            !q36_vulkan_prewarm_weights(e) || !q36_gpu_finish_model_cache())) {
+            fprintf(stderr,"q36: unable to make assigned Flash Next weights resident\n");
+            q36_engine_close(e);
+            return 1;
+        }
+#endif
+        if (q36_dist_enabled(&e->distributed)) {
+            q36_dist_model_info info;
+            q36_engine_distributed_info(e,&info);
+            if (q36_dist_engine_open(&e->dist,e,&e->distributed,&info)) {
+                q36_engine_close(e);
+                return 1;
+            }
+        }
+        *out = e;
+        return 0;
+    }
     if (Q36_MODEL_DENSE && e->ssd_streaming) {
         fprintf(stderr, "q36: Qwen3.8 27B dense does not use expert SSD streaming\n");
         q36_engine_close(e);
@@ -10983,6 +11369,8 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
 
 void q36_engine_close(q36_engine *e) {
     if (!e) return;
+    q36_ssd_prefetch_free(e->route_reader);
+    e->route_reader = NULL;
     q36_dist_engine_close(e->dist);
 #ifndef Q36_NO_GPU
     q36_gpu_tensor_free(e->directional_steering_gpu);
@@ -11092,18 +11480,20 @@ int q36_engine_set_power(q36_engine *e, int power_percent) {
 }
 
 const char *q36_engine_model_name(q36_engine *e) {
+    if (e && e->variant == Q36_VARIANT_FLASH_NEXT) return "qwen3.8-flash-next";
     if (e && e->variant == Q36_VARIANT_27B) return "qwen3.8-27b";
     return "qwen3.6-35b-a3b";
 }
 
 int q36_engine_model_id(q36_engine *e) {
     /* Different dense weights must never restore each other's KV state. */
+    if (e && e->variant == Q36_VARIANT_FLASH_NEXT) return 5;
     if (e && e->variant == Q36_VARIANT_27B && e->gsq_rco) return 4;
     return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
 }
 
 bool q36_engine_is_qwen38(q36_engine *e) {
-    return e && e->variant == Q36_VARIANT_27B;
+    return e && (e->variant == Q36_VARIANT_27B || e->variant == Q36_VARIANT_FLASH_NEXT);
 }
 
 void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
@@ -11283,7 +11673,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0 || ctx_size > Q36_CONTEXT_ALLOC_MAX) return 1;
     uint64_t reserved = 0;
 #ifndef Q36_NO_GPU
-    if (!q36_streaming_reserve_session(e, ctx_size, &reserved)) {
+    if (e->variant != Q36_VARIANT_FLASH_NEXT && !q36_streaming_reserve_session(e, ctx_size, &reserved)) {
         fprintf(stderr, "q36: requested context leaves insufficient SSD streaming memory\n");
         return 1;
     }
@@ -11299,7 +11689,16 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     memset(s->logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->logits));
     s->logits_host_valid = true;
     s->gpu_top2_valid = false;
-    if (q36_engine_uses_vulkan_runtime(e)) {
+    if (e->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_q4_state *rt = xcalloc(1, sizeof(*rt));
+        q36_q4_state_init(rt, ctx_size < 256 ? (uint32_t)ctx_size : 256);
+        s->runtime = rt;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend == Q36_BACKEND_VULKAN && !q36_q4_gpu_init(rt,e)) {
+            q36_q4_state_free(rt); free(rt); free(s->logits); free(s->sample_probs); free(s); return 1;
+        }
+#endif
+    } else if (q36_engine_uses_vulkan_runtime(e)) {
 #ifdef Q36_NO_GPU
         s->runtime = NULL;
 #else
@@ -11343,15 +11742,24 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
 
 void q36_session_free(q36_session *s) {
     if (!s) return;
+    if (s->route_total && getenv("Q36_SSD_ROUTE_PROFILE"))
+        fprintf(stderr,"q36: SSD route prediction total=%" PRIu64 " top4_hits=%" PRIu64
+                " active_hits=%" PRIu64 " hint_bytes=%" PRIu64 "\n",
+                s->route_total,s->route_top4_hits,s->route_active_hits,s->route_hint_bytes);
     q36_dist_session_free(s->dist);
 #ifndef Q36_NO_GPU
+    q36_gpu_tensor_free(s->route_stage);
+    q36_gpu_tensor_free(s->route_input);
     if (s->engine->distributed.role == Q36_DISTRIBUTED_WORKER &&
         getenv("Q36_VK_MEMORY_REPORT")) q36_gpu_print_memory_report("pipeline worker");
 #endif
     s->engine->session_bytes -= s->reserved_context_bytes;
     s->engine->live_sessions--;
     q36_tokens_free(&s->checkpoint);
-    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_q4_state_free(s->runtime);
+        free(s->runtime);
+    } else if (q36_engine_uses_vulkan_runtime(s->engine)) {
 #ifndef Q36_NO_GPU
         q36_vulkan_runtime_free((q36_vulkan_runtime *)s->runtime);
 #endif
@@ -11378,6 +11786,7 @@ int q36_session_power(q36_session *s) {
 static bool q36_session_reserve_kv(q36_session *s, uint32_t need,
                                    uint32_t rows) {
     if (!s || need > (uint32_t)s->ctx_size) return false;
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) return q36_q4_reserve(s->runtime, need);
 #ifdef Q36_NO_GPU
     (void)rows;
 #endif
@@ -11483,6 +11892,19 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
         if (s->cancel && s->cancel(s->cancel_ud)) {
             if (err && errlen) snprintf(err, errlen, "interrupted");
             return Q36_SESSION_SYNC_INTERRUPTED;
+        }
+        if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+            if (!q36_q4_reserve(s->runtime, (uint32_t)i + 1) ||
+                !q36_q4_forward(s, prompt->v[i], (uint32_t)i, i + 1 == prompt->len)) {
+                if (err && errlen) snprintf(err, errlen, "Flash Next prefill failed at token %d", i);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            q36_tokens_push(&s->checkpoint, prompt->v[i++]);
+            s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+            if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_chunk", i, prompt->len);
+            continue;
         }
         int n = prompt->len - i;
         bool compute_logits;
@@ -11770,6 +12192,15 @@ static bool q36_session_ensure_logits_host(q36_session *s) {
     if (!s || !s->logits) return false;
     if (s->logits_host_valid) return true;
 #ifndef Q36_NO_GPU
+#if !defined(Q36_METAL)
+    if (s->engine->variant==Q36_VARIANT_FLASH_NEXT && s->engine->backend==Q36_BACKEND_VULKAN) {
+        q36_q4_state *st=s->runtime;
+        q36_q4_gpu *g=st ? st->gpu : NULL;
+        if (!g || !q36_gpu_tensor_read(g->v[Q4_LOGITS],0,s->logits,Q36_N_VOCAB*sizeof(float))) return false;
+        s->logits_host_valid=q36_all_finite(s->logits,Q36_N_VOCAB);
+        return s->logits_host_valid;
+    }
+#endif
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
         q36_vulkan_runtime *rt = (q36_vulkan_runtime *)s->runtime;
         if (rt && q36_gpu_tensor_read(
@@ -12435,12 +12866,30 @@ const float *q36_session_logits(q36_session *s, int *n_vocab) {
 
 static void q36_session_reset_runtime(q36_session *s) {
     if (!s) return;
+    q36_ssd_prefetch_submit(s->engine->route_reader,NULL,0);
+    s->route_pending = false;
     s->slice_pos = 0;
     s->slice_spec_active = false;
     s->slice_spec_n = 0;
     s->logits_host_valid = false;
     s->gpu_top2_valid = false;
-    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_q4_state *rt = s->runtime;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        const char *reuse=getenv("Q36_VK_FLASH_RESET_REUSE");
+        if (s->engine->backend==Q36_BACKEND_VULKAN && (!reuse || strcmp(reuse,"0"))) {
+            if (!q36_q4_gpu_reset(rt)) q36_die("cannot reset Flash Next Vulkan state");
+            return;
+        }
+#endif
+        uint32_t cap = rt->cap;
+        q36_q4_state_free(rt);
+        q36_q4_state_init(rt, cap);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (s->engine->backend == Q36_BACKEND_VULKAN && !q36_q4_gpu_init(rt,s->engine))
+            q36_die("cannot reset Flash Next Vulkan state");
+#endif
+    } else if (q36_engine_uses_vulkan_runtime(s->engine)) {
 #ifndef Q36_NO_GPU
         (void)q36_vulkan_runtime_reset((q36_vulkan_runtime *)s->runtime);
 #endif
@@ -12686,7 +13135,7 @@ static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
 uint64_t q36_session_payload_bytes(q36_session *s) {
     if (!s || s->vision_state) return 0;
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    if (s->dist)
+    if (s->dist || s->engine->variant == Q36_VARIANT_FLASH_NEXT)
         return sizeof(q36_payload_header) + (uint64_t)rows * sizeof(int32_t);
     bool typed = s->engine &&
         (s->engine->cache_type_k != Q36_KV_CACHE_F16 ||
@@ -12816,8 +13265,8 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         return 1;
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    /* Partial pipeline KV requires token replay. */
-    if (s->dist) {
+    /* Replay restores PLE history as well as recurrent and attention state. */
+    if (s->dist || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_payload_header h = {Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_TOKEN_ONLY, rows};
         return q36_payload_write_bytes(fp, &h, sizeof(h), err, errlen) ||
                q36_payload_write_bytes(fp, s->checkpoint.v,
@@ -12974,6 +13423,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     if (s->dist) {
         q36_payload_set_err(err, errlen, "pipeline restore requires a token-only checkpoint");
+        return 1;
+    }
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_payload_set_err(err,errlen,"Flash Next requires a token replay checkpoint");
         return 1;
     }
     if (version != Q36_PAYLOAD_VERSION && version != Q36_PAYLOAD_VERSION_TYPED_KV && version != Q36_PAYLOAD_VERSION_MTP) {
@@ -13244,6 +13697,7 @@ void q36_engine_distributed_info(q36_engine *e, q36_dist_model_info *info) {
     memset(info, 0, sizeof(*info));
     info->n_layers = Q36_N_LAYER;
     info->n_embd = Q36_N_EMBD;
+    info->n_hidden = Q36_N_EMBD * (e->variant == Q36_VARIANT_FLASH_NEXT ? 4u : 1u);
     info->n_vocab = Q36_N_VOCAB;
     info->layer_start = e->layer_start;
     info->layer_end = e->layer_end;
@@ -13253,7 +13707,14 @@ void q36_engine_distributed_info(q36_engine *e, q36_dist_model_info *info) {
 #endif
     info->context_size = e->context_size;
     info->mtp = e->mtp_ready;
-    info->speculation = e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming;
+    info->speculation = e->variant != Q36_VARIANT_FLASH_NEXT &&
+                        e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming;
+    if (e->variant == Q36_VARIANT_FLASH_NEXT) {
+        info->prefill_cap=1;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        info->prefill_cap=q36_q4_gpu_prefill_cap(e);
+#endif
+    }
     info->fingerprint = hash_bytes(e->model.map, e->model.tensor_data_pos);
     /* Metadata identifies the layout; bounded samples also distinguish weights
      * with identical names and quantization, without paging in the whole model. */
@@ -13298,6 +13759,34 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
     for (uint32_t i = 0; i < n_tokens; i++)
         if (tokens[i] < 0 || tokens[i] >= (int)Q36_N_VOCAB) goto fail;
     if (!q36_session_reserve_kv(s, pos0 + n_tokens, pos0)) goto fail;
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        if (s->slice_spec_active) goto fail;
+        q36_engine *e = s->engine;
+        q36_q4_state *st = s->runtime;
+        bool ok;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend == Q36_BACKEND_VULKAN) {
+            if (n_tokens > q36_q4_gpu_prefill_cap(e)) goto fail;
+            q36_q4_gpu *g=st->gpu;
+            const char *setting=getenv("Q36_VK_FLASH_SUBMIT");
+            uint32_t limit=g && g->resident ? (setting ? (uint32_t)atoi(setting) : n_tokens>1 ? 128u : 32u) : 32;
+            uint32_t previous=q36_gpu_submit_limit(limit);
+            ok = q36_q4_gpu_forward_batch(s,tokens,n_tokens,pos0,output_logits,
+                                          layer_start,layer_end,input_hidden,output_hidden);
+            q36_gpu_submit_limit(previous);
+            if (ok && output_logits) memcpy(logits,s->logits,Q36_N_VOCAB*sizeof(float));
+        } else
+#endif
+        {
+            if (n_tokens != 1) goto fail;
+            ok = q36_q4_forward_slice_token(&e->model,&e->weights,st,tokens[0],pos0,
+                layer_start,layer_end,input_hidden,output_logits ? logits : NULL,output_hidden,
+                layer_end+1 == Q36_N_LAYER ? st->last_h : NULL,NULL);
+        }
+        if (!ok) goto fail;
+        s->slice_pos+=n_tokens;
+        return 0;
+    }
     bool ok = false;
 #ifndef Q36_NO_GPU
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
@@ -13335,6 +13824,20 @@ int q36_session_read_final_hidden(q36_session *s, uint32_t n_tokens,
         float *hidden, char *err, size_t errlen) {
     if (!s || !s->runtime || !hidden || !n_tokens ||
         s->engine->layer_end + 1u != Q36_N_LAYER) goto fail;
+    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_q4_state *st = s->runtime;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (s->engine->backend == Q36_BACKEND_VULKAN) {
+            q36_q4_gpu *g = st->gpu;
+            if (!q36_gpu_tensor_read(g->v[Q4_X],0,hidden,Q36_N_EMBD*sizeof(float))) goto fail;
+        } else
+#endif
+        {
+            if (n_tokens != 1) goto fail;
+            memcpy(hidden,st->last_h,Q36_N_EMBD*sizeof(float));
+        }
+        return 0;
+    }
 #ifndef Q36_NO_GPU
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
         q36_vulkan_runtime *rt = s->runtime;
@@ -13362,6 +13865,33 @@ int q36_session_project_logits(q36_session *s, const float *hidden,
         float *logits, char *err, size_t errlen) {
     if (!s || !s->runtime || !hidden || (!logits && !s->slice_spec_active)) goto fail;
     q36_engine *e = s->engine;
+    if (e->variant == Q36_VARIANT_FLASH_NEXT) {
+        if (!logits) goto fail;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend == Q36_BACKEND_VULKAN) {
+            const q36_model *m = &e->model;
+            q36_q4_gpu *g = ((q36_q4_state *)s->runtime)->gpu;
+            s->logits_host_valid=false;
+            s->gpu_top2_valid=false;
+            if (!q36_gpu_tensor_write(g->v[Q4_X],0,hidden,Q36_N_EMBD*sizeof(float)) ||
+                !q36_q4_gpu_mm(g,m,e->weights.output,0,Q36_N_VOCAB,g->v[Q4_LOGITS],g->v[Q4_X])) goto fail;
+            if (logits==s->logits && q36_gpu_top2_tensor(g->v[Q4_GATE],g->v[Q4_LOGITS],Q36_N_VOCAB)) {
+                int32_t ids[2];
+                if (!q36_gpu_tensor_read(g->v[Q4_GATE],0,ids,sizeof(ids))) goto fail;
+                s->gpu_top2[0]=ids[0]; s->gpu_top2[1]=ids[1];
+                s->gpu_top2_valid=ids[0]>=0 && ids[1]>=0;
+                if (s->gpu_top2_valid) return 0;
+            }
+            if (!q36_gpu_tensor_read(g->v[Q4_LOGITS],0,logits,Q36_N_VOCAB*sizeof(float))) goto fail;
+        } else
+#endif
+        q36_q4_output(&e->model,&e->weights,hidden,logits);
+        memcpy(s->logits,logits,Q36_N_VOCAB*sizeof(float));
+        s->logits_host_valid = q36_all_finite(logits,Q36_N_VOCAB);
+        s->gpu_top2_valid = false;
+        if (!s->logits_host_valid) goto fail;
+        return 0;
+    }
 #ifndef Q36_NO_GPU
     if (q36_engine_uses_vulkan_runtime(e)) {
         q36_vulkan_runtime *rt = s->runtime;
@@ -13391,8 +13921,11 @@ fail:
 
 int q36_session_read_final_rows(q36_session *s, uint32_t count,
         float *hidden, char *err, size_t errlen) {
+    if (s && s->engine->variant == Q36_VARIANT_FLASH_NEXT && count == 1)
+        return q36_session_read_final_hidden(s,1,hidden,err,errlen);
 #ifndef Q36_NO_GPU
-    if (s && hidden && count && q36_engine_uses_vulkan_runtime(s->engine) &&
+    if (s && s->engine->variant != Q36_VARIANT_FLASH_NEXT && hidden && count &&
+        q36_engine_uses_vulkan_runtime(s->engine) &&
         s->engine->layer_end + 1u == Q36_N_LAYER) {
         q36_vulkan_runtime *rt = s->runtime;
         uint64_t bytes = (uint64_t)count * Q36_N_EMBD * sizeof(float);
@@ -13427,7 +13960,8 @@ int q36_session_pipeline_mtp_catchup(q36_session *s, const int *tokens,
 
 int q36_session_pipeline_spec_begin(q36_session *s, char *err, size_t errlen) {
 #ifndef Q36_NO_GPU
-    if (!s || s->slice_spec_active || s->engine->backend != Q36_BACKEND_VULKAN ||
+    if (!s || s->engine->variant == Q36_VARIANT_FLASH_NEXT ||
+        s->slice_spec_active || s->engine->backend != Q36_BACKEND_VULKAN ||
         s->engine->ssd_streaming) goto fail;
     q36_vulkan_runtime *rt = s->runtime;
     for (uint32_t il = s->engine->layer_start; il <= s->engine->layer_end; il++) {
@@ -13457,7 +13991,8 @@ fail:
 int q36_session_pipeline_spec_commit(q36_session *s, uint32_t count,
         char *err, size_t errlen) {
 #ifndef Q36_NO_GPU
-    if (!s || !s->slice_spec_active || !count || count > s->slice_spec_n) goto fail;
+    if (!s || s->engine->variant == Q36_VARIANT_FLASH_NEXT ||
+        !s->slice_spec_active || !count || count > s->slice_spec_n) goto fail;
     if (count < s->slice_spec_n && !q36_vulkan_replay_recurrent(s, count)) goto fail;
     s->slice_pos = s->slice_spec_pos + count;
     s->slice_spec_active = false;
@@ -13476,7 +14011,7 @@ fail:
 int q36_session_pipeline_project(q36_session *s, const float *hidden,
         int excluded, int *top, char *err, size_t errlen) {
 #ifndef Q36_NO_GPU
-    if (s && s->slice_spec_active && top &&
+    if (s && s->engine->variant != Q36_VARIANT_FLASH_NEXT && s->slice_spec_active && top &&
         !q36_session_project_logits(s, hidden, NULL, err, errlen)) {
         q36_vulkan_runtime *rt = s->runtime;
         uint64_t bytes = (uint64_t)Q36_N_VOCAB * sizeof(float);
@@ -13500,8 +14035,17 @@ fail:
 
 int q36_session_pipeline_read_logits(q36_session *s, float *logits,
         char *err, size_t errlen) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (s && logits && s->engine->variant==Q36_VARIANT_FLASH_NEXT &&
+        s->engine->backend==Q36_BACKEND_VULKAN && !q36_session_ensure_logits_host(s)) goto fail;
+#endif
+    if (s && s->engine->variant == Q36_VARIANT_FLASH_NEXT && logits && s->logits_host_valid) {
+        if (logits != s->logits) memcpy(logits,s->logits,Q36_N_VOCAB*sizeof(float));
+        return 0;
+    }
 #ifndef Q36_NO_GPU
-    if (s && q36_engine_uses_vulkan_runtime(s->engine) && logits) {
+    if (s && s->engine->variant != Q36_VARIANT_FLASH_NEXT &&
+        q36_engine_uses_vulkan_runtime(s->engine) && logits) {
         q36_vulkan_runtime *rt = s->runtime;
         uint64_t bytes = (uint64_t)Q36_N_VOCAB * sizeof(float);
         bool gpu_top = q36_gpu_top2_tensor(rt->top2, rt->logits, Q36_N_VOCAB);

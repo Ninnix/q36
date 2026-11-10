@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define DIST_MAGIC UINT32_C(0x51333644)
-#define DIST_VERSION 3u
+#define DIST_VERSION 4u
 #define DIST_MAX_FRAME (64u * 1024u * 1024u)
 #define DIST_HELLO 1u
 #define DIST_ERROR 2u
@@ -58,6 +58,12 @@ typedef struct dist_worker_session {
     q36_session *session;
     struct dist_worker_session *next;
 } dist_worker_session;
+
+/* HC models exchange the complete residual stream; the vocabulary head
+ * still consumes one embedding-width row returned by the output mixer. */
+static uint32_t dist_hidden_width(const q36_dist_model_info *info) {
+    return info->n_hidden ? info->n_hidden : info->n_embd;
+}
 
 static int dist_error(char *err, size_t len, const char *fmt, ...) {
     if (err && len) {
@@ -211,7 +217,7 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
     uint32_t words[] = {DIST_VERSION, i->n_layers, i->n_embd, i->n_vocab,
         i->layer_start, i->layer_end, i->context_size, i->prefill_cap,
         (uint32_t)(i->fingerprint >> 32), (uint32_t)i->fingerprint,
-        i->speculation, i->mtp};
+        i->speculation, i->mtp, dist_hidden_width(i)};
     uint8_t hello[sizeof(words)];
     for (size_t k = 0; k < sizeof(words)/sizeof(*words); k++) dist_put(hello + 4*k, words[k]);
     if (dist_send(fd, DIST_HELLO, hello, sizeof(hello), owner)) {
@@ -238,12 +244,12 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
         dist_error(err, errlen, "invalid pipeline hello");
         goto done;
     }
-    uint32_t peer[12];
-    for (int k = 0; k < 12; k++) peer[k] = dist_get(data + 4*k);
+    uint32_t peer[13];
+    for (int k = 0; k < 13; k++) peer[k] = dist_get(data + 4*k);
     if (peer[0] != DIST_VERSION || peer[1] != i->n_layers || peer[2] != i->n_embd ||
         peer[3] != i->n_vocab || peer[8] != words[8] || peer[9] != words[9] ||
         !peer[6] || peer[6] > Q36_CONTEXT_ALLOC_MAX || !peer[7] || peer[7] > 8192 ||
-        peer[10] > 1u || peer[11] > 1u) {
+        peer[10] > 1u || peer[11] > 1u || peer[12] != words[12]) {
         dist_error(err, errlen, "pipeline model, protocol, context or batch mismatch");
         goto done;
     }
@@ -259,7 +265,7 @@ static int dist_hello(q36_dist_engine *d, int fd, q36_session *owner,
     }
     d->peer = (q36_dist_model_info){.n_layers=peer[1], .n_embd=peer[2],
         .n_vocab=peer[3], .layer_start=peer[4], .layer_end=peer[5],
-        .context_size=peer[6], .prefill_cap=peer[7], .speculation=peer[10], .mtp=peer[11]};
+        .context_size=peer[6], .prefill_cap=peer[7], .speculation=peer[10], .mtp=peer[11], .n_hidden=peer[12]};
     rc = 0;
 done:
     free(data);
@@ -451,14 +457,14 @@ static int dist_eval_span_body(q36_dist_session *s, q36_session *owner,
     if (cap > count) cap = count;
     if (cap > d->peer.prefill_cap) cap = d->peer.prefill_cap;
     if (d->opt.prefill_chunk && cap > d->opt.prefill_chunk) cap = d->opt.prefill_chunk;
-    uint32_t frame_cap = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    uint32_t frame_cap = (DIST_MAX_FRAME - 16u) / ((1u + dist_hidden_width(&d->info)) * 4u);
     if (cap > frame_cap) cap = frame_cap;
     uint32_t local_cap = prepared ? count : cap;
     uint32_t window = d->opt.prefill_window ? d->opt.prefill_window : 2;
-    uint64_t max_bytes = 16u + (uint64_t)cap * (1u + d->info.n_embd) * 4u;
+    uint64_t max_bytes = 16u + (uint64_t)cap * (1u + dist_hidden_width(&d->info)) * 4u;
     if (max_bytes > DIST_MAX_FRAME) return dist_error(err, errlen, "pipeline chunk exceeds frame limit");
     uint8_t *data = malloc((size_t)max_bytes);
-    float *hidden = prepared ? prepared->input : malloc((size_t)local_cap * d->info.n_embd * sizeof(float));
+    float *hidden = prepared ? prepared->input : malloc((size_t)local_cap * dist_hidden_width(&d->info) * sizeof(float));
     if (!data || !hidden) {
         free(data);
         if (!prepared) free(hidden);
@@ -504,13 +510,13 @@ static int dist_eval_span_body(q36_dist_session *s, q36_session *owner,
             if (verify) flags |= DIST_SPEC | (i == 0 ? DIST_BEGIN : 0);
             dist_put(data + 12, flags);
             for (uint32_t j = 0; j < n; j++) dist_put(data + 16u + 4u*j, (uint32_t)tokens[i+j]);
-            uint64_t values = (uint64_t)n * d->info.n_embd;
+            uint64_t values = (uint64_t)n * dist_hidden_width(&d->info);
             for (uint64_t j = 0; j < values; j++) {
                 uint32_t bits;
-                memcpy(&bits, hidden + (uint64_t)(i - local_start) * d->info.n_embd + j, 4);
+                memcpy(&bits, hidden + (uint64_t)(i - local_start) * dist_hidden_width(&d->info) + j, 4);
                 dist_put(data + 16u + 4u*n + 4u*j, bits);
             }
-            uint32_t bytes = 16u + n * (1u + d->info.n_embd) * 4u;
+            uint32_t bytes = 16u + n * (1u + dist_hidden_width(&d->info)) * 4u;
             if (d->info.mtp && head != tail) {
                 /* Large target-row replies must drain while the next frame
                  * is sent, including when the link has small TCP buffers. */
@@ -594,9 +600,9 @@ static int dist_prefill_span(q36_dist_session *s, q36_session *owner,
     q36_dist_engine *d = s->engine;
     uint32_t wire = d->peer.prefill_cap;
     if (d->opt.prefill_chunk && wire > d->opt.prefill_chunk) wire = d->opt.prefill_chunk;
-    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + dist_hidden_width(&d->info)) * 4u);
     if (wire > frame) wire = frame;
-    uint64_t bytes = (uint64_t)cap * d->info.n_embd * sizeof(float);
+    uint64_t bytes = (uint64_t)cap * dist_hidden_width(&d->info) * sizeof(float);
     float *current = malloc(bytes), *next = malloc(bytes);
     float *target = malloc(d->info.mtp ? bytes : (uint64_t)d->info.n_embd * sizeof(float));
     dist_prefill job = {.session=s, .target=target};
@@ -686,7 +692,7 @@ static int dist_eval_span(q36_dist_session *s, q36_session *owner,
     q36_dist_engine *d = s->engine;
     uint32_t cap = d->info.prefill_cap, wire = d->peer.prefill_cap;
     if (d->opt.prefill_chunk && wire > d->opt.prefill_chunk) wire = d->opt.prefill_chunk;
-    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + d->info.n_embd) * 4u);
+    uint32_t frame = (DIST_MAX_FRAME - 16u) / ((1u + dist_hidden_width(&d->info)) * 4u);
     if (wire > frame) wire = frame;
     if (!verify && count > cap && cap > wire)
         return dist_prefill_span(s, owner, tokens, count, pos0, cap, progress, logits, err, errlen);
@@ -846,7 +852,7 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
             }
         } else if (type == DIST_WORK && bytes >= 16 && s) {
             uint32_t pos = dist_get(data + 4), n = dist_get(data + 8), flags = dist_get(data + 12);
-            uint64_t expected = 16u + (uint64_t)n * (1u + d->info.n_embd) * 4u;
+            uint64_t expected = 16u + (uint64_t)n * (1u + dist_hidden_width(&d->info)) * 4u;
             if (!n || n > d->info.prefill_cap || expected != bytes ||
                 pos > s->ctx || n > s->ctx - pos ||
                 flags & ~(DIST_RESET | DIST_LOGITS | DIST_ROWS | DIST_SPEC | DIST_BEGIN) ||
@@ -858,13 +864,13 @@ static int dist_worker_loop(q36_dist_engine *d, int fd, char *err, size_t errlen
                 (s->spec && !(flags & DIST_SPEC))) rc = dist_error(err, errlen, "invalid pipeline work shape");
             else {
                 int *tokens = malloc((size_t)n * sizeof(int));
-                float *hidden = malloc((size_t)n * d->info.n_embd * sizeof(float));
+                float *hidden = malloc((size_t)n * dist_hidden_width(&d->info) * sizeof(float));
                 uint32_t returned = flags & DIST_ROWS ? n : flags & DIST_LOGITS ? 1u : 0u;
                 float *result = returned ? malloc((size_t)returned * d->info.n_embd * sizeof(float)) : NULL;
                 if (!tokens || !hidden || (returned && !result)) rc = dist_error(err, errlen, "worker allocation failed");
                 else {
                     for (uint32_t j = 0; j < n; j++) tokens[j] = (int)dist_get(data + 16u + 4u*j);
-                    for (uint64_t j = 0; j < (uint64_t)n * d->info.n_embd; j++) {
+                    for (uint64_t j = 0; j < (uint64_t)n * dist_hidden_width(&d->info); j++) {
                         uint32_t bits = dist_get(data + 16u + 4u*n + 4u*j);
                         memcpy(hidden + j, &bits, 4);
                     }

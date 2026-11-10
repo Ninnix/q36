@@ -52,6 +52,12 @@ void main(void) {
     uint elem0 = lid * 4u;
     uint xbase = (tok * pc.in_dim) + block * QK_K;
     uint out_base = (tok * pc.blocks + block) * Q8K_WORDS;
+#ifdef Q36_STRIDED
+    xbase = tok * 16384u + block * QK_K;
+    out_base = tok * 16384u + block * Q8K_WORDS;
+#elif defined(Q36_INPUT_STRIDED)
+    xbase = tok * 16384u + block * QK_K;
+#endif
     float best_abs = 0.0f;
     float best_val = 0.0f;
     uint best_idx = elem0;

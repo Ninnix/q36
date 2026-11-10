@@ -179,11 +179,13 @@ kernel void q36_delta_qkv(
         sq_q = fma(qv, qv, sq_q);
         sq_k = fma(kv, kv, sq_k);
     }
-    float qs = 1.0f / max(sqrt(simd_sum(sq_q)), args.eps);
-    float ks = 1.0f / max(sqrt(simd_sum(sq_k)), args.eps);
+    float n = float(args.dim);
+    float qs = 1.0f / sqrt(simd_sum(sq_q) / n + args.eps / n);
+    float ks = 1.0f / sqrt(simd_sum(sq_k) / n + args.eps / n);
+    float scale = 1.0f / sqrt(n);
     for (uint i = lane; i < args.dim; i += 32u) {
-        qout[ob + i] = conv[cb + (ulong)g * args.dim + i] * qs;
-        kout[ob + i] = conv[cb + (ulong)(args.groups + g) * args.dim + i] * ks;
+        qout[ob + i] = (conv[cb + (ulong)g * args.dim + i] * qs) * scale;
+        kout[ob + i] = (conv[cb + (ulong)(args.groups + g) * args.dim + i] * ks) * scale;
         if (write_v)
             vout[ob + i] = conv[cb + (ulong)2u * args.groups * args.dim +
                                       (ulong)head * args.dim + i];
@@ -191,6 +193,11 @@ kernel void q36_delta_qkv(
 }
 
 struct q36_delta_gate_args { uint heads; uint tokens; };
+
+inline float q36_log1p(float x) {
+    volatile float u = 1.0f + x;
+    return u == 1.0f ? x : log(u) * (x / (u - 1.0f));
+}
 
 kernel void q36_delta_gates(
         device float *out [[buffer(0)]],
@@ -204,7 +211,7 @@ kernel void q36_delta_gates(
     ulong src = (ulong)gid.y * args.heads + gid.x;
     ulong dst = (ulong)gid.y * args.heads * 2u + gid.x;
     float z = alpha[src] + dt[gid.x];
-    float softplus = z > 20.0f ? z : log(1.0f + exp(z));
+    float softplus = z > 20.0f ? z : q36_log1p(exp(z));
     out[dst] = exp(softplus * acoef[gid.x]);
     float b = beta[src];
     out[dst + args.heads] = b >= 0.0f

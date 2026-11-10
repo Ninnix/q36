@@ -1,0 +1,101 @@
+#version 460
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint FORMAT = 0xffffffffu;
+layout(binding = 0) readonly buffer W { uint wb[]; };
+layout(binding = 1) readonly buffer X { float x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(binding = 3) readonly buffer Tables { uint tables[]; };
+layout(push_constant) uniform Push { uint width, rows, row_bytes, type, out_offset; } pc;
+shared double sums[64];
+shared float partial[32];
+uint u8(uint p) { return (wb[p / 4] >> (8 * (p % 4))) & 255u; }
+uint u16(uint p) { return u8(p) | (u8(p + 1) << 8); }
+uint u32(uint p) { return u16(p) | (u16(p + 2) << 16); }
+float h(uint p) { return unpackHalf2x16(u16(p)).x; }
+int i8(uint p) { return int(u8(p) ^ 128u) - 128; }
+uint tab8(uint p) { return (tables[p / 4] >> (8 * (p % 4))) & 255u; }
+const int iq4[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+float value(uint row, uint i) {
+    uint b = row * pc.row_bytes;
+    uint t = FORMAT == 0xffffffffu ? pc.type : FORMAT;
+    if (t == 0) return uintBitsToFloat(u32(b + 4 * i));
+    if (t == 1) return h(b + 2 * i);
+    if (t == 30) return uintBitsToFloat(u16(b + 2 * i) << 16);
+    if (t == 8) { b += (i / 32) * 34; return h(b) * float(i8(b + 2 + i % 32)); }
+    if (t == 42) { b += (i / 64) * 18; i %= 64; return h(b) * float(int((u8(b + 2 + i / 4) >> (2 * (i % 4))) & 3u) - 1); }
+    if (t == 20) { b += (i / 32) * 18; i %= 32; return h(b) * float(iq4[(u8(b + 2 + i % 16) >> (i >= 16 ? 4 : 0)) & 15u]); }
+    if (t == 23) {
+        b += (i / 256) * 136; i %= 256;
+        uint s = i / 32;
+        int scale = int(((u8(b + 4 + s / 2) >> (4 * (s % 2))) & 15u) | (((u16(b + 2) >> (2 * s)) & 3u) << 4)) - 32;
+        uint q = (u8(b + 8 + s * 16 + i % 16) >> (i % 32 >= 16 ? 4 : 0)) & 15u;
+        return h(b) * float(scale) * float(iq4[q]);
+    }
+    if (t == 16 || t == 22) {
+        b += (i / 256) * (t == 16 ? 66 : 82); i %= 256;
+        uint group = i / 32, lane = (i % 32) / 8, sub = i % 8;
+        uint entry, signs;
+        float d;
+        uint table;
+        if (t == 16) {
+            uint packed = u32(b + 6 + 8 * group);
+            entry = u8(b + 2 + 8 * group + lane);
+            signs = tab8(2048 + ((packed >> (7 * lane)) & 127u));
+            table = 0;
+            d = h(b) * (0.5 + float(packed >> 28)) * 0.25;
+        } else {
+            entry = u8(b + 2 + 4 * group + lane) | ((u8(b + 66 + group) << (8 - 2 * lane)) & 768u);
+            signs = u8(b + 34 + 4 * group + lane);
+            uint sc = u8(b + 74 + group);
+            d = h(b) * (0.5 + float(lane < 2 ? sc & 15u : sc >> 4)) * 0.25;
+            table = 544;
+        }
+        uint grid = (tables[table + entry * 2 + sub / 4] >> (8 * (sub % 4))) & 255u;
+        return d * float(grid) * ((signs & (1u << sub)) != 0 ? -1.0 : 1.0);
+    }
+    if (t == 12 || t == 13) {
+        b += (i / 256) * (t == 12 ? 144 : 176); i %= 256;
+        uint g = i / 32, j = i % 32;
+        uint sc, mn;
+        if (g < 4) { sc = u8(b + 4 + g) & 63u; mn = u8(b + 8 + g) & 63u; }
+        else { sc = (u8(b + 8 + g) & 15u) | ((u8(b + g) >> 6) << 4); mn = (u8(b + 8 + g) >> 4) | ((u8(b + 4 + g) >> 6) << 4); }
+        uint q = (u8(b + (t == 12 ? 16 : 48) + (g / 2) * 32 + j) >> (4 * (g % 2))) & 15u;
+        if (t == 13) q |= ((u8(b + 16 + j) >> g) & 1u) << 4;
+        return h(b) * float(sc) * float(q) - h(b + 2) * float(mn);
+    }
+    if (t == 14) {
+        b += (i / 256) * 210; i %= 256;
+        uint half_id = i / 128, pos = i % 128, j = pos % 32, sel = pos / 32;
+        uint low = (u8(b + half_id * 64 + (sel % 2) * 32 + j) >> (sel < 2 ? 0 : 4)) & 15u;
+        uint high = (u8(b + 128 + half_id * 32 + j) >> (2 * sel)) & 3u;
+        return h(b + 208) * float(i8(b + 192 + i / 16)) * float(int(low | (high << 4)) - 32);
+    }
+    return 0.0 / 0.0;
+}
+void main() {
+    uint row = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    uint input_base = 0, output_base = pc.out_offset;
+#ifdef Q36_BATCH
+    input_base = gl_WorkGroupID.y * pc.width;
+    output_base += gl_WorkGroupID.y * pc.rows;
+#endif
+    if (row >= pc.rows) return;
+    if ((FORMAT == 0xffffffffu ? pc.type : FORMAT) == 30 && pc.width % 32 == 0) {
+        float v = 0;
+        if (lane < 32) for (uint i = lane; i < pc.width; i += 32) v += value(row,i) * x[input_base+i];
+        if (lane < 32) partial[lane] = v;
+        barrier();
+        if (lane < 8) partial[lane] = (partial[lane]+partial[lane+16])+(partial[lane+8]+partial[lane+24]);
+        barrier();
+        if (lane < 4) partial[lane] += partial[lane+4];
+        barrier();
+        if (lane == 0) y[output_base+row] = (partial[0]+partial[2])+(partial[1]+partial[3]);
+        return;
+    }
+    double sum = 0;
+    for (uint i = lane; i < pc.width; i += 64) sum += double(value(row, i)) * double(x[input_base+i]);
+    sums[lane] = sum;
+    barrier();
+    for (uint n = 32; n > 0; n /= 2) { if (lane < n) sums[lane] += sums[lane + n]; barrier(); }
+    if (lane == 0) y[output_base + row] = float(sums[0]);
+}

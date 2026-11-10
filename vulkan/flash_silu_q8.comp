@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#include "reference_math.glsl"
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Gate { float gate[]; };
+layout(binding = 1) readonly buffer Up { float up[]; };
+layout(binding = 2) writeonly buffer Output { uint packed[]; };
+layout(push_constant) uniform Push { uint width; } p;
+void main() {
+    uint index=gl_LocalInvocationID.x, lane=index&31u;
+    uint block=gl_WorkGroupID.x*2+index/32, row=gl_WorkGroupID.y;
+    uint i=block*32+lane, base=row*16384;
+    float v=i<p.width ? q36_silu(gate[base+i])*up[base+i] : 0;
+    float maximum=abs(v);
+    for (uint j=16; j>0; j/=2) maximum=max(maximum,subgroupShuffleXor(maximum,j));
+    float inv=0, scale=0;
+    if (lane==0 && maximum!=0) { inv=q36_div(127.0,maximum); scale=q36_div(maximum,127.0); }
+    uint first=gl_SubgroupInvocationID&~31u;
+    inv=subgroupShuffle(inv,first); scale=subgroupShuffle(scale,first);
+    int q=int(clamp(roundEven(v*inv),-128,127));
+    if (i<p.width && lane==0) packed[base+block*9]=q36_half(scale);
+    uint word=0;
+    for (uint j=0; j<4; j++) {
+        int value=subgroupShuffle(q,first+(lane&7u)*4+j);
+        word|=(uint(value)&255u)<<(j*8);
+    }
+    if (block<p.width/32 && lane<8) packed[base+block*9+1+lane]=word;
+}

@@ -40,7 +40,7 @@ void main(void) {
     uint tok = gl_WorkGroupID.y;
     uint row = tok * pc.n_head + head;
     float input_value = k[row * pc.src_stride + lid];
-    sh_sum[lid] = double(input_value) * double(input_value);
+    sh_sum[lid] = double(input_value * input_value);
     barrier();
     for (uint s = 128u; s > 0u; s >>= 1u) {
         if (lid < s) sh_sum[lid] += sh_sum[lid + s];

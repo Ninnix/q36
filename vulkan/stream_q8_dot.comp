@@ -1,0 +1,77 @@
+#version 460
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#ifndef Q36_ROWS
+#define Q36_ROWS 2
+#endif
+#ifndef Q36_BLOCK_LANES
+#define Q36_BLOCK_LANES 32
+#endif
+#ifndef Q36_MAX_BLOCKS
+#define Q36_MAX_BLOCKS 96
+#endif
+layout(local_size_x = Q36_ROWS*Q36_BLOCK_LANES) in;
+layout(constant_id = 0) const uint FORMAT = 20;
+layout(binding = 0) readonly buffer W { uint w[]; };
+layout(binding = 1) readonly buffer X { uint x[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push { uint width, rows, row_bytes, type, out_offset; } pc;
+shared float dots[Q36_ROWS*Q36_MAX_BLOCKS], scales[Q36_ROWS*Q36_MAX_BLOCKS];
+#ifdef Q36_ROUTED
+layout(binding = 3) readonly buffer Selected { uint selected[]; };
+uint route_token, route_rank, route_expert;
+void init_route(void) {
+    route_token=gl_WorkGroupID.z; route_rank=gl_WorkGroupID.y;
+    route_expert=selected[route_token*16384u+route_rank];
+}
+#endif
+const int values[16] = int[16](-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+
+uint byte_at(uint off) {
+#ifdef Q36_ROUTED
+    off += route_expert*pc.rows*pc.row_bytes;
+#endif
+    return (w[off/4] >> ((off&3)*8)) & 255u; }
+float half_at(uint off) { return unpackHalf2x16(byte_at(off) | (byte_at(off+1)<<8)).x; }
+uint word_at(uint off) {
+    return byte_at(off) | (byte_at(off+1)<<8) | (byte_at(off+2)<<16) | (byte_at(off+3)<<24);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x % Q36_BLOCK_LANES, local_row = gl_LocalInvocationID.x/Q36_BLOCK_LANES;
+    uint row = gl_WorkGroupID.x*Q36_ROWS + local_row, blocks = pc.width/32;
+    uint input_base = 0, output_base = pc.out_offset;
+#ifdef Q36_ROUTED
+    init_route();
+    input_base=route_token*16384u+route_rank*blocks*9u;
+    output_base=route_token*32768u+route_rank*pc.rows;
+#endif
+#ifdef Q36_BATCH
+    input_base = gl_WorkGroupID.y * blocks * 9u;
+    output_base += gl_WorkGroupID.y * pc.rows;
+#endif
+    if (row < pc.rows) for (uint b = lane; b < blocks; b += Q36_BLOCK_LANES) {
+        uint base = row*pc.row_bytes + b*(FORMAT == 8 ? 34 : 18);
+        int acc = 0;
+        for (uint j = 0; j < 8; j++) {
+            uint packed = 0;
+            if (FORMAT == 8) packed = word_at(base+2+j*4);
+            else for (uint k = 0; k < 4; k++) {
+                uint i = j*4+k;
+                uint code = (byte_at(base+2+i%16) >> (i < 16 ? 0 : 4)) & 15u;
+                packed |= (uint(values[code])&255u) << (k*8);
+            }
+            acc += dotPacked4x8EXT(int(packed),int(x[input_base+b*9+1+j]));
+        }
+        float dx = unpackHalf2x16(x[input_base+b*9]).x, dw = half_at(base);
+        dots[local_row*Q36_MAX_BLOCKS+b] = FORMAT == 8 ? float(acc) : dx*float(acc);
+        scales[local_row*Q36_MAX_BLOCKS+b] = FORMAT == 8 ? dw*dx : dw;
+    }
+    barrier();
+    if (lane == 0 && row < pc.rows) {
+        float sum = 0;
+        for (uint b = 0; b < blocks; b++)
+            sum = fma(scales[local_row*Q36_MAX_BLOCKS+b],dots[local_row*Q36_MAX_BLOCKS+b],sum);
+        y[output_base+row] = sum;
+    }
+}
