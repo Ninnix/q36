@@ -4,8 +4,8 @@
 
 ## Build and run
 
-Use an Apple Silicon M1 or newer Mac with macOS 11 or newer. Install Xcode or
-the Command Line Tools for the SDK and Metal framework:
+Use an Apple Silicon M1 or newer Mac with macOS 11 or newer. Install Apple's
+command-line developer tools if needed:
 
 ```sh
 xcode-select --install
@@ -19,72 +19,130 @@ make metal
 ./q36 --metal
 ```
 
-The build produces the same CLI, agent, server, benchmark, and evaluator as
-Vulkan. Shader sources compile through Metal at runtime; a separate offline
-`metal` invocation is unnecessary. Run commands from the repository root so
-the runtime can find `metal/*.metal`.
+The build produces the CLI, server, agent, benchmark, and evaluator. Metal
+shaders compile at runtime. Run from the project tree and include `metal/`
+with binary packages. Building another runtime overwrites the same executable
+names; use separate worktrees to keep several builds.
 
 ## Memory
 
-On a 16 GB Mac, start with the resident Qwen3.6 Q2 model and leave memory for
-the context and runtime buffers. On an 8 GB Mac, start with a bounded expert
-cache and a smaller context:
+| Memory | Starting point |
+| --- | --- |
+| 8 GB | Qwen3.6 Q2 with SSD streaming and a smaller context |
+| 16 GB | Resident Qwen3.6 Q2; leave room for context and the OS |
+
+For an 8 GB Mac, start with the automatic cache budget:
+
+```sh
+./q36 --metal --ssd-streaming --ctx 4096
+```
+
+To reserve more memory for the OS or context, request a smaller expert cache:
 
 ```sh
 ./q36 --metal --ssd-streaming --ssd-streaming-cache-experts 512 --ctx 4096
 ```
 
-The cache size is additional to non-routed weights, context, and scratch.
-See [SSD streaming](SSD_STREAMING.md#metal-cache) before increasing it.
-Dense Qwen3.8 requires resident weights; use the supported smaller quant when
-memory is tight, and check the startup estimate.
+A plain number requests expert slots; a value such as `1GB` requests a byte
+budget. Both are capped to leave room for non-routed weights, context, and
+scratch. Automatic sizing uses the device's `recommendedMaxWorkingSetSize`.
+The startup report shows the effective allocation.
 
-## Device and compatibility policy
+The cache holds routed experts in bounded shared Metal buffers. Mixed expert
+sizes share padded slots; crossing into Q4 layers does not reset the cache.
+Preloading reads real weights, and full-resident prefix layers consume their
+actual bytes. These controls manage Metal allocations rather than relying on
+macOS paging. See [SSD streaming](SSD_STREAMING.md) for the cache policy.
 
-A normal local Metal process uses `MTLCreateSystemDefaultDevice`.
-Apple Silicon exposes its unified GPU as one logical Metal device, so Q36 does
-not require or expose a device list for M1, M2, M3, M4, or later families.
-The [two-stage pipeline](DISTRIBUTED.md) is validated on CPU/Vulkan; multi-Mac
-Metal pipelines have not been validated. The usual Metal configuration owns one
-default local Metal device and one model. Run only one large model process at a
-time when validating memory and performance.
+Dense Qwen3.8-27B weights must fit resident. Flash Next and vision execution
+are unavailable on Metal. Multi-Mac inference has not been validated.
 
-The Metal binary targets macOS 11. Newer facilities are optional:
+## Server and agent
 
-* macOS 15 residency sets and `MTLMathMode` are selected only after runtime
-  availability checks.
-* Older releases use the same shared/no-copy buffers and baseline Metal
-  kernels without residency sets.
-* Host code defaults to the Apple M1 instruction baseline, so a binary built
-  on a newer Mac remains usable on M1. Use
-  `NATIVE_CPU_FLAG=-mcpu=native make metal` only for a local-only build.
-* Routed MoE prefill follows DS4's expert-major batch-MM dispatch and selects
-  the map specialization for the model's actual routed-expert count. If the
-  shape, pipeline, thread count, or threadgroup memory is unsupported, Metal
-  automatically uses the exact matvec path. `Q36_METAL_MOE_MM=0` forces that
-  fallback for diagnostics.
-* Cache auto-sizing uses the device's `recommendedMaxWorkingSetSize`, not a
-  hard-coded machine-memory percentage.
-* All model buffers use unified storage; no discrete-GPU transfer or eGPU
-  placement path is provided.
+Start the HTTP server:
 
-The minimum deployment target proves link compatibility, not every driver and
-GPU generation. Release QA must still run on a physical M1 with the oldest
-supported macOS, a representative newer Mac, a 16 GB resident configuration,
-and a physical 8 GB SSD-streaming configuration.
+```sh
+./q36-server --metal --ctx 32768
+```
 
-Metal shaders are compiled at runtime from `metal/*.metal`. Run the CLI,
-server, benchmark, and evaluation harness from the Q36 project tree, and ship
-the `metal` directory with binary packages. A frontend that changes working
-directory before model startup must provide absolute paths through
-`Q36_METAL_DENSE_SOURCE`, `Q36_METAL_MOE_SOURCE`,
-`Q36_METAL_NORM_SOURCE`, `Q36_METAL_OPS_SOURCE`,
-`Q36_METAL_RECURRENT_SOURCE`, `Q36_METAL_KV_SOURCE`, and
-`Q36_METAL_ATTN_SOURCE`.
+On an 8 GB Mac:
 
-## Next steps
+```sh
+./q36-server --metal --ssd-streaming --ssd-streaming-cache-experts 512 --ctx 4096
+```
 
-- [Models and vision](MODELS.md): vision execution currently requires Vulkan.
-- [Batched serving](SERVER.md#multiple-sessions).
-- [Measurements and benchmark commands](PERFORMANCE.md).
-- [Metal regression and release checks](TESTING.md).
+The API and client setup are described in [Server](SERVER.md),
+[Clients](CLIENTS.md), and [UI](UI.md).
+
+The native agent runs without an HTTP server:
+
+```sh
+./q36-agent --metal --chdir /path/to/project
+```
+
+For SSD streaming:
+
+```sh
+./q36-agent --metal --ssd-streaming --ssd-streaming-cache-experts 512
+```
+
+See [agent sessions](AGENT.md) for context defaults, tools, and saved sessions.
+
+## Benchmarking and evaluation
+
+Measure prefill and generation at successive context frontiers:
+
+```sh
+./q36-bench --metal --prompt-file tests/long_context_story_prompt.txt
+```
+
+Run the capability evaluation through SSD streaming:
+
+```sh
+./q36-eval --metal --ssd-streaming --trace /tmp/q36-eval-metal-ssd.txt
+```
+
+See [benchmarking](PERFORMANCE.md) for measurement rules and
+[evaluation](TESTING.md#capability-evaluation) for the suites and controls.
+
+## Regression checks
+
+```sh
+make test-metal
+make test-metal-model
+make test-server-live-metal
+make test-server-batching-metal
+```
+
+The first target covers model-free tests and isolated GPU kernels. The others
+need the release GGUF. The [release QA guide](../QA_BEFORE_RELEASES.md) also
+covers SSD streaming, release builds, and physical 8 GB and M1 checks.
+
+The build uses an M1 instruction baseline and a macOS 11 deployment target.
+Newer residency and math APIs are selected only after runtime availability
+checks. A successful build does not replace testing on the oldest supported
+hardware and OS.
+
+## Recorded measurements
+
+The following single-process measurements used the default q2 GGUF fully
+resident and the mixed q2-q4 GGUF with SSD streaming on a 16 GB M2 Pro with
+macOS 26.5. The SSD run used the automatic 4240-expert (6.99 GiB) cache. Both
+runs used [the story fixture](../tests/long_context_story_prompt.txt),
+incremental prefill at doubling context frontiers, greedy decoding with 128
+generated tokens per frontier, and Q8_0 K / Q4_0 V cache:
+
+| Runtime | Quant | Expert residency | Prompt | Prefill | Generation |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Metal | q2 | Full model resident | 2048 ctx | 448.75 t/s | 37.78 t/s |
+| Metal | q2 | Full model resident | 4096 ctx | 366.19 t/s | 34.93 t/s |
+| Metal | q2 | Full model resident | 8192 ctx | 270.02 t/s | 31.08 t/s |
+| Metal | q2 | Full model resident | 16384 ctx | 177.21 t/s | 25.64 t/s |
+| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 4096 ctx | 58.74 t/s | 8.97 t/s |
+| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 8192 ctx | 55.32 t/s | 9.20 t/s |
+
+![M2 Pro Metal Q2 t/s](../speed-bench/metal_q2_ts.svg)
+
+These numbers show the expected capacity tradeoff, not a cross-machine
+performance promise. Metal generation, prefill, and SSD behavior should be
+remeasured on the oldest and smallest supported Mac before a release.

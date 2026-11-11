@@ -5,18 +5,12 @@
 ## Start locally
 
 ```sh
-./q36-server --vulkan --ctx 32768
+./q36-server --ctx 32768
 ```
 
-On Apple Silicon, use `--metal`. The default address is
-`http://127.0.0.1:8000`. Use `--host` and `--port` to change it; pass `-m FILE`
-to select a supported GGUF. Run from the repository root.
-
-An 8 GB Mac needs a smaller context and bounded MoE expert cache:
-
-```sh
-./q36-server --metal --ssd-streaming --ssd-streaming-cache-experts 512 --ctx 4096
-```
+The default address is `http://127.0.0.1:8000`. Use `--host` and `--port`
+to change it; pass `-m FILE` to select a supported GGUF. Run from the
+repository root. For Apple Silicon and smaller Macs, see [Metal](METAL.md#server-and-agent).
 
 ## APIs
 

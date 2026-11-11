@@ -17,11 +17,11 @@ change how QuarkStar is built.
 Start the server:
 
 ```sh
-./q36-server --vulkan --ctx 32768
+./q36-server --ctx 32768
 ```
 
-On Apple Silicon, use `--metal` instead of `--vulkan`. The default address
-is `http://127.0.0.1:8000`.
+The default address is `http://127.0.0.1:8000`. For Apple Silicon, see
+[Metal server setup](METAL.md#server-and-agent).
 
 - OpenAI clients use base URL `http://127.0.0.1:8000/v1` and the
   `/v1/chat/completions` endpoint.

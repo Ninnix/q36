@@ -7,12 +7,16 @@ keeps the transcript and live model state together, shows prefill progress,
 and uses Qwen's native tagged tool format. Built-in tools cover files,
 search, shell commands, processes, and the web.
 
-Start the agent in the current directory, another project, or one-shot mode:
+Start the agent in your project:
 
 ```sh
-./q36-agent
 ./q36-agent --chdir /path/to/project
-./q36-agent -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf --mtp --chdir /path/to/project
+```
+
+Omit `--chdir` to work in the current directory. Use `-m FILE` to choose
+another [supported model](MODELS.md). For a single task:
+
+```sh
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
 
@@ -48,14 +52,9 @@ Resident Metal and Vulkan both use Q8_0 keys with Q4_0 values and default to a
 100000-token agent context. The backend's automatic resident GPU prefill width
 resolves to 1024 tokens. Compact Metal attention scratch keeps this faster
 chunk width practical at long contexts. CPU uses F16 KV. SSD-streamed model
-weights also default to a 100000-token context with F16 KV:
-
-```sh
-./q36-agent --metal
-./q36-agent --metal --ssd-streaming --ssd-streaming-cache-experts 512
-```
-
+weights also default to a 100000-token context with F16 KV.
 Explicit `--ctx`, `-ctk`, and `-ctv` values override the preset.
+See [Metal](METAL.md#server-and-agent) for Apple Silicon examples.
 
 `q36-agent --chdir` loads its model and runtime assets from the launch directory,
 then changes to the requested project for agent tools. Built-in path tools also

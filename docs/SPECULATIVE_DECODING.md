@@ -32,7 +32,7 @@ down experts use Q4_K, projections and shared experts use Q8_0, and
 routers/norms remain F32. Enable it with:
 
 ```sh
-./q36 -m gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf --mtp --temp 0 --nothink \
+./q36 --mtp --temp 0 \
   -p "Write a C function that reverses a linked list."
 ```
 
@@ -41,9 +41,8 @@ routers/norms remain F32. Enable it with:
 For greedy Vulkan generation with the dense embedded head:
 
 ```sh
-model=gguf/Qwen3.8-27B-UD-IQ3_S.gguf
-./q36 -m "$model" --mtp \
-  --temp 0 --nothink -p "Write a C function that reverses a linked list."
+./q36 -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf --mtp --temp 0 \
+  -p "Write a C function that reverses a linked list."
 ```
 
 The verifier uses up to eight tokens per pass. Draft rejection restores the
@@ -69,7 +68,7 @@ mixes and SSD streaming retain scalar verification.
 Opportunistic sampling is the default with `--mtp` at a positive temperature:
 
 ```sh
-./q36 -m "$model" --mtp --temp 1 --seed 42 --nothink \
+./q36 -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf --mtp --temp 1 \
   -p "Write a C function that reverses a linked list."
 ```
 
