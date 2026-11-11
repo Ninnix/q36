@@ -36,6 +36,7 @@ static bool test_is_cpu_only_build(void) {
 static q36_engine *test_engine;
 static const char *test_model_override;
 static const char *test_case_override;
+static q36_dist_options test_parity_distributed;
 
 static void test_skip(const char *name, const char *reason) {
     fprintf(stderr, "%s: SKIP (%s)\n", name, reason);
@@ -813,6 +814,8 @@ static q36_engine *test_open_backend_engine(const char *model_path,
         .backend = backend,
         .n_threads = threads,
     };
+    if (backend == Q36_BACKEND_VULKAN)
+        opt.distributed = test_parity_distributed;
     /* Keep the streaming override for checking the same Vulkan path against
      * a captured CPU trajectory on machines that cannot use residency. */
     if (backend == Q36_BACKEND_VULKAN && stream && stream[0] && atoi(stream)) {
@@ -2594,7 +2597,7 @@ done:
 
 static void test_vulkan_delta_verify(void) {
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
-    enum { heads = 2, dim = 128, width = heads * dim, tokens = 8,
+    enum { heads = 2, dim = 128, width = heads * dim, tokens = 128,
            state_count = heads * dim * dim };
     float input[3][tokens * width], gates[tokens * heads * 2];
     union { float f[state_count]; uint16_t h[state_count]; } initial;
@@ -2608,7 +2611,7 @@ static void test_vulkan_delta_verify(void) {
     for (unsigned t = 0; t < tokens; t++)
         for (unsigned h = 0; h < heads; h++) {
             gates[2 * t * heads + h] = 0.93f + h * 0.02f;
-            gates[(2 * t + 1) * heads + h] = 0.61f - t * 0.03f;
+            gates[(2 * t + 1) * heads + h] = 0.61f - (t % 8u) * 0.03f;
         }
     for (unsigned i = 0; i < 4; i++) {
         uint64_t bytes = i == 3 ? sizeof(gates) : sizeof(input[0]);
@@ -2634,7 +2637,7 @@ static void test_vulkan_delta_verify(void) {
         TEST_ASSERT(source);
         if (!source) goto done;
         TEST_ASSERT(q36_gpu_tensor_write(source, 0, &initial, state_bytes));
-        for (unsigned n = 1; n <= tokens; n++) {
+        for (unsigned n = 1; n <= tokens; n = n < 8 ? n+1 : n == 8 ? 32 : n == 32 ? 128 : tokens+1) {
             for (unsigned i = 0; i < 2; i++)
                 TEST_ASSERT(q36_gpu_tensor_write(state[i], 0, &initial, state_bytes));
             q36_gpu_set_micro_batch(false);
@@ -2649,10 +2652,12 @@ static void test_vulkan_delta_verify(void) {
                     row[2], row[3], row[4], heads, dim, 1));
                 for (unsigned i = 0; i < 5; i++) q36_gpu_tensor_free(row[i]);
             }
-            q36_gpu_set_micro_batch(true);
+            q36_gpu_set_dense_prefill_exact(n > 8u);
+            q36_gpu_set_micro_batch(n <= 8u);
             TEST_ASSERT(q36_gpu_delta_net_decode_tensor(state[1], x[0], x[1], x[2],
                 x[3], out[1], heads, dim, n));
             q36_gpu_set_micro_batch(false);
+            q36_gpu_set_dense_prefill_exact(false);
             TEST_ASSERT(q36_gpu_tensor_read(state[0], 0, a, state_bytes));
             TEST_ASSERT(q36_gpu_tensor_read(state[1], 0, b, state_bytes));
             TEST_ASSERT(memcmp(a, b, state_bytes) == 0);
@@ -2660,6 +2665,7 @@ static void test_vulkan_delta_verify(void) {
             TEST_ASSERT(q36_gpu_tensor_read(out[0], 0, a, out_bytes));
             TEST_ASSERT(q36_gpu_tensor_read(out[1], 0, b, out_bytes));
             TEST_ASSERT(memcmp(a, b, out_bytes) == 0);
+            if (n > 8u) continue;
             /* The spare destination contains unrelated speculative state. */
             for (unsigned fallback = 0; fallback < (n == 1 ? 2u : 1u); fallback++) {
                 memset(b, 0, state_bytes);
@@ -3464,12 +3470,12 @@ cleanup:
     free(want);
 }
 
-static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
-                                  uint32_t out_dim, uint32_t in_dim) {
+static void test_vulkan_small_dims_mode(uint32_t type, uint32_t block_bytes,
+                                  uint32_t out_dim, uint32_t in_dim, bool exact_prefill) {
     /* Nine tokens select the large tile as an independent oracle. Odd block
      * counts and row counts cross alignment and every small tile boundary.
      * Q8 uses padded reference rows to select the original wide kernel. */
-    enum { tokens = 9 };
+    const uint32_t tokens = exact_prefill ? 129u : 9u;
     const uint32_t blocks = (type == 8 || type == 20) ? in_dim / 32u : in_dim / 256u;
     const uint32_t ref_rows = type == 8 && out_dim < 131u ? 131u : out_dim;
     const size_t ref_bytes = (size_t)tokens * ref_rows * sizeof(float);
@@ -3515,6 +3521,36 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
     int (*matmul)(q36_gpu_tensor *, const void *, uint64_t, uint64_t,
                   uint32_t, uint64_t, uint64_t, const q36_gpu_tensor *, uint64_t, float) =
         type < 16 ? q36_gpu_matmul_k_quant_scaled_tensor : q36_gpu_matmul_iq_quant_scaled_tensor;
+    if (exact_prefill) {
+        q36_gpu_set_micro_batch(false);
+        for (uint32_t t = 0; t < tokens; t++) {
+            q36_gpu_tensor *xi = q36_gpu_tensor_view(x,(uint64_t)t*in_dim*sizeof(float),in_dim*sizeof(float));
+            q36_gpu_tensor *yi = q36_gpu_tensor_view(ref,(uint64_t)t*out_dim*sizeof(float),out_dim*sizeof(float));
+            TEST_ASSERT(xi && yi);
+            if (xi && yi) TEST_ASSERT(type == 8 ?
+                q36_gpu_matmul_q8_0_scaled_tensor(yi,weights,weight_bytes,0,in_dim,out_dim,xi,1,-0.5f) :
+                matmul(yi,weights,weight_bytes,0,type,in_dim,out_dim,xi,1,-0.5f));
+            q36_gpu_tensor_free(xi); q36_gpu_tensor_free(yi);
+        }
+        TEST_ASSERT(q36_gpu_tensor_read(ref,0,want,y_bytes));
+        q36_gpu_set_dense_prefill_exact(true);
+        const uint32_t counts[] = {2,7,8,9,15,16,17,31,32,33,64,128,129};
+        for (unsigned c = 0; c < sizeof(counts)/sizeof(*counts); c++) {
+            uint32_t n = counts[c];
+            for (uint32_t i = 0; i < tokens*out_dim; i++) got[i] = 12345.0f;
+            TEST_ASSERT(q36_gpu_tensor_write(out,0,got,y_bytes));
+            TEST_ASSERT(type == 8 ?
+                q36_gpu_matmul_q8_0_scaled_tensor(out,weights,weight_bytes,0,in_dim,out_dim,x,n,-0.5f) :
+                matmul(out,weights,weight_bytes,0,type,in_dim,out_dim,x,n,-0.5f));
+            TEST_ASSERT(q36_gpu_tensor_read(out,0,got,y_bytes));
+            if (memcmp(got,want,(size_t)n*out_dim*sizeof(float))) {
+                fprintf(stderr,"q36-test: exact prefill type=%u width=%u rows=%u tokens=%u\n",type,in_dim,out_dim,n);
+                TEST_ASSERT(false);
+            }
+            for (uint32_t i = n*out_dim; i < tokens*out_dim; i++) TEST_ASSERT(got[i] == 12345.0f);
+        }
+        goto cleanup;
+    }
     const float scales[] = {0.75f, -0.5f};
     for (unsigned s = 0; s < sizeof(scales) / sizeof(scales[0]); s++) {
         TEST_ASSERT(type == 8 ?
@@ -3645,6 +3681,11 @@ cleanup:
     free(want);
 }
 
+static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
+                                   uint32_t out_dim, uint32_t in_dim) {
+    test_vulkan_small_dims_mode(type,block_bytes,out_dim,in_dim,false);
+}
+
 static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
                                   uint32_t out_dim) {
     test_vulkan_small_dims(type, block_bytes, out_dim, type == 8 ? 736u : 768u);
@@ -3655,6 +3696,12 @@ static void test_vulkan_small_tiles(void) {
 #if defined(Q36_NO_GPU) || defined(Q36_METAL)
     test_skip("vulkan-small-tiles", "Vulkan-only test");
 #else
+    const uint32_t exact_types[] = {8,12,13,14,20,23},
+        exact_bytes[] = {34,144,176,210,18,136},
+        exact_widths[] = {5120,1280,5120,17408,5120,5120};
+    for (unsigned i = 0; i < sizeof(exact_types)/sizeof(*exact_types); i++)
+        test_vulkan_small_dims_mode(exact_types[i],exact_bytes[i],132,exact_widths[i],true);
+    test_vulkan_small_dims_mode(13,176,131,768,true);
     const uint32_t q8_rows[] = {1, 7, 31, 48, 63, 131};
     for (unsigned i = 0; i < sizeof(q8_rows) / sizeof(q8_rows[0]); i++)
         test_vulkan_small_one(8, 34, q8_rows[i]);
@@ -7556,6 +7603,40 @@ static void test_gpu_cpu_parity(void) {
         test_skip("gpu-cpu-parity", "model file not found");
         return;
     }
+    const char *load = getenv("Q36_TEST_PARITY_LOAD_DIR");
+    if (load && load[0]) {
+        for (size_t i = 0; i < N_CASES; i++) {
+            if (!test_vector_case_selected(cases[i].id)) continue;
+            char path[1024];
+            snprintf(path,sizeof(path),"%s/%s.bin",load,cases[i].id);
+            FILE *fp = fopen(path,"rb");
+            uint32_t shape[4];
+            bool ok = fp && fread(shape,sizeof(shape),1,fp) == 1 &&
+                shape[0] == 0x51333650u && shape[1] > 0 && shape[1] <= 1048576u &&
+                shape[2] > 0 && shape[2] <= (uint32_t)cases[i].steps &&
+                shape[3] > 0 && shape[3] < (uint32_t)cases[i].ctx;
+            if (ok) {
+                test_backend_parity_capture *c = &captures[i];
+                c->vocab = shape[1]; c->steps = shape[2];
+                c->prompt.len = c->prompt.cap = shape[3];
+                c->prompt.v = test_xcalloc(shape[3],sizeof(int));
+                c->tokens = test_xcalloc(shape[2],sizeof(int));
+                c->logits = test_xcalloc(shape[2],sizeof(float *));
+                ok = fread(c->prompt.v,sizeof(int),shape[3],fp) == shape[3] &&
+                     fread(c->tokens,sizeof(int),shape[2],fp) == shape[2];
+                for (int j = 0; j < c->steps; j++) {
+                    c->logits[j] = test_xcalloc(c->vocab,sizeof(float));
+                    if (fread(c->logits[j],sizeof(float),c->vocab,fp) != (size_t)c->vocab) ok = false;
+                }
+                if (fgetc(fp) != EOF) ok = false;
+            }
+            if (fp) fclose(fp);
+            TEST_ASSERT(ok);
+            if (!ok) goto done;
+            selected[i] = true;
+        }
+        goto replay;
+    }
     const char *ref_env = getenv("Q36_TEST_PARITY_REF");
     bool ref_vulkan = ref_env && !strcmp(ref_env, "vulkan");
     test_parity_cache_env(getenv("Q36_TEST_REF_CACHE_TYPE_K"),
@@ -7598,6 +7679,7 @@ static void test_gpu_cpu_parity(void) {
     }
     q36_engine_close(cpu_engine);
 
+replay:
     test_parity_cache_env(getenv("Q36_TEST_VK_CACHE_TYPE_K"),
                           getenv("Q36_TEST_VK_CACHE_TYPE_V"));
     gpu_engine = test_open_backend_engine(test_model_path(), Q36_BACKEND_VULKAN, 1);
@@ -8642,6 +8724,8 @@ static void test_print_help(const char *prog) {
     puts("\nEnvironment:");
     puts("  Q36_TEST_MODEL=FILE        Model path. Default: " Q36_DEFAULT_MODEL_PATH);
     puts("  Q36_TEST_THREADS=N         q36 CPU threads for test helpers (0/unset = runtime default).");
+    puts("  Q36_TEST_PARITY_DUMP_DIR=DIR  Save CPU parity captures for later GPU replay.");
+    puts("  Q36_TEST_PARITY_LOAD_DIR=DIR  Replay captures from the same model and CPU build.");
     puts("  Q36_TEST_LONG_PROMPT=FILE  Rendered long-context regression prompt.");
     puts("  Q36_TEST_VECTOR_FILE=FILE  Simple reference vector fixture.");
     puts("  Q36_TEST_LLAMA_VECTOR_FILE=FILE  llama.cpp vector fixture.");
@@ -8649,6 +8733,8 @@ static void test_print_help(const char *prog) {
     puts("  Q36_TEST_SSD_STREAM_CACHE_MB=N  Cap the streaming expert cache instead of the auto budget.");
     puts("  Q36_TEST_SSD_FULL_LAYERS=N  Keep a resident prefix when testing streaming kernels.");
     puts("  --hf-template             Use the official HF text-only chat template in special parity modes.");
+    puts("  Pipeline options apply to the GPU replay of --gpu-cpu-parity only.");
+    q36_dist_usage(stdout);
 }
 
 static const q36_test_entry *test_find_entry(const char *arg) {
@@ -8683,6 +8769,10 @@ int main(int argc, char **argv) {
     bool selected[sizeof(test_entries) / sizeof(test_entries[0])] = {0};
 
     for (int i = 1; i < argc; i++) {
+        char error[256];
+        int rc = q36_dist_parse_cli_arg(argv[i],&i,argc,argv,&test_parity_distributed,error,sizeof(error));
+        if (rc < 0) { fprintf(stderr,"q36-test: %s\n",error); return 2; }
+        if (rc > 0) continue;
         if (!strcmp(argv[i], "--all")) {
             run_all = true;
         } else if (!strcmp(argv[i], "--model") && i + 1 < argc) {
@@ -8705,6 +8795,17 @@ int main(int argc, char **argv) {
                 return 2;
             }
             selected[(size_t)(entry - test_entries)] = true;
+        }
+    }
+
+    if (q36_dist_enabled(&test_parity_distributed)) {
+        const q36_test_entry *parity = test_find_entry("--gpu-cpu-parity");
+        bool only_parity = !run_all && test_parity_distributed.role == Q36_DISTRIBUTED_COORDINATOR;
+        for (size_t i = 0; i < sizeof(test_entries)/sizeof(*test_entries); i++)
+            if (selected[i] && &test_entries[i] != parity) only_parity = false;
+        if (!only_parity || !selected[parity-test_entries]) {
+            fprintf(stderr,"q36-test: pipeline options require only --gpu-cpu-parity and a coordinator role\n");
+            return 2;
         }
     }
 

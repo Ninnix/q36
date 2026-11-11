@@ -80,6 +80,62 @@ static void test_rms_norm(void) {
         check(fabsf(out[i] - expected) <= 2e-7f,"RMS norm accumulation at dense-model width");
 }
 
+static void test_dense_mixed_ffn(void) {
+    enum {width=256, rows=3};
+    q36_shape saved = g_q36_shape;
+    g_q36_shape = Q36_SHAPE_27B;
+    g_q36_shape.n_embd = g_q36_shape.n_ff_shared = width;
+    size_t gate_bytes = width * 8 * sizeof(q36_block_iq4_nl);
+    size_t up_bytes = width * sizeof(q36_block_q5_k);
+    size_t bytes = gate_bytes + up_bytes + width * width * sizeof(float);
+    uint8_t *map = xcalloc(1,bytes);
+    q36_tensor gate = {.type=Q36_TENSOR_IQ4_NL,.ndim=2,.dim={width,width},.bytes=gate_bytes};
+    q36_tensor up = {.type=Q36_TENSOR_Q5_K,.ndim=2,.dim={width,width},.bytes=up_bytes,.abs_offset=gate_bytes};
+    q36_tensor down = {.type=Q36_TENSOR_F32,.ndim=2,.dim={width,width},
+        .bytes=width*width*sizeof(float),.abs_offset=gate_bytes+up_bytes};
+    for (unsigned i = 0; i < width*8; i++) {
+        q36_block_iq4_nl *b = (q36_block_iq4_nl *)map+i;
+        b->d = q36_f32_to_f16(.001f);
+        memset(b->qs,0xa9,sizeof(b->qs));
+    }
+    for (unsigned i = 0; i < width; i++) {
+        q36_block_q5_k *b = (q36_block_q5_k *)(map+gate_bytes)+i;
+        b->d = q36_f32_to_f16(.002f);
+        memset(b->scales,1,sizeof(b->scales));
+        memset(b->qs,0x32,sizeof(b->qs));
+        ((float *)(map+down.abs_offset))[i*width+i] = 1;
+    }
+    q36_engine e = {.model={.map=map,.size=bytes},.n_threads=1};
+    float input[rows*width], output[rows*width], want[width], a[width], b[width];
+    float work[4][rows*width];
+    uint8_t xq[rows*sizeof(q36_block_q8_k)];
+    q36_cpu_runtime rt = {.work2=work[0],.work3=work[1],.work4=work[2],.work5=work[3],
+        .batch_ffn_shared_gate=work[0],.batch_ffn_shared_up=work[1],
+        .batch_ffn_shared_mid=work[2],.batch_xq=xq};
+    for (unsigned i = 0; i < rows*width; i++) input[i] = sinf(i*.03f)*.1f;
+    q36_tensor *gates[] = {&gate,&up,&up,&down};
+    q36_tensor *ups[] = {&up,&gate,&up,&up};
+    for (unsigned c = 0; c < 4; c++) {
+        q36_layer_weights l = {.ffn_gate_shexp=gates[c],.ffn_up_shexp=ups[c],.ffn_down_shexp=&down};
+        check(q36_forward_ffn_batch(&e,&l,input,output,rows,&rt),"mixed dense FFN prefill");
+        for (unsigned t = 0; t < rows; t++) {
+            check(q36_tensor_matvec(&e,gates[c],input+t*width,a,NULL,width,width) &&
+                  q36_tensor_matvec(&e,ups[c],input+t*width,b,NULL,width,width),"independent FFN projections");
+            for (unsigned i = 0; i < width; i++) {
+                want[i] = q36_siluf(a[i])*b[i];
+                check(isfinite(output[t*width+i]) && fabsf(output[t*width+i]-want[i]) < 1e-6f,
+                      "dense prefill uses each projection's activation format");
+            }
+            check(q36_forward_ffn(&e,&l,input+t*width,output,&rt),"mixed dense FFN decode");
+            for (unsigned i = 0; i < width; i++)
+                check(isfinite(output[i]) && fabsf(output[i]-want[i]) < 1e-6f,
+                      "dense decode uses each projection's activation format");
+        }
+    }
+    free(map);
+    g_q36_shape = saved;
+}
+
 static void test_vector_exp(void) {
     for (int i = -256; i <= 256; i++) {
         float x = (float)i * 0.3125f;
@@ -251,7 +307,7 @@ static void test_layer_slices(const char *path) {
 
 int main(int argc, char **argv) {
     test_q2_0(); test_activation_rounding(); test_bf16_activation(); test_gdn_norm(); test_rms_norm();
-    test_vector_exp(); test_f32_dot(); test_softmax(); test_delta_state();
+    test_vector_exp(); test_f32_dot(); test_softmax(); test_delta_state(); test_dense_mixed_ffn();
     test_attention_head(); test_ngram(); test_sparse_tail();
     puts("Quantization, GDN/RMS norms, n-grams and sparse attention: OK");
     if (argc == 2) test_layer_slices(argv[1]);

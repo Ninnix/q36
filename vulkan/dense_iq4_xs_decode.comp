@@ -96,10 +96,23 @@ int packed_iq4(uint v, uint shift) {
 #endif
 #endif
 
+#ifdef Q36_IQ4_NL
+uint load_word(uint offset) {
+    uint shift = (offset & 3u) * 8u;
+    uint word = ww[offset >> 2u];
+    return shift == 0u ? word : (word >> shift) | (ww[(offset >> 2u)+1u] << (32u-shift));
+}
+#endif
+
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
+#ifdef Q36_PREFILL
+    uint tok0 = gl_WorkGroupID.y * N_TOKENS;
+#else
+    uint tok0 = 0u;
+#endif
 #ifdef Q36_HEAD_MASK
     if (ages[first_row / 64u] == 0u) {
         if (lid < ROWS && first_row + lid < pc.out_dim)
@@ -136,7 +149,7 @@ void main(void) {
 #endif
         float yd[N_TOKENS];
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
-            uint offset = t * pc.blocks * Q8K_WORDS;
+            uint offset = (tok0+t) * pc.blocks * Q8K_WORDS;
 #ifndef Q36_I16
 #if Q36_TOKENS > 1
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
@@ -153,9 +166,14 @@ void main(void) {
 #if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
 #endif
+#ifdef Q36_IQ4_NL
+            uint base = row*pc.row_bytes+(b*8u+itid)*18u;
+            uint meta0 = load_word(base);
+#else
             uint base = (row * pc.row_bytes + 136u * b) >> 2u;
             uint meta0 = ww[base];
             uint meta1 = ww[base + 1u];
+#endif
             /* These 32 byte products sum exactly in f32; packed integer dots
              * preserve the decode result before applying float scales. */
 #if Q36_TOKENS > 1
@@ -166,7 +184,11 @@ void main(void) {
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0.0;
 #endif
             UNROLL for (uint l = 0u; l < 4u; l++) {
+#ifdef Q36_IQ4_NL
+                uint packed = load_word(base+2u+4u*l);
+#else
                 uint packed = ww[base + 2u + 4u * ib + l];
+#endif
 #ifdef Q36_I16
                 uvec2 w0 = packed_iq4(packed, 0u);
                 uvec2 w1 = packed_iq4(packed, 4u);
@@ -181,7 +203,7 @@ void main(void) {
 #ifdef Q36_I16
                     /* Two products per i16 lane fit even at 2 * 127 * 128.
                      * Widen each partial before adding low and high halves. */
-                    uint raw = (t * pc.blocks + b) * 128u + 16u * itid + 2u * l;
+                    uint raw = ((tok0+t) * pc.blocks + b) * 128u + 16u * itid + 2u * l;
                     i16vec2 a = unpackInt2x16(int(w0.x)) * unpackInt2x16(int(raw_values[raw]));
                     a += unpackInt2x16(int(w0.y)) * unpackInt2x16(int(raw_values[raw + 1u]));
                     i16vec2 c = unpackInt2x16(int(w1.x)) * unpackInt2x16(int(raw_values[raw + 8u]));
@@ -204,6 +226,7 @@ void main(void) {
 #endif
                 }
             }
+#ifndef Q36_IQ4_NL
             uint sl = meta1 >> (8u * (ib >> 1u));
             uint sh = meta0 >> 16u;
             int ls = int((sl >> (4u * (ib & 1u))) & 15u) |
@@ -211,6 +234,11 @@ void main(void) {
             float wd = unpackHalf2x16(meta0).x;
             UNROLL for (uint t = 0u; t < N_TOKENS; t++)
             acc[t][r] = fma(wd * yd[t] * float(ls - 32), float(sum[t]), acc[t][r]);
+#else
+            float wd = unpackHalf2x16(meta0).x;
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++)
+                acc[t][r] = fma(yd[t],wd*float(sum[t]),acc[t][r]);
+#endif
         }
     }
 
@@ -222,7 +250,7 @@ void main(void) {
 #if Q36_BOUNDS
                 && row < pc.out_dim
 #endif
-            ) y[t * pc.out_dim + row] = total * pc.scale;
+            ) y[(tok0+t) * pc.out_dim + row] = total * pc.scale;
         }
     }
 }

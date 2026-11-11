@@ -1386,6 +1386,7 @@ int q36_gpu_prepare_q5_k_output_cache(
 }
 
 void q36_gpu_set_dense_model(bool dense) { q36_dense_model = dense; }
+void q36_gpu_set_dense_prefill_exact(bool enabled) { (void)enabled; }
 void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
 bool q36_gpu_attn_fused_enabled(void) { return false; }
 

@@ -26,6 +26,9 @@ layout(push_constant) uniform Push {
     float alpha_scale;
     float beta_scale;
     float eps;
+#ifdef Q36_BATCH
+    uint n_tok;
+#endif
 } pc;
 
 shared float qv[128], kv[128], sa[6], sb[6];
@@ -54,11 +57,16 @@ vec4 round_bf16(vec4 value) {
 void main() {
     uint tid=gl_LocalInvocationID.x, h=gl_WorkGroupID.x;
     uint per=pc.heads/pc.groups, channels=(2u*pc.groups+pc.heads)*128u;
+#ifdef Q36_BATCH
+    for (uint tok=0u; tok<pc.n_tok; tok++) {
+#else
+    const uint tok=0u;
+#endif
     if (tid<128u) for (uint j=0u; j<2u+per; j++) {
         uint c=(j<2u ? j*pc.groups+h : 2u*pc.groups+h+(j-2u)*pc.groups)*128u+tid;
         float acc=0.0;
         for (uint t=0u; t<3u; t++) acc+=history[t*channels+c]*cw[c*4u+t];
-        float x=cur[c];
+        float x=cur[tok*channels+c];
         acc+=x*cw[c*4u+3u];
         history[c]=history[channels+c];
         history[channels+c]=history[2u*channels+c];
@@ -66,7 +74,7 @@ void main() {
         float v=acc*sigmoid_stable(acc);
         if (j==0u) qv[tid]=v;
         else if (j==1u) kv[tid]=v;
-        else vout[(h+(j-2u)*pc.groups)*128u+tid]=v;
+        else vout[(tok*pc.heads+h+(j-2u)*pc.groups)*128u+tid]=v;
     }
     barrier();
     if (tid<64u) {
@@ -84,8 +92,8 @@ void main() {
     uint lane=tid%128u;
     for (uint j=tid/128u; j<per; j+=3u) {
         uint row=h+j*pc.groups;
-        qout[row*128u+lane]=(qv[lane]*qs)*scale;
-        kout[row*128u+lane]=(kv[lane]*ks)*scale;
+        qout[(tok*pc.heads+row)*128u+lane]=(qv[lane]*qs)*scale;
+        kout[(tok*pc.heads+row)*128u+lane]=(kv[lane]*ks)*scale;
         float aa=0.0, ab=0.0;
 #ifdef Q36_BF16
         uint n4 = pc.blocks * 8u;
@@ -93,7 +101,7 @@ void main() {
             uint base = row * n4 * 4u + i * 4u;
             vec4 a = uintBitsToFloat(uvec4(wa[base], wa[base+1u], wa[base+2u], wa[base+3u]) << 16u);
             vec4 b = uintBitsToFloat(uvec4(wb[base], wb[base+1u], wb[base+2u], wb[base+3u]) << 16u);
-            vec4 input_value = round_bf16(xv[i]);
+            vec4 input_value = round_bf16(xv[tok*pc.blocks*8u+i]);
             aa += dot(a, input_value);
             ab += dot(b, input_value);
         }
@@ -106,7 +114,7 @@ void main() {
             uint b0=uint(wb[q])|(uint(wb[q+1u])<<16u);
             uint b1=uint(wb[q+2u])|(uint(wb[q+3u])<<16u);
             uint xi=(b*32u+eoff)>>2u;
-            vec4 x0=xv[xi], x1=xv[xi+1u];
+            vec4 x0=xv[tok*pc.blocks*8u+xi], x1=xv[tok*pc.blocks*8u+xi+1u];
             aa+=unpackHalf2x16(uint(wa[base])).x*(dot(vec4(unpack8(int(a0))),x0)+dot(vec4(unpack8(int(a1))),x1));
             ab+=unpackHalf2x16(uint(wb[base])).x*(dot(vec4(unpack8(int(b0))),x0)+dot(vec4(unpack8(int(b1))),x1));
         }
@@ -118,9 +126,14 @@ void main() {
             aa=sa[j*2u]+sa[j*2u+1u]; ab=sb[j*2u]+sb[j*2u+1u];
             float a=aa*pc.alpha_scale+dt[row];
             float sp=a>20.0 ? a : q36_log1p(exp(a));
-            gb[row]=exp(sp*av[row]);
-            gb[pc.heads+row]=sigmoid_stable(ab*pc.beta_scale);
+            gb[tok*2u*pc.heads+row]=exp(sp*av[row]);
+            gb[tok*2u*pc.heads+pc.heads+row]=sigmoid_stable(ab*pc.beta_scale);
         }
         barrier();
     }
+#ifdef Q36_BATCH
+        memoryBarrierBuffer();
+        barrier();
+    }
+#endif
 }

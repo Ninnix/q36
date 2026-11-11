@@ -112,9 +112,13 @@ The supported dense Qwen3.8-27B weights come from
 [Unsloth](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) and
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF).
 Thank you to both teams for making these quantized models available:
-Unsloth provides the UD-IQ3_S release, and ISTA-DASLab provides the smaller
-GSQ-RCO IQ3_XXS release. Their work gives QuarkStar dense-model options for
+Unsloth provides the UD-IQ3_S and UD-Q6_K releases, and ISTA-DASLab provides
+the smaller GSQ-RCO IQ3_XXS release. Their work gives QuarkStar dense-model options for
 different memory budgets.
+
+Download the 20.5 GiB Q6_K model with `./download_model.sh 27b-q6`.
+It supports distribuited inference
+[two-board Vulkan pipeline with MTP](docs/DISTRIBUTED.md#qwen38-27b-q6_k).
 
 ## Status
 

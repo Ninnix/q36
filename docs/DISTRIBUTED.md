@@ -106,6 +106,84 @@ coordinator reads n-grams from SSD. Flash Next has no implemented MTP head.
 See the [recorded pipeline measurements](../speed-bench/qwen38-flash-next/README.md#resident-distributed-pipeline)
 for context sweeps and memory use.
 
+## Qwen3.8-27B Q6_K
+
+Download the Unsloth Dynamic Q6_K model with `./download_model.sh 27b-q6`.
+Its mixed tensor types and embedded MTP block use the existing dense kernels.
+The measured split is `0:33` on the coordinator and `34:output` on the worker:
+about 10.48 GiB and 8.68 GiB of resident weights respectively, excluding the
+coordinator's pageable embeddings and optional 335 MiB MTP block. Runtime
+scratch, recurrent state, and KV cache need additional space.
+
+With the complete GGUF on both boards, use the normal launch commands above
+with these layer ranges. For a worker with slow or limited storage, stage
+only its suffix directly into Vulkan instead:
+
+```sh
+python3 tools/pipeline_worker.py \
+  --model gguf/Qwen3.8-27B-UD-Q6_K.gguf \
+  --ssh root@worker --remote-dir /root/q36 \
+  --metadata /dev/shm/q36-q6.q36-resident \
+  --layer-start 34 --coordinator 192.168.1.90 --ctx 4096 \
+  --env Q36_VK_PREFILL_CHUNK=128
+```
+
+Keep this helper running. It starts the worker, sends the catalogue and
+fingerprint samples, then uploads only assigned target weights, including
+final normalization. The MTP block stays on the coordinator. No full model
+copy is stored on the worker. `--dry-run` reports the weight slice without
+connecting. The old `tools/flash_next_worker.py` entry point remains available.
+
+If the coordinator's firewall blocks inbound inference traffic, an SSH
+reverse tunnel can carry it without changing firewall rules:
+
+```sh
+ssh -N -R 127.0.0.1:19911:192.168.1.90:9911 root@worker
+```
+
+In that case, pass `--coordinator 127.0.0.1 --port 19911` to the helper.
+The coordinator still listens on `192.168.1.90:9911`. Optional
+`--bulk-host WORKER_LAN_IP --bulk-peer COORDINATOR_LAN_IP` sends the initial
+weight payload over the trusted LAN while inference uses the tunnel.
+
+Start the coordinator with the matching route:
+
+```sh
+./q36 -m gguf/Qwen3.8-27B-UD-Q6_K.gguf --vulkan \
+  --role coordinator --layers 0:33 --listen 192.168.1.90 9911 \
+  --ctx 4096 --prefill-chunk 128 --dist-prefill-chunk 128
+```
+
+Add `--mtp` only on the coordinator to use the embedded head. Both boards
+must run the same build. The sparse `.q36-resident` descriptor is valid only
+with the helper's weight stream; it is not a standalone model file.
+
+Dense Q6 prefill batches the existing native arithmetic across tokens. It
+reuses the verification kernels, shares Q5_K/Q6_K/IQ4_NL weight loads, and
+rounds FP16 recurrent state after every token. This fixes the accumulated
+4K drift without evaluating the whole model one token at a time. The default
+stage capacity is 128 tokens. Other quantizations retain their existing
+prefill selection. See the [measurements](../speed-bench/qwen38-27b-q6/README.md).
+
+For interactive CPU inference on one board:
+
+```sh
+./q36 -m gguf/Qwen3.8-27B-UD-Q6_K.gguf --cpu -t 16 --ctx 4096
+```
+
+To check the distributed Vulkan path against CPU, start the helper with
+`--ctx 4096`, then run:
+
+```sh
+Q36_TEST_THREADS=16 ./q36_test --gpu-cpu-parity --case short \
+  --model gguf/Qwen3.8-27B-UD-Q6_K.gguf \
+  --role coordinator --layers 0:33 --listen 192.168.1.90 9911
+```
+
+This uses the existing top-1 through top-64 parity gates, capturing CPU
+results before opening the Vulkan coordinator. CPU runs page
+weights from disk when the model exceeds RAM and can be slow.
+
 ## Sessions and recovery
 
 Sessions keep separate worker state and run in order. A failed connection

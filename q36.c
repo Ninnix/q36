@@ -42,6 +42,7 @@
 #include "q36_ssd.h"
 
 #define Q36_GGUF_MAGIC 0x46554747u
+#define Q36_GGUF_FTYPE_Q6_K 18u
 #define Q36_MAX_DIMS 8
 #define Q36_NEG_INF (-1.0e30f)
 #define Q36_RMS_EPS (1.0e-6f)
@@ -591,6 +592,7 @@ struct q36_engine {
     uint32_t n_threads;
     uint32_t cpu_prefill_cap;
     uint32_t prefill_cap_override;
+    bool precise_prefill;
     int context_size;
     uint32_t planned_sessions, live_sessions;
     uint64_t session_bytes, context_hint_bytes;
@@ -957,6 +959,8 @@ static uint32_t q36_engine_gpu_prefill_cap(const q36_engine *e) {
     }
 #endif
     if (e->prefill_cap_override) return e->prefill_cap_override;
+    if (e->precise_prefill && q36_dist_enabled(&e->distributed) &&
+        !getenv("Q36_VK_PREFILL_CHUNK")) return 128;
     if (e->ssd_streaming && !getenv("Q36_VK_PREFILL_CHUNK")) return 512;
     return q36_default_gpu_prefill_cap();
 }
@@ -5881,8 +5885,7 @@ static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
     pthread_t reader_thread;
     int input_fd = -1;
 #ifndef Q36_METAL
-    if (e->variant == Q36_VARIANT_FLASH_NEXT &&
-        e->distributed.role == Q36_DISTRIBUTED_WORKER && getenv("Q36_RESIDENT_WEIGHT_FD"))
+    if (e->distributed.role == Q36_DISTRIBUTED_WORKER && getenv("Q36_RESIDENT_WEIGHT_FD"))
         input_fd = atoi(getenv("Q36_RESIDENT_WEIGHT_FD"));
 #endif
     bool threaded = input_fd < 0 && e->model.fd >= 0 &&
@@ -7072,12 +7075,14 @@ static bool q36_forward_ffn(const q36_engine *e, const q36_layer_weights *l, con
                                              1.0f, 1.0f)) {
             if (!q36_tensor_matvec_prequant(
                     e, l->ffn_gate_shexp, inp, xq, gate, rowbuf,
-                    Q36_N_EMBD, Q36_N_FF_SHARED) ||
-                !q36_tensor_matvec_prequant(
+                    Q36_N_EMBD, Q36_N_FF_SHARED)) return false;
+            /* Dynamic quants can give gate and up different activation formats. */
+            if (q36_activation_quant_kind_for_type(l->ffn_up_shexp->type) != inpq_kind) {
+                if (!q36_tensor_matvec(e, l->ffn_up_shexp, inp, up, rowbuf,
+                                       Q36_N_EMBD, Q36_N_FF_SHARED)) return false;
+            } else if (!q36_tensor_matvec_prequant(
                     e, l->ffn_up_shexp, inp, xq, up, rowbuf,
-                    Q36_N_EMBD, Q36_N_FF_SHARED)) {
-                return false;
-            }
+                    Q36_N_EMBD, Q36_N_FF_SHARED)) return false;
         }
         for (uint32_t j = 0; j < Q36_N_FF_SHARED; j++)
             mid[j] = q36_siluf(gate[j]) * up[j];
@@ -7550,13 +7555,14 @@ static bool q36_forward_ffn_batch(const q36_engine *e,
             if (!q36_tensor_matmul_batch_prequant(
                     e, l->ffn_gate_shexp, inp, gate_inp_xq,
                     rt->batch_ffn_shared_gate, n_tok,
-                    Q36_N_EMBD, Q36_N_FF_SHARED, 1.0f) ||
-                !q36_tensor_matmul_batch_prequant(
-                    e, l->ffn_up_shexp, inp, gate_inp_xq,
+                    Q36_N_EMBD, Q36_N_FF_SHARED, 1.0f)) return false;
+            q36_activation_quant_kind up_kind = q36_activation_quant_kind_for_type(l->ffn_up_shexp->type);
+            if (up_kind != inpq_kind && !q36_quantize_activation_batch(
+                    up_kind, inp, rt->batch_xq, n_tok, Q36_N_EMBD, e->n_threads)) return false;
+            if (!q36_tensor_matmul_batch_prequant(
+                    e, l->ffn_up_shexp, inp, up_kind == Q36_ACTIVATION_QUANT_NONE ? NULL : rt->batch_xq,
                     rt->batch_ffn_shared_up, n_tok,
-                    Q36_N_EMBD, Q36_N_FF_SHARED, 1.0f)) {
-                return false;
-            }
+                    Q36_N_EMBD, Q36_N_FF_SHARED, 1.0f)) return false;
         }
         q36_swiglu_rows(rt->batch_ffn_shared_mid,
                         rt->batch_ffn_shared_gate,
@@ -8526,32 +8532,45 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
     }
 #endif
 #ifndef Q36_METAL
-    if (!e->ssd_streaming && rt->spec_verifying && n_tok > 1u &&
+    if (!e->ssd_streaming && (rt->spec_verifying || e->precise_prefill) && n_tok > 1u &&
         rt->recur_conv_fused && Q36_N_SSM_STATE == 128u && Q36_N_SSM_CONV == 4u &&
         l->ssm_alpha->type == l->ssm_beta->type &&
         (l->ssm_alpha->type == Q36_TENSOR_Q8_0 || l->ssm_alpha->type == Q36_TENSOR_BF16) &&
         q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK)) {
         const uint64_t offsets[5] = {l->ssm_conv1d->abs_offset, l->ssm_alpha->abs_offset,
             l->ssm_beta->abs_offset, l->ssm_dt->abs_offset, l->ssm_a->abs_offset};
-        front = true;
-        for (uint32_t t = 0; t < n_tok; t++) {
-            q36_gpu_tensor *rows[6];
-            q36_gpu_tensor *src[6] = {rt->recur_qkv, (q36_gpu_tensor *)inp,
-                rt->recur_q, rt->recur_k, rt->recur_v, rt->recur_gb};
-            uint32_t widths[6] = {Q36_N_SSM_CONV_DIM, Q36_N_EMBD,
-                Q36_N_SSM_INNER, Q36_N_SSM_INNER, Q36_N_SSM_INNER, 2u * Q36_N_SSM_DT_RANK};
-            bool ok = true;
-            for (unsigned i = 0; i < 6; i++) {
-                rows[i] = q36_vulkan_row(src[i], t, widths[i]);
-                if (!rows[i]) ok = false;
+        if (!rt->spec_verifying) {
+            /* Q/K recycle the QKV owner. The ordered front needs future raw
+             * rows intact, so stage them in the existing convolution panel. */
+            if (!q36_gpu_tensor_copy(rt->recur_conv,0,rt->recur_qkv,0,
+                    (uint64_t)n_tok*Q36_N_SSM_CONV_DIM*sizeof(float))) return false;
+            front = q36_gpu_gdn_front_rows_tensor(cache->conv,rt->recur_conv,inp,
+                rt->recur_q,rt->recur_k,rt->recur_v,rt->recur_gb,
+                e->model.map,e->model.size,offsets,Q36_N_EMBD,Q36_N_SSM_GROUP,Q36_N_SSM_DT_RANK,
+                l->ssm_alpha->type,q36_tensor_scalar_or(&e->model,l->ssm_alpha_scale,1.0f),
+                q36_tensor_scalar_or(&e->model,l->ssm_beta_scale,1.0f),Q36_RMS_EPS,n_tok) != 0;
+            if (!front) return false;
+        } else {
+            front = true;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                q36_gpu_tensor *rows[6];
+                q36_gpu_tensor *src[6] = {rt->recur_qkv, (q36_gpu_tensor *)inp,
+                    rt->recur_q, rt->recur_k, rt->recur_v, rt->recur_gb};
+                uint32_t widths[6] = {Q36_N_SSM_CONV_DIM, Q36_N_EMBD,
+                    Q36_N_SSM_INNER, Q36_N_SSM_INNER, Q36_N_SSM_INNER, 2u * Q36_N_SSM_DT_RANK};
+                bool ok = true;
+                for (unsigned i = 0; i < 6; i++) {
+                    rows[i] = q36_vulkan_row(src[i], t, widths[i]);
+                    if (!rows[i]) ok = false;
+                }
+                if (ok) ok = q36_gpu_gdn_front_tensor(cache->conv, rows[0], rows[1],
+                    rows[2], rows[3], rows[4], rows[5], e->model.map, e->model.size, offsets,
+                    Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK, l->ssm_alpha->type,
+                    q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f),
+                    q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f), Q36_RMS_EPS) != 0;
+                for (unsigned i = 0; i < 6; i++) q36_gpu_tensor_free(rows[i]);
+                if (!ok) return false;
             }
-            if (ok) ok = q36_gpu_gdn_front_tensor(cache->conv, rows[0], rows[1],
-                rows[2], rows[3], rows[4], rows[5], e->model.map, e->model.size, offsets,
-                Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK, l->ssm_alpha->type,
-                q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f),
-                q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f), Q36_RMS_EPS) != 0;
-            for (unsigned i = 0; i < 6; i++) q36_gpu_tensor_free(rows[i]);
-            if (!ok) return false;
         }
     }
 #endif
@@ -11042,6 +11061,25 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
     e->variant = g_q36_shape.variant;
+    uint32_t file_type = 0;
+    model_get_u32(&e->model,"general.file_type",&file_type);
+    e->precise_prefill = Q36_MODEL_DENSE && file_type == Q36_GGUF_FTYPE_Q6_K;
+    const char *weight_fd = getenv("Q36_RESIDENT_WEIGHT_FD");
+    if (weight_fd) {
+        char *end;
+        long fd = strtol(weight_fd,&end,10);
+        if (!weight_fd[0] || *end || fd < 0 || fd > INT32_MAX ||
+            e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming ||
+            e->distributed.role != Q36_DISTRIBUTED_WORKER) {
+            fprintf(stderr,"q36: resident weight input requires a resident Vulkan worker and a valid fd\n");
+            q36_engine_close(e);
+            return 1;
+        }
+    } else if (strstr(opt->model_path,".q36-resident")) {
+        fprintf(stderr,"q36: worker metadata requires its resident weight stream\n");
+        q36_engine_close(e);
+        return 1;
+    }
     /* The vector bank follows the detected model, including the 64 x 5120
      * dense model. Load zero-scale banks too so /steer can enable them later. */
     if (!q36_load_directional_steering(e)) {
@@ -11082,22 +11120,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         fprintf(stderr, "q36: vision sidecar mapped from disk: %s\n", opt->vision_path);
     }
     if (e->variant == Q36_VARIANT_FLASH_NEXT) {
-        const char *weight_fd = getenv("Q36_RESIDENT_WEIGHT_FD");
-        if (weight_fd) {
-            char *end;
-            long fd = strtol(weight_fd,&end,10);
-            if (!weight_fd[0] || *end || fd < 0 || fd > INT32_MAX ||
-                e->backend != Q36_BACKEND_VULKAN || e->ssd_streaming ||
-                e->distributed.role != Q36_DISTRIBUTED_WORKER) {
-                fprintf(stderr,"q36: resident weight input requires a resident Vulkan worker and a valid fd\n");
-                q36_engine_close(e);
-                return 1;
-            }
-        } else if (strstr(opt->model_path,".q36-resident")) {
-            fprintf(stderr,"q36: worker metadata requires its resident weight stream\n");
-            q36_engine_close(e);
-            return 1;
-        }
         if (e->backend == Q36_BACKEND_METAL || opt->mtp_path || opt->vision_path ||
             opt->directional_steering_file) {
             fprintf(stderr, "q36: Flash Next supports CPU/Vulkan text inference; MTP, vision and steering are unavailable\n");
@@ -11244,6 +11266,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
 #ifndef Q36_NO_GPU
     if (q36_backend_uses_graph(opt->backend)) {
         q36_gpu_set_dense_model(Q36_MODEL_DENSE);
+        q36_gpu_set_dense_prefill_exact(e->precise_prefill);
         if (e->mtp_ready) {
             q36_gpu_set_micro_batch(true);
             q36_gpu_set_micro_batch(false);
@@ -13791,6 +13814,7 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
 #ifndef Q36_NO_GPU
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
         q36_vulkan_runtime *rt = s->runtime;
+        if (n_tokens > rt->prefill_cap) goto fail;
         if (s->slice_spec_active && (n_tokens != 1u || s->slice_spec_n >= Q36_MTP_VERIFY_MAX)) goto fail;
         rt->spec_verifying = s->slice_spec_active;
         rt->spec_row = s->slice_spec_n;

@@ -16,6 +16,9 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
 #endif
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+#ifdef Q36_I16
+layout(set = 0, binding = 3) readonly buffer Raw { uint raw_values[]; };
+#endif
 #ifdef Q36_HEAD_MASK
 layout(set = 0, binding = 3) readonly buffer Mask { uint ages[]; };
 #endif
@@ -433,6 +436,11 @@ void main(void) {
     uint part_id = lid & 15u;
     uint first_row = gl_WorkGroupID.x * ROWS;
     float acc[N_TOKENS][ROWS];
+#ifdef Q36_PREFILL
+    uint tok0 = gl_WorkGroupID.y * N_TOKENS;
+#else
+    uint tok0 = 0u;
+#endif
     [[unroll]] for (uint t = 0u; t < N_TOKENS; t++)
         [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 
@@ -501,8 +509,17 @@ void main(void) {
                     w[i] = d * unpack_i8(packed) - m;
                 }
             }
+#ifdef Q36_I16
+            i16vec2 w16[8];
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                uint p = uint(packed_w[i]);
+                int center = QTYPE == Q6_K ? 32 : 0;
+                w16[2u*i] = i16vec2(int(p & 255u)-center,int((p >> 8u) & 255u)-center);
+                w16[2u*i+1u] = i16vec2(int((p >> 16u) & 255u)-center,int(p >> 24u)-center);
+            }
+#endif
             [[unroll]] for (uint t = 0u; t < N_TOKENS; t++) {
-                uint qbase = (t * pc.blocks + b) * Q8K_WORDS;
+                uint qbase = ((tok0 + t) * pc.blocks + b) * Q8K_WORDS;
                 float yd = uintBitsToFloat(q8[qbase]);
                 float qsum = 0.0, qdot = 0.0;
                 if (QTYPE == Q2_K) {
@@ -513,10 +530,25 @@ void main(void) {
                     uint sums = q8[qbase + 66u + (part_id >> 1u)];
                     int isum = bitfieldExtract(int(sums), int((part_id & 1u) * 16u), 16);
                     int idot = 0;
+#ifdef Q36_I16
+                    /* Widen before packed i16 partials can overflow. */
+                    i16vec2 partial = i16vec2(0);
+                    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                        uint off = ((tok0+t)*pc.blocks+b)*128u+part_id*8u+2u*i;
+                        partial += w16[2u*i] * unpackInt2x16(int(raw_values[off]));
+                        partial += w16[2u*i+1u] * unpackInt2x16(int(raw_values[off+1u]));
+                        if ((i & 1u) != 0u) {
+                            idot += int(partial.x)+int(partial.y);
+                            partial = i16vec2(0);
+                        }
+                    }
+                    if (QTYPE == Q6_K) isum = 0;
+#else
                     [[unroll]] for (uint i = 0u; i < 4u; i++) {
                         int q = int(q8[qbase + 2u + 4u * part_id + i]);
                         idot += dotPacked4x8EXT(packed_w[i], q);
                     }
+#endif
                     qsum = float(isum);
                     qdot = float(idot);
                 }
@@ -537,7 +569,9 @@ void main(void) {
 #if Q36_BOUNDS
                 && row < pc.out_dim
 #endif
-            ) y[t * pc.out_dim + row] = total * pc.scale;
+            ) {
+                y[(tok0 + t) * pc.out_dim + row] = total * pc.scale;
+            }
         }
     }
 }

@@ -74,6 +74,8 @@ VULKAN_SHADERS := \
 	vulkan/qwen4_ops.spv \
 	vulkan/gdn_front.spv \
 	vulkan/gdn_front_bf16.spv \
+	vulkan/gdn_front_batch.spv \
+	vulkan/gdn_front_batch_bf16.spv \
 	vulkan/matmul_f16.spv \
 	vulkan/matmul_bf16.spv \
 	vulkan/matmul_bf16_fast.spv \
@@ -122,6 +124,7 @@ VULKAN_SHADERS := \
 	vulkan/matmul_q8_0_mm_f16.spv \
 	vulkan/matmul_q8_0_mm_f16_out32.spv \
 	vulkan/matmul_q8_0_f32b_nx.spv \
+	vulkan/matmul_q8_0_prefill_exact.spv \
 	vulkan/matmul_q8_0_verify.spv \
 	vulkan/matmul_q8_0_decode.spv \
 	vulkan/matmul_q8_0_decode_q36.spv \
@@ -257,6 +260,9 @@ VULKAN_SHADERS := \
 	vulkan/dense_q4k_verify.spv \
 	vulkan/dense_q5k_verify.spv \
 	vulkan/dense_q6k_verify.spv \
+	vulkan/dense_q5k_prefill.spv \
+	vulkan/dense_q6k_prefill.spv \
+	vulkan/dense_iq4_nl_prefill.spv \
 	vulkan/dense_kquant_decode_r2.spv \
 	vulkan/dense_q6k_decode_dot.spv \
 	vulkan/dense_q5k_decode_r1.spv \
@@ -492,6 +498,9 @@ vulkan/dense_kquant_bm64_mmq.spv: vulkan/dense_kquant_mmq.comp
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/matmul_q8_0_prefill_exact.spv: vulkan/matmul_q8_0_f32b_nx.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_NT=32 -DQ36_FULL_TILES=1 -o $@ $<
+
 vulkan/dense_q3k_decode.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q3K_ONLY -DQ36_BOUNDS=0 -o $@ $<
 
@@ -524,6 +533,21 @@ vulkan/dense_q5k_decode_dot.spv: vulkan/dense_kquant_decode.comp
 
 vulkan/dense_q6k_decode_dot.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q6K_ONLY=1 -DQ36_ROWS=2 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q5k_prefill.spv: vulkan/dense_kquant_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TOKENS=16 -DQ36_Q5K_ONLY=1 -DQ36_ROWS=4 -DQ36_PREFILL=1 -DQ36_I16=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q6k_prefill.spv: vulkan/dense_kquant_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TOKENS=8 -DQ36_Q6K_ONLY=1 -DQ36_ROWS=4 -DQ36_PREFILL=1 -DQ36_I16=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_iq4_nl_prefill.spv: vulkan/dense_iq4_xs_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TOKENS=8 -DQ36_ROWS=4 -DQ36_PREFILL=1 -DQ36_I16=1 -DQ36_IQ4_NL=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/gdn_front_batch.spv: vulkan/gdn_front.comp vulkan/reference_math.glsl Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BATCH=1 -o $@ $<
+
+vulkan/gdn_front_batch_bf16.spv: vulkan/gdn_front.comp vulkan/reference_math.glsl Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BATCH=1 -DQ36_BF16=1 -o $@ $<
 
 vulkan/mtp_head_q5k_dot.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 -o $@ $<
@@ -962,10 +986,10 @@ test-qwen27b-metal-parity: metal
 	./q36_test --dense-quant-model-rows --gpu-cpu-parity --model $(QWEN27B_MODEL) --case short
 
 test-qwen27b-vulkan-parity: q36_test
-	./q36_test --vulkan-cpu-parity --model $(QWEN27B_MODEL) --case short
+	Q36_TEST_THREADS=16 ./q36_test --vulkan-cpu-parity --model $(QWEN27B_MODEL) --case short
 
 test-qwen27b-llama-parity: q36_llama_test
-	./q36_llama_test --llama-parity-seq --model $(QWEN27B_MODEL) --case short
+	Q36_TEST_THREADS=16 ./q36_llama_test --llama-parity-seq --model $(QWEN27B_MODEL) --case short
 
 test-vulkan: q36_test
 	./q36_test --vulkan-kernels
@@ -1156,6 +1180,7 @@ tests/test_distributed: tests/test_distributed.c q36_distributed.c q36_distribut
 .PHONY: test-distributed
 test-distributed: tests/test_distributed
 	./tests/test_distributed
+	python3 tests/test_pipeline_worker.py
 
 q36_gpu_core.o q36_cpu.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o q36_cli.o q36_cli_cpu.o q36_cli_metal.o q36_server.o q36_server_cpu.o q36_agent.o q36_agent_cpu.o q36_bench.o q36_bench_cpu.o q36_eval.o q36_eval_cpu.o: q36_distributed.h
 

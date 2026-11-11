@@ -10,7 +10,8 @@
  * idle ALUs, so accumulating all tokens in registers per weight load
  * costs the same bandwidth as one token; per-token accumulation order
  * is exactly the single-token kernel's, so a verified token is
- * bit-identical to the same token decoded alone. */
+ * bit-identical to the same token decoded alone. Prefill uses full 32-token
+ * tiles of the same arithmetic, with bounded verification for the tail. */
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -35,13 +36,17 @@ layout(push_constant) uniform Push {
 } pc;
 
 const uint Q8_0_U16 = 17u;
-const uint NT = 8u;
+#ifndef Q36_NT
+#define Q36_NT 8u
+#endif
+const uint NT = Q36_NT;
 
 shared float sh_sub[4][NT];
 
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.y * 16384u + gl_WorkGroupID.x;
+    uint tok0 = gl_WorkGroupID.z * NT;
     if (row >= pc.out_dim) return;
     uint row_base = row * pc.blocks * Q8_0_U16;
     uint in_vec4 = pc.blocks * 8u;
@@ -61,8 +66,10 @@ void main(void) {
         vec4 w1 = vec4(unpack8(int(p1)));
         uint xi = (b * 32u + eoff) >> 2u;
         for (uint t = 0u; t < NT; t++) {
-            if (t >= pc.n_tok) break;
-            uint xt = t * in_vec4 + xi;
+#ifndef Q36_FULL_TILES
+            if (tok0 + t >= pc.n_tok) break;
+#endif
+            uint xt = (tok0 + t) * in_vec4 + xi;
             acc[t] += d * (dot(w0, xv[xt]) + dot(w1, xv[xt + 1u]));
         }
     }
@@ -82,7 +89,11 @@ void main(void) {
     }
     if (tid == 0u) {
         for (uint t = 0u; t < NT; t++) {
-            if (t < pc.n_tok) y[t * pc.out_dim + row] = acc[t] * pc.scale;
+#ifndef Q36_FULL_TILES
+            if (tok0 + t < pc.n_tok) y[(tok0 + t) * pc.out_dim + row] = acc[t] * pc.scale;
+#else
+            y[(tok0 + t) * pc.out_dim + row] = acc[t] * pc.scale;
+#endif
         }
     }
 }

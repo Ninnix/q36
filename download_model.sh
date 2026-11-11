@@ -9,6 +9,7 @@ VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 Q4_FILE="Qwen3.6-35B-A3B-IQ4XS-Q4K-Q8.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
+DENSE_Q6_FILE="Qwen3.8-27B-UD-Q6_K.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
 FLASH_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf"
 FLASH_NGRAM_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00002-of-00002.gguf"
@@ -32,6 +33,7 @@ Usage:
   ./download_model.sh q2 [--token TOKEN]
   ./download_model.sh q4 [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
+  ./download_model.sh 27b-q6 [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh flash-next [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
@@ -51,6 +53,11 @@ Targets:
 
   27b
        Dense Qwen3.8 27B Dynamic 3.0 IQ3_S quant from $DENSE_REPO.
+
+  27b-q6
+       Dense Qwen3.8 27B Dynamic Q6_K quant from $DENSE_REPO, about 20.5 GiB.
+       Use a two-board layer pipeline on BC-250. Includes an embedded MTP
+       head; enable it with --mtp on the coordinator. CPU inference supported.
 
   27b-iq3-xxs
        Dense Qwen3.8 27B GSQ-RCO IQ3_XXS from $DENSE_SMALL_REPO.
@@ -109,6 +116,7 @@ case "$MODEL" in
     q2) MODEL_FILE=$Q2_FILE ;;
     q4) MODEL_FILE=$Q4_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
+    27b-q6) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_Q6_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
     flash-next|qwen38-flash-next)
         MODEL_REPO=$FLASH_REPO

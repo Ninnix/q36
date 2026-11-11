@@ -118,6 +118,7 @@ int q36_gpu_prepare_q5_k_output_cache(const void *model_map,
                                       uint64_t out_dim);
 #endif
 void q36_gpu_set_dense_model(bool dense);
+void q36_gpu_set_dense_prefill_exact(bool enabled);
 void q36_gpu_set_micro_batch(bool enabled);
 /* True when the fused attention path will serve q36_gpu_attn_decode_tensor;
  * the runtime then skips the per-context scores scratch. Sampled once. */
@@ -474,6 +475,12 @@ int q36_gpu_gdn_front_tensor(q36_gpu_tensor *history,
     const void *map, uint64_t size, const uint64_t offsets[5],
     uint32_t width, uint32_t groups, uint32_t heads, uint32_t weight_type,
     float alpha_scale, float beta_scale, float eps);
+int q36_gpu_gdn_front_rows_tensor(q36_gpu_tensor *history,
+    const q36_gpu_tensor *cur, const q36_gpu_tensor *x,
+    q36_gpu_tensor *q, q36_gpu_tensor *k, q36_gpu_tensor *v, q36_gpu_tensor *gb,
+    const void *map, uint64_t size, const uint64_t offsets[5],
+    uint32_t width, uint32_t groups, uint32_t heads, uint32_t weight_type,
+    float alpha_scale, float beta_scale, float eps, uint32_t n_tok);
 
 int q36_gpu_recurrent_conv_silu_tensor(
         q36_gpu_tensor       *cache_conv,
