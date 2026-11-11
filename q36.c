@@ -960,7 +960,7 @@ static uint32_t q36_engine_gpu_prefill_cap(const q36_engine *e) {
 #endif
     if (e->prefill_cap_override) return e->prefill_cap_override;
     if (e->precise_prefill && q36_dist_enabled(&e->distributed) &&
-        !getenv("Q36_VK_PREFILL_CHUNK")) return 128;
+        !getenv("Q36_VK_PREFILL_CHUNK")) return 64;
     if (e->ssd_streaming && !getenv("Q36_VK_PREFILL_CHUNK")) return 512;
     return q36_default_gpu_prefill_cap();
 }

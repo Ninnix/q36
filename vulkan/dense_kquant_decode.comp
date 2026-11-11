@@ -434,13 +434,16 @@ void main(void) {
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint part_id = lid & 15u;
-    uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[N_TOKENS][ROWS];
 #ifdef Q36_PREFILL
-    uint tok0 = gl_WorkGroupID.y * N_TOKENS;
+    /* Pair token tiles while streaming rows, sharing weights through cache. */
+    uint first_row = (gl_WorkGroupID.x / 2u) * ROWS;
+    uint tok0 = (gl_WorkGroupID.y * 2u + gl_WorkGroupID.x % 2u) * N_TOKENS;
+    if (tok0 >= pc.n_tok) return;
 #else
+    uint first_row = gl_WorkGroupID.x * ROWS;
     uint tok0 = 0u;
 #endif
+    float acc[N_TOKENS][ROWS];
     [[unroll]] for (uint t = 0u; t < N_TOKENS; t++)
         [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 
@@ -531,13 +534,14 @@ void main(void) {
                     int isum = bitfieldExtract(int(sums), int((part_id & 1u) * 16u), 16);
                     int idot = 0;
 #ifdef Q36_I16
-                    /* Widen before packed i16 partials can overflow. */
+                    /* Q5 needs one widening: 8 * 31 * 128 fits an i16 lane.
+                     * Centered Q6 keeps two partials to include -32 * -128. */
                     i16vec2 partial = i16vec2(0);
                     [[unroll]] for (uint i = 0u; i < 4u; i++) {
                         uint off = ((tok0+t)*pc.blocks+b)*128u+part_id*8u+2u*i;
                         partial += w16[2u*i] * unpackInt2x16(int(raw_values[off]));
                         partial += w16[2u*i+1u] * unpackInt2x16(int(raw_values[off+1u]));
-                        if ((i & 1u) != 0u) {
+                        if ((i & 1u) != 0u && (QTYPE != Q5_K || i == 3u)) {
                             idot += int(partial.x)+int(partial.y);
                             partial = i16vec2(0);
                         }

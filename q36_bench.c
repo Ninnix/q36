@@ -89,7 +89,7 @@ static void usage(FILE *fp) {
         "  --metal | --vulkan | --cpu | --backend NAME\n"
         "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "  -t, --threads N        CPU helper threads.\n"
-        "  --prefill-chunk N      Override GPU graph prefill width. Default: auto; resident GPU resolves to 1024.\n"
+        "  --prefill-chunk N      Override GPU graph prefill width. Default: model/runtime setting.\n"
         "  -ctk, --cache-type-k TYPE\n"
         "                         KV cache K type: f16, q8_0, or q4_0.\n"
         "                         Default: Vulkan/Metal resident q8_0, otherwise f16\n"
@@ -535,9 +535,11 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(const bench_config *c) {
+static void log_context_memory(const bench_config *c, q36_engine *engine) {
+    q36_dist_model_info info;
+    q36_engine_distributed_info(engine, &info);
     q36_context_memory m = q36_context_memory_estimate_configured(
-            c->backend, c->ctx_alloc, c->prefill_chunk,
+            c->backend, c->ctx_alloc, info.prefill_cap,
             c->cache_type_k, c->cache_type_v);
     fprintf(stderr,
             "q36-bench: context buffers %.2f MiB (scratch=%.2f MiB, raw=%.2f MiB, compressed=%.2f MiB, ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
@@ -578,7 +580,7 @@ int main(int argc, char **argv) {
     };
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &opt) != 0) return 1;
-    log_context_memory(&cfg);
+    log_context_memory(&cfg, engine);
     int top_k;
     float default_temp, top_p, min_p;
     q36_engine_sampling_defaults(engine, &default_temp, &top_k, &top_p, &min_p);

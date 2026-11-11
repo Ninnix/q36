@@ -9,7 +9,11 @@
 /* Share each activation load across output rows, with the same block
  * order and subgroup reduction as the single-token Q8 matvec. */
 layout(local_size_x = 128) in;
+#ifdef Q36_PREFILL
+const uint NT = 8u;
+#else
 layout(constant_id = 0) const uint NT = 2u;
+#endif
 const uint NR = NT == 2u ? 2u : 4u;
 
 layout(set = 0, binding = 0) readonly buffer Weights { uint16_t w[]; };
@@ -27,6 +31,11 @@ shared float partial[4][NR][NT];
 
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
+#ifdef Q36_PREFILL
+    uint tok0 = gl_WorkGroupID.z * NT;
+#else
+    const uint tok0 = 0u;
+#endif
     uint row0 = (gl_WorkGroupID.y * 16384u + gl_WorkGroupID.x) * NR;
     if (row0 >= pc.out_dim) return;
     float acc[NR][NT];
@@ -43,7 +52,7 @@ void main(void) {
             vec4 a = vec4(unpack8(int(uint(w[q]) | (uint(w[q + 1u]) << 16u))));
             vec4 c = vec4(unpack8(int(uint(w[q + 2u]) | (uint(w[q + 3u]) << 16u))));
             [[unroll]] for (uint t = 0u; t < NT; t++) {
-                uint xt = t * pc.blocks * 8u + xi;
+                uint xt = (tok0 + t) * pc.blocks * 8u + xi;
                 acc[r][t] += d * (dot(a, x[xt]) + dot(c, x[xt + 1u]));
             }
         }
@@ -60,7 +69,7 @@ void main(void) {
             [[unroll]] for (uint t = 0u; t < NT; t++) {
                 float sum = partial[0][r][t];
                 for (uint i = 1u; i < gl_NumSubgroups; i++) sum += partial[i][r][t];
-                y[t * pc.out_dim + row0 + r] = sum * pc.scale;
+                y[(tok0 + t) * pc.out_dim + row0 + r] = sum * pc.scale;
             }
         }
     }

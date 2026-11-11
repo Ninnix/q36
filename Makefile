@@ -498,8 +498,8 @@ vulkan/dense_kquant_bm64_mmq.spv: vulkan/dense_kquant_mmq.comp
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
-vulkan/matmul_q8_0_prefill_exact.spv: vulkan/matmul_q8_0_f32b_nx.comp Makefile
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_NT=32 -DQ36_FULL_TILES=1 -o $@ $<
+vulkan/matmul_q8_0_prefill_exact.spv: vulkan/matmul_q8_0_verify.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_PREFILL=1 -o $@ $<
 
 vulkan/dense_q3k_decode.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q3K_ONLY -DQ36_BOUNDS=0 -o $@ $<

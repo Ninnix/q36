@@ -65,14 +65,19 @@ See [launch and parity commands](../../docs/DISTRIBUTED.md#qwen38-27b-q6_k).
 Raw logs and CPU captures are under the ignored local directory
 `tests/test-vectors/local/q38-q6-20261111/` and
 `tests/test-vectors/local/q38-q6-speedup-20261111/` on the test coordinator.
+The latest optimization run is in
+`tests/test-vectors/local/q38-q6-next-20261111/`.
 
 ## Pipeline arithmetic
 
 The previous fast batched path changed both projection rounding and the
 FP16 recurrent-state rounding interval. Those differences accumulated until
 4K logits failed parity. Prefill now batches native decode arithmetic:
-Q5_K/Q6_K/IQ4_NL tiles share weight loads across tokens, Q8_0 retains its
-native FP32 reduction, and recurrent state rounds after each token. The fused
+Q5_K/Q6_K/IQ4_NL tiles share weight loads across tokens. Q8_0 now reuses
+the verification tile across four output rows and eight tokens while retaining
+its native FP32 reduction. Paired Q5_K/Q6_K token tiles share weights through
+cache; Q5_K widens once per dot while keeping every i16 partial in range.
+Recurrent state rounds after each token. The fused
 convolution/gating front processes ordered rows in one dispatch, reusing
 existing scratch so future QKV inputs survive output aliasing. Incomplete
 tiles and other formats reuse the existing verification kernels.
@@ -80,82 +85,94 @@ tiles and other formats reuse the existing verification kernels.
 This profile is selected only for dense models marked Q6_K in GGUF. Plain
 decode, MTP verification, and other quantizations keep their existing kernel
 selection. No additional dependency or repacked weight copy is required.
-The default distributed prefill capacity is 128 tokens. Complete vocabulary
+The default distributed prefill capacity is 64 tokens. Complete vocabulary
 logits match the saved token-by-token reference exactly at 128, 2,048, and
 4,096 tokens. Kernel tests also cover 2–129 rows, including irregular tails,
-odd output dimensions, and untouched output sentinels. FP16 recurrent output
-and state match sequential evaluation byte for byte at 32 and 128 rows.
+odd output dimensions, large row grids, and untouched output sentinels. FP16
+recurrent output and state match sequential evaluation byte for byte at 32
+and 128 rows.
 
 ## Pipeline performance
 
-Measurements use a 34/30 layer split, 128-token stage and transport chunks,
-a two-chunk window, 4,608-token allocation, and 24 generated tokens per point.
-Each process warms all measured frontiers before timing. The 128/2K/4K prose
-sweep checks context scaling; code, reasoning, and sampled generation use
-128 tokens. Sampled runs use temperature 0.7 and seed 1234567. MTP uses four
-drafts and zero margin, with opportunistic MTP for sampling. Arms run
-sequentially. These are single runs; small differences need repetition.
+Measurements use the 34/30 layer split, explicit 64-token stage and
+transport chunks, a two-chunk window, 4,608-token allocation, and 24 generated
+tokens per point. Each process warms all measured frontiers before timing.
+The prose sweep measures 128/2K/4K context scaling. Other workload/sampling
+arms use 128 tokens. Sampling uses temperature 0.7 and seed 1234567; MTP uses
+four drafts and zero margin, with opportunistic MTP for sampling. Arms run
+sequentially under the normal clock and thermal policies. These are single
+runs; small differences need repetition.
 
 Greedy prose, in tokens/s:
 
 | Context | Plain prefill | MTP prefill | Plain decode | MTP decode | Decode gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 53.14 | 52.62 | 14.74 | 17.72 | 20.2% |
-| 2048 | 104.66 | 97.96 | 14.52 | 17.92 | 23.4% |
-| 4096 | 101.62 | 95.39 | 14.50 | 17.48 | 20.6% |
+| 128 | 85.66 | 83.88 | 14.76 | 18.03 | 22.2% |
+| 2048 | 131.03 | 116.38 | 14.56 | 18.08 | 24.2% |
+| 4096 | 124.62 | 109.79 | 14.53 | 17.59 | 21.1% |
 
-The 4K plain prefill rate is 4.28 times the earlier 23.76 tokens/s
-scalar fallback. The 150–200 tokens/s target was not reached.
+At 4K, plain prefill improves from the previous exact profile's 101.62 to
+124.62 tokens/s (22.6%). The earlier scalar fallback reached
+23.76 tokens/s. The 150–200 tokens/s target was not reached.
 
-The chunk sweep retained exact full-vocabulary logits at every frontier:
+The latest chunk sweep retained exact full-vocabulary logits against the
+saved token-by-token reference at all three context frontiers:
 
-| Chunk | Prefill at 2K | Prefill at 4K | Planned scratch per stage |
-| ---: | ---: | ---: | ---: |
-| 128 | 104.64 | 101.86 | 47.21 MiB |
-| 256 | 92.61 | 89.19 | 93.46 MiB |
-| 512 | 80.25 | 79.18 | 185.95 MiB |
+| Chunk | Prefill at 128 | Prefill at 2K | Prefill at 4K | Planned scratch per stage |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 101.20 | 122.08 | 116.21 | 12.53 MiB |
+| 64 | 84.46 | 130.67 | 123.56 | 24.09 MiB |
+| 128 | 63.26 | 126.19 | 120.25 | 47.21 MiB |
 
-Larger chunks increased pipeline bubbles without reducing stage compute
-time. The earlier 30/34 split reached 94.53/91.70 tokens/s at 2K/4K.
-The default 128-token profile uses about 40.5 MiB more planned scratch than
-the earlier 16-token scalar fallback, while sharing existing convolution and
-activation panels. The
-weight arena and recurrent-state layouts are unchanged by the kernels.
+The 64-token profile gives the best measured long-prefill rate and reduces
+planned scratch from 47.21 to 24.09 MiB per stage. A 32-token override improves
+short-prefill latency but loses throughput at 2K/4K. There are no new buffers
+or repacked weight copies. Plain decode and MTP verification retain their
+existing kernel selection; other quantizations retain their prefill profile.
 
 Short-context decode, in tokens/s:
 
 | Workload | Sampling | Plain | MTP | Gain |
 | --- | --- | ---: | ---: | ---: |
-| Prose | Greedy | 14.74 | 17.72 | 20.2% |
-| Prose | Temperature 0.7 | 14.08 | 16.37 | 16.3% |
-| Code | Greedy | 14.13 | 17.64 | 24.8% |
-| Code | Temperature 0.7 | 14.29 | 21.05 | 47.3% |
-| Reasoning | Greedy | 13.87 | 20.07 | 44.7% |
-| Reasoning | Temperature 0.7 | 14.17 | 19.59 | 38.2% |
+| Prose | Greedy | 14.76 | 18.03 | 22.2% |
+| Prose | Temperature 0.7 | 14.00 | 16.41 | 17.2% |
+| Code | Greedy | 14.71 | 18.54 | 26.0% |
+| Code | Temperature 0.7 | 13.99 | 21.28 | 52.1% |
+| Reasoning | Greedy | 14.70 | 18.91 | 28.6% |
+| Reasoning | Temperature 0.7 | 14.37 | 18.37 | 27.8% |
 
-The geometric mean decode gain across these six arms is 31.4%.
-Raw measurements, including sampled prefill controls, remain in the ignored
-local results directory. MTP adds prefill work: at 4K it changes
-101.62 to 95.39 tokens/s.
+The geometric mean MTP decode gain across these six arms is
+28.6%. At 4K, MTP prefill changes 124.62 to 109.79 tokens/s.
+Raw measurements, including sampled prefill controls, stay in the ignored
+local results directory.
 
-Public Vulkan tensor counters peaked at 10.64 GiB on the plain
-coordinator, 11.05 GiB with MTP, and 8.89 GiB on the worker.
-Separate private scratch counters peaked at 52.6 MiB on the coordinator
-and 51.0 MiB on the worker. These exclude pageable GGUF mappings and
+Reasoning MTP initially measured 18.91/18.37 tokens/s for greedy/sampled
+generation, below the previous 20.07/19.59. Repeating the same new profile
+measured 20.15/19.67. Acceptance histograms were unchanged: eight speculative
+calls produced 24 tokens, with five four-token blocks. The table retains the
+first measurements; these runs do not establish a stable decode improvement.
+
+Public Vulkan tensor counters peaked at 10.61 GiB on the plain
+coordinator, 11.02 GiB with MTP, and 8.88 GiB on the worker.
+Separate private scratch counters peaked at 26.4 MiB on the coordinator
+and 49.3 MiB on the worker. These exclude pageable GGUF mappings and
 general process memory. No Vulkan allocation failed. End-of-arm GPU
-temperatures were 50–57°C on the coordinator and 57–70°C on the worker.
+temperatures were 52–58°C on the coordinator and 59–72°C on the worker.
 
 With the worker staged as described above, the plain prose sweep is:
 
 ```sh
 ./q36-bench -m gguf/Qwen3.8-27B-UD-Q6_K.gguf --vulkan -t 16 \
   --role coordinator --layers 0:33 --listen 192.168.1.90 9911 \
-  --prefill-chunk 128 --dist-prefill-chunk 128 --ctx-alloc 4608 \
+  --prefill-chunk 64 --dist-prefill-chunk 64 --ctx-alloc 4608 \
   --ctx-start 128 --ctx-max 4096 --step-mul 16 --gen-tokens 24 --warmup \
   --prompt-file tests/long_context_story_prompt.txt
 ```
 
-For MTP, add `--mtp gguf/Qwen3.8-27B-UD-Q6_K.gguf --mtp-draft 4 --mtp-margin 0`.
+The runtime defaults to 64 tokens for this model. The benchmark memory
+estimate uses the resolved engine capacity, including model defaults.
+For MTP, add
+`--mtp gguf/Qwen3.8-27B-UD-Q6_K.gguf --mtp-draft 4 --mtp-margin 0`.
 For sampling, add `--temp .7 --seed 1234567`, and add `--mtp-opportunistic`
 to its MTP arm. Initialization, staging, snapshot replay, and warm-up are
 excluded from rates.

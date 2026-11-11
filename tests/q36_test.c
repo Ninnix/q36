@@ -3702,6 +3702,8 @@ static void test_vulkan_small_tiles(void) {
     for (unsigned i = 0; i < sizeof(exact_types)/sizeof(*exact_types); i++)
         test_vulkan_small_dims_mode(exact_types[i],exact_bytes[i],132,exact_widths[i],true);
     test_vulkan_small_dims_mode(13,176,131,768,true);
+    test_vulkan_small_dims_mode(8,34,131,5120,true);
+    test_vulkan_small_dims_mode(8,34,65540,32,true);
     const uint32_t q8_rows[] = {1, 7, 31, 48, 63, 131};
     for (unsigned i = 0; i < sizeof(q8_rows) / sizeof(q8_rows[0]); i++)
         test_vulkan_small_one(8, 34, q8_rows[i]);

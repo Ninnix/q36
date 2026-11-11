@@ -125,7 +125,7 @@ python3 tools/pipeline_worker.py \
   --ssh root@worker --remote-dir /root/q36 \
   --metadata /dev/shm/q36-q6.q36-resident \
   --layer-start 34 --coordinator 192.168.1.90 --ctx 4096 \
-  --env Q36_VK_PREFILL_CHUNK=128
+  --env Q36_VK_PREFILL_CHUNK=64
 ```
 
 Keep this helper running. It starts the worker, sends the catalogue and
@@ -151,7 +151,7 @@ Start the coordinator with the matching route:
 ```sh
 ./q36 -m gguf/Qwen3.8-27B-UD-Q6_K.gguf --vulkan \
   --role coordinator --layers 0:33 --listen 192.168.1.90 9911 \
-  --ctx 4096 --prefill-chunk 128 --dist-prefill-chunk 128
+  --ctx 4096 --prefill-chunk 64 --dist-prefill-chunk 64
 ```
 
 Add `--mtp` only on the coordinator to use the embedded head. Both boards
@@ -162,7 +162,7 @@ Dense Q6 prefill batches the existing native arithmetic across tokens. It
 reuses the verification kernels, shares Q5_K/Q6_K/IQ4_NL weight loads, and
 rounds FP16 recurrent state after every token. This fixes the accumulated
 4K drift without evaluating the whole model one token at a time. The default
-stage capacity is 128 tokens. Other quantizations retain their existing
+stage capacity is 64 tokens. Other quantizations retain their existing
 prefill selection. See the [measurements](../speed-bench/qwen38-27b-q6/README.md).
 
 For interactive CPU inference on one board:

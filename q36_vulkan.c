@@ -5097,8 +5097,8 @@ static int q36_vk_matmul_q8_0_f32b_nx(q36_gpu_tensor *out,
                                       uint64_t n_tok,
                                       uint64_t blocks,
                                       float scale) {
-    if (n_tok > 8u && n_tok % 32u) {
-        uint64_t full = n_tok / 32u * 32u, xb = blocks * 32u * sizeof(float), ob = out_dim * sizeof(float);
+    if (n_tok > 8u && (n_tok % 8u || out_dim % 4u)) {
+        uint64_t full = out_dim % 4u ? 0u : n_tok / 8u * 8u, xb = blocks * 32u * sizeof(float), ob = out_dim * sizeof(float);
         int ok = !full || q36_vk_matmul_q8_0_f32b_nx(out,w,weight_bytes,x,row_bytes,out_dim,full,blocks,scale);
         for (uint64_t t = full; ok && t < n_tok; t += 8u) {
             uint64_t n = n_tok-t < 8u ? n_tok-t : 8u;
@@ -5128,7 +5128,11 @@ static int q36_vk_matmul_q8_0_f32b_nx(q36_gpu_tensor *out,
         const q36_gpu_tensor *bindings[3] = { weights, x, out };
         const char *op = q36_vk.prof_ops ? q36_vk_q8_0_op_name(out_dim, blocks, n_tok) : "dense_q8_0";
         q36_vk_kernel *kernel = n_tok > 8u ? &q36_vk.matmul_q8_0_prefill_exact : &q36_vk.matmul_q8_0_f32b_nx;
-        if (n_tok <= 8u && q36_vk.bc250 && q36_vk.subgroup_size == 64u &&
+        if (n_tok > 8u) {
+            uint32_t tiles = (uint32_t)out_dim / 4u;
+            gx = tiles > 16384u ? 16384u : tiles;
+            gy = (tiles + 16383u) / 16384u;
+        } else if (q36_vk.bc250 && q36_vk.subgroup_size == 64u &&
             blocks >= 32u && out_dim >= 1024u && out_dim % 4u == 0u &&
             q36_vk_env_default_on("Q36_VK_Q8_VERIFY")) {
             uint32_t rows = n_tok == 2u ? 2u : 4u;
@@ -5138,7 +5142,7 @@ static int q36_vk_matmul_q8_0_f32b_nx(q36_gpu_tensor *out,
             kernel = &q36_vk.matmul_q8_0_verify[n_tok - 2u];
         }
         ok = q36_vk_run_unlocked(op, kernel, bindings, &push, sizeof(push), gx, gy,
-                                 n_tok > 8u ? ((uint32_t)n_tok + 31u) / 32u : 1u);
+                                 n_tok > 8u ? (uint32_t)n_tok / 8u : 1u);
     }
     pthread_mutex_unlock(&q36_vk_mu);
     return ok;
@@ -5628,17 +5632,19 @@ static int q36_vk_prefill_quant(q36_gpu_tensor *out,
     /* Full tiles omit hot bounds checks; the tail keeps bounded verification. */
     uint32_t full = (uint32_t)n_tok / tile * tile, blocks = (uint32_t)in_dim / 256u;
     struct {uint32_t in_dim,out_dim,n_tok,blocks,row_bytes,type;float scale;}
-        pk={in_dim,out_dim,n_tok,blocks,row_bytes,type,scale};
+        pk={in_dim,out_dim,full,blocks,row_bytes,type,scale};
     struct {uint32_t out_dim,blocks,row_bytes;float scale;uint32_t n_tok;}
-        pi={out_dim,blocks,row_bytes,scale,n_tok};
+        pi={out_dim,blocks,row_bytes,scale,full};
     bool iq4 = type == Q36_VK_TENSOR_IQ4_NL;
+    uint32_t paired = iq4 ? 1u : 2u;
     pthread_mutex_lock(&q36_vk_mu);
     q36_gpu_tensor *weights = q36_vk_weight_get_unlocked(source,weight_bytes);
     q36_gpu_tensor *raw = q36_vk_predequant_b16_unlocked(q8,full,blocks,true);
     const q36_gpu_tensor *bindings[4]={weights,q8,out,raw};
     int ok = weights && raw && q36_vk_run_unlocked("dense_quant_prefill",
         &q36_vk.dense_quant_prefill[iq4 ? 2 : type == Q36_VK_TENSOR_Q6_K],bindings,
-        iq4 ? (void *)&pi : (void *)&pk,iq4 ? sizeof(pi) : sizeof(pk),out_dim/4u,full/tile,1);
+        iq4 ? (void *)&pi : (void *)&pk,iq4 ? sizeof(pi) : sizeof(pk),
+        out_dim/4u*paired,(full/tile+paired-1u)/paired,1);
     pthread_mutex_unlock(&q36_vk_mu);
     if (ok && full < n_tok) {
         uint64_t qb = blocks*sizeof(q36_vk_block_q8_K), ob = out_dim*sizeof(float), n = n_tok-full;
