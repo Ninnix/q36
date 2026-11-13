@@ -166,6 +166,9 @@ For a first run on a 16 GB machine, download Qwen3.6-35B-A3B Q2:
 ```
 
 Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
+The downloader verifies the exact file size and SHA-256, including for existing
+files. If either check fails, it stops and keeps the file for inspection; move
+that file aside before retrying. Verification requires `sha256sum` or `shasum`.
 Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.

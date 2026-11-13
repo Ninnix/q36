@@ -90,6 +90,10 @@ Environment:
 After a main-model download the script updates the legacy link:
   ./q36moe.gguf -> <download directory>/<selected model>
 
+Every file is checked against its expected size and SHA-256 before use,
+including existing downloads. A mismatch stops the script and keeps the file
+for inspection. Move it aside before retrying. Requires sha256sum or shasum.
+
 With the default output directory, q2 matches the compiled model path:
   ./q36 -p "Hello"
   ./q36-server --ctx 32768
@@ -173,6 +177,76 @@ if [ -z "$TOKEN" ] && [ -s "$HOME/.cache/huggingface/token" ]; then
     TOKEN=$(cat "$HOME/.cache/huggingface/token")
 fi
 
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    echo "Download verification requires sha256sum or shasum." >&2
+    exit 1
+fi
+
+# Sizes and SHA-256 hashes from the Hugging Face LFS metadata.
+artifact_identity() {
+    case "$1" in
+        "$Q2_FILE")
+            expected_bytes=12070095168
+            expected_sha=4dab0f76b675cc1215b7ee599e85d2a5bbc97a20bd6fca18a8f35e343d90c013
+            ;;
+        "$Q4_FILE")
+            expected_bytes=20458702976
+            expected_sha=17597eb07526022e9f0c73730174cad3daf5ae53b2ce4a64ddfe4461323dc5fe
+            ;;
+        "$DENSE_FILE")
+            expected_bytes=12040883104
+            expected_sha=d847e2c1e4aa276e4b7b8e9ad7628050e61e165d49ab995407bc36677a6f3864
+            ;;
+        "$DENSE_Q6_FILE")
+            expected_bytes=21980441504
+            expected_sha=6cac55f876015d6d4b94b1656d23f79f424ac9b583652aedf0633dba116576a8
+            ;;
+        "$DENSE_SMALL_FILE")
+            expected_bytes=10442827840
+            expected_sha=63f29a2189a6b4cc31f81e093d3856ad293a5583114439f41ae1ed7af4093262
+            ;;
+        "$FLASH_FILE")
+            expected_bytes=21986609760
+            expected_sha=f519acc9e3c6d570299224f589b5d1b0a7868698ea1736809480f87dbb07a1e9
+            ;;
+        "$FLASH_NGRAM_FILE")
+            expected_bytes=28800138432
+            expected_sha=316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
+            ;;
+        "$VISION_FILE")
+            expected_bytes=899283680
+            expected_sha=8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f
+            ;;
+        "$DENSE_VISION_FILE")
+            expected_bytes=927607488
+            expected_sha=cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e
+            ;;
+        *)
+            echo "Missing artifact identity: $1" >&2
+            exit 1
+            ;;
+    esac
+}
+
+verify_download() {
+    artifact_identity "$1"
+    if [ "$(wc -c < "$2")" -ne "$expected_bytes" ]; then
+        echo "Incorrect file size: $2. Move the file aside and retry." >&2
+        exit 1
+    fi
+    echo "Verifying SHA-256: $2"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum < "$2")
+    else
+        actual_sha=$(shasum -a 256 < "$2")
+    fi
+    actual_sha=${actual_sha%% *}
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        echo "Checksum mismatch: $2. Move the file aside and retry; it was not accepted." >&2
+        exit 1
+    fi
+}
+
 download_one() {
     repo=$1
     remote=$2
@@ -192,7 +266,8 @@ download_one() {
         exit 1
     fi
 
-    if [ -s "$out" ]; then
+    if [ -e "$out" ]; then
+        verify_download "$file" "$out"
         echo "Already downloaded: $out"
         return
     fi
@@ -207,6 +282,7 @@ download_one() {
         curl -fL --progress-meter -C - -o "$part" "$url"
     fi
 
+    verify_download "$file" "$part"
     mv "$part" "$out"
 }
 

@@ -926,7 +926,7 @@ linenoise_cpu.o: linenoise.c linenoise.h
 rax_cpu.o: rax.c rax.h rax_malloc.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ rax.c
 
-test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed test-qwen4 test-ssd-prefetch
+test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed test-qwen4 test-ssd-prefetch test-download
 	$(MAKE) -C gguf-tools test
 	./q36-eval --self-test-extractors
 	./q36_agent_test
@@ -934,6 +934,11 @@ test: all q36_agent_test $(SAMPLING_TEST) test-quality test-distributed test-qwe
 	python3 tests/test_agent_terminal.py ./q36_agent_test
 	./tests/test_sampling
 	./q36_test --mtp-lookup --quant-primitives --routed-q4-quants --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
+
+.PHONY: test-download
+test-download:
+	sh -n download_model.sh
+	python3 tests/test_download_model.py
 
 test-quick: test
 
