@@ -54,6 +54,9 @@ layout(push_constant) uniform Push {
 #define Q36_GQA_HEADS 8
 #endif
 #define HQ Q36_GQA_HEADS
+#ifndef Q36_HEAD_GROUPS
+#define Q36_HEAD_GROUPS 1
+#endif
 #define QT Q36_QT
 #define HD 256u
 #define ROWS HQ
@@ -98,10 +101,18 @@ void main(void) {
     uint lane = tid & 63u;
     uint r0 = rg * ROWS;
     uint vi = lane * 4u;
+#if Q36_HEAD_GROUPS > 1
+    uint kvh = gl_WorkGroupID.x / Q36_HEAD_GROUPS;
+    uint hgroup = gl_WorkGroupID.x % Q36_HEAD_GROUPS;
+    uint vblk = kvh * V_HEAD_BYTES + (vi >> 5u) * 18u;
+#else
     uint vblk = gl_WorkGroupID.x * V_HEAD_BYTES + (vi >> 5u) * 18u;
+#endif
     uint vqo = 2u + (vi & 15u);
     uint vsh = (vi & 31u) < 16u ? 0u : 4u;
+#if Q36_HEAD_GROUPS == 1
     uint kvh = gl_WorkGroupID.x;
+#endif
     uint local0 = gl_WorkGroupID.y * QT;
     uint tok0 = pc.tok_base + local0;
     uint tn = min(QT, pc.n_tok - local0);
@@ -113,7 +124,11 @@ void main(void) {
     if (span_first >= max_spans) return;
 
     uint heads = pc.n_head / pc.n_head_kv;
+#if Q36_HEAD_GROUPS > 1
+    uint h0 = kvh * heads + hgroup * HQ;
+#else
     uint h0 = kvh * heads;
+#endif
     float scale = 1.0 / sqrt(float(HD));
 
     for (uint e = tid; e < QT * HQ * HD; e += 64u * QT) {

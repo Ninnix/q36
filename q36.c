@@ -758,13 +758,9 @@ static bool q36_cpu_workers_atexit;
 static __thread int q36_cpu_parallel_depth;
 
 #ifndef Q36_NO_GPU
-/* Prefill batch width: the Vulkan scratch tensors hold this many token rows,
- * so q36_session_sync() can walk a prompt in chunks.  1024 keeps the routed
- * MoE GEMM tiles ~full (8192 slots, 32 per expert on average); the 8192-slot
- * schedule cap and the attention-partials scratch (which scales with
- * chunk x context spans) are why this does not go higher.  Chunk width was
- * never numerics-invariant once the prefill GEMM kernels landed; Vulkan SSD
- * streaming keeps its own 512 default. */
+/* Activation rows allocated for batched prefill. Resident MoE also supports
+ * 2048 rows; recurrent half-state stores retain the 1024-row boundaries.
+ * SSD streaming keeps its own 512 default. */
 enum { Q36_GPU_PREFILL_CHUNK_DEFAULT = 1024 };
 
 typedef struct {

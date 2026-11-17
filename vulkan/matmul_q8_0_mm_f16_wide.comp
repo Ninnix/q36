@@ -1,0 +1,76 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+/* BC-250 Q8 prefill: a 192x64 tile reuses activations across more rows.
+ * Each output keeps the original 32-element F16 sum and F32 scale order. */
+layout(local_size_x = 256) in;
+layout(binding=0) readonly buffer A { uint16_t w[]; };
+layout(binding=1) readonly buffer X { float x[]; };
+layout(binding=2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push {
+    uint out_dim, n_tok, blocks, row_bytes;
+    float scale;
+} pc;
+#ifndef Q36_BM
+#define Q36_BM 192
+#endif
+const uint BM=Q36_BM, BN=64u, WG=256u;
+const uint RX=8u, RY=WG/RX, MR=BM/RY, NR=BN/RX;
+shared f16vec4 a[BM][9];
+shared f16vec4 b[BN][9];
+shared float ds[BM];
+void main() {
+    uint tid=gl_LocalInvocationID.x, row0=gl_WorkGroupID.x*BM, col0=gl_WorkGroupID.y*BN;
+    uint tx=tid%RX, ty=tid/RX, dim=pc.blocks*32u;
+    float acc[MR][NR];
+    for (uint i=0; i<MR; i++)
+        for (uint j=0; j<NR; j++) acc[i][j]=0;
+    for (uint kb=0; kb<pc.blocks; kb++) {
+        for (uint r=tid/2u; r<BM; r+=WG/2u) {
+            uint kk=(tid&1u)*4u, row=row0+r;
+            uint base=row<pc.out_dim ? (row*pc.blocks+kb)*17u : 0u;
+            uint q=base+1u+kk*2u;
+            for (uint j=0; j<4u; j++) {
+                uint p=uint(w[q+2u*j]) | (uint(w[q+2u*j+1u])<<16u);
+                a[r][kk+j]=f16vec4(unpack8(int(p)))*float16_t(0.0078125);
+            }
+            if ((tid&1u)==0u) ds[r]=row<pc.out_dim ? unpackHalf2x16(uint(w[base])).x*128.0 : 0.0;
+        }
+        for (uint c=tid/4u; c<BN; c+=WG/4u) {
+            uint kk=(tid&3u)*2u, col=col0+c;
+            uint off=col*dim+kb*32u+kk*4u;
+            bool live=col<pc.n_tok;
+            vec4 x0=live ? vec4(x[off],x[off+1],x[off+2],x[off+3]) : vec4(0);
+            vec4 x1=live ? vec4(x[off+4],x[off+5],x[off+6],x[off+7]) : vec4(0);
+            b[c][kk]=f16vec4(x0);
+            b[c][kk+1u]=f16vec4(x1);
+        }
+        barrier();
+        f16vec2 pk[MR][NR];
+        for (uint i=0; i<MR; i++)
+            for (uint j=0; j<NR; j++) pk[i][j]=f16vec2(0.0hf);
+        for (uint kk=0; kk<8u; kk++) {
+            f16vec4 v[NR];
+            for (uint j=0; j<NR; j++) v[j]=b[tx+RX*j][kk];
+            for (uint i=0; i<MR; i++) {
+                f16vec4 av=a[ty+RY*i][kk];
+                for (uint j=0; j<NR; j++)
+                    pk[i][j]=fma(av.zw,v[j].zw,fma(av.xy,v[j].xy,pk[i][j]));
+            }
+        }
+        for (uint i=0; i<MR; i++) {
+            float d=ds[ty+RY*i];
+            for (uint j=0; j<NR; j++) acc[i][j]=fma(d,float(pk[i][j].x)+float(pk[i][j].y),acc[i][j]);
+        }
+        barrier();
+    }
+    for (uint j=0; j<NR; j++) {
+        uint col=col0+tx+RX*j;
+        if (col>=pc.n_tok) continue;
+        for (uint i=0; i<MR; i++) {
+            uint row=row0+ty+RY*i;
+            if (row<pc.out_dim) y[col*pc.out_dim+row]=acc[i][j]*pc.scale;
+        }
+    }
+}

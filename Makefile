@@ -122,6 +122,9 @@ VULKAN_SHADERS := \
 	vulkan/matmul_q8_0_mm.spv \
 	vulkan/matmul_q8_0_mm_small.spv \
 	vulkan/matmul_q8_0_mm_f16.spv \
+	vulkan/matmul_q8_0_mm_f16_wide.spv \
+	vulkan/matmul_q8_0_mm_f16_wide128.spv \
+	vulkan/matmul_f32_batch.spv \
 	vulkan/matmul_q8_0_mm_f16_out32.spv \
 	vulkan/matmul_q8_0_f32b_nx.spv \
 	vulkan/matmul_q8_0_prefill_exact.spv \
@@ -184,6 +187,8 @@ VULKAN_SHADERS := \
 	vulkan/moe_down_q4k_sum_decode.spv \
 	vulkan/moe_gate_up_gemm.spv \
 	vulkan/moe_down_gemm.spv \
+	vulkan/moe_gate_up_gemm_bm128.spv \
+	vulkan/moe_down_gemm_bm128.spv \
 	vulkan/moe_matvec.spv \
 	vulkan/moe_iq4_xs_single.spv \
 	vulkan/moe_q4_k_single.spv \
@@ -354,8 +359,8 @@ vulkan/mtp_head_mask.spv: vulkan/mtp_head_mask.comp
 vulkan/router_topk_fast.spv: vulkan/router_topk.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_SUBGROUPS=1 $< -o $@
 
-vulkan/attn_prefill_qtile1_gqa8.spv: vulkan/attn_prefill_qtile2.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=8 $< -o $@
+vulkan/attn_prefill_qtile1_gqa8.spv: vulkan/attn_prefill_qtile2.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=4 -DQ36_HEAD_GROUPS=2 $< -o $@
 
 vulkan/attn_decode_gqa8.spv: vulkan/attn_decode_gqa6.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_GQA8=1 $< -o $@
@@ -400,7 +405,7 @@ vulkan/dense_iq3_s_decode_r1.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_v
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=1 -DQ36_BOUNDS=0 -o $@ $<
 
 vulkan/dense_iq3_s_bm96_pair_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc vulkan/dense_token_pairs.glsl Makefile
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -DQ36_K_CHUNK=4 -o $@ $<
 
 vulkan/dense_iq3_s_bm96_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
@@ -579,6 +584,15 @@ vulkan/matmul_q8_0_mm.spv: vulkan/matmul_q8_0_mm.comp
 vulkan/matmul_q8_0_mm_f16.spv: vulkan/matmul_q8_0_mm_f16.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/matmul_q8_0_mm_f16_wide.spv: vulkan/matmul_q8_0_mm_f16_wide.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_f32_batch.spv: vulkan/matmul_f32_batch.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_q8_0_mm_f16_wide128.spv: vulkan/matmul_q8_0_mm_f16_wide.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=128 -o $@ $<
+
 vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -609,8 +623,14 @@ vulkan/moe_down_q4k_sum_decode.spv: vulkan/moe_down_q4k_sum_decode.comp
 vulkan/moe_gate_up_gemm.spv: vulkan/moe_gate_up_gemm.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/moe_gate_up_gemm_bm128.spv: vulkan/moe_gate_up_gemm.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=128 -o $@ $<
+
 vulkan/moe_down_gemm.spv: vulkan/moe_down_gemm.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/moe_down_gemm_bm128.spv: vulkan/moe_down_gemm.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=128 -o $@ $<
 
 vulkan/delta_net_cols.spv: vulkan/delta_net_cols.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

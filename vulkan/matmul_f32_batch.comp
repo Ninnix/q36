@@ -1,0 +1,26 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#define TOKENS 16
+/* Reuse each router weight across token rows; each lane keeps the original
+ * strided dot chain and the same 64-lane reduction. */
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer Weights { vec4 w[]; };
+layout(binding=1) readonly buffer Input { vec4 x[]; };
+layout(binding=2) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Push { uint in_dim,out_dim,n_tok;float scale; } pc;
+void main() {
+    uint row=gl_WorkGroupID.x,tok=gl_WorkGroupID.y*TOKENS,lid=gl_LocalInvocationID.x,n4=pc.in_dim/4u;
+    float acc[TOKENS];for(uint j=0;j<TOKENS;j++)acc[j]=0;
+    for(uint i=lid;i<n4;i+=64u) {
+        vec4 weight=w[row*n4+i];
+        for(uint j=0;j<TOKENS;j++) {
+            vec4 v=tok+j<pc.n_tok?x[(tok+j)*n4+i]:vec4(0);
+            acc[j]+=dot(weight,v);
+        }
+    }
+    for(uint j=0;j<TOKENS;j++) {
+        float v=subgroupAdd(acc[j]);
+        if(lid==0 && tok+j<pc.n_tok)y[(tok+j)*pc.out_dim+row]=v*pc.scale;
+    }
+}

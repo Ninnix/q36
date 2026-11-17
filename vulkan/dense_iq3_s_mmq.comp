@@ -188,7 +188,14 @@ void main(void) {
                           fma(f16vec2(av.y), f16vec2(b0.y, b1.y), sum));
             }
 #else
+#ifdef Q36_K_CHUNK
+            /* Bound live operands while retaining every FMA in K order. */
+            [[dont_unroll]] for (uint kb = 0u; kb < BK / 2u; kb += Q36_K_CHUNK) {
+                [[unroll]] for (uint kk = 0u; kk < Q36_K_CHUNK; kk++) {
+                    uint k = kb + kk;
+#else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
+#endif
                 f16vec2 av[ROWS_PER_LANE];
                 f16vec2 bv[4];
 #if Q36_BM == 32
@@ -229,6 +236,9 @@ void main(void) {
                                 sum[tp * ROWS_PER_LANE + rr]));
 #endif
             }
+#ifdef Q36_K_CHUNK
+            }
+#endif
 #endif
             barrier();
         }

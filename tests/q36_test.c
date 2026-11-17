@@ -5030,6 +5030,55 @@ static void test_vulkan_attn_decode_fused(void) {
 #endif
 }
 
+static void test_vulkan_scratch_reuse(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    enum { CASES = 128, WIDTH = 2240 };
+    const uint64_t row_bytes = WIDTH * sizeof(float);
+    float *input = malloc(CASES * row_bytes), *got = malloc(CASES * row_bytes);
+    float add[WIDTH];
+    q36_gpu_tensor *x = q36_gpu_tensor_alloc(CASES * row_bytes);
+    q36_gpu_tensor *z = q36_gpu_tensor_alloc(row_bytes);
+    q36_gpu_tensor *out = q36_gpu_tensor_alloc(CASES * row_bytes);
+    TEST_ASSERT(input && got && x && z && out);
+    if (!input || !got || !x || !z || !out) goto done;
+    for (unsigned i = 0; i < CASES; i++)
+        for (unsigned j = 0; j < WIDTH; j++) input[i * WIDTH + j] = i * 0.25f;
+    for (unsigned j = 0; j < WIDTH; j++) add[j] = 3.0f;
+    TEST_ASSERT(q36_gpu_tensor_write(x, 0, input, CASES * row_bytes));
+    TEST_ASSERT(q36_gpu_tensor_write(z, 0, add, row_bytes));
+    /* Reuse one size, then exceed the private pool's capacity with distinct
+     * sizes. Each old result must survive later writes and pool eviction. */
+    for (unsigned i = 0; i < CASES; i++) {
+        unsigned n = 2048 + (i < 32 ? 0 : i - 32);
+        uint64_t bytes = n * sizeof(float);
+        q36_gpu_tensor *row = q36_gpu_tensor_view(x, i * row_bytes, bytes);
+        q36_gpu_tensor *tmp = q36_gpu_tensor_alloc_scratch(bytes);
+        TEST_ASSERT(row && tmp);
+        if (row && tmp) {
+            TEST_ASSERT(q36_gpu_add_tensor(tmp, row, z, n));
+            TEST_ASSERT(q36_gpu_tensor_copy(out, i * row_bytes, tmp, 0, bytes));
+        }
+        q36_gpu_tensor_free(row);
+        q36_gpu_tensor_free(tmp);
+        /* Reacquiring without recording a new use must retain the old use. */
+        tmp = q36_gpu_tensor_alloc_scratch(bytes);
+        TEST_ASSERT(tmp);
+        q36_gpu_tensor_free(tmp);
+    }
+    TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, CASES * row_bytes));
+    for (unsigned i = 0; i < CASES; i++) {
+        unsigned n = 2048 + (i < 32 ? 0 : i - 32);
+        for (unsigned j = 0; j < n; j++) TEST_ASSERT(got[i * WIDTH + j] == i * 0.25f + 3.0f);
+    }
+done:
+    q36_gpu_tensor_free(out);
+    q36_gpu_tensor_free(z);
+    q36_gpu_tensor_free(x);
+    free(got);
+    free(input);
+#endif
+}
+
 static void test_vulkan_host_overwrite(void) {
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
     const float input[] = {3, -5, 7, 11}, zero[4] = {0};
@@ -5190,6 +5239,7 @@ done:
 }
 
 static void test_vulkan_kernels(void) {
+    test_vulkan_scratch_reuse();
     test_vulkan_router_subgroups();
     test_vulkan_top2_rows();
     test_vulkan_host_overwrite();

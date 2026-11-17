@@ -1,13 +1,14 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 /* Routed IQ2_XXS gate/up/SwiGLU GEMM for prefill batches: one workgroup
- * owns a 64-mid-row x 32-slot tile of one expert's token group. The
+ * owns a Q36_BM-row x 32-slot tile of one expert's token group. The
  * expert row block dequantizes into shared memory once per k-block and
- * is applied to all 32 slots through packed f16 FMAs, so the dequant
+ * is applied across the live slots through packed f16 FMAs, so the dequant
  * and weight traffic amortize over the tile instead of per 8 routed
  * pairs, and no subgroup reduction runs at all.
  *
@@ -44,7 +45,21 @@ const uint IQ2_U16 = 33u;
 const uint SLOT_TILE = 32u;
 const uint TILE_WORDS = 1u + SLOT_TILE;
 const uint INVALID = 0xffffffffu;
-const uint BM = 64u;
+#ifndef Q36_BM
+#define Q36_BM 64
+#endif
+const uint BM = Q36_BM;
+#ifndef COLUMN_THREADS
+#if Q36_BM >= 128
+#define COLUMN_THREADS 8
+#else
+#define COLUMN_THREADS 32
+#endif
+#endif
+const uint TX = COLUMN_THREADS;
+const uint RY = 256u / TX;
+const uint MR = BM / RY;
+const uint NC = 32u / TX;
 const uint KK = 8u;
 
 shared uint sh_grid[512];
@@ -56,6 +71,35 @@ shared float Dg[BM];
 shared float Du[BM];
 shared uint sh_slot[SLOT_TILE];
 shared uint sh_x4[SLOT_TILE];
+
+void accumulate(uint tx, uint ty, uint rows, uint cols,
+                inout float accg[MR][NC], inout float accu[MR][NC]) {
+    f16vec2 pkg[MR][NC], pku[MR][NC];
+    [[unroll]] for (uint i = 0u; i < rows; i++) {
+        [[unroll]] for (uint j = 0u; j < cols; j++) {
+            pkg[i][j] = f16vec2(0.0hf);
+            pku[i][j] = f16vec2(0.0hf);
+        }
+    }
+    [[unroll]] for (uint kk = 0u; kk < KK; kk++) {
+        f16vec4 b[NC];
+        [[unroll]] for (uint j = 0u; j < cols; j++) b[j] = Bs[tx + TX*j][kk];
+        [[unroll]] for (uint i = 0u; i < rows; i++) {
+            f16vec4 ag = Ag[ty + RY * i][kk];
+            f16vec4 au = Au[ty + RY * i][kk];
+            [[unroll]] for (uint j = 0u; j < cols; j++) {
+                pkg[i][j] = fma(ag.zw, b[j].zw, fma(ag.xy, b[j].xy, pkg[i][j]));
+                pku[i][j] = fma(au.zw, b[j].zw, fma(au.xy, b[j].xy, pku[i][j]));
+            }
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < rows; i++) {
+        [[unroll]] for (uint j = 0u; j < cols; j++) {
+            accg[i][j] = fma(Dg[ty + RY * i], float(pkg[i][j].x) + float(pkg[i][j].y), accg[i][j]);
+            accu[i][j] = fma(Du[ty + RY * i], float(pku[i][j].x) + float(pku[i][j].y), accu[i][j]);
+        }
+    }
+}
 
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
@@ -72,30 +116,38 @@ void main(void) {
     for (uint w = tid; w < 512u; w += 256u) sh_grid[w] = tables[w];
 
     uint row_u16 = pc.blocks * IQ2_U16;
-    uint ar = tid >> 2u;      /* staged row 0..63 */
+    uint ar = tid >> 2u;
     uint sub = tid & 3u;      /* 8-element group within the 32-block */
-    uint row = row0 + ar;
-    uint base_u16 = (expert * pc.mid_dim + (row < pc.mid_dim ? row : 0u)) * row_u16;
     uint bc = tid >> 3u;      /* staged slot 0..31 */
     uint bkk = tid & 7u;
-    uint tx = tid & 31u;      /* output slot lane */
-    uint ty = tid >> 5u;      /* output row lane: rows ty + 8*i */
+    uint tx = tid % TX;
+    uint ty = tid / TX;
 
-    float accg[8];
-    float accu[8];
-    for (uint i = 0u; i < 8u; i++) {
-        accg[i] = 0.0;
-        accu[i] = 0.0;
+    float accg[MR][NC];
+    float accu[MR][NC];
+    for (uint i = 0u; i < MR; i++) {
+        for (uint j = 0u; j < NC; j++) {
+            accg[i][j] = 0.0;
+            accu[i][j] = 0.0;
+        }
     }
     barrier();
+
+    /* Skip empty columns without changing any output's K order. */
+#if Q36_BM >= 128
+    uint width = sh_slot[16] != INVALID ? 32u : sh_slot[8] != INVALID ? 16u : 8u;
+#else
+    const uint width = 32u;
+#endif
 
     uint n_kb = pc.blocks * 8u;
     for (uint kb = 0u; kb < n_kb; kb++) {
         uint sb = kb >> 3u;
         uint ib32 = kb & 7u;
-        /* Stage gate and up: 64 rows x one 32-element scale group, one
-         * 8-element grid word per thread. */
-        {
+        /* Wider row tiles reuse B without changing any output's K order. */
+        for (uint r = ar; r < BM; r += 64u) {
+            uint row = row0 + r;
+            uint base_u16 = (expert * pc.mid_dim + (row < pc.mid_dim ? row : 0u)) * row_u16;
             uint gb = base_u16 + sb * IQ2_U16;
             uint gq = gb + 1u + 4u * ib32;
             uint gss = uint(gw[gq + 2u]) | (uint(gw[gq + 3u]) << 16u);
@@ -109,22 +161,22 @@ void main(void) {
             vec4 g1 = vec4(unpack8(sh_grid[gqs * 2u + 1u]));
             g0 = mix(g0, -g0, bvec4((gsign & 1u) != 0u, (gsign & 2u) != 0u, (gsign & 4u) != 0u, (gsign & 8u) != 0u));
             g1 = mix(g1, -g1, bvec4((gsign & 16u) != 0u, (gsign & 32u) != 0u, (gsign & 64u) != 0u, (bitCount(gsign) & 1) != 0));
-            Ag[ar][sub * 2u] = f16vec4(g0 * 0.015625);
-            Ag[ar][sub * 2u + 1u] = f16vec4(g1 * 0.015625);
+            Ag[r][sub * 2u] = f16vec4(g0 * 0.015625);
+            Ag[r][sub * 2u + 1u] = f16vec4(g1 * 0.015625);
 
             uint usign = bitfieldExtract(uss, int(sbit), 7);
             vec4 u0 = vec4(unpack8(sh_grid[uqs * 2u]));
             vec4 u1 = vec4(unpack8(sh_grid[uqs * 2u + 1u]));
             u0 = mix(u0, -u0, bvec4((usign & 1u) != 0u, (usign & 2u) != 0u, (usign & 4u) != 0u, (usign & 8u) != 0u));
             u1 = mix(u1, -u1, bvec4((usign & 16u) != 0u, (usign & 32u) != 0u, (usign & 64u) != 0u, (bitCount(usign) & 1) != 0));
-            Au[ar][sub * 2u] = f16vec4(u0 * 0.015625);
-            Au[ar][sub * 2u + 1u] = f16vec4(u1 * 0.015625);
+            Au[r][sub * 2u] = f16vec4(u0 * 0.015625);
+            Au[r][sub * 2u + 1u] = f16vec4(u1 * 0.015625);
 
             if (sub == 0u) {
                 float gd = unpackHalf2x16(uint(gw[gb])).x;
                 float ud = unpackHalf2x16(uint(uw[gb])).x;
-                Dg[ar] = gd * 0.25 * (0.5 + float(gss >> 28u)) * 64.0;
-                Du[ar] = ud * 0.25 * (0.5 + float(uss >> 28u)) * 64.0;
+                Dg[r] = gd * 0.25 * (0.5 + float(gss >> 28u)) * 64.0;
+                Du[r] = ud * 0.25 * (0.5 + float(uss >> 28u)) * 64.0;
             }
         }
         /* Stage B: 32 slots x 32 elements, rounded once to f16. */
@@ -134,37 +186,23 @@ void main(void) {
         }
         barrier();
 
-        f16vec2 pkg[8];
-        f16vec2 pku[8];
-        for (uint i = 0u; i < 8u; i++) {
-            pkg[i] = f16vec2(0.0hf);
-            pku[i] = f16vec2(0.0hf);
-        }
-        for (uint kk = 0u; kk < KK; kk++) {
-            f16vec4 b = Bs[tx][kk];
-            for (uint i = 0u; i < 8u; i++) {
-                f16vec4 ag = Ag[ty + 8u * i][kk];
-                f16vec4 au = Au[ty + 8u * i][kk];
-                pkg[i] = fma(ag.zw, b.zw, fma(ag.xy, b.xy, pkg[i]));
-                pku[i] = fma(au.zw, b.zw, fma(au.xy, b.xy, pku[i]));
-            }
-        }
-        for (uint i = 0u; i < 8u; i++) {
-            accg[i] = fma(Dg[ty + 8u * i], float(pkg[i].x) + float(pkg[i].y), accg[i]);
-            accu[i] = fma(Du[ty + 8u * i], float(pku[i].x) + float(pku[i].y), accu[i]);
-        }
+        if (width == 8u) accumulate(tx, ty, MR, (8u+TX-1u)/TX, accg, accu);
+        else if (width == 16u) accumulate(tx, ty, MR, (16u+TX-1u)/TX, accg, accu);
+        else accumulate(tx, ty, MR, NC, accg, accu);
         barrier();
     }
 
-    uint slot = sh_slot[tx];
-    if (slot == INVALID) return;
     float gsc = pc.has_gate_scales != 0u ? gate_scales[expert] : 1.0;
     float usc = pc.has_up_scales != 0u ? up_scales[expert] : 1.0;
-    for (uint i = 0u; i < 8u; i++) {
-        uint r = row0 + ty + 8u * i;
-        if (r >= pc.mid_dim) continue;
-        float g = accg[i] * gsc;
-        float v = accu[i] * usc;
-        y[slot * pc.mid_dim + r] = (g / (1.0f + exp(-g))) * v;
+    [[unroll]] for (uint j = 0u; j < NC; j++) {
+        uint slot = sh_slot[tx + TX*j];
+        if (slot == INVALID) continue;
+        [[unroll]] for (uint i = 0u; i < MR; i++) {
+            uint r = row0 + ty + RY * i;
+            if (r >= pc.mid_dim) continue;
+            float g = accg[i][j] * gsc;
+            float v = accu[i][j] * usc;
+            y[slot * pc.mid_dim + r] = (g / (1.0f + exp(-g))) * v;
+        }
     }
 }
