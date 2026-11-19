@@ -309,7 +309,7 @@ vulkan/dense_iq3_xxs_decode_r4.spv: vulkan/dense_iq3_xxs_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=1 -DQ36_WAVES=4 -DQ36_BOUNDS=0 -o $@ $<
 
 vulkan/dense_iq3_xxs_bm96_pair_mmq.spv: vulkan/dense_iq3_xxs_mmq.comp vulkan/dense_token_pairs.glsl Makefile
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -DQ36_K_CHUNK=4 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -DQ36_ROW_LANES=16 -DQ36_K_CHUNK=8 -o $@ $<
 
 vulkan/dense_iq3_xxs_bm96_mmq.spv: vulkan/dense_iq3_xxs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
@@ -405,7 +405,7 @@ vulkan/dense_iq3_s_decode_r1.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_v
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=1 -DQ36_BOUNDS=0 -o $@ $<
 
 vulkan/dense_iq3_s_bm96_pair_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc vulkan/dense_token_pairs.glsl Makefile
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -DQ36_K_CHUNK=4 -o $@ $<
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -DQ36_TOKEN_PAIRS=1 -DQ36_ROW_LANES=16 -DQ36_K_CHUNK=8 -o $@ $<
 
 vulkan/dense_iq3_s_bm96_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<

@@ -42,6 +42,11 @@ const uint BN = Q36_BN;
 const uint BK = Q36_BK;
 const uint SLICES_PER_TILE = BK / 32u;
 const uint ROWS_PER_LANE = BM / 4u;
+#ifdef Q36_ROW_LANES
+const uint ROWS = BM / Q36_ROW_LANES;
+const uint TOKEN_LANES = 32u / Q36_ROW_LANES;
+const uint PAIRS = 16u / TOKEN_LANES;
+#endif
 const uint STRIDE = BK / 2u + 1u;
 const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
@@ -96,11 +101,18 @@ void main(void) {
     uint lane = gl_SubgroupInvocationID;
     uint warp_row = 0u;
     uint warp_tok = wave;
+#ifdef Q36_ROW_LANES
+    uint thread_row = lane / TOKEN_LANES;
+    uint thread_tok = lane % TOKEN_LANES;
+    f16vec2 sum[PAIRS * ROWS];
+    [[unroll]] for (uint i = 0u; i < PAIRS * ROWS; i++) sum[i] = f16vec2(0.0);
+#else
     uint thread_row = lane & 3u;
     uint thread_tok = lane >> 2u;
     f16vec2 sum[2u * ROWS_PER_LANE];
     [[unroll]] for (uint i = 0u; i < 2u * ROWS_PER_LANE; i++)
         sum[i] = f16vec2(0.0);
+#endif
 #endif
     for (uint i = lid; i < 512u; i += 128u)
         grid_lut[i] = q36_iq3s_grid[i];
@@ -196,6 +208,20 @@ void main(void) {
 #else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
 #endif
+#ifdef Q36_ROW_LANES
+                /* More token pairs share each weight, with the same FMA chain. */
+                f16vec2 av[ROWS];
+                [[unroll]] for (uint r = 0u; r < ROWS; r++)
+                    av[r] = buf_a[(thread_row * ROWS + r) * STRIDE + k];
+                [[unroll]] for (uint tp = 0u; tp < PAIRS; tp++) {
+                    uint pair = wave * 16u + tp * TOKEN_LANES + thread_tok;
+                    f16vec2 bx = buf_b[2u * k * B_STRIDE + pair];
+                    f16vec2 by = buf_b[(2u * k + 1u) * B_STRIDE + pair];
+                    [[unroll]] for (uint r = 0u; r < ROWS; r++)
+                        sum[tp * ROWS + r] = fma(f16vec2(av[r].x), bx,
+                            fma(f16vec2(av[r].y), by, sum[tp * ROWS + r]));
+                }
+#else
                 f16vec2 av[ROWS_PER_LANE];
                 f16vec2 bv[4];
 #if Q36_BM == 32
@@ -235,6 +261,7 @@ void main(void) {
                                 f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
                                 sum[tp * ROWS_PER_LANE + rr]));
 #endif
+#endif
             }
 #ifdef Q36_K_CHUNK
             }
@@ -250,6 +277,17 @@ void main(void) {
     if (row < pc.out_dim) {
         if (tok < pc.n_tok) y[tok * pc.out_dim + row] = float(sum.x);
         if (tok + 1u < pc.n_tok) y[(tok + 1u) * pc.out_dim + row] = float(sum.y);
+    }
+#else
+#ifdef Q36_ROW_LANES
+    [[unroll]] for (uint tp = 0u; tp < PAIRS; tp++) {
+        uint tok = tok0 + wave * 32u + 2u * (tp * TOKEN_LANES + thread_tok);
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            uint row = row0 + thread_row * ROWS + r;
+            if (row >= pc.out_dim) continue;
+            if (tok < pc.n_tok) y[tok * pc.out_dim + row] = float(sum[tp * ROWS + r].x);
+            if (tok + 1u < pc.n_tok) y[(tok + 1u) * pc.out_dim + row] = float(sum[tp * ROWS + r].y);
+        }
     }
 #else
     [[unroll]] for (uint tt = 0u; tt < 4u; tt++) {
@@ -269,5 +307,6 @@ void main(void) {
                     sum[(tt >> 1u) * ROWS_PER_LANE + rr].y);
         }
     }
+#endif
 #endif
 }
