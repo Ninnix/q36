@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<desc>Resident Vulkan prefill measured on 2026-11-19 with a16e88c, Q8_0 K, Q4_0 V and 1024-token prefill chunks. The plain and MTP decode curves were recorded on 2026-10-25.</desc>
 <style>
 text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .title { font-size: 26px; font-weight: 700; fill: #1f2933; }
@@ -8,25 +9,24 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
 </style>
 <rect width="960" height="540" fill="#ffffff"/>
-<text class="title" x="480.0" y="34" text-anchor="middle">BC-250 · Qwen3.8-27B</text>
+<text class="title" x="480.0" y="34" text-anchor="middle">BC-250 · Qwen3.6-35B-A3B</text>
 <line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="70" y="472.00" text-anchor="end">0</text>
 <line x1="82" y1="387.60" x2="878" y2="387.60" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="391.60" text-anchor="end">50</text>
+<text class="tick" x="70" y="391.60" text-anchor="end">200</text>
 <line x1="82" y1="307.20" x2="878" y2="307.20" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="311.20" text-anchor="end">100</text>
+<text class="tick" x="70" y="311.20" text-anchor="end">400</text>
 <line x1="82" y1="226.80" x2="878" y2="226.80" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="230.80" text-anchor="end">150</text>
+<text class="tick" x="70" y="230.80" text-anchor="end">600</text>
 <line x1="82" y1="146.40" x2="878" y2="146.40" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="150.40" text-anchor="end">200</text>
+<text class="tick" x="70" y="150.40" text-anchor="end">800</text>
 <line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
-<text class="tick" x="70" y="70.00" text-anchor="end">250</text>
+<text class="tick" x="70" y="70.00" text-anchor="end">1k</text>
 <text class="tick" x="890" y="472.00" text-anchor="start">0</text>
-<text class="tick" x="890" y="391.60" text-anchor="start">10</text>
-<text class="tick" x="890" y="311.20" text-anchor="start">20</text>
-<text class="tick" x="890" y="230.80" text-anchor="start">30</text>
-<text class="tick" x="890" y="150.40" text-anchor="start">40</text>
-<text class="tick" x="890" y="70.00" text-anchor="start">50</text>
+<text class="tick" x="890" y="371.50" text-anchor="start">50</text>
+<text class="tick" x="890" y="271.00" text-anchor="start">100</text>
+<text class="tick" x="890" y="170.50" text-anchor="start">150</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">200</text>
 <line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
 <line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
@@ -41,9 +41,9 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 <text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
 <text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
 <text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">decode t/s</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,143.89 131.75,164.43 181.50,202.13 281.00,253.24 480.00,313.39 878.00,369.12"/>
-<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,266.52 131.75,254.62 181.50,261.85 281.00,273.03 480.00,306.15 878.00,321.67"/>
-<polyline fill="none" stroke="#16a34a" stroke-width="3" stroke-dasharray="8 5" stroke-linecap="round" stroke-linejoin="round" points="106.88,221.25 131.75,149.29 181.50,201.15 281.00,183.95 480.00,253.17 878.00,297.39"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,112.85 131.75,109.22 156.62,150.95 181.50,183.12 206.38,207.74 231.25,230.42 256.12,247.43 281.00,263.46 305.88,277.37 330.75,289.44 355.62,300.22 380.50,309.98 405.38,317.69 430.25,325.52 455.12,332.65 480.00,339.08 504.88,345.41 529.75,348.94 554.62,353.48 579.50,358.08 604.38,364.34 629.25,366.55 654.12,369.67 679.00,373.20 703.88,376.24 728.75,380.88 753.62,381.59 778.50,384.35 803.38,387.12 828.25,389.53 853.12,391.43 878.00,394.89"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,285.83 131.75,284.67 156.62,288.53 181.50,288.37 206.38,288.93 231.25,294.86 256.12,295.06 281.00,299.60 305.88,300.00 330.75,300.69 355.62,305.99 380.50,306.54 405.38,310.07 430.25,311.22 455.12,310.86 480.00,318.40 504.88,314.92 529.75,318.88 554.62,319.00 579.50,324.26 604.38,322.98 629.25,323.66 654.12,326.58 679.00,327.24 703.88,341.59 728.75,330.56 753.62,330.96 778.50,333.85 803.38,334.27 828.25,335.06 853.12,337.69 878.00,337.91"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="3" stroke-dasharray="8 5" stroke-linecap="round" stroke-linejoin="round" points="106.88,164.05 131.75,203.91 156.62,234.32 181.50,212.39 206.38,149.64 231.25,241.96 256.12,184.11 281.00,180.29 305.88,209.47 330.75,239.20 355.62,236.65 380.50,249.11 405.38,246.26 430.25,279.20 455.12,267.90 480.00,311.30 504.88,219.44 529.75,232.15 554.62,220.81 579.50,307.08 604.38,236.95 629.25,275.80 654.12,271.20 679.00,272.69 703.88,309.13 728.75,269.65 753.62,250.66 778.50,285.81 803.38,268.25 828.25,275.72 853.12,304.95 878.00,301.17"/>
 <rect x="694" y="66" width="176" height="88" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
 <rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
 <text class="legend" x="730" y="89">prefill</text>

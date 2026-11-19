@@ -24,25 +24,31 @@ Apple Silicon commands and results are in [Metal](METAL.md#recorded-measurements
 
 ## BC-250 context sweeps
 
-These recorded BC-250 sweeps use resident models, Q8_0 keys / Q4_0 values,
-and 128 greedy generation tokens per frontier. Prefill measures the newly
-added interval. MTP uses the embedded head with draft limit eight and
-adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
+These recorded BC-250 sweeps use resident models, Q8_0 keys and Q4_0 values.
+Prefill measures the newly added interval. Decode measures 128 greedy
+generation tokens per frontier. MTP uses the embedded head with draft limit
+eight and adaptive confidence (`--mtp-margin 0`). All rates are in tokens
+per second.
 
 ### Qwen3.6-35B-A3B
 
 `gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf`
 
+Prefill was measured on 2026-11-19 at commit `a16e88c` with Mesa 26.3.0. The
+sweep covers 2,048 through 65,536 tokens in 2,048-token intervals with
+1,024-token prefill chunks. The decode and MTP decode rates were recorded on
+2026-10-25.
+
 | Context | Prefill | Decode | MTP decode |
 | ---: | ---: | ---: | ---: |
-| 2,048 | 634.96 | 90.63 | 151.22 |
-| 4,096 | 634.74 | 91.21 | 131.39 |
-| 8,192 | 510.59 | 89.37 | 127.17 |
-| 16,384 | 371.32 | 83.78 | 143.14 |
-| 32,768 | 236.85 | 74.43 | 77.96 |
-| 65,536 | 137.01 | 64.72 | 83.00 |
+| 2,048 | 883.45 | 90.63 | 151.22 |
+| 4,096 | 892.49 | 91.21 | 131.39 |
+| 8,192 | 708.66 | 89.37 | 127.17 |
+| 16,384 | 508.80 | 83.78 | 143.14 |
+| 32,768 | 320.70 | 74.43 | 77.96 |
+| 65,536 | 181.86 | 64.72 | 83.00 |
 
-![BC-250 Qwen3.6-35B-A3B prefill, decode, and MTP decode](../speed-bench/bc250-20261025/qwen36_ts.svg)
+![BC-250 Qwen3.6-35B-A3B prefill, decode, and MTP decode](../speed-bench/qwen36_ts.svg)
 
 ### Qwen3.8-27B
 
@@ -57,7 +63,7 @@ adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
 | 32,768 | 95.43 | 22.06 | 30.61 |
 | 65,536 | 59.48 | 20.18 | 25.32 |
 
-![BC-250 Qwen3.8-27B prefill, decode, and MTP decode](../speed-bench/bc250-20261025/qwen38-xxs_ts.svg)
+![BC-250 Qwen3.8-27B prefill, decode, and MTP decode](../speed-bench/qwen38-xxs_ts.svg)
 
 ### Qwen3.8-27B (IQ3_S)
 
@@ -72,20 +78,17 @@ adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
 | 32,768 | 96.68 | 21.48 | 29.32 |
 | 65,536 | 59.46 | 19.28 | 26.01 |
 
-![BC-250 Qwen3.8-27B IQ3_S prefill, decode, and MTP decode](../speed-bench/bc250-20261025/qwen38-iq3s_ts.svg)
+![BC-250 Qwen3.8-27B IQ3_S prefill, decode, and MTP decode](../speed-bench/qwen38-iq3s_ts.svg)
 
-Recorded on 2026-10-25. The charts are in
-[the sweep directory](../speed-bench/bc250-20261025). These are recorded
-baselines, not a fresh benchmark of every commit.
+Both Qwen3.8 sweeps were recorded on 2026-10-25.
 
 ## Earlier measurements
 
-[October 24 sweeps](../speed-bench/bc250-20261024/README.md) retain the previous
-resident measurements and reproduction commands. The [historical BC-250 chart](../speed-bench/bc250_ts.svg)
-includes the earlier Qwen3.6 resident and SSD-streaming runs.
+The earlier BC-250 runs cover Qwen3.6 resident and SSD-streaming inference.
+[Historical BC-250 chart](../speed-bench/bc250_ts.svg)
 
-The published BC-250 measurements use a 40-CU unlock, a 500-2000 MHz governor
-range, and an 85 C thermal ceiling. A stock 24-CU board will be slower.
+The October measurements used a 40-CU unlock, a 500–2000 MHz governor
+range, and an 85 °C thermal ceiling. A stock 24-CU board will be slower.
 
 ## MTP measurements
 

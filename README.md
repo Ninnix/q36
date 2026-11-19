@@ -418,11 +418,11 @@ See [testing](docs/TESTING.md) for regression and release checks.
 
 ## Speed
 
-The recorded BC-250 sweeps use resident Qwen3.6 Q2 and Qwen3.8 IQ3 models,
-Q8_0 keys / Q4_0 values, and 128 greedy generation tokens at each frontier.
-They are baselines, not a fresh benchmark of every commit.
+The recorded BC-250 sweeps use resident Qwen3.6 Q2 and Qwen3.8 IQ3 models
+with Q8_0 keys and Q4_0 values. The Qwen3.6 MoE chart shows the November 19
+prefill refresh alongside the October 25 decode results.
 
-![BC-250 Qwen3.6-35B-A3B throughput](speed-bench/bc250-20261025/qwen36_ts.svg)
+![BC-250 Qwen3.6-35B-A3B throughput](speed-bench/qwen36_ts.svg)
 
 See [performance and benchmarking](docs/PERFORMANCE.md) for the complete
 tables, dense-model charts, Metal results, measurement conditions, and commands.
