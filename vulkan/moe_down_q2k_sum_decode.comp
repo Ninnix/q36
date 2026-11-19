@@ -6,8 +6,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_ARB_gpu_shader_int64 : require
 
-/* Decode-only Q2_K down projection and routing-weighted sum. One
- * workgroup owns one output row and visits the eight experts in order. */
+/* Each group of 32 lanes computes one Q2_K expert dot at a time. */
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -15,8 +14,12 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wb[]; };
 layout(set = 0, binding = 1) readonly buffer Mid { vec2 mid[]; };
 layout(set = 0, binding = 2) readonly buffer Selected { uint selected[]; };
 layout(set = 0, binding = 3) readonly buffer Scales { float scales[]; };
+#ifdef Q36_EXPERT_ROWS
+layout(set = 0, binding = 4) writeonly buffer Output { float y[]; };
+#else
 layout(set = 0, binding = 4) readonly buffer RouteWeights { float route[]; };
 layout(set = 0, binding = 5) writeonly buffer Output { float y[]; };
+#endif
 
 layout(push_constant) uniform Push {
     uint out_dim;
@@ -29,6 +32,7 @@ layout(push_constant) uniform Push {
 
 const uint Q2K_U16 = 42u;
 
+#ifndef Q36_EXPERT_ROWS
 float fma32(float a, float b, float c) {
     double p = double(a) * double(b);
     double s = p + double(c);
@@ -45,10 +49,15 @@ float fma32(float a, float b, float c) {
     return float(s);
 }
 
-void main(void) {
+#endif
+
+float expert_dot(uint expert, uint row, uint slot) {
     uint tid = gl_LocalInvocationID.x;
-    uint row = gl_WorkGroupID.x;
-    uint slot = gl_WorkGroupID.y * pc.n_used;
+#ifdef Q36_EXPERT_ROWS
+    const uint blocks = 2u, width = 512u;
+#else
+    uint blocks = pc.blocks, width = pc.in_dim;
+#endif
     uint itid = tid & 15u;
     uint ix = tid >> 4u;
     uint v_im = itid >> 3u;
@@ -56,74 +65,93 @@ void main(void) {
     uint l0 = 2u * v_in;
     uint q_off16 = (32u * v_im + l0) >> 1u;
     uint y_off = 128u * v_im + l0;
-    uint row_u16 = pc.blocks * Q2K_U16;
-    float sum = 0.0;
+    uint base_u16 = (expert * pc.out_dim + row) * (blocks * Q2K_U16);
+    uint m2 = slot * width / 2u;
+    float acc = 0.0;
+    for (uint i = ix; i < blocks; i += 2u) {
+        uint bb = base_u16 + i * Q2K_U16;
+        uint qs_u32 = uint(wb[bb + 8u + q_off16]) |
+                      (uint(wb[bb + 8u + q_off16 + 8u]) << 16u);
+        vec4 q0 = vec4(unpack8(qs_u32 & 0x03030303u));
+        vec4 q2 = vec4(unpack8((qs_u32 >> 2u) & 0x03030303u));
+        vec4 q4 = vec4(unpack8((qs_u32 >> 4u) & 0x03030303u));
+        vec4 q6 = vec4(unpack8((qs_u32 >> 6u) & 0x03030303u));
 
-    for (uint u = 0u; u < pc.n_used; u++) {
-        uint expert = selected[slot + u];
-        uint base_u16 = (expert * pc.out_dim + row) * row_u16;
-        uint m2 = (slot + u) * pc.in_dim / 2u;
-        float acc = 0.0;
-
-        for (uint i = ix; i < pc.blocks; i += 2u) {
-            uint bb = base_u16 + i * Q2K_U16;
-            uint qs_u32 = uint(wb[bb + 8u + q_off16]) |
-                          (uint(wb[bb + 8u + q_off16 + 8u]) << 16u);
-            vec4 q0 = vec4(unpack8(qs_u32 & 0x03030303u));
-            vec4 q2 = vec4(unpack8((qs_u32 >> 2u) & 0x03030303u));
-            vec4 q4 = vec4(unpack8((qs_u32 >> 4u) & 0x03030303u));
-            vec4 q6 = vec4(unpack8((qs_u32 >> 6u) & 0x03030303u));
-
-            float sc1[8];
-            float sc2[8];
-            for (uint w = 0u; w < 4u; w++) {
-                uint sw = uint(wb[bb + 4u * v_im + w]);
-                sc1[2u * w] = float(sw & 0xFu);
-                sc2[2u * w] = float((sw >> 4u) & 0xFu);
-                sc1[2u * w + 1u] = float((sw >> 8u) & 0xFu);
-                sc2[2u * w + 1u] = float((sw >> 12u) & 0xFu);
-            }
-
-            vec2 dm = unpackHalf2x16(uint(wb[bb + 40u]) |
-                                     (uint(wb[bb + 41u]) << 16u));
-            uint yb = m2 + ((i * 256u + y_off) >> 1u);
-            vec2 b0 = mid[yb + 0u];
-            vec2 b16 = mid[yb + 8u];
-            vec2 b32 = mid[yb + 16u];
-            vec2 b48 = mid[yb + 24u];
-            vec2 b64 = mid[yb + 32u];
-            vec2 b80 = mid[yb + 40u];
-            vec2 b96 = mid[yb + 48u];
-            vec2 b112 = mid[yb + 56u];
-
-            float sum1 = 0.0;
-            float sum2 = 0.0;
-            for (uint l = 0u; l < 2u; l++) {
-                sum1 = fma(b0[l], sc1[0] * q0[l],
-                       fma(b16[l], sc1[1] * q0[l + 2u],
-                       fma(b32[l], sc1[2] * q2[l],
-                       fma(b48[l], sc1[3] * q2[l + 2u],
-                       fma(b64[l], sc1[4] * q4[l],
-                       fma(b80[l], sc1[5] * q4[l + 2u],
-                       fma(b96[l], sc1[6] * q6[l],
-                       fma(b112[l], sc1[7] * q6[l + 2u], sum1))))))));
-                sum2 = fma(b0[l], sc2[0],
-                       fma(b16[l], sc2[1],
-                       fma(b32[l], sc2[2],
-                       fma(b48[l], sc2[3],
-                       fma(b64[l], sc2[4],
-                       fma(b80[l], sc2[5],
-                       fma(b96[l], sc2[6],
-                       fma(b112[l], sc2[7], sum2))))))));
-            }
-            acc = fma(dm.x, sum1, fma(-dm.y, sum2, acc));
+        float sc1[8];
+        float sc2[8];
+        for (uint w = 0u; w < 4u; w++) {
+            uint sw = uint(wb[bb + 4u * v_im + w]);
+            sc1[2u * w] = float(sw & 0xFu);
+            sc2[2u * w] = float((sw >> 4u) & 0xFu);
+            sc1[2u * w + 1u] = float((sw >> 8u) & 0xFu);
+            sc2[2u * w + 1u] = float((sw >> 12u) & 0xFu);
         }
 
-        acc = subgroupAdd(acc);
+        vec2 dm = unpackHalf2x16(uint(wb[bb + 40u]) |
+                                 (uint(wb[bb + 41u]) << 16u));
+        uint yb = m2 + ((i * 256u + y_off) >> 1u);
+        vec2 b0 = mid[yb + 0u];
+        vec2 b16 = mid[yb + 8u];
+        vec2 b32 = mid[yb + 16u];
+        vec2 b48 = mid[yb + 24u];
+        vec2 b64 = mid[yb + 32u];
+        vec2 b80 = mid[yb + 40u];
+        vec2 b96 = mid[yb + 48u];
+        vec2 b112 = mid[yb + 56u];
+
+        float sum1 = 0.0;
+        float sum2 = 0.0;
+        for (uint l = 0u; l < 2u; l++) {
+            sum1 = fma(b0[l], sc1[0] * q0[l],
+                   fma(b16[l], sc1[1] * q0[l + 2u],
+                   fma(b32[l], sc1[2] * q2[l],
+                   fma(b48[l], sc1[3] * q2[l + 2u],
+                   fma(b64[l], sc1[4] * q4[l],
+                   fma(b80[l], sc1[5] * q4[l + 2u],
+                   fma(b96[l], sc1[6] * q6[l],
+                   fma(b112[l], sc1[7] * q6[l + 2u], sum1))))))));
+            sum2 = fma(b0[l], sc2[0],
+                   fma(b16[l], sc2[1],
+                   fma(b32[l], sc2[2],
+                   fma(b48[l], sc2[3],
+                   fma(b64[l], sc2[4],
+                   fma(b80[l], sc2[5],
+                   fma(b96[l], sc2[6],
+                   fma(b112[l], sc2[7], sum2))))))));
+        }
+        acc = fma(dm.x, sum1, fma(-dm.y, sum2, acc));
+    }
+
+    return subgroupAdd(acc);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+#ifdef Q36_EXPERT_ROWS
+    /* Keep adjacent rows on the same selected expert. The existing reducer
+     * applies routing weights in order after all projections finish. */
+    uint slot = gl_WorkGroupID.y;
+    uint expert = selected[slot];
+    for (uint r = 0u; r < 2u; r++) {
+        uint row = 2u * gl_WorkGroupID.x + r;
+        float value = expert_dot(expert, row, slot);
         if (tid == 0u) {
             float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
-            sum = fma32(acc * sc, route[slot + u], sum);
+            y[slot * pc.out_dim + row] = value * sc;
+        }
+    }
+#else
+    uint row = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y * pc.n_used;
+    float sum = 0.0;
+    for (uint u = 0u; u < pc.n_used; u++) {
+        uint expert = selected[slot + u];
+        float value = expert_dot(expert, row, slot + u);
+        if (tid == 0u) {
+            float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
+            sum = fma32(value * sc, route[slot + u], sum);
         }
     }
     if (tid == 0u) y[gl_WorkGroupID.y * pc.out_dim + row] = sum;
+#endif
 }

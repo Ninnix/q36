@@ -8,7 +8,13 @@
 
 /* Share each activation load across output rows, with the same block
  * order and subgroup reduction as the single-token Q8 matvec. */
+#ifdef Q36_WAVE64
+layout(local_size_x = 64) in;
+const uint HALVES = 2u;
+#else
 layout(local_size_x = 128) in;
+const uint HALVES = 1u;
+#endif
 #ifdef Q36_PREFILL
 const uint NT = 8u;
 #else
@@ -27,7 +33,9 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
+#ifndef Q36_WAVE64
 shared float partial[4][NR][NT];
+#endif
 
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
@@ -38,31 +46,46 @@ void main(void) {
 #endif
     uint row0 = (gl_WorkGroupID.y * 16384u + gl_WorkGroupID.x) * NR;
     if (row0 >= pc.out_dim) return;
-    float acc[NR][NT];
-    [[unroll]] for (uint r = 0u; r < NR; r++)
-        [[unroll]] for (uint t = 0u; t < NT; t++) acc[r][t] = 0.0;
+    float acc[HALVES][NR][NT];
+    [[unroll]] for (uint h = 0u; h < HALVES; h++)
+        [[unroll]] for (uint r = 0u; r < NR; r++)
+            [[unroll]] for (uint t = 0u; t < NT; t++) acc[h][r][t] = 0.0;
 
-    for (uint b = tid >> 2u; b < pc.blocks; b += 32u) {
-        uint e = (tid & 3u) * 8u;
-        uint xi = (b * 32u + e) / 4u;
-        [[unroll]] for (uint r = 0u; r < NR; r++) {
-            uint base = ((row0 + r) * pc.blocks + b) * 17u;
-            uint q = base + 1u + e / 2u;
-            float d = unpackHalf2x16(uint(w[base])).x;
-            vec4 a = vec4(unpack8(int(uint(w[q]) | (uint(w[q + 1u]) << 16u))));
-            vec4 c = vec4(unpack8(int(uint(w[q + 2u]) | (uint(w[q + 3u]) << 16u))));
-            [[unroll]] for (uint t = 0u; t < NT; t++) {
-                uint xt = (tok0 + t) * pc.blocks * 8u + xi;
-                acc[r][t] += d * (dot(a, x[xt]) + dot(c, x[xt + 1u]));
+    for (uint first = tid >> 2u; first < pc.blocks; first += 32u) {
+        [[unroll]] for (uint h = 0u; h < HALVES; h++) {
+            uint b = first + 16u * h;
+#ifdef Q36_WAVE64
+            if (b >= pc.blocks) continue;
+#endif
+            uint e = (tid & 3u) * 8u;
+            uint xi = (b * 32u + e) / 4u;
+            [[unroll]] for (uint r = 0u; r < NR; r++) {
+                uint base = ((row0 + r) * pc.blocks + b) * 17u;
+                uint q = base + 1u + e / 2u;
+                float d = unpackHalf2x16(uint(w[base])).x;
+                vec4 a = vec4(unpack8(int(uint(w[q]) | (uint(w[q + 1u]) << 16u))));
+                vec4 c = vec4(unpack8(int(uint(w[q + 2u]) | (uint(w[q + 3u]) << 16u))));
+                [[unroll]] for (uint t = 0u; t < NT; t++) {
+                    uint xt = (tok0 + t) * pc.blocks * 8u + xi;
+                    acc[h][r][t] += d * (dot(a, x[xt]) + dot(c, x[xt + 1u]));
+                }
             }
         }
     }
     [[unroll]] for (uint r = 0u; r < NR; r++) {
         [[unroll]] for (uint t = 0u; t < NT; t++) {
-            acc[r][t] = subgroupAdd(acc[r][t]);
-            if (subgroupElect()) partial[gl_SubgroupID][r][t] = acc[r][t];
+#ifdef Q36_WAVE64
+            /* Preserve the two wave sums and their original addition order. */
+            float lo = subgroupAdd(acc[0][r][t]);
+            float hi = subgroupAdd(acc[1][r][t]);
+            if (tid == 0u) y[t * pc.out_dim + row0 + r] = (lo + hi) * pc.scale;
+#else
+            float sum = subgroupAdd(acc[0][r][t]);
+            if (subgroupElect()) partial[gl_SubgroupID][r][t] = sum;
+#endif
         }
     }
+#ifndef Q36_WAVE64
     barrier();
     if (tid == 0u) {
         [[unroll]] for (uint r = 0u; r < NR; r++) {
@@ -73,4 +96,5 @@ void main(void) {
             }
         }
     }
+#endif
 }

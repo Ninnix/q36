@@ -51,7 +51,11 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3XXS_GRID = 3104u;
 
 shared uint grid_lut[256];
+#ifdef Q36_VERIFY_SIGNS
+shared uvec4 sign_lut[128];
+#else
 shared uvec2 sign_lut[16];
+#endif
 
 uint load_u8(uint off) {
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -66,10 +70,12 @@ uint load_u32(uint off) {
     return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
 }
 
+#ifndef Q36_VERIFY_SIGNS
 int signed_bytes(uint grid, uint signs) {
     uvec2 mask = sign_lut[signs & 15u];
     return int((grid ^ mask.x) + mask.y);
 }
+#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x & 63u;
@@ -81,11 +87,20 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     UNROLL for (uint i = gl_LocalInvocationID.x; i < 256u; i += 64u * Q36_WAVES)
         grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
+#ifdef Q36_VERIFY_SIGNS
+    /* A verifier reuses both signed halves for every token in the batch. */
+    for (uint i = gl_LocalInvocationID.x; i < 128u; i += 64u * Q36_WAVES) {
+        uint signs = i | ((bitCount(i) & 1u) << 7u);
+        uvec2 bits = (uvec2(signs & 15u, signs >> 4u) * 0x00204081u) & 0x01010101u;
+        sign_lut[i] = uvec4(bits * 255u, bits);
+    }
+#else
     /* Build each byte mask once instead of spreading signs for every grid. */
     if (gl_LocalInvocationID.x < 16u) {
         uint bits = (lid * 0x00204081u) & 0x01010101u;
         sign_lut[lid] = uvec2(bits * 255u, bits);
     }
+#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
@@ -115,11 +130,17 @@ void main(void) {
                 UNROLL for (uint l = 0u; l < 2u; l++) {
                     uint signs =
                         (aux >> (7u * (2u * part + l))) & 127u;
-                    uint parity = bitCount(signs) & 1u;
                     uint grid0 = grid_lut[(qs >> (16u * l)) & 255u];
                     uint grid1 = grid_lut[(qs >> (16u * l + 8u)) & 255u];
+#ifdef Q36_VERIFY_SIGNS
+                    uvec4 mask = sign_lut[signs];
+                    ivec2 weights = ivec2((uvec2(grid0, grid1) ^ mask.xy) + mask.zw);
+                    int w0 = weights.x, w1 = weights.y;
+#else
+                    uint parity = bitCount(signs) & 1u;
                     int w0 = signed_bytes(grid0, signs);
                     int w1 = signed_bytes(grid1, (signs >> 4u) | (parity << 3u));
+#endif
                     uint q = 4u * part + 2u * l;
                     UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                         sum[t] += dotPacked4x8EXT(w0, qv[t][q]);

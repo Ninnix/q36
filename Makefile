@@ -129,6 +129,7 @@ VULKAN_SHADERS := \
 	vulkan/matmul_q8_0_f32b_nx.spv \
 	vulkan/matmul_q8_0_prefill_exact.spv \
 	vulkan/matmul_q8_0_verify.spv \
+	vulkan/matmul_q8_0_verify_wave64.spv \
 	vulkan/matmul_q8_0_decode.spv \
 	vulkan/matmul_q8_0_decode_q36.spv \
 	vulkan/matmul_q8_0_decode_b64.spv \
@@ -183,6 +184,7 @@ VULKAN_SHADERS := \
 	vulkan/moe_gate_up_decode.spv \
 	vulkan/moe_down_q2k_f32b.spv \
 	vulkan/moe_down_q2k_sum_decode.spv \
+	vulkan/moe_down_q2k_decode_rows.spv \
 	vulkan/moe_gate_up_q4k_f32b.spv \
 	vulkan/moe_down_q4k_sum_decode.spv \
 	vulkan/moe_gate_up_gemm.spv \
@@ -195,6 +197,7 @@ VULKAN_SHADERS := \
 	vulkan/moe_matvec_fast.spv \
 	vulkan/dense_iq3_xxs_decode.spv \
 	vulkan/dense_iq3_xxs_verify.spv \
+	vulkan/dense_iq3_xxs_verify_signs.spv \
 	vulkan/dense_iq3_xxs_decode_r4.spv \
 	vulkan/dense_iq3_xxs_mmq.spv \
 	vulkan/dense_iq3_xxs_pair_mmq.spv \
@@ -236,6 +239,13 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs_mmq_n4.spv \
 	vulkan/dense_iq4_xs_mmq_n8.spv \
 	vulkan/dense_iq1_m.spv \
+	vulkan/dense_iq2_xxs_packed_decode.spv \
+	vulkan/dense_iq2_xxs_packed_verify.spv \
+	vulkan/dense_iq2_xs_packed_decode.spv \
+	vulkan/dense_iq2_xs_packed_verify.spv \
+	vulkan/dense_iq1_s_packed_decode.spv \
+	vulkan/dense_iq2_s_packed_decode.spv \
+	vulkan/dense_iq2_s_packed_verify.spv \
 	vulkan/dense_extra_decode.spv \
 	vulkan/dense_extra_decode_float.spv \
 	vulkan/dense_iq2_xxs_verify.spv \
@@ -337,6 +347,9 @@ vulkan/dense_iq3_s_decode_full.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid
 
 vulkan/dense_iq3_xxs_verify.spv: vulkan/dense_iq3_xxs_decode.comp Makefile
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 $< -o $@
+
+vulkan/dense_iq3_xxs_verify_signs.spv: vulkan/dense_iq3_xxs_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 -DQ36_VERIFY_SIGNS $< -o $@
 
 vulkan/dense_iq4_xs_verify_i16.spv: vulkan/dense_iq4_xs_decode.comp Makefile
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_I16=1 -DQ36_BOUNDS=0 -o $@ $<
@@ -463,6 +476,16 @@ vulkan/dense_iq2_s_decode_float.spv: vulkan/dense_extra_decode.comp
 
 vulkan/dense_iq4_nl_decode.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TYPE=20 -DQ36_ROWS=1 -o $@ $<
+
+vulkan/dense_iq2_xxs_packed_decode.spv vulkan/dense_iq2_xxs_packed_verify.spv: IQ_TYPE = 16
+vulkan/dense_iq2_xs_packed_decode.spv vulkan/dense_iq2_xs_packed_verify.spv: IQ_TYPE = 17
+vulkan/dense_iq1_s_packed_decode.spv: IQ_TYPE = 19
+vulkan/dense_iq2_s_packed_decode.spv vulkan/dense_iq2_s_packed_verify.spv: IQ_TYPE = 22
+vulkan/dense_iq2_xxs_packed_verify.spv vulkan/dense_iq2_xs_packed_verify.spv vulkan/dense_iq2_s_packed_verify.spv: vulkan/dense_iq_packed_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TYPE=$(IQ_TYPE) -DQ36_VERIFY $< -o $@
+
+vulkan/dense_iq2_xxs_packed_decode.spv vulkan/dense_iq2_xs_packed_decode.spv vulkan/dense_iq1_s_packed_decode.spv vulkan/dense_iq2_s_packed_decode.spv: vulkan/dense_iq_packed_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TYPE=$(IQ_TYPE) -o $@ $<
 
 vulkan/dense_extra_decode.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -o $@ $<
@@ -599,6 +622,9 @@ vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/matmul_q8_0_verify_wave64.spv: vulkan/matmul_q8_0_verify.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_WAVE64 $< -o $@
+
 vulkan/matmul_q8_0_verify.spv: vulkan/matmul_q8_0_verify.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -610,6 +636,9 @@ vulkan/moe_gate_up_decode.spv: vulkan/moe_gate_up_decode.comp
 
 vulkan/moe_down_q2k_f32b.spv: vulkan/moe_down_q2k_f32b.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/moe_down_q2k_decode_rows.spv: vulkan/moe_down_q2k_sum_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_EXPERT_ROWS=1 -o $@ $<
 
 vulkan/moe_down_q2k_sum_decode.spv: vulkan/moe_down_q2k_sum_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

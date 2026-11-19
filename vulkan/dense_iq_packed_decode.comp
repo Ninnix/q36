@@ -1,0 +1,152 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer Bytes { uint8_t wb[]; };
+layout(binding = 0) readonly buffer Halves { uint16_t wh[]; };
+layout(binding = 1) readonly buffer Input { uint q8[]; };
+layout(binding = 2) writeonly buffer Output { float y[]; };
+layout(binding = 3) readonly buffer Tables { uvec2 grids[]; };
+
+layout(push_constant) uniform Push {
+    uint out_dim, blocks, row_bytes, type;
+    float scale;
+} pc;
+
+#if Q36_TYPE == 16
+const uint BLOCK_BYTES = 66u, GRID = 0u;
+#elif Q36_TYPE == 17
+const uint BLOCK_BYTES = 74u, GRID = 3728u;
+#elif Q36_TYPE == 19
+const uint BLOCK_BYTES = 50u, GRID = 1680u;
+#else
+const uint BLOCK_BYTES = 82u, GRID = 272u;
+#endif
+
+#ifdef Q36_VERIFY
+layout(constant_id = 0) const uint NT = 2u;
+const uint ROWS = 4u;
+#else
+const uint NT = 1u;
+const uint ROWS = Q36_TYPE == 19 ? 8u : Q36_TYPE == 22 ? 4u : 2u;
+#endif
+
+#if Q36_TYPE == 19
+shared uvec2 iq1_grid[2048];
+#else
+const uint N_SIGNS = Q36_TYPE == 22 ? 256u : 128u;
+shared uvec4 masks[N_SIGNS];
+#endif
+
+/* IQ blocks and their four-byte index groups are halfword aligned. */
+uint load_word(uint off) {
+    return uint(wh[off >> 1u]) | (uint(wh[(off >> 1u) + 1u]) << 16u);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint group = lane & 7u;
+    uint first = gl_WorkGroupID.x * ROWS;
+#if Q36_TYPE == 19
+    for (uint i = lane; i < 2048u; i += 64u) iq1_grid[i] = grids[GRID + i];
+#else
+    /* One lookup supplies the sign masks for both halves of an IQ2 grid. */
+    for (uint i = lane; i < N_SIGNS; i += 64u) {
+        uint signs = Q36_TYPE == 22 ? i : i | ((bitCount(i) & 1u) << 7u);
+        uvec2 bits = (uvec2(signs & 15u, signs >> 4u) * 0x00204081u) & 0x01010101u;
+        masks[i] = uvec4(bits * 255u, bits);
+    }
+#endif
+    barrier();
+    float acc[NT][ROWS];
+    [[unroll]] for (uint t = 0; t < NT; t++)
+        [[unroll]] for (uint r = 0; r < ROWS; r++) acc[t][r] = 0.0;
+    for (uint b = lane >> 3u; b < pc.blocks; b += 8u) {
+        uint qb = 74u * b;
+        uint q = qb + 2u + 8u * group;
+        float yd[NT];
+        [[unroll]] for (uint t = 0; t < NT; t++)
+            yd[t] = uintBitsToFloat(q8[t * pc.blocks * 74u + qb]);
+        [[unroll]] for (uint r = 0; r < ROWS; r++) {
+            uint base = (first + r) * pc.row_bytes + b * BLOCK_BYTES;
+            float wd = unpackHalf2x16(uint(wh[base >> 1u])).x;
+#if Q36_TYPE == 16 || Q36_TYPE == 17
+            uint off = base + 2u + 8u * group;
+            uvec2 packed = uvec2(load_word(off), load_word(off + 4u));
+#else
+            uint low = load_word(base + 2u + 4u * group);
+#endif
+#if Q36_TYPE == 19
+            uint high = uint(wh[(base + 34u) / 2u + group]);
+#elif Q36_TYPE == 22
+            uint high = uint(wb[base + 66u + group]);
+            uint sign_bytes = load_word(base + 34u + 4u * group);
+#endif
+#if Q36_TYPE == 17 || Q36_TYPE == 22
+            uint sc = uint(wb[base + BLOCK_BYTES - 8u + group]);
+            vec2 scales = (wd * 0.25) * (vec2(sc & 15u, sc >> 4u) + 0.5);
+#endif
+            int isum[NT];
+            float sum[NT];
+            [[unroll]] for (uint t = 0; t < NT; t++) {
+                isum[t] = 0;
+                sum[t] = 0.0;
+            }
+            /* Apply each signed grid to all verifier inputs before unpacking the next. */
+            [[unroll]] for (uint l = 0; l < 4u; l++) {
+#if Q36_TYPE == 16
+                uint index = bitfieldExtract(packed.x, int(8u*l), 8);
+                uint sign = bitfieldExtract(packed.y, int(7u*l), 7);
+#elif Q36_TYPE == 17
+                uint entry = bitfieldExtract(packed[l >> 1u], int(16u*(l & 1u)), 16);
+                uint index = entry & 511u, sign = entry >> 9u;
+#elif Q36_TYPE == 22
+                uint index = bitfieldExtract(low, int(8u*l), 8) | ((high << (8u-2u*l)) & 768u);
+                uint sign = bitfieldExtract(sign_bytes, int(8u*l), 8);
+#else
+                uint index = bitfieldExtract(low, int(8u*l), 8) | (bitfieldExtract(high, int(3u*l), 3) << 8u);
+#endif
+#if Q36_TYPE == 19
+                ivec2 w = ivec2(iq1_grid[index]);
+#else
+                uvec4 m = masks[sign];
+                ivec2 w = ivec2((grids[GRID + index] ^ m.xy) + m.zw);
+#endif
+                [[unroll]] for (uint t = 0; t < NT; t++) {
+                    uint word = t * pc.blocks * 74u + q + 2u * l;
+                    int lo = dotPacked4x8EXT(w.x, int(q8[word]));
+                    int hi = dotPacked4x8EXT(w.y, int(q8[word + 1u]));
+#if Q36_TYPE == 16 || Q36_TYPE == 19
+                    isum[t] += lo + hi;
+#else
+                    sum[t] += scales[l >> 1u] * float(lo);
+                    sum[t] += scales[l >> 1u] * float(hi);
+#endif
+                }
+            }
+            [[unroll]] for (uint t = 0; t < NT; t++) {
+#if Q36_TYPE == 16
+                sum[t] = (wd * (0.5 + float(packed.y >> 28u)) * 0.25) * float(isum[t]);
+#elif Q36_TYPE == 19
+                /* Each grid value is integral plus a shared +/-1/8. Both terms
+                 * sum exactly; Q8_K already stores the two 16-value input sums. */
+                uint bs = q8[t * pc.blocks * 74u + qb + 66u + group];
+                int qsum = bitfieldExtract(int(bs), 0, 16) + bitfieldExtract(int(bs), 16, 16);
+                float delta = (high & 32768u) != 0u ? -0.125 : 0.125;
+                sum[t] = (wd * float(2u * ((high >> 12u) & 7u) + 1u)) * (float(isum[t]) + delta * float(qsum));
+#endif
+                acc[t][r] = fma(yd[t], sum[t], acc[t][r]);
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+        [[unroll]] for (uint t = 0; t < NT; t++) {
+            float total = subgroupAdd(acc[t][r]);
+            if (lane == 0u) y[t * pc.out_dim + first + r] = total * pc.scale;
+        }
+    }
+}

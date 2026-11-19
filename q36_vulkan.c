@@ -62,6 +62,17 @@ typedef struct q36_gpu_tensor {
                                  * same buffer apart */
 } q36_gpu_tensor;
 
+static const struct {
+    uint32_t type, rows;
+    const char *path;
+} q36_vk_iq_decode_tiles[] = {
+    {Q36_VK_TENSOR_IQ2_XXS, 2, "vulkan/dense_iq2_xxs_packed_decode.spv"},
+    {Q36_VK_TENSOR_IQ2_XS,  2, "vulkan/dense_iq2_xs_packed_decode.spv"},
+    {Q36_VK_TENSOR_IQ1_S,   8, "vulkan/dense_iq1_s_packed_decode.spv"},
+    {Q36_VK_TENSOR_IQ2_S,   4, "vulkan/dense_iq2_s_packed_decode.spv"},
+};
+enum { Q36_VK_IQ_DECODE_TILES = sizeof(q36_vk_iq_decode_tiles) / sizeof(q36_vk_iq_decode_tiles[0]) };
+
 typedef struct q36_vk_kernel {
     const char *path;
     uint32_t bindings;
@@ -277,6 +288,7 @@ typedef struct {
     q36_vk_kernel moe_gate_up_decode;
     q36_vk_kernel moe_down_q2k_f32b;
     q36_vk_kernel moe_down_q2k_sum_decode;
+    q36_vk_kernel moe_down_q2k_decode_rows;
     q36_vk_kernel moe_gate_up_q4k_f32b;
     q36_vk_kernel moe_down_q4k_sum_decode;
     q36_vk_kernel moe_gate_up_gemm;
@@ -317,6 +329,7 @@ typedef struct {
     q36_vk_kernel dense_iq2_s_verify[7];
     q36_vk_kernel dense_iq2_xs_verify[7];
     q36_vk_kernel dense_iq2_xxs_verify[7];
+    q36_vk_kernel dense_iq_packed_decode[Q36_VK_IQ_DECODE_TILES];
     q36_vk_kernel dense_extra_decode;
     q36_vk_kernel dense_extra_decode_batch[7];
     q36_vk_kernel dense_iq4_nl_decode;
@@ -3122,6 +3135,7 @@ int q36_gpu_init(void) {
     q36_vk.moe_gate_up_f32b = Q36_VK_KERNEL("vulkan/moe_gate_up_f32b.spv", 8, 24, 1u << 6);
     q36_vk.moe_gate_up_decode = Q36_VK_KERNEL("vulkan/moe_gate_up_decode.spv", 8, 24, 1u << 6);
     q36_vk.moe_down_q2k_f32b = Q36_VK_KERNEL("vulkan/moe_down_q2k_f32b.spv", 5, 24, 1u << 4);
+    q36_vk.moe_down_q2k_decode_rows = Q36_VK_KERNEL("vulkan/moe_down_q2k_decode_rows.spv", 5, 24, 1u << 4);
     q36_vk.moe_down_q2k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q2k_sum_decode.spv", 6, 24, 1u << 5);
     q36_vk.moe_gate_up_q4k_f32b = Q36_VK_KERNEL("vulkan/moe_gate_up_q4k_f32b.spv", 7, 24, 1u << 6);
     q36_vk.moe_down_q4k_sum_decode = Q36_VK_KERNEL("vulkan/moe_down_q4k_sum_decode.spv", 6, 24, 1u << 5);
@@ -3168,6 +3182,8 @@ int q36_gpu_init(void) {
     q36_vk_verify_kernels(q36_vk.dense_iq2_s_verify, "vulkan/dense_iq2_s_verify.spv", 4, 24);
     q36_vk_verify_kernels(q36_vk.dense_iq2_xs_verify, "vulkan/dense_iq2_xs_verify.spv", 4, 24);
     q36_vk_verify_kernels(q36_vk.dense_iq2_xxs_verify, "vulkan/dense_iq2_xxs_verify.spv", 4, 24);
+    for (unsigned i = 0; i < Q36_VK_IQ_DECODE_TILES; i++)
+        q36_vk.dense_iq_packed_decode[i] = Q36_VK_KERNEL(q36_vk_iq_decode_tiles[i].path, 4, 20, 1u << 2);
     q36_vk.dense_extra_decode = Q36_VK_KERNEL("vulkan/dense_extra_decode.spv", 4, 20, 1u << 2);
     q36_vk.dense_iq4_nl_decode = Q36_VK_KERNEL("vulkan/dense_iq4_nl_decode.spv", 4, 20, 1u << 2);
     q36_vk.dense_iq2_s_decode = Q36_VK_KERNEL("vulkan/dense_iq2_s_decode.spv", 4, 20, 1u << 2);
@@ -3403,11 +3419,22 @@ int q36_gpu_init(void) {
         q36_vk.dense_iq2_s_decode.path = "vulkan/dense_iq2_s_decode_float.spv";
     }
     if (q36_vk.bc250 && q36_vk.have_int_dot && q36_vk.have_f16) {
+        for (unsigned i = 0; i < 7; i++) {
+            q36_vk.dense_iq2_xxs_verify[i].path = "vulkan/dense_iq2_xxs_packed_verify.spv";
+            q36_vk.dense_iq2_xs_verify[i].path = "vulkan/dense_iq2_xs_packed_verify.spv";
+            q36_vk.dense_iq3_xxs_decode_batch[i].path = "vulkan/dense_iq3_xxs_verify_signs.spv";
+        }
+        /* Wider IQ2_S batches benefit from the original token loop. */
+        q36_vk.dense_iq2_s_verify[0].path = "vulkan/dense_iq2_s_packed_verify.spv";
         q36_vk.dense_q3k_decode.path = "vulkan/dense_q3k_decode_dot.spv";
         q36_vk.dense_q4k_decode.path = "vulkan/dense_q4k_decode_dot.spv";
         q36_vk.dense_q5k_decode.path = "vulkan/dense_q5k_decode_dot.spv";
         q36_vk.dense_kquant_decode_r2.path = "vulkan/dense_q6k_decode_dot.spv";
         q36_vk.mtp_head_q5k.path = "vulkan/mtp_head_q5k_dot.spv";
+    }
+    if (q36_vk.bc250 && q36_vk.subgroup_size == 64u) {
+        for (unsigned i = 1; i < 7; i++)
+            q36_vk.matmul_q8_0_verify[i].path = "vulkan/matmul_q8_0_verify_wave64.spv";
     }
     if (q36_vk.bc250) {
         /* Three/four-token panels amortize native i16 multiply-adds here;
@@ -3681,6 +3708,8 @@ void q36_gpu_cleanup(void) {
     for (unsigned i = 0; i < 7; i++) q36_vk_kernel_destroy(&q36_vk.dense_iq2_s_verify[i]);
     for (unsigned i = 0; i < 7; i++) q36_vk_kernel_destroy(&q36_vk.dense_iq2_xs_verify[i]);
     for (unsigned i = 0; i < 7; i++) q36_vk_kernel_destroy(&q36_vk.dense_iq2_xxs_verify[i]);
+    for (unsigned i = 0; i < Q36_VK_IQ_DECODE_TILES; i++)
+        q36_vk_kernel_destroy(&q36_vk.dense_iq_packed_decode[i]);
     q36_vk_kernel_destroy(&q36_vk.dense_extra_decode);
     for (unsigned i = 0; i < 7; i++)
         q36_vk_kernel_destroy(&q36_vk.dense_extra_decode_batch[i]);
@@ -3752,6 +3781,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_decode);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_sum_decode);
+    q36_vk_kernel_destroy(&q36_vk.moe_down_q2k_decode_rows);
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_q4k_f32b);
     q36_vk_kernel_destroy(&q36_vk.moe_down_q4k_sum_decode);
     q36_vk_kernel_destroy(&q36_vk.moe_gate_up_gemm);
@@ -9094,7 +9124,8 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
 
 
     /* These specialized verifiers own four complete output rows. */
-    bool verify_tail = (weight_type == Q36_VK_TENSOR_IQ2_S ||
+    bool verify_tail = ((q36_vk.bc250 && weight_type == Q36_VK_TENSOR_IQ2_XXS) ||
+                        weight_type == Q36_VK_TENSOR_IQ2_S ||
                         weight_type == Q36_VK_TENSOR_IQ2_XS ||
                         weight_type == Q36_VK_TENSOR_IQ3_XXS) && out_dim % 4u;
     if (q36_vk_micro_batch && n_tok > 1u &&
@@ -9152,6 +9183,16 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                 } else if (weight_type == Q36_VK_TENSOR_IQ4_NL && in_dim <= 5120u && out_dim <= 1024u) {
                     kernel = &q36_vk.dense_iq4_nl_decode;
                     rows = 1u;
+                }
+                if (q36_vk.bc250 && q36_vk.have_storage16 && q36_vk_use_dense_iq3_fast()) {
+                    for (unsigned i = 0; i < Q36_VK_IQ_DECODE_TILES; i++) {
+                        if (weight_type == q36_vk_iq_decode_tiles[i].type &&
+                            out_dim % q36_vk_iq_decode_tiles[i].rows == 0) {
+                            kernel = &q36_vk.dense_iq_packed_decode[i];
+                            rows = q36_vk_iq_decode_tiles[i].rows;
+                            break;
+                        }
+                    }
                 }
                 ok = q36_vk_run_unlocked(
                     op, kernel, bindings, &push, sizeof(push),
@@ -9908,7 +9949,10 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
     /* Decode: one distinct expert per slot, so the selection itself is the
      * schedule and the tile build dispatch is skipped. */
     bool identity = (n_tok == 1u || (q36_vk_micro_batch && n_tok <= 8u && !streamed)) && !overflow;
-    bool down_sum_decode = identity && q36_vk_use_moe_down_sum_decode();
+    bool decode = identity && q36_vk_use_moe_down_sum_decode();
+    bool down_rows = decode && q36_vk.bc250 && !streamed && !down_q4k &&
+                     mid_dim == 512u && n_used == 8u && out_dim % 2u == 0u;
+    bool down_sum_decode = decode && !down_rows;
     /* Prefill batches route to the register-tiled GEMM kernels: wider
      * expert token tiles amortize the dequant and weight reads that bound
      * the matvec path. Small batches (chunk tails, MTP verify windows)
@@ -10044,10 +10088,17 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                     down_scales ? down_scales : down_bank,
                     down8,
                 };
-                ok = gemm ? q36_vk_run_unlocked("moe_q2k_down_gemm", &q36_vk.moe_down_gemm, db, &dpush, sizeof(dpush),
-                                                (out_dim + gemm_rows - 1u) / gemm_rows, wave_tile_count, 1)
-                          : q36_vk_run_unlocked("moe_q2k_down", &q36_vk.moe_down_q2k_f32b, db, &dpush, sizeof(dpush),
-                                                out_dim, wave_tile_count, 1);
+                if (down_rows) {
+                    ok = q36_vk_run_unlocked("moe_q2k_down_decode_rows", &q36_vk.moe_down_q2k_decode_rows,
+                                             db, &dpush, sizeof(dpush), out_dim / 2u, wave_tile_count, 1);
+                } else if (gemm) {
+                    ok = q36_vk_run_unlocked("moe_q2k_down_gemm", &q36_vk.moe_down_gemm,
+                                             db, &dpush, sizeof(dpush), (out_dim + gemm_rows - 1u) / gemm_rows,
+                                             wave_tile_count, 1);
+                } else {
+                    ok = q36_vk_run_unlocked("moe_q2k_down", &q36_vk.moe_down_q2k_f32b,
+                                             db, &dpush, sizeof(dpush), out_dim, wave_tile_count, 1);
+                }
             }
         }
         pthread_mutex_unlock(&q36_vk_mu);

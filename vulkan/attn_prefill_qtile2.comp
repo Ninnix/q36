@@ -1,5 +1,6 @@
 #version 460
 
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -85,14 +86,26 @@ uint qidx(uint a) {
 
 /* Adjacent output dimensions share a Q4 scale and four packed bytes. */
 vec4 vc_at(uint key, uint vblk, uint vqo, uint vsh) {
-    uint base = key * pc.v_row_bytes + vblk;
-    uint dw = vc[base >> 2u];
-    float scale = unpackHalf2x16((base & 2u) == 0u ? dw : dw >> 16u).x;
-    uint off = base + vqo;
-    uint wi = off >> 2u;
+    /* Each 256-dimensional Q4 head occupies 144 bytes, so advancing a row
+     * preserves the scale and payload alignment of every block. */
+    uint row = key * (pc.v_row_bytes >> 2u);
+    uint dw = vc[row + (vblk >> 2u)];
+    float scale = unpackHalf2x16((vblk & 2u) == 0u ? dw : dw >> 16u).x;
+    uint off = vblk + vqo;
+    uint wi = row + (off >> 2u);
     uint shift = (off & 3u) * 8u;
     uint bits = shift == 0u ? vc[wi] : (vc[wi] >> shift) | (vc[wi + 1u] << (32u - shift));
     return scale * (vec4(unpack8(int((bits >> vsh) & 0x0f0f0f0fu))) - vec4(8.0));
+}
+
+void add_value(uint key, uint t, uint r0, uint vblk, uint vqo, uint vsh,
+               inout float l[ROWS], inout float acc[ROWS][VD]) {
+    vec4 value = vc_at(key, vblk, vqo, vsh);
+    for (uint rr = 0u; rr < ROWS; rr++) {
+        float w = sh_w[(r0 + rr) * TILE + t];
+        l[rr] += w;
+        for (uint v = 0u; v < VD; v++) acc[rr][v] += w * value[v];
+    }
 }
 
 void main(void) {
@@ -293,20 +306,21 @@ void main(void) {
             }
             barrier();
 
-            float vv[VD];
-            for (uint t = 0u; t < tile_n; t++) {
-                vec4 val = vc_at(base + t, vblk, vqo, vsh);
-                for (uint v = 0u; v < VD; v++) vv[v] = val[v];
-                for (uint rr = 0u; rr < ROWS; rr++) {
-                    uint r = r0 + rr;
-                    uint ti = r / HQ;
-                    uint n_kv = pc.pos0 + tok0 + ti + 1u;
-                    if (ti >= tn || base + t >= n_kv) continue;
-                    float w = sh_w[r * TILE + t];
-                    l[rr] += w;
-                    for (uint v = 0u; v < VD; v++) acc[rr][v] += w * vv[v];
-                }
+            uint end = tile_n;
+            uint t = 0u;
+#if Q36_QT == 1
+            /* All heads of one query share its causal end. Issue independent
+             * V loads together while adding the weights in key order. */
+            for (; t + 8u <= end; t += 8u) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++)
+                    add_value(base + t + i, t + i, 0u, vblk, vqo, vsh, l, acc);
             }
+#else
+            uint n_kv = pc.pos0 + tok0 + rg + 1u;
+            end = rg < tn && base < n_kv ? min(tile_n, n_kv - base) : 0u;
+#endif
+            for (; t < end; t++)
+                add_value(base + t, t, r0, vblk, vqo, vsh, l, acc);
             for (uint rr = 0u; rr < ROWS; rr++) m[rr] = nm[rr];
             barrier();
         }
