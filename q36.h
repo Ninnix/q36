@@ -34,6 +34,7 @@ typedef enum {
     Q36_THINK_LOW,
     Q36_THINK_MEDIUM,
     Q36_THINK_XHIGH,
+    Q36_THINK_MINIMAL,
 } q36_think_mode;
 
 typedef enum {
@@ -211,6 +212,8 @@ const char *q36_kv_cache_type_name(q36_kv_cache_type type);
 bool q36_parse_kv_cache_type(const char *s, q36_kv_cache_type *out);
 q36_kv_cache_type q36_default_kv_cache_type_k(q36_backend backend, bool ssd_streaming);
 q36_kv_cache_type q36_default_kv_cache_type_v(q36_backend backend, bool ssd_streaming);
+bool q36_parse_think_option(const char *name, q36_think_mode *mode);
+q36_think_mode q36_model_think_mode(q36_engine *e, q36_think_mode mode);
 bool q36_think_mode_enabled(q36_think_mode mode);
 const char *q36_think_mode_name(q36_think_mode mode);
 const char *q36_think_max_prefix(void);
@@ -269,6 +272,10 @@ int q36_chat_append_vision_message(q36_engine *e, q36_tokens *tokens,
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode);
 
 char *q36_token_text(q36_engine *e, int token, size_t *len);
+char *q36_chat_token_text(q36_engine *e, int token, bool show_thinking, bool *thinking, size_t *len);
+bool q36_engine_is_inkling(q36_engine *e);
+int q36_token_think_end(q36_engine *e);
+
 int q36_token_eos(q36_engine *e);
 
 int q36_session_create(q36_session **out, q36_engine *e, int ctx_size);
@@ -370,6 +377,8 @@ void q36_session_invalidate(q36_session *s);
 void q36_session_rewind(q36_session *s, int pos);
 int q36_session_pos(q36_session *s);
 int q36_session_ctx(q36_session *s);
+/* Allocated attention K and V rows on the active backend. */
+uint64_t q36_session_kv_bytes(const q36_session *s);
 int q36_engine_routed_quant_bits(q36_engine *e);
 bool q36_engine_has_mtp(q36_engine *e);
 int q36_engine_mtp_draft_tokens(q36_engine *e);

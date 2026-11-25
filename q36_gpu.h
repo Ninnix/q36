@@ -46,6 +46,14 @@ int q36_gpu_cached_matmul(q36_gpu_tensor *out, const q36_gpu_tensor *x,
     const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
     uint64_t row_offset, uint32_t type, uint32_t width, uint32_t rows,
     uint32_t row_bytes, uint32_t tokens, uint32_t out_stride, const q36_gpu_tensor *prepared_q8);
+int q36_gpu_inkling_packed(void);
+int q36_gpu_inkling_tiled(unsigned kv_format);
+int q36_gpu_inkling_cache(const void *map,uint64_t size,uint64_t offset,uint64_t bytes,
+    unsigned type,unsigned width);
+int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t params[8], unsigned kv_format);
+int q36_gpu_inkling_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
+    q36_gpu_tensor *weights, q36_gpu_tensor *routes, uint32_t type, uint32_t width,
+    uint32_t rows, uint32_t stride, uint32_t mode, uint32_t tokens);
 int q36_gpu_qwen4_native(void);
 uint32_t q36_gpu_submit_limit(uint32_t count);
 int q36_gpu_qwen4_delta(q36_gpu_tensor *const tensors[6], uint32_t tokens);
@@ -96,7 +104,7 @@ int q36_gpu_vision_matmul_f16_disk(q36_gpu_tensor *out, int fd,
                                    uint64_t n_tok);
 int q36_gpu_vision_attention(q36_gpu_tensor *out,
                              const q36_gpu_tensor *qkv,
-                             uint32_t rows);
+                             uint32_t rows, uint32_t head_dim);
 
 int q36_gpu_begin_commands(void);
 int q36_gpu_flush_commands(void);

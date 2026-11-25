@@ -2,11 +2,9 @@
 
 [README](../README.md#start-here) | [Distributed inference](DISTRIBUTED.md) | [SSD streaming](SSD_STREAMING.md)
 
-QuarkStar runs the project's Qwen3.6-35B-A3B, dense Qwen3.8-27B, and
-Qwen3.8 Flash Next GGUFs. It is not a general GGUF loader. Other files may
-have unsupported tensor layouts, quantization mixes, metadata, or MTP state.
-Use the download targets below; `./download_model.sh --help` lists filenames
-and options.
+QuarkStar runs Qwen3.6-35B-A3B, dense Qwen3.8-27B, Qwen3.8 Flash Next, and
+Inkling 2 Mini GGUFs. Use the download targets below for supported files.
+`./download_model.sh --help` lists filenames and options.
 
 ## Downloads
 
@@ -16,6 +14,7 @@ and options.
 | `q4` | Qwen3.6-35B-A3B IQ4_XS/Q4_K | 19.05 GiB | Recommended for two-machine distributed inference |
 | `27b` | Qwen3.8-27B UD-IQ3_S | 11.21 GiB | Resident dense model |
 | `27b-iq3-xxs` | Qwen3.8-27B GSQ-RCO IQ3_XXS | 9.73 GiB | Smaller dense weights, leaving more room for context |
+| `inkling-2-mini` | Inkling 2 Mini UD-IQ3_XXS | About 10.9 GiB | Resident single-board model with an optional vision projector |
 | `flash-next` | Qwen3.8 Flash Next GSQ-RCO Coder IQ2_XXS | About 50.8 GB, two shards | Recommended for two-machine distributed inference |
 
 For a first run on the BC-250:
@@ -113,6 +112,12 @@ For Qwen3.6, download the matching encoder and start the CLI:
 
 For dense Qwen3.8-27B, use the `qwen38-vision` target and pass
 `--vision gguf/Qwen3.8-27B-mmproj-F16.gguf` with the selected dense model.
+
+For Inkling 2 Mini, use the `inkling-2-mini-vision` target and pass
+`--vision gguf/Inkling-2-Mini-mmproj-F16.gguf` with the Inkling language model.
+Inkling vision pads images to 40-pixel boundaries, with larger inputs resized to
+a maximum padded area of 409,600 pixels. See the [Inkling launch example](CLIENTS.md#inkling-2-mini-on-one-board).
+
 Encoder downloads do not change the legacy main-model link.
 
 At the interactive prompt, `/read photo.jpg` submits an image turn.

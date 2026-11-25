@@ -118,6 +118,63 @@ Optionally make it the default Pi model in `~/.pi/agent/settings.json`:
 }
 ```
 
+## Inkling 2 Mini on one board
+
+Start the native Vulkan server with the Inkling GGUF.
+
+```sh
+./q36-server --vulkan -t 16 --ctx 16384 -m gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf
+```
+
+Enable image input with the separate projector.
+
+```sh
+./download_model.sh inkling-2-mini-vision
+./q36-server --vulkan -t 16 --ctx 16384 \
+  -m gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf \
+  --vision gguf/Inkling-2-Mini-mmproj-F16.gguf
+```
+
+QuarkStar reads the projector matrices from disk into a reusable 32 MiB Vulkan weight buffer. The same `--vision` flag enables `/read FILE [PROMPT]` in `q36` and `view_image` in `q36-agent`.
+
+OpenCode 2.0.29 accepts this project-local `opencode.json`. Each variant sends an explicit effort in the request body.
+
+```json
+{
+  "model": "q36/inkling-2-mini",
+  "providers": {
+    "q36": {
+      "name": "QuarkStar",
+      "package": "@ai-sdk/openai-compatible",
+      "settings": {"baseURL": "http://127.0.0.1:8000/v1", "apiKey": "local"},
+      "models": {
+        "inkling-2-mini": {
+          "name": "Inkling 2 Mini",
+          "limit": {"context": 16384, "output": 768},
+          "capabilities": {"tools": true, "reasoning": {"supported": true}},
+          "variants": [
+            {"id": "none", "body": {"reasoning_effort": "none"}},
+            {"id": "minimal", "body": {"reasoning_effort": "minimal"}},
+            {"id": "low", "body": {"reasoning_effort": "low"}},
+            {"id": "medium", "body": {"reasoning_effort": "medium"}},
+            {"id": "high", "body": {"reasoning_effort": "high"}},
+            {"id": "xhigh", "body": {"reasoning_effort": "xhigh"}}
+          ]
+        }
+      }
+    }
+  },
+  "websearch": {"provider": "tinyfish"}
+}
+```
+
+For Pi 0.74.0, use the Pi example above with model ID `inkling-2-mini`, `contextWindow` set to 16384, and `maxTokens` set to 768. Set `compat.thinkingFormat` to `"openai"` so Pi sends the selected level. In `thinkingLevelMap`, use `"off": "none"` and `"minimal": "minimal"`. Pi supplies its own tools. Web search requires a search extension.
+
+```sh
+opencode run --standalone --model 'q36/inkling-2-mini#low' 'Read README.md and give its first heading.'
+pi -p --provider q36 --model inkling-2-mini --thinking medium 'Read README.md and give its first heading.'
+```
+
 ## Claude Code
 
 Use the Anthropic-compatible endpoint. Save this wrapper with a name

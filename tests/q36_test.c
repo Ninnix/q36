@@ -40,6 +40,7 @@ static q36_dist_options test_parity_distributed;
 
 static void test_skip(const char *name, const char *reason) {
     fprintf(stderr, "%s: SKIP (%s)\n", name, reason);
+    if (getenv("Q36_TEST_REQUIRE_BACKEND")) test_failures++;
 }
 
 static bool test_model_available(const char *path) {
@@ -505,7 +506,7 @@ static void test_encode_prompt_mode(q36_engine *engine,
                                     q36_think_mode think_mode,
                                     bool hf_template,
                                     q36_tokens *prompt) {
-    if (!hf_template) {
+    if (!hf_template || !strcmp(q36_engine_model_name(engine),"inkling-2-mini")) {
         q36_encode_chat_prompt(engine, system, prompt_text, think_mode, prompt);
         return;
     }
@@ -6506,6 +6507,7 @@ static void test_logit_comparison_print(const char *name, const char *case_id, i
 static void test_logit_comparison_assert_strict(const char *name, const char *case_id, int step,
                                         const test_logit_comparison *result) {
     test_logit_comparison_print(name, case_id, step, result);
+    TEST_ASSERT(result->nonfinite == 0);
     TEST_ASSERT(result->same_top1);
     TEST_ASSERT(result->top5_overlap >= 4);
     TEST_ASSERT(result->top20_overlap >= 15);
@@ -6548,7 +6550,13 @@ static void test_llama_parity_case(q36_engine *engine,
     prompt_text = test_read_file(tc->prompt_path);
     TEST_ASSERT(prompt_text != NULL);
     if (!prompt_text) goto done;
-    rendered = test_render_hf_chat_prompt("", prompt_text, Q36_THINK_NONE);
+    if (!strcmp(q36_engine_model_name(engine),"inkling-2-mini")) {
+        const char *fmt = "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
+                          "<|message_user|><|content_text|>%s<|end_message|>";
+        size_t n = strlen(fmt)+strlen(prompt_text)+1;
+        rendered = test_xcalloc(n,1);
+        snprintf(rendered,n,fmt,prompt_text);
+    } else rendered = test_render_hf_chat_prompt("", prompt_text, Q36_THINK_NONE);
     TEST_ASSERT(rendered != NULL);
     if (!rendered) goto done;
     q36_encode_chat_prompt(engine, "", prompt_text, Q36_THINK_NONE, &prompt);
@@ -6632,7 +6640,7 @@ done:
 }
 
 static void test_llama_quant_dots(q36_engine *engine) {
-    static const uint32_t types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 42};
+    static const uint32_t types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 40, 42};
     ggml_cpu_init();
     for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
         uint32_t type = types[ti], n;

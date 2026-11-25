@@ -20,6 +20,7 @@ CFLAGS ?= -O3 -ffast-math $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
 LLAMA_CPP_DIR ?= llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build
 REFERENCE_MODEL ?= gguf/Qwen3.6-35B-A3B-Q8_0.gguf
+INKLING_MODEL ?= gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf
 QWEN27B_MODEL ?= gguf/Qwen3.8-27B-UD-IQ3_S.gguf
 QWEN27B_PROMPT ?= tests/long_context_story_prompt.txt
 QWEN27B_GEN ?= 128
@@ -70,6 +71,9 @@ VULKAN_SHADERS := \
 	vulkan/stream_q2_0.spv \
 	vulkan/stream_bf16.spv \
 	vulkan/stream_bf16_split.spv \
+	vulkan/inkling_ops.spv vulkan/inkling_matvec.spv vulkan/inkling_matvec_dot.spv vulkan/inkling_tile.spv \
+	vulkan/inkling_matvec_fma.spv vulkan/inkling_matvec_iq.spv vulkan/inkling_tile_fma.spv vulkan/inkling_tile_half.spv vulkan/inkling_ops_fma.spv \
+	vulkan/inkling_tile_min.spv vulkan/inkling_matvec_i16_tile.spv \
 	vulkan/stream_matvec.spv \
 	vulkan/qwen4_ops.spv \
 	vulkan/gdn_front.spv \
@@ -830,13 +834,13 @@ q36_metal.o: q36_metal.m q36_gpu.h q36_quant.h q36_ssd.h $(METAL_SRCS)
 q36_cli.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_cli.c
 
-q36_server.o: q36_server.c q36.h rax.h q36_tool_text.h
+q36_server.o: q36_server.c q36.h rax.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_server.c
 
 q36_bench.o: q36_bench.c q36.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_bench.c
 
-q36_agent.o: q36_prompt_prefix.h q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h
+q36_agent.o: q36_prompt_prefix.h q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_agent.c
 
 q36_eval.o: q36_eval_cases.h q36_eval.c q36.h q36_help.h q36_ssd.h
@@ -854,10 +858,10 @@ q36_ssd.o: q36_ssd.c q36_ssd.h
 q36_web.o: q36_web.c q36_web.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
-q36_test_metal.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_test_metal.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_test.c
 
 gguf-tools/quality-testing/score_openrouter.o: gguf-tools/quality-testing/score_openrouter.c q36.h q36_ssd.h q36_prompt_prefix.h
@@ -868,6 +872,28 @@ linenoise.o: linenoise.c linenoise.h
 
 rax.o: rax.c rax.h rax_malloc.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ rax.c
+
+vulkan/inkling_matvec.spv vulkan/inkling_matvec_dot.spv vulkan/inkling_tile.spv vulkan/inkling_ops.spv: vulkan/expf.glsl
+vulkan/inkling_ops.spv: vulkan/reference_math.glsl
+# Older SPIR-V tools can use the equivalent multiply-add shader.
+vulkan/inkling_ops_fma.spv: vulkan/inkling_ops.comp vulkan/expf.glsl vulkan/reference_math.glsl vulkan/inkling_ops.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_FMA=1 -o $@ $< || cp vulkan/inkling_ops.spv $@
+vulkan/inkling_matvec_fma.spv: vulkan/inkling_matvec.comp vulkan/inkling_matvec_dot.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_FMA=1 -o $@ $< || cp vulkan/inkling_matvec_dot.spv $@
+vulkan/inkling_matvec_iq.spv: vulkan/inkling_matvec.comp vulkan/inkling_matvec_dot.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_FMA=1 -DINK_IQ_DECODE=1 -o $@ $< || cp vulkan/inkling_matvec_dot.spv $@
+vulkan/inkling_tile_fma.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -DINK_FMA=1 -o $@ $< || cp vulkan/inkling_tile.spv $@
+vulkan/inkling_tile_half.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile_fma.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -DINK_FMA=1 -DINK_HALF_WEIGHT=1 -o $@ $< || cp vulkan/inkling_tile_fma.spv $@
+vulkan/inkling_tile_min.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile_fma.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -DINK_FMA=1 -DINK_MIN_TILE=1 -o $@ $< || cp vulkan/inkling_tile_fma.spv $@
+vulkan/inkling_matvec_i16_tile.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile_fma.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -DINK_FMA=1 -DINK_IQ_TILE_I16=1 -o $@ $< || cp vulkan/inkling_tile_fma.spv $@
+vulkan/inkling_tile.spv: vulkan/inkling_matvec.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -o $@ $<
+vulkan/inkling_matvec_dot.spv: vulkan/inkling_matvec.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -o $@ $<
 
 vulkan/%.spv: vulkan/%.comp
 	$(GLSLC) -O -o $@ $<
@@ -933,13 +959,13 @@ q36_image.o: q36_image.c q36_image.h third_party/iris/jpeg.h third_party/iris/pn
 q36_cli_cpu.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_cli.c
 
-q36_server_cpu.o: q36_server.c q36.h rax.h q36_tool_text.h
+q36_server_cpu.o: q36_server.c q36.h rax.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_server.c
 
 q36_bench_cpu.o: q36_bench.c q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_bench.c
 
-q36_agent_cpu.o: q36_prompt_prefix.h q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h
+q36_agent_cpu.o: q36_prompt_prefix.h q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_agent.c
 
 q36_eval_cpu.o: q36_eval_cases.h q36_eval.c q36.h q36_help.h q36_ssd.h
@@ -957,7 +983,7 @@ q36_ssd_cpu.o: q36_ssd.c q36_ssd.h
 q36_web_cpu.o: q36_web.c q36_web.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_tool_text.h
+q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(CPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
 q36_sampling_test_core.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
@@ -1035,6 +1061,25 @@ test-metal: metal q36_agent_test_metal $(SAMPLING_TEST)
 test-metal-model: metal
 	@echo "=== Metal model-dependent tests (requires q36moe.gguf) ==="
 	./q36_test --tool-call-quality --qwen-tool-call-quality --thinking-generation --kv-cache-save-restore --session-sync-resume --gpu-cpu-parity --vulkan-fusion-parity --ssd-streaming-parity --mtp-verifier
+
+.PHONY: test-inkling-llama-parity test-inkling-vulkan-parity test-inkling-kv-parity
+test-inkling-llama-parity: q36_llama_test
+	@test -r "$(INKLING_MODEL)"
+	Q36_TEST_REQUIRE_BACKEND=1 Q36_TEST_THREADS=16 ./q36_llama_test --llama-parity-seq --model "$(INKLING_MODEL)" --case short
+
+test-inkling-vulkan-parity: q36_test
+	@test -r "$(INKLING_MODEL)"
+	Q36_TEST_VK_CACHE_TYPE_K=$${Q36_TEST_VK_CACHE_TYPE_K:-f16} Q36_TEST_VK_CACHE_TYPE_V=$${Q36_TEST_VK_CACHE_TYPE_V:-f16} \
+	Q36_TEST_REQUIRE_BACKEND=1 Q36_TEST_THREADS=16 ./q36_test --vulkan-cpu-parity --model "$(INKLING_MODEL)" --case short
+
+test-inkling-kv-parity: test-inkling-vulkan-parity
+	@set -e; for pair in q8_0/q8_0 q8_0/q4_0 q4_0/q4_0; do \
+		k=$${pair%/*}; v=$${pair#*/}; \
+		echo "Inkling CPU/Vulkan KV $$pair"; \
+		Q36_TEST_REF_CACHE_TYPE_K=$$k Q36_TEST_REF_CACHE_TYPE_V=$$v \
+		Q36_TEST_VK_CACHE_TYPE_K=$$k Q36_TEST_VK_CACHE_TYPE_V=$$v \
+		$(MAKE) test-inkling-vulkan-parity; \
+	done
 
 test-qwen27b-metal-parity: metal
 	./q36_test --dense-quant-model-rows --gpu-cpu-parity --model $(QWEN27B_MODEL) --case short
@@ -1183,7 +1228,7 @@ test-long: q36_test
 		-o $@ tests/test-vectors/llama_qwen_logprobs_capture.c \
 		$(LLAMA_LIBS) $(LDLIBS) $(LLAMA_LDLIBS)
 
-q36_llama_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
+q36_llama_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(CPU_CFLAGS) $(LLAMA_INCLUDE) -DQ36_WITH_LLAMA -Wno-unused-function -c -o $@ tests/q36_test.c
 
 q36_llama_test: q36_llama_test.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS)
@@ -1192,13 +1237,13 @@ q36_llama_test: q36_llama_test.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(C
 q36_reference_test: q36_test_cpu.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS)
 	$(CC) $(CPU_CFLAGS) -o $@ q36_test_cpu.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-q36_agent_test.o: q36_prompt_prefix.h tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h
+q36_agent_test.o: q36_prompt_prefix.h tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_agent_test.c
 
 q36_agent_test: q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_agent_test.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
 
-q36_agent_test_metal.o: q36_prompt_prefix.h tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h
+q36_agent_test_metal.o: q36_prompt_prefix.h tests/q36_agent_test.c q36_agent.c q36.h q36_help.h q36_kvstore.h q36_ssd.h q36_web.h linenoise.h q36_tool_text.h q36_tool_json.h
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_agent_test.c
 
 q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(METAL_CORE_OBJS)
@@ -1244,16 +1289,19 @@ tests/test_distributed_model: tests/test_distributed_model.c q36_distributed.h q
 tests/test_distributed_mtp: tests/test_distributed_mtp.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
 
-q36_cpu.o q36_gpu_core.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o: q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc
+MODEL_INCLUDES := q36_inkling.inc q36_inkling_gpu.inc q36_inkling_model.inc q36_inkling_tokenizer.inc \
+                  q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc
 
-tests/test_qwen4: tests/test_qwen4.c q36.c q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc q36_distributed.o q36_image.o q36_ssd_cpu.o q36_prompt_prefix.o
+q36_cpu.o q36_gpu_core.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o: $(MODEL_INCLUDES)
+
+tests/test_qwen4: tests/test_qwen4.c q36.c $(MODEL_INCLUDES) q36_distributed.o q36_image.o q36_ssd_cpu.o q36_prompt_prefix.o
 	$(CC) $(CPU_CFLAGS) -I. -o $@ $< q36_distributed.o q36_image.o q36_ssd_cpu.o q36_prompt_prefix.o $(LDLIBS)
 
 .PHONY: test-qwen4
 test-qwen4: tests/test_qwen4
 	./tests/test_qwen4
 
-tests/qwen4_kernels: tests/qwen4_kernels.c q36.c q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc q36_distributed.o q36_image.o q36_vulkan.o q36_ssd.o q36_prompt_prefix.o
+tests/qwen4_kernels: tests/qwen4_kernels.c q36.c $(MODEL_INCLUDES) q36_distributed.o q36_image.o q36_vulkan.o q36_ssd.o q36_prompt_prefix.o
 	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -I. -o $@ $< q36_distributed.o q36_image.o q36_vulkan.o q36_ssd.o q36_prompt_prefix.o $(GPU_LDLIBS)
 
 vulkan/qwen4_ops.spv: vulkan/reference_math.glsl vulkan/expf.glsl

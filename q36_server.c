@@ -65,12 +65,6 @@ static void stop_signal_handler(int sig) {
     }
 }
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-} buf;
-
 static void die(const char *msg) {
     fprintf(stderr, "q36-server: %s\n", msg);
     exit(1);
@@ -139,173 +133,7 @@ static char *xstrndup(const char *s, size_t n) {
     return p;
 }
 
-static void buf_reserve(buf *b, size_t add) {
-    if (add > SIZE_MAX - b->len - 1) die("buffer overflow");
-    size_t need = b->len + add + 1;
-    if (need <= b->cap) return;
-    size_t cap = b->cap ? b->cap : 256;
-    while (cap < need) {
-        if (cap > SIZE_MAX / 2) {
-            cap = need;
-            break;
-        }
-        cap *= 2;
-    }
-    b->ptr = xrealloc(b->ptr, cap);
-    b->cap = cap;
-}
-
-static void buf_append(buf *b, const void *p, size_t n) {
-    buf_reserve(b, n);
-    memcpy(b->ptr + b->len, p, n);
-    b->len += n;
-    b->ptr[b->len] = '\0';
-}
-
-static void buf_putc(buf *b, char c) {
-    buf_append(b, &c, 1);
-}
-
-static void buf_puts(buf *b, const char *s) {
-    buf_append(b, s, strlen(s));
-}
-
-static void buf_printf(buf *b, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    va_list ap2;
-    va_copy(ap2, ap);
-    int n = vsnprintf(NULL, 0, fmt, ap);
-    va_end(ap);
-    if (n < 0) die("vsnprintf failed");
-    buf_reserve(b, (size_t)n);
-    vsnprintf(b->ptr + b->len, b->cap - b->len, fmt, ap2);
-    va_end(ap2);
-    b->len += (size_t)n;
-}
-
-static char *buf_take(buf *b) {
-    if (!b->ptr) return xstrdup("");
-    char *p = b->ptr;
-    memset(b, 0, sizeof(*b));
-    return p;
-}
-
-static void buf_free(buf *b) {
-    free(b->ptr);
-    memset(b, 0, sizeof(*b));
-}
-
-static void json_ws(const char **p) {
-    while (**p && isspace((unsigned char)**p)) (*p)++;
-}
-
-static bool json_lit(const char **p, const char *lit) {
-    size_t n = strlen(lit);
-    if (strncmp(*p, lit, n) != 0) return false;
-    *p += n;
-    return true;
-}
-
-static int json_hex(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-    return -1;
-}
-
-static void utf8_put(buf *b, uint32_t cp) {
-    if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
-    if (cp <= 0x7f) {
-        buf_putc(b, (char)cp);
-    } else if (cp <= 0x7ff) {
-        buf_putc(b, (char)(0xc0 | (cp >> 6)));
-        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
-    } else if (cp <= 0xffff) {
-        buf_putc(b, (char)(0xe0 | (cp >> 12)));
-        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
-        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
-    } else {
-        buf_putc(b, (char)(0xf0 | (cp >> 18)));
-        buf_putc(b, (char)(0x80 | ((cp >> 12) & 0x3f)));
-        buf_putc(b, (char)(0x80 | ((cp >> 6) & 0x3f)));
-        buf_putc(b, (char)(0x80 | (cp & 0x3f)));
-    }
-}
-
-static bool json_u16(const char **p, uint32_t *out) {
-    if ((*p)[0] != '\\' || (*p)[1] != 'u') return false;
-    uint32_t cp = 0;
-    for (int i = 0; i < 4; i++) {
-        int h = json_hex((*p)[2 + i]);
-        if (h < 0) return false;
-        cp = (cp << 4) | (uint32_t)h;
-    }
-    *p += 6;
-    *out = cp;
-    return true;
-}
-
-static bool json_string(const char **p, char **out) {
-    *out = NULL;
-    json_ws(p);
-    if (**p != '"') return false;
-    (*p)++;
-    buf b = {0};
-    while (**p && **p != '"') {
-        unsigned char c = (unsigned char)*(*p)++;
-        if (c != '\\') {
-            buf_putc(&b, (char)c);
-            continue;
-        }
-        c = (unsigned char)*(*p)++;
-        switch (c) {
-        case '"': buf_putc(&b, '"'); break;
-        case '\\': buf_putc(&b, '\\'); break;
-        case '/': buf_putc(&b, '/'); break;
-        case 'b': buf_putc(&b, '\b'); break;
-        case 'f': buf_putc(&b, '\f'); break;
-        case 'n': buf_putc(&b, '\n'); break;
-        case 'r': buf_putc(&b, '\r'); break;
-        case 't': buf_putc(&b, '\t'); break;
-        case 'u': {
-            *p -= 2;
-            uint32_t cp = 0, lo = 0;
-            if (!json_u16(p, &cp)) goto fail;
-            if (cp >= 0xd800 && cp <= 0xdbff) {
-                const char *low_start = *p;
-                if (json_u16(p, &lo) && lo >= 0xdc00 && lo <= 0xdfff) {
-                    cp = 0x10000u + ((cp - 0xd800u) << 10) + (lo - 0xdc00u);
-                } else {
-                    *p = low_start;
-                    cp = 0xfffd;
-                }
-            }
-            utf8_put(&b, cp);
-            break;
-        }
-        default:
-            goto fail;
-        }
-    }
-    if (**p != '"') goto fail;
-    (*p)++;
-    *out = buf_take(&b);
-    return true;
-fail:
-    buf_free(&b);
-    return false;
-}
-
-static bool json_number(const char **p, double *out) {
-    json_ws(p);
-    char *end = NULL;
-    double v = strtod(*p, &end);
-    if (end == *p || !isfinite(v)) return false;
-    *p = end;
-    *out = v;
-    return true;
-}
+#include "q36_tool_json.h"
 
 static bool json_int(const char **p, int *out) {
     double v = 0.0;
@@ -328,130 +156,6 @@ static bool json_bool(const char **p, bool *out) {
         return true;
     }
     return false;
-}
-
-/* The request parser only understands the API fields we use and skips the
- * rest.  Skipping is recursive because JSON values nest, so keep an explicit
- * ceiling: without it, a useless ignored field like {"x":[[[...]]]} can spend
- * the whole C stack before the request is rejected. */
-#define JSON_MAX_NESTING 256
-
-static bool json_skip_value_depth(const char **p, int depth);
-
-static bool json_skip_array_depth(const char **p, int depth) {
-    if (depth >= JSON_MAX_NESTING) return false;
-    json_ws(p);
-    if (**p != '[') return false;
-    (*p)++;
-    json_ws(p);
-    if (**p == ']') {
-        (*p)++;
-        return true;
-    }
-    for (;;) {
-        if (!json_skip_value_depth(p, depth + 1)) return false;
-        json_ws(p);
-        if (**p == ']') {
-            (*p)++;
-            return true;
-        }
-        if (**p != ',') return false;
-        (*p)++;
-    }
-}
-
-static bool json_skip_object_depth(const char **p, int depth) {
-    if (depth >= JSON_MAX_NESTING) return false;
-    json_ws(p);
-    if (**p != '{') return false;
-    (*p)++;
-    json_ws(p);
-    if (**p == '}') {
-        (*p)++;
-        return true;
-    }
-    for (;;) {
-        char *key = NULL;
-        if (!json_string(p, &key)) return false;
-        free(key);
-        json_ws(p);
-        if (**p != ':') return false;
-        (*p)++;
-        if (!json_skip_value_depth(p, depth + 1)) return false;
-        json_ws(p);
-        if (**p == '}') {
-            (*p)++;
-            return true;
-        }
-        if (**p != ',') return false;
-        (*p)++;
-    }
-}
-
-static bool json_skip_value_depth(const char **p, int depth) {
-    json_ws(p);
-    if (**p == '"') {
-        char *s = NULL;
-        bool ok = json_string(p, &s);
-        free(s);
-        return ok;
-    }
-    if (**p == '{') return json_skip_object_depth(p, depth);
-    if (**p == '[') return json_skip_array_depth(p, depth);
-    if (json_lit(p, "true") || json_lit(p, "false") || json_lit(p, "null")) return true;
-    double v = 0.0;
-    return json_number(p, &v);
-}
-
-static bool json_skip_value(const char **p) {
-    return json_skip_value_depth(p, 0);
-}
-
-static bool json_raw_value(const char **p, char **out) {
-    json_ws(p);
-    const char *start = *p;
-    if (!json_skip_value(p)) return false;
-    size_t n = (size_t)(*p - start);
-    char *s = xmalloc(n + 1);
-    memcpy(s, start, n);
-    s[n] = '\0';
-    *out = s;
-    return true;
-}
-
-static char *json_minify_raw_value(const char *json) {
-    const char *p = json ? json : "null";
-    json_ws(&p);
-    const char *start = p;
-    if (!json_skip_value(&p)) return xstrdup(json ? json : "null");
-    const char *end = p;
-
-    buf b = {0};
-    bool in_string = false;
-    bool escape = false;
-    for (const char *s = start; s < end; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (in_string) {
-            buf_putc(&b, (char)c);
-            if (escape) escape = false;
-            else if (c == '\\') escape = true;
-            else if (c == '"') in_string = false;
-        } else if (c == '"') {
-            in_string = true;
-            buf_putc(&b, (char)c);
-        } else if (!isspace(c)) {
-            buf_putc(&b, (char)c);
-        }
-    }
-    return buf_take(&b);
-}
-
-static bool json_raw_value_is_complete(const char *json) {
-    const char *p = json ? json : "";
-    json_ws(&p);
-    if (!json_skip_value(&p)) return false;
-    json_ws(&p);
-    return *p == '\0';
 }
 
 #define SERVER_IMAGE_MARKER_BYTES 64
@@ -756,12 +460,17 @@ typedef struct {
 } tool_schema_orders;
 
 typedef struct {
+    char *id, *text;
+    size_t start, end;
+} tool_result_span;
+
+typedef struct {
     char *role;
     char *content;
     server_image_inputs images;
     char *reasoning;
     char *tool_call_id;
-    char **result_ids;
+    tool_result_span *results;
     size_t result_count;
     int tool_errors; /* Consecutive failures at the end of this result group. */
     bool other_content;
@@ -848,14 +557,21 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
     calls->v[calls->len++] = tc;
 }
 
+static void chat_results_free(chat_msg *m) {
+    for (size_t i = 0; i < m->result_count; i++) {
+        free(m->results[i].id);
+        free(m->results[i].text);
+    }
+    free(m->results);
+}
+
 static void chat_msg_free(chat_msg *m) {
     server_image_inputs_free(&m->images);
     free(m->role);
     free(m->content);
     free(m->reasoning);
     free(m->tool_call_id);
-    for (size_t i = 0; i < m->result_count; i++) free(m->result_ids[i]);
-    free(m->result_ids);
+    chat_results_free(m);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -1013,7 +729,8 @@ static bool parse_reasoning_effort_name(const char *s, q36_think_mode *out) {
         *out = Q36_THINK_MAX;
         return true;
     }
-    if (!strcmp(s, "low") || !strcmp(s, "minimal")) *out = Q36_THINK_LOW;
+    if (!strcmp(s, "minimal")) *out = Q36_THINK_MINIMAL;
+    else if (!strcmp(s, "low")) *out = Q36_THINK_LOW;
     else if (!strcmp(s, "medium")) *out = Q36_THINK_MEDIUM;
     else if (!strcmp(s, "high")) *out = Q36_THINK_HIGH;
     else if (!strcmp(s, "xhigh")) *out = Q36_THINK_XHIGH;
@@ -2053,15 +1770,11 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
     } else if (type && !strcmp(type, "tool_result")) {
         msg->tool_errors = is_error ? msg->tool_errors + 1 : 0;
         if (!id || !id[0]) msg->other_content = true;
-        else {
-            msg->result_ids = xrealloc(msg->result_ids,
-                                      (msg->result_count + 1) * sizeof(char *));
-            msg->result_ids[msg->result_count++] = xstrdup(id);
-        }
         const char *nested = tool_result ? tool_result : "\"\"";
         if (!parse_anthropic_content_mode(&nested, &result, false)) goto bad;
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
+        size_t start = b.len;
         buf_puts(&b, "<tool_response>\n");
         char *trimmed = chat_content_text(result.content, false, NULL);
         append_xml_text_escaped(&b, trimmed);
@@ -2075,6 +1788,12 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
             memset(&result.images.v[i], 0, sizeof(result.images.v[i]));
         }
         buf_puts(&b, "\n</tool_response>");
+        if (id && *id) {
+            msg->results = xrealloc(msg->results, (msg->result_count + 1) * sizeof(*msg->results));
+            msg->results[msg->result_count++] = (tool_result_span){
+                .id = xstrdup(id), .text = xstrdup(result.content ? result.content : ""), .start = start, .end = b.len
+            };
+        }
         free(msg->content);
         msg->content = buf_take(&b);
     } else if (type && !strcmp(type, "image")) {
@@ -2206,13 +1925,12 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
                 free(msg.reasoning);
                 tool_calls_free(&msg.calls);
                 server_image_inputs_free(&msg.images);
-                for (size_t i = 0; i < msg.result_count; i++) free(msg.result_ids[i]);
-                free(msg.result_ids);
-                msg.result_ids = parsed.result_ids;
+                chat_results_free(&msg);
+                msg.results = parsed.results;
                 msg.result_count = parsed.result_count;
                 msg.tool_errors = parsed.tool_errors;
                 msg.other_content = parsed.other_content;
-                parsed.result_ids = NULL;
+                parsed.results = NULL;
                 parsed.result_count = 0;
                 msg.images = parsed.images;
                 memset(&parsed.images, 0, sizeof(parsed.images));
@@ -2372,90 +2090,6 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
         "</IMPORTANT>");
 }
 
-static void json_escape(buf *b, const char *s);
-
-typedef struct {
-    char *key;
-    char *value;
-    bool is_string;
-    bool used;
-} json_arg;
-
-typedef struct {
-    json_arg *v;
-    int len;
-    int cap;
-} json_args;
-
-static void json_args_free(json_args *args) {
-    for (int i = 0; i < args->len; i++) {
-        free(args->v[i].key);
-        free(args->v[i].value);
-    }
-    free(args->v);
-    memset(args, 0, sizeof(*args));
-}
-
-static void json_args_push(json_args *args, json_arg arg) {
-    if (args->len == args->cap) {
-        args->cap = args->cap ? args->cap * 2 : 8;
-        args->v = xrealloc(args->v, (size_t)args->cap * sizeof(args->v[0]));
-    }
-    args->v[args->len++] = arg;
-}
-
-static int json_args_find_unused(json_args *args, const char *key) {
-    if (!key) return -1;
-    for (int i = 0; i < args->len; i++) {
-        if (!args->v[i].used && args->v[i].key && !strcmp(args->v[i].key, key)) return i;
-    }
-    return -1;
-}
-
-static bool json_args_parse(const char *json, json_args *args) {
-    const char *p = json ? json : "";
-    json_ws(&p);
-    if (*p != '{') return false;
-    p++;
-    json_ws(&p);
-    while (*p && *p != '}') {
-        bool is_string = false;
-        char *key = NULL;
-        char *value = NULL;
-        if (!json_string(&p, &key)) goto bad;
-        json_ws(&p);
-        if (*p != ':') goto bad;
-        p++;
-        json_ws(&p);
-        if (*p == '"') {
-            is_string = true;
-            if (!json_string(&p, &value)) goto bad;
-        } else {
-            char *raw = NULL;
-            if (!json_raw_value(&p, &raw)) goto bad;
-            value = json_minify_raw_value(raw);
-            free(raw);
-        }
-
-        json_arg arg = {.key = key, .value = value, .is_string = is_string};
-        json_args_push(args, arg);
-        key = value = NULL;
-        json_ws(&p);
-        if (*p == ',') p++;
-        json_ws(&p);
-        continue;
-bad:
-        free(key);
-        free(value);
-        json_args_free(args);
-        return false;
-    }
-    if (*p != '}') {
-        json_args_free(args);
-        return false;
-    }
-    return true;
-}
 
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
     json_escape(b, arg->key);
@@ -2506,18 +2140,6 @@ static void append_json_object_or_empty(buf *b, const char *json) {
     }
     buf_putc(b, '}');
     json_args_free(&args);
-}
-
-static void append_qwen_parameter(buf *b, const json_arg *arg) {
-    buf_puts(b, "<parameter=");
-    buf_puts(b, arg->key ? arg->key : "");
-    buf_puts(b, ">\n");
-    for (const char *p = arg->value ? arg->value : ""; *p; p++) {
-        if (q36_tool_text_needs_escape(p, Q36_PARAM_END))
-            buf_puts(b, *p == '<' ? "&lt;" : "&amp;");
-        else buf_putc(b, *p);
-    }
-    buf_puts(b, "\n</parameter>\n");
 }
 
 static void append_qwen_arguments(buf *b, const char *json,
@@ -2950,8 +2572,115 @@ static void request_note_tool_continuation(request *r, const chat_msgs *msgs,
         if (!strcmp(m->role, "tool"))
             r->continuation_ids[r->continuation_count++] = xstrdup(m->tool_call_id);
         else for (size_t k = 0; k < m->result_count; k++)
-            r->continuation_ids[r->continuation_count++] = xstrdup(m->result_ids[k]);
+            r->continuation_ids[r->continuation_count++] = xstrdup(m->results[k].id);
     }
+}
+
+static void append_inkling_assistant(buf *out, const char *content, const char *reasoning,
+                                     const tool_calls *calls) {
+    if (reasoning && *reasoning)
+        buf_printf(out, "<|message_model|><|content_thinking|>%s<|end_message|>", reasoning);
+    if ((content && *content) || (!calls->len && (!reasoning || !*reasoning)))
+        buf_printf(out, "<|message_model|><|content_text|>%s<|end_message|>", content ? content : "");
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        const char *name = tc->name ? tc->name : "";
+        buf_printf(out, "<|message_model|>%s<|content_invoke_tool_json|>{\"name\":", name);
+        json_escape(out, name);
+        buf_puts(out, ",\"args\":");
+        append_json_object_or_empty(out, tc->arguments);
+        buf_puts(out, "}<|end_message|>");
+    }
+    buf_puts(out, "<|content_model_end_sampling|>");
+}
+
+static const char *inkling_tool_name(const chat_msgs *msgs, int before, const char *id) {
+    if (id) for (int i = before - 1; i >= 0; i--)
+        for (int j = 0; j < msgs->v[i].calls.len; j++) {
+            const tool_call *tc = &msgs->v[i].calls.v[j];
+            if (tc->id && !strcmp(tc->id, id)) return tc->name;
+        }
+    return "";
+}
+
+static void render_inkling_image_parts(q36_engine *e, q36_tokens *tokens,
+                                       const chat_msg *m, const char *text,
+                                       size_t len, const char *tool_name) {
+    const char *end = text + len;
+    for (size_t i = 0; i <= m->images.len; i++) {
+        const char *part_end = end;
+        const char *marker = i < m->images.len ? m->images.v[i].marker : NULL;
+        if (marker) {
+            part_end = strstr(text, marker);
+            if (!part_end || part_end >= end) continue;
+        }
+        if (part_end > text) {
+            char *part = xstrndup(text, (size_t)(part_end - text));
+            if (tool_name) inkling_append_result(e, tokens, tool_name, part);
+            else q36_chat_append_message(e, tokens, "user", part);
+            free(part);
+        }
+        if (!marker) break;
+        // The multimodal tokenizer replaces this marker with the image content and end tokens.
+        if (tool_name) inkling_append_tool_header(e, tokens, tool_name);
+        else q36_tokenize_rendered_chat(e, "<|message_user|>", tokens);
+        q36_tokenize_text(e, marker, tokens);
+        text = part_end + strlen(marker);
+    }
+}
+
+static char *render_request_chat(q36_engine *e, const request *r,
+                                 const chat_msgs *msgs, const char *tools) {
+    if (!q36_engine_is_inkling(e))
+        return render_chat_prompt_text_model(msgs,tools,&r->tool_orders,r->think_mode,
+                                             r->qwen38,r->preserve_thinking);
+    q36_tokens tokens = {0};
+    inkling_append_tools(e, &tokens, tools);
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) {
+            buf frame = {0};
+            append_inkling_assistant(&frame, m->content, r->preserve_thinking ? m->reasoning : NULL, &m->calls);
+            q36_tokenize_rendered_chat(e, frame.ptr, &tokens);
+            buf_free(&frame);
+        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            const char *name = inkling_tool_name(msgs, i, m->tool_call_id);
+            if (m->images.len)
+                render_inkling_image_parts(e, &tokens, m, m->content, strlen(m->content), name);
+            else inkling_append_result(e, &tokens, name, m->content);
+        } else if (m->result_count && !strcmp(m->role, "user")) {
+            size_t pos = 0;
+            for (size_t k = 0; k < m->result_count; k++) {
+                const tool_result_span *result = &m->results[k];
+                if (result->start > pos) {
+                    if (m->images.len) render_inkling_image_parts(e, &tokens, m, m->content + pos,
+                                                                  result->start - pos, NULL);
+                    else {
+                        char *part = xstrndup(m->content + pos, result->start - pos);
+                        if (text_has_trimmed_content(part)) q36_chat_append_message(e, &tokens, "user", part);
+                        free(part);
+                    }
+                }
+                const char *name = inkling_tool_name(msgs, i, result->id);
+                if (m->images.len)
+                    render_inkling_image_parts(e, &tokens, m, result->text, strlen(result->text), name);
+                else inkling_append_result(e, &tokens, name, result->text);
+                pos = result->end;
+            }
+            if (m->images.len)
+                render_inkling_image_parts(e, &tokens, m, m->content + pos, strlen(m->content + pos), NULL);
+            else if (text_has_trimmed_content(m->content + pos))
+                q36_chat_append_message(e, &tokens, "user", m->content + pos);
+        } else if (m->images.len && !strcmp(m->role, "user")) {
+            render_inkling_image_parts(e, &tokens, m, m->content, strlen(m->content), NULL);
+        } else {
+            q36_chat_append_message(e, &tokens, m->role, m->content);
+        }
+    }
+    q36_chat_append_assistant_prefix(e,&tokens,r->think_mode);
+    char *text = render_tokens_text(e,&tokens,NULL);
+    q36_tokens_free(&tokens);
+    return text;
 }
 
 static bool request_tokenize_multimodal_prompt(q36_engine *e, server *s,
@@ -2959,7 +2688,15 @@ static bool request_tokenize_multimodal_prompt(q36_engine *e, server *s,
                                                const chat_msgs *msgs,
                                                char *err, size_t errlen) {
     size_t count = 0;
-    for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (m->images.len && q36_engine_is_inkling(e) && strcmp(m->role, "user") &&
+            strcmp(m->role, "tool") && strcmp(m->role, "function")) {
+            snprintf(err, errlen, "Inkling accepts images in user and tool messages");
+            return false;
+        }
+        count += m->images.len;
+    }
     if (count == 0) {
         q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
@@ -3229,15 +2966,13 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled,
-            think_mode_from_budget(r, reasoning_effort)), ctx_size);
+            q36_model_think_mode(e, think_mode_from_budget(r, reasoning_effort))), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_model(
-        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->qwen38, r->preserve_thinking);
+    r->prompt_text = render_request_chat(e,r,&msgs,active_tool_schemas);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3619,15 +3354,13 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled,
-            think_mode_from_budget(r, reasoning_effort)), ctx_size);
+            q36_model_think_mode(e, think_mode_from_budget(r, reasoning_effort))), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tools = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_model(
-        &msgs, active_tools, &r->tool_orders, r->think_mode,
-        r->qwen38, r->preserve_thinking);
+    r->prompt_text = render_request_chat(e,r,&msgs,active_tools);
     request_note_tool_continuation(r, &msgs, active_tools);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3879,15 +3612,13 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled,
-            think_mode_from_budget(r, reasoning_effort)), ctx_size);
+            q36_model_think_mode(e, think_mode_from_budget(r, reasoning_effort))), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
-    r->prompt_text = render_chat_prompt_text_model(
-        &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->qwen38, r->preserve_thinking);
+    r->prompt_text = render_request_chat(e,r,&msgs,active_tool_schemas);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -4110,10 +3841,8 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
     apply_chat_thinking_controls(&msgs, &thinking_enabled);
     r->think_mode = q36_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled,
-            think_mode_from_budget(r, reasoning_effort)), ctx_size);
-    r->prompt_text = render_chat_prompt_text_model(
-        &msgs, NULL, NULL, r->think_mode, r->qwen38,
-        r->preserve_thinking);
+            q36_model_think_mode(e, think_mode_from_budget(r, reasoning_effort))), ctx_size);
+    r->prompt_text = render_request_chat(e,r,&msgs,NULL);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     return true;
@@ -4159,28 +3888,6 @@ static bool send_all(int fd, const void *p, size_t n) {
         deadline = wall_ms() + Q36_SERVER_SEND_STALL_TIMEOUT_MS;
     }
     return true;
-}
-
-static void json_escape(buf *b, const char *s) {
-    buf_putc(b, '"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        if (c == '"' || c == '\\') {
-            buf_putc(b, '\\');
-            buf_putc(b, (char)c);
-        } else if (c == '\n') {
-            buf_puts(b, "\\n");
-        } else if (c == '\r') {
-            buf_puts(b, "\\r");
-        } else if (c == '\t') {
-            buf_puts(b, "\\t");
-        } else if (c < 0x20) {
-            buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
-            buf_putc(b, (char)c);
-        }
-    }
-    buf_putc(b, '"');
 }
 
 static void json_escape_n(buf *b, const char *s, size_t n) {
@@ -9076,7 +8783,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
-    char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    char *suffix_text;
+    if (q36_engine_is_inkling(s->engine)) {
+        buf frame = {0};
+        append_inkling_assistant(&frame, content, j->req.preserve_thinking ? reasoning : NULL, calls);
+        suffix_text = buf_take(&frame);
+    } else {
+        suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
+    }
 
     buf rendered = {0};
     size_t prefix_len = strlen(j->req.prompt_text);
@@ -9203,7 +8917,8 @@ static bool request_continue_vision(server *s, server_slot *slot, request *r) {
     size_t old_count = 0;
     const q36_vision_span *old = q36_session_vision_spans(slot->session, &old_count);
     if (!old_count || old_count + r->image_count > 16) return false;
-    const char *suffix = strstr(r->prompt_text, "<|im_start|>user\n<tool_response>\n");
+    const char *suffix = strstr(r->prompt_text, q36_engine_is_inkling(s->engine) ?
+                                "<|message_tool|>" : "<|im_start|>user\n<tool_response>\n");
     if (!suffix) return false;
     const q36_tokens *live = q36_session_tokens(slot->session);
     q36_tokens next = {0};
@@ -9239,11 +8954,17 @@ static void slot_remember_vision_tools(server *s, server_slot *slot,
     const q36_tokens *live = q36_session_tokens(slot->session);
     if (!live || !q36_session_vision_prefix_matches(slot->session, r->images, r->image_count)) return;
     q36_tokens_copy(&closed, live);
-    char *text = render_tokens_text(s->engine, live, NULL);
-    size_t len = strlen(text), end_len = strlen("<|im_end|>\n");
-    if (len < end_len || strcmp(text + len - end_len, "<|im_end|>\n"))
-        q36_tokenize_rendered_chat(s->engine, "<|im_end|>\n", &closed);
-    free(text);
+    bool ink = q36_engine_is_inkling(s->engine);
+    int eos = q36_token_eos(s->engine);
+    if (!ink || !live->len || live->v[live->len - 1] != eos) {
+        const char *end = ink ? "<|end_message|>" : "<|im_end|>\n";
+        char *text = render_tokens_text(s->engine, live, NULL);
+        size_t len = strlen(text), end_len = strlen(end);
+        if (len < end_len || strcmp(text + len - end_len, end))
+            q36_tokenize_rendered_chat(s->engine, end, &closed);
+        free(text);
+        if (ink) q36_tokens_push(&closed, eos);
+    }
     char err[160] = {0};
     int rc = server_session_sync_multimodal(s, slot, &closed, r->images,
                                            r->image_count, err, sizeof(err));
@@ -9465,13 +9186,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
-    int think_close_id = -1;
-    if (j->req.thinking_budget > 0) {
-        q36_tokens close = {0};
-        q36_tokenize_rendered_chat(s->engine, "</think>", &close);
-        if (close.len == 1) think_close_id = close.v[0];
-        q36_tokens_free(&close);
-    }
+    const bool show_thinking = q36_think_mode_enabled(j->req.think_mode);
+    bool native_thinking = false;
+    inkling_tool_stream native_tools = {0};
+    int think_close_id = j->req.thinking_budget > 0 ? q36_token_think_end(s->engine) : -1;
     const bool thinking_gates_tool_markers = q36_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -9582,7 +9300,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             }
 
             size_t piece_len = 0;
-            char *piece = q36_token_text(s->engine, token, &piece_len);
+            char *piece;
+            if (j->req.has_tools && q36_engine_is_inkling(s->engine))
+                piece = inkling_tool_piece(&native_tools, s->engine, token, show_thinking, &piece_len);
+            else
+                piece = q36_chat_token_text(s->engine, token, show_thinking, &native_thinking, &piece_len);
             completion++;
             kept++;
             q36_tokens_push(&generated_tokens, token);
@@ -9958,6 +9680,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     tool_calls_free(&parsed_calls);
     openai_stream_free(&openai_live);
     buf_free(&text);
+    inkling_tool_reset(&native_tools);
     q36_tokens_free(&generated_tokens);
     q36_tokens_free(&effective_prompt);
 }
@@ -10199,8 +9922,7 @@ static void append_model_json_profile(buf *b, int ctx, int default_tokens,
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
         "\"supported_parameters\":["
-            "\"tools\","
-            "\"tool_choice\","
+            "\"tools\",\"tool_choice\","
             "\"max_tokens\","
             "\"temperature\","
             "\"top_p\","
@@ -10227,8 +9949,9 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
 #endif
 
 static void append_model_json(buf *b, const server *s) {
-    append_model_json_profile(b, q36_session_ctx(s->session), s->default_tokens,
-                              q36_engine_model_name(s->engine),
+    const char *id = q36_engine_model_name(s->engine);
+    append_model_json_profile(b, q36_session_ctx(s->session), s->default_tokens, id,
+                              !strcmp(id,"inkling-2-mini") ? "Inkling 2 Mini" :
                               q36_engine_is_qwen38(s->engine) ?
                               "Qwen 3.8 27B" : "Qwen 3.6 35B A3B");
 }
@@ -11878,7 +11601,8 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == Q36_THINK_NONE);
     TEST_ASSERT(think_mode_from_enabled(true, mode) == Q36_THINK_NONE);
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == Q36_THINK_LOW);
-    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == Q36_THINK_LOW);
+    TEST_ASSERT(parse_reasoning_effort_name("minimal", &mode) && mode == Q36_THINK_MINIMAL);
+    TEST_ASSERT(q36_model_think_mode(NULL, mode) == Q36_THINK_LOW);
     TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == Q36_THINK_MEDIUM);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == Q36_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("xhigh", &mode) && mode == Q36_THINK_XHIGH);
@@ -12021,6 +11745,18 @@ static void test_render_non_thinking_prompt_closes_think(void) {
     TEST_ASSERT(strstr(prompt, "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
+}
+
+static void test_inkling_tool_frames(void) {
+    const char *json = "{\"args\":{\"path\":\"a/b\",\"whole\":true},\"name\":\"read\"}";
+    char *xml = inkling_call_xml("read", json);
+    TEST_ASSERT(xml && strstr(xml, "<function=read>") &&
+                strstr(xml, "<parameter=path>\na/b\n</parameter>") &&
+                strstr(xml, "<parameter=whole>\ntrue\n</parameter>"));
+    free(xml);
+    TEST_ASSERT(!inkling_call_xml("write", json));
+    TEST_ASSERT(!inkling_call_xml("read", "{\"name\":\"read\",\"args\":{"));
+    TEST_ASSERT(!inkling_call_xml("read", "{\"name\":\"read\",\"args\":42}"));
 }
 
 static void test_render_drops_old_reasoning_without_tools(void) {
@@ -14588,6 +14324,7 @@ static void q36_server_unit_tests_run(void) {
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_inkling_tool_frames();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();

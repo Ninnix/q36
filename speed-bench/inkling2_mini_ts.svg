@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<desc>Inkling-2-Mini-UD-IQ3_XXS on single-board Vulkan with 512-token prefill chunks. Each point reports 2048 new prompt tokens and 128 greedy decode tokens. The input uses three copies of the Quarkstar story fixture. Warm-up at 8192 tokens.</desc>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 26px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 14px; font-weight: 600; fill: #334155; }
+.tick { font-size: 12px; fill: #64748b; }
+.legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">BC-250 · Inkling-2-Mini · Q8_0 K / Q4_0 V</text>
+<line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="367.50" x2="878" y2="367.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="371.50" text-anchor="end">100</text>
+<line x1="82" y1="267.00" x2="878" y2="267.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="271.00" text-anchor="end">200</text>
+<line x1="82" y1="166.50" x2="878" y2="166.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="170.50" text-anchor="end">300</text>
+<line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="70.00" text-anchor="end">400</text>
+<text class="tick" x="890" y="472.00" text-anchor="start">0</text>
+<text class="tick" x="890" y="391.60" text-anchor="start">10</text>
+<text class="tick" x="890" y="311.20" text-anchor="start">20</text>
+<text class="tick" x="890" y="230.80" text-anchor="start">30</text>
+<text class="tick" x="890" y="150.40" text-anchor="start">40</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">50</text>
+<line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
+<line x1="324.92" y1="66" x2="324.92" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="324.92" y="492" text-anchor="middle">20k</text>
+<line x1="567.84" y1="66" x2="567.84" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="567.84" y="492" text-anchor="middle">40k</text>
+<line x1="810.76" y1="66" x2="810.76" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="810.76" y="492" text-anchor="middle">60k</text>
+<line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
+<text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
+<text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">decode t/s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,160.34 131.75,178.17 156.62,179.96 181.50,186.09 206.38,195.18 231.25,199.63 256.12,208.54 281.00,213.86 305.88,222.46 330.75,230.13 355.62,233.34 380.50,238.50 405.38,245.96 430.25,249.71 455.12,252.95 480.00,260.65 504.88,266.04 529.75,271.15 554.62,274.43 579.50,285.71 604.38,282.72 629.25,286.94 654.12,289.84 679.00,299.94 703.88,297.66 728.75,300.28 753.62,303.94 778.50,306.71 803.38,309.20 828.25,316.66 853.12,314.27 878.00,317.21"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="106.88,95.35 131.75,94.22 156.62,101.38 181.50,105.88 206.38,111.59 231.25,111.43 256.12,114.56 281.00,118.90 305.88,122.68 330.75,126.70 355.62,129.92 380.50,134.58 405.38,137.72 430.25,142.70 455.12,146.56 480.00,149.70 504.88,152.67 529.75,156.77 554.62,160.15 579.50,164.09 604.38,167.14 629.25,170.12 654.12,173.82 679.00,178.48 703.88,180.73 728.75,183.95 753.62,187.08 778.50,189.82 803.38,192.63 828.25,195.52 853.12,198.18 878.00,201.07"/>
+<rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="730" y="89">prefill</text>
+<rect x="708" y="104" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="730" y="115">decode</text>
+</svg>

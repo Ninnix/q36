@@ -12,7 +12,8 @@
  * then snapshots the live session in memory, performs a fixed-length decode
  * run without allowing EOS, restores the snapshot, and continues to the next
  * frontier.  Snapshot save/restore time is intentionally outside both timing
- * windows.
+ * windows. The CSV reports allocated attention KV bytes at the frontier and
+ * the serialized snapshot size separately.
  */
 
 #include <errno.h>
@@ -669,7 +670,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,snapshot_bytes\n");
     fflush(out);
 
     q36_session_snapshot snap = {0};
@@ -697,6 +698,7 @@ int main(int argc, char **argv) {
             break;
         }
         const double prefill_t1 = bench_now_sec();
+        uint64_t kv_bytes = q36_session_kv_bytes(session);
 #ifndef Q36_NO_GPU
         if (prof_prefill) q36_gpu_prof_report("prefill");
 #endif
@@ -797,12 +799,13 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%llu,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                (unsigned long long)kv_bytes,
                 (unsigned long long)snap.len);
         fflush(out);
 

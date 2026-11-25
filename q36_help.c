@@ -202,8 +202,8 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--top-p F", "Nucleus sampling probability.");
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
-    opt(fp, c, "--think", "Use normal thinking mode.");
-    opt(fp, c, "--think-max", "Use Think Max with at least 98304 context tokens.");
+    opt(fp, c, "--think-minimal, --think-low, --think-medium, --think, --think-xhigh", "Select reasoning effort.");
+    opt(fp, c, "--think-max", "Use xhigh on Inkling, or Qwen Think Max with at least 98304 context tokens.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     para(fp, c, "Sampling defaults to temp=1, top-k=0, top-p=1, min-p=0.05. Explicit options win.");
     if (full) {
@@ -281,8 +281,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--chdir DIR", "Set the agent tool working directory; runtime assets load first.");
     opt(fp, c, "-n, --tokens N", "Hard output limit per assistant generation. Default: 100000.");
     opt(fp, c, "--thinking-budget N", "Begin adaptive </think> rank closing after N thinking tokens. Default: 50000.");
-    opt(fp, c, "--think-low, --think-medium, --think, --think-xhigh", "Select the initial dense thinking mode without changing the budget.");
-    opt(fp, c, "Tab", "Cycle dense low/medium/high/xhigh or MoE off/on; keep the current thinking budget.");
+    opt(fp, c, "--think-minimal, --think-low, --think-medium, --think, --think-xhigh", "Select the initial reasoning effort without changing the budget.");
+    opt(fp, c, "Tab", "Cycle the thinking levels supported by the loaded model.");
     para(fp, c, "User and system messages accept persistent <|think_on|> and <|think_off|> controls.");
     fputc('\n', fp);
 }

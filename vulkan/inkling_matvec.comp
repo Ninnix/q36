@@ -1,0 +1,1021 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef INK_HALF_WEIGHT
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#ifdef INK_IQ_TILE_I16
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+#ifdef INK_DOT
+#extension GL_EXT_integer_dot_product : require
+#endif
+#ifdef INK_FMA
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions=["SPV_KHR_fma"],capabilities=[6030],id=4427)
+float ink_fma(float a,float b,float c);
+spirv_instruction(extensions=["SPV_KHR_fma"],capabilities=[6030],id=4427)
+vec4 ink_fma(vec4 a,vec4 b,vec4 c);
+#endif
+layout(local_size_x=64) in;
+layout(binding=0) readonly buffer Weight { uint w[]; };
+layout(binding=1) readonly buffer Input { uint x[]; };
+layout(binding=2) writeonly buffer Output { float y[]; };
+layout(binding=3) readonly buffer Tables { uint tables[]; };
+layout(binding=4) readonly buffer Routes { uint ids[]; };
+layout(constant_id=0) const uint KEY=64*2304;
+const uint FORMAT=KEY%64, TYPE=FORMAT==41 ? 0 : FORMAT, WIDTH=(KEY/64)%8192;
+const bool nv_tile=KEY>=64*8192 && TYPE==40;
+uint xbase, wbase;
+layout(push_constant) uniform Push { uint width, rows, stride, route; } p;
+shared float sums[64], mins[64];
+shared float iq4dots[TYPE==20 ? 8*(WIDTH/32) : 1], iq4scales[TYPE==20 ? 8*(WIDTH/32) : 1];
+const int iq4[16]=int[16](-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
+const int fp4[16] = int[16](0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+#ifndef INK_FMA
+#include "expf.glsl"
+float ink_fma(float a,float b,float c) { return q36_router_fma(a,b,c); }
+vec4 ink_fma(vec4 a,vec4 b,vec4 c) {
+    return vec4(ink_fma(a.x,b.x,c.x),ink_fma(a.y,b.y,c.y),ink_fma(a.z,b.z,c.z),ink_fma(a.w,b.w,c.w));
+}
+#endif
+float float_weight(uint row,uint col) {
+    uint at=row*WIDTH+col;
+#ifdef INK_DOT
+    if (WIDTH==64 && FORMAT==41)
+        return uintBitsToFloat((w[row/64*2048+(col%32)*64+row%64]>>(16*(col/32)))<<16);
+    if (WIDTH==64) at=(row/64*64+col)*64+row%64;
+#endif
+    if (FORMAT==41) return uintBitsToFloat((w[at/2]>>(16*(at%2)))<<16);
+    return uintBitsToFloat(w[at]);
+}
+uint byte_at(uint i) { i+=wbase; return (w[i/4]>>(8*(i%4)))&255u; }
+float e4m3(uint v) {
+    uint e=(v>>3)&15u, m=v&7u;
+    return v==127 ? 0 : e==0 ? float(m)*(1.0/1024) : uintBitsToFloat(((e+119)<<23)|(m<<20));
+}
+uint halfword(uint i) { return byte_at(i)|(byte_at(i+1)<<8); }
+uint word(uint i) {
+    uint off=wbase+i, shift=(off%4)*8, lo=w[off/4];
+    return shift==0 ? lo : (lo>>shift)|(w[off/4+1]<<(32-shift));
+}
+uint sign_bits(uint i) { return (tables[512+i/4]>>(8*(i%4)))&255u; }
+#ifdef INK_DOT
+uvec2 fp4_words(uint row,uint lane,uint block) {
+    uint base=wbase/4+(row/8*(WIDTH/64)+block)*72;
+    return uvec2(w[base+8*(row%8)+lane],w[base+64+row%8]);
+}
+uint fp4_codes(uint row,uint lane,uint b,out float scale) {
+    uvec2 bits=fp4_words(row,lane,b/2);
+    scale=e4m3((bits.y>>((2*(b%2)+lane/4)*8))&255u);
+    return bits.x>>((b%2)*16);
+}
+int iq4_weight(uint base,uint b,uint k) {
+    uint u=w[base+(k%4)*(WIDTH/32)+b]>>(16*(k/4));
+    return int(tables[4096+(u&255)]|(tables[4096+((u>>8)&255)]<<16));
+}
+float iq4_scale(uint base,uint b) {
+    return unpackHalf2x16(w[base+4*(WIDTH/32)+b/2]>>(16*(b%2))).x;
+}
+void packed_block(uint row,uint lane,uint b,out uint weight,out float scale) {
+    uint tile=row/8,r=row%8;
+    if (TYPE==8) {
+        uint base=wbase/4+(tile*(WIDTH/32)+b)*68;
+        weight=w[base+8*r+lane];
+        scale=unpackHalf2x16(w[base+64+r/2]>>((r%2)*16)).x;
+    } else {
+        uint codes=fp4_codes(row,lane,b,scale);
+        weight=tables[3840+(codes&255u)]|(tables[3840+((codes>>8)&255u)]<<16);
+    }
+}
+#endif
+int signed_grid(uint grid,uint signs) {
+    uint mask=((signs&15u)*0x00204081u)&0x01010101u;
+    return int((grid^(mask*255u))+mask);
+}
+int dot4(int weight,uint act) {
+#ifdef INK_DOT
+    return dotPacked4x8EXT(weight,int(act));
+#else
+    int sum=0;
+    for (uint i=0;i<4;i++) sum+=bitfieldExtract(weight,int(8*i),8)*bitfieldExtract(int(act),int(8*i),8);
+    return sum;
+#endif
+}
+#ifdef INK_IQ_DECODE
+const uint iq_bytes=TYPE==16 ? 66 : TYPE==17 ? 74 : TYPE==18 ? 98 : 82;
+shared uint iq_rows[2*iq_bytes*(WIDTH/256)];
+#define iq_word(i) iq_rows[i]
+#else
+#define iq_word(i) w[i]
+#endif
+#ifdef INK_DOT
+uint iq_index(uint t,uint row,uint block,uint g,uint lane,out uint signs,out uint sc) {
+    uint sub=lane/2, grid, bytes=t==16 ? 66 : t==17 ? 74 : t==18 ? 98 : 82;
+#ifdef INK_IQ_DECODE
+    uint base=block*(2*bytes);
+#else
+    uint base=wbase/4+(row/8*(WIDTH/256)+block)*(2*bytes);
+#endif
+    uint r=row%8;
+    if (t==18 || t==22) {
+        uint shift=8*(g%4), subword=8*r+2*sub+g/4;
+        uint control, sign_word, code;
+        if (t==18) {
+            control=iq_word(base+128+8*r+g);
+            code=iq_word(base+64*(g/4)+8*r+lane)>>shift;
+            sign_word=(iq_word(base+128+subword)>>(7*(g%4)))&127u;
+            sign_word|=(bitCount(sign_word)&1u)<<7;
+            grid=1536+(code&255u); sc=control>>28;
+        } else {
+            control=iq_word(base+128+4*r+g/2)>>(16*(g%2));
+            code=iq_word(base+subword)>>shift;
+            sign_word=iq_word(base+64+subword)>>shift;
+            grid=1792+2*((code&255u)|((control<<(8-2*sub))&768u))+lane%2;
+            sc=(control>>(8+4*(sub/2)))&15u;
+        }
+        signs=(sign_word>>(4*(lane%2)))&15u;
+        return grid;
+    }
+    base+=g*((bytes-2)/4);
+    uint entry,idx;
+    if (t==16) {
+        uint control=iq_word(base+8+r);
+        sc=control>>28; idx=(control>>(7*sub))&127u;
+        entry=iq_word(base+r)>>(sub*8);
+        grid=(entry&255u)*2+lane%2;
+    } else {
+        uint code=iq_word(base+2*r+sub/2)>>((sub%2)*16);
+        sc=(iq_word(base+16+r/4)>>(8*(r%4)+4*(sub/2)))&15u;
+        idx=(code>>9)&127u;
+        grid=512+(code&511u)*2+lane%2;
+    }
+    signs=idx|((bitCount(idx)&1u)<<7);
+    signs=(signs>>(4*(lane%2)))&15u;
+    return grid;
+}
+#endif
+int iq_grid(uint t,uint off,uint row,uint block,uint g,uint lane,out uint sc) {
+#ifdef INK_DOT
+    uint signs, grid=iq_index(t,row,block,g,lane,signs,sc);
+    return signed_grid(tables[grid],signs);
+#else
+    uint sub=lane/2, grid, signs;
+    if (t==16 || t==18) {
+        uint packed=word(off+(t==16 ? 6+8*g : 66+4*g));
+        sc=packed>>28;
+        signs=sign_bits((packed>>(7*sub))&127u);
+        grid=t==16 ? tables[2*byte_at(off+2+8*g+sub)+lane%2] :
+             tables[3104+byte_at(off+2+8*g+lane)];
+    } else {
+        uint entry;
+        if (t==17) {
+            uint packed=halfword(off+2+8*g+2*sub);
+            entry=packed&511u; signs=sign_bits(packed>>9);
+        } else {
+            entry=byte_at(off+2+4*g+sub)|((byte_at(off+66+g)<<(8-2*sub))&768u);
+            signs=byte_at(off+34+4*g+sub);
+        }
+        sc=(byte_at(off+(t==17 ? 66 : 74)+g)>>(4*(sub/2)))&15u;
+        grid=tables[(t==17 ? 7456 : 544)+2*entry+lane%2];
+    }
+    return signed_grid(grid,signs>>(4*(lane%2)));
+#endif
+}
+float iq_scale(uint row,uint b,uint bytes,uint off) {
+#ifdef INK_DOT
+#ifdef INK_IQ_DECODE
+    uint base=(b+1)*2*bytes-4;
+#else
+    uint base=wbase/4+(row/8*(WIDTH/256)+b+1)*2*bytes-4;
+#endif
+    return unpackHalf2x16(iq_word(base+(row%8)/2)>>((row%2)*16)).x;
+#else
+    return unpackHalf2x16(halfword(off)).x;
+#endif
+}
+float iq_row(uint row,uint lane) {
+    uint t=TYPE, bytes=t==16 ? 66 : t==17 ? 74 : t==18 ? 98 : 82;
+    float sum=0;
+    [[unroll]] for (uint b=0;b<WIDTH/256;b++) {
+        uint off=row*p.stride+b*bytes, xb=b*74, sub=lane/2;
+        float d=iq_scale(row,b,bytes,off);
+        if (t!=18) d*=0.125;
+        int acc=0;
+        [[unroll]] for (uint g=0;g<8;g++) {
+            uint sc;
+            int grid=iq_grid(t,off,row,b,g,lane,sc);
+            acc+=int(2*sc+1)*dot4(grid,x[xbase+xb+2+8*g+lane]);
+        }
+        sum=ink_fma(d*uintBitsToFloat(x[xbase+xb]),float(acc),sum);
+    }
+    return sum;
+}
+int bsum(uint xb,uint i) { return bitfieldExtract(int(x[xbase+xb+66+i/2]),int(16*(i%2)),16); }
+uint k_codes(uint t,uint off,uint g,uint lane) {
+    uint j=4*lane;
+    if (t==14) {
+        uint lo=word(off+(g/4)*64+(g%2)*32+j), hi=word(off+128+(g/4)*32+j);
+        return ((lo>>(4*((g%4)/2)))&0x0f0f0f0fu)|(((hi>>(2*(g%4)))&0x03030303u)<<4);
+    }
+    uint lo=(word(off+(t==12 ? 16 : 48)+(g/2)*32+j)>>(4*(g%2)))&0x0f0f0f0fu;
+    return t==13 ? lo|(((word(off+16+j)>>g)&0x01010101u)<<4) : lo;
+}
+float k_row(uint row,uint lane,out float minimum) {
+    uint t=TYPE, bytes=t==12 ? 144 : t==13 ? 176 : 210;
+    float sum=0; minimum=0;
+    for (uint b=0;b<WIDTH/256;b++) {
+        uint off=row*p.stride+b*bytes, xb=b*74;
+        int acc=0, mins=0;
+        for (uint g=0;g<8;g++) {
+            uint sx=4*lane;
+            int sc, mn=0;
+            if (t==14) sc=int(byte_at(off+192+2*g+sx/16)^128u)-128;
+            else if (g<4) { sc=int(byte_at(off+4+g)&63u);mn=int(byte_at(off+8+g)&63u); }
+            else {
+                sc=int((byte_at(off+8+g)&15u)|((byte_at(off+g)>>6)<<4));
+                mn=int((byte_at(off+8+g)>>4)|((byte_at(off+4+g)>>6)<<4));
+            }
+            uint act=x[xbase+xb+2+8*g+lane];
+            acc+=sc*dot4(int(k_codes(t,off,g,lane)),act);
+            if ((t==12 && lane==g/2) || (t==13 && lane==0))
+                mins+=mn*(bsum(xb,2*g)+bsum(xb,2*g+1));
+        }
+        float xd=uintBitsToFloat(x[xbase+xb]);
+        if (t==14) {
+            for (uint k=2*lane;k<=2*lane+1;k++)
+                acc-=32*(int(byte_at(off+192+k)^128u)-128)*bsum(xb,k);
+        } else minimum=ink_fma(-unpackHalf2x16(halfword(off+2)).x*xd,float(mins),minimum);
+        float d=unpackHalf2x16(halfword(off+(t==14 ? 208 : 0))).x*xd;
+        sum=ink_fma(d,float(acc),sum);
+    }
+    return sum;
+}
+#ifdef INK_TILE
+// The dense fallback shares each row between four input tokens.
+shared vec4 tile_sum[64];
+shared vec4 tile_extra[64];
+uint path[8], input_base[8], row_out[8];
+vec4 accum(vec4 scale,ivec4 dot,vec4 sum) {
+    return ink_fma(scale,vec4(dot),sum);
+}
+// IQ4_NL folds the block scales left to right. Compute independent block
+// products in parallel, then give one lane each ordered row/token sum.
+shared float pieces[TYPE==20 && WIDTH==1152 ? 64*(WIDTH/32) : 1];
+void iq4_tile() {
+    uint l=gl_LocalInvocationID.x, tile=gl_WorkGroupID.x/8, nt=p.route>>8;
+    uint first=(gl_WorkGroupID.y*8+gl_WorkGroupID.x%8)*8, row=first+l/8;
+    uint mode=p.route&15u, desc=16*nt+1+9*tile;
+    if (first>=p.rows || (mode!=0 && tile>=ids[16*nt])) return;
+    wbase=mode!=0 ? (ids[desc]&127u)*p.rows*p.stride : 0;
+    [[unroll]] for (uint t=0;t<8;t++) {
+        path[t]=mode!=0 ? ids[desc+1+t] : 8*tile+t<nt ? 8*tile+t : ~0u;
+        uint id=path[t]==~0u ? path[0] : path[t];
+        input_base[t]=(mode==1 ? id/8 : id)*(WIDTH/32)*9;
+    }
+    for (uint b=l%8;b<WIDTH/32;b+=8) {
+        uint base=wbase/4+row*(p.stride/4);
+        int weights[8];
+        [[unroll]] for (uint k=0;k<8;k++) weights[k]=iq4_weight(base,b,k);
+        float scale=iq4_scale(base,b);
+        [[unroll]] for (uint t=0;t<8;t++) {
+            uint at=input_base[t]+9*b;
+            int dot=0;
+            [[unroll]] for (uint k=0;k<8;k++) dot+=dot4(int(weights[k]),x[at+1+k]);
+            precise float product=(float(dot)*unpackHalf2x16(x[at]).x)*scale;
+            pieces[((l/8)*8+t)*(WIDTH/32)+b]=product;
+        }
+    }
+    barrier();
+    if (path[l%8]!=~0u) {
+        precise float sum=0;
+        for (uint b=0;b<WIDTH/32;b++) sum+=pieces[l*(WIDTH/32)+b];
+        y[path[l%8]*p.rows+row]=sum;
+    }
+}
+
+int tile_weight(uint row,uint b,uint group,uint lane,bool iq,uint bytes,out int mult,inout float scale) {
+    if (iq) {
+        uint off=row*p.stride+b*bytes, sc;
+        int weight=iq_grid(TYPE,off,row,b,group,lane,sc);
+        mult=int(2*sc+1);
+        if (group==0) scale=iq_scale(row,b,bytes,off)*(TYPE==18 ? 1 : 0.125);
+        return weight;
+    }
+    uint weight;
+    packed_block(row,lane,b,weight,scale);
+    mult=1;
+    return int(weight);
+}
+
+#ifdef INK_HALF_WEIGHT
+f16vec4 fp4_components(uint codes) {
+    return f16vec4(unpackHalf2x16(tables[12032+(codes&255u)]),
+                   unpackHalf2x16(tables[12032+((codes>>8)&255u)]));
+}
+
+vec2 fp4_pair_dot(f16vec4 w,f16vec2 x[4]) {
+    // An odd sum of two products is at most 128*(12+3).
+    // Every larger sum is even and still exact in binary16.
+    f16vec2 lo=fma(f16vec2(w.y),x[1],f16vec2(w.x)*x[0]);
+    f16vec2 hi=fma(f16vec2(w.w),x[3],f16vec2(w.z)*x[2]);
+    return vec2(lo)+vec2(hi);
+}
+#endif
+
+vec4 tile_components(uint row,uint b,uint g,uint lane,bool iq,uint bytes,inout float scale) {
+#ifdef INK_FMA
+    if (TYPE==18) {
+        uint signs,sc,grid=iq_index(TYPE,row,b,g,lane,signs,sc);
+        uint pairs=tables[12288+grid-1536], base=12544+256*sc;
+        if (g==0) scale=iq_scale(row,b,bytes,row*p.stride+b*bytes);
+        return vec4(unpackHalf2x16(tables[base+64*(signs&3)+(pairs&63)]),
+                    unpackHalf2x16(tables[base+64*(signs>>2)+(pairs>>6)]));
+    }
+#endif
+#ifdef INK_HALF_WEIGHT
+    if (iq || TYPE==40) {
+        uvec2 bits;
+        float16_t factor=float16_t(1);
+        if (iq) {
+            uint signs, sc, grid=iq_index(TYPE,row,b,g,lane,signs,sc);
+            uint base=4352+2*grid;
+            bits=uvec2(tables[base],tables[base+1]);
+            bits^=(uvec2(signs,signs>>2)*0x40008000u)&0x80008000u;
+            factor=float16_t(2*sc+1);
+            if (g==0) scale=iq_scale(row,b,bytes,row*p.stride+b*bytes)*(TYPE==18 ? 1 : 0.125);
+        } else return vec4(fp4_components(fp4_codes(row,lane,b,scale)));
+        f16vec2 lo=f16vec2(unpackHalf2x16(bits.x)), hi=f16vec2(unpackHalf2x16(bits.y));
+        return vec4(vec2(lo*factor),vec2(hi*factor));
+    }
+#endif
+    int mult, codes=tile_weight(row,b,g,lane,iq,bytes,mult,scale);
+    vec4 weight;
+    [[unroll]] for (uint k=0;k<4;k++) weight[k]=float(bitfieldExtract(codes,int(8*k),8)*mult);
+    return weight;
+}
+
+// Q8 integers are exact in half precision. Even the largest scaled IQ lane
+// sum (32 * 128 * 62 * 31) is exact in binary32. Only the block rescaling
+// needs the rounded FMA and the eight-lane reduction used by the CPU.
+void paired_tile(uint paths,uint rows) {
+    uint l=gl_LocalInvocationID.x, lane=l%8, tile=gl_WorkGroupID.x/8;
+    uint row=(gl_WorkGroupID.y*8+gl_WorkGroupID.x%8)*(8*rows)+l/8, nt=p.route>>8;
+    if (row>=p.rows) return;
+    bool routed=(p.route&15u)!=0, iq=TYPE!=40 && TYPE!=8;
+    if (!routed && paths==16) tile*=2;
+    uint desc=16*nt+1+9*tile, blocks=WIDTH/(iq ? 256 : 32), groups=iq ? 8 : 1;
+    uint bytes=TYPE==16 ? 66 : TYPE==17 ? 74 : TYPE==18 ? 98 : 82;
+    wbase=routed ? (ids[desc]&127u)*p.rows*p.stride : 0;
+    uint id[16];
+    [[unroll]] for (uint t=0;t<paths;t++)
+        id[t]=routed ? ids[desc+1+t+t/8] : 8*tile+t<nt ? 8*tile+t : ~0u;
+    float result[4][16];
+    [[unroll]] for (uint r=0;r<rows;r++) [[unroll]] for (uint t=0;t<paths;t++) result[r][t]=0;
+    for (uint b=0;b<blocks;b++) {
+        uint xb=(tile*blocks+b)*(8+128*groups);
+        float dots[4][16], scales[4];
+        [[unroll]] for (uint r=0;r<rows;r++) [[unroll]] for (uint t=0;t<paths;t++) dots[r][t]=0;
+#ifdef INK_IQ_TILE_I16
+        [[unroll]] for (uint r=0;r<rows;r++) {
+            uint out_row=row+8*r;
+            scales[r]=iq_scale(out_row,b,bytes,out_row*p.stride+b*bytes)*(TYPE==18 ? 1 : 0.125);
+        }
+        [[dont_unroll]] for (uint g0=0;g0<8;g0+=2) [[unroll]] for (uint gg=0;gg<2;gg++) {
+            uint g=g0+gg;
+            i16vec4 weights[4];
+            float mult[4];
+            [[unroll]] for (uint r=0;r<rows;r++) {
+                uint sc, out_row=row+8*r;
+                int codes=iq_grid(TYPE,out_row*p.stride+b*bytes,out_row,b,g,lane,sc);
+                [[unroll]] for (int k=0;k<4;k++) weights[r][k]=int16_t(bitfieldExtract(codes,8*k,8));
+                mult[r]=float(2*sc+1);
+            }
+            [[unroll]] for (uint t=0;t<paths/2;t++) {
+                uint at=xb+(t/4)*blocks*(8+128*groups)+8+128*g+32*(t%4)+lane;
+                i16vec2 act[4];
+                [[unroll]] for (uint k=0;k<4;k++) act[k]=unpackInt2x16(int(x[at+8*k]));
+                [[unroll]] for (uint r=0;r<rows;r++) {
+                    // Four unscaled IQ3 products fit in a signed 16-bit lane.
+                    i16vec2 dot=i16vec2(0);
+                    [[unroll]] for (uint k=0;k<4;k++) dot+=i16vec2(weights[r][k])*act[k];
+                    dots[r][2*t]=ink_fma(mult[r],float(dot.x),dots[r][2*t]);
+                    dots[r][2*t+1]=ink_fma(mult[r],float(dot.y),dots[r][2*t+1]);
+                }
+            }
+        }
+#else
+        [[unroll]] for (uint g=0;g<groups;g++) {
+            vec4 weight[4];
+            [[unroll]] for (uint r=0;r<rows;r++)
+                weight[r]=tile_components(row+8*r,b,g,lane,iq,bytes,scales[r]);
+            [[unroll]] for (uint t=0;t<paths/2;t++) {
+                uint at=xb+(t/4)*blocks*(8+128*groups)+8+128*g+32*(t%4)+lane;
+#ifdef INK_HALF_WEIGHT
+                if (TYPE==40) {
+                    f16vec2 act[4];
+                    [[unroll]] for (uint k=0;k<4;k++) act[k]=f16vec2(unpackHalf2x16(x[at+8*k]));
+                    [[unroll]] for (uint r=0;r<rows;r++) {
+                        vec2 v=fp4_pair_dot(f16vec4(weight[r]),act);
+                        dots[r][2*t]=v.x; dots[r][2*t+1]=v.y;
+                    }
+                } else
+#endif
+                [[unroll]] for (uint k=0;k<4;k++) {
+                    vec2 act=unpackHalf2x16(x[at+8*k]);
+                    [[unroll]] for (uint r=0;r<rows;r++) {
+                        dots[r][2*t]=fma(weight[r][k],act.x,dots[r][2*t]);
+                        dots[r][2*t+1]=fma(weight[r][k],act.y,dots[r][2*t+1]);
+                    }
+                }
+            }
+        }
+#endif
+        [[unroll]] for (uint t=0;t<paths;t++) {
+            float scale=uintBitsToFloat(x[xb+(t/8)*blocks*(8+128*groups)+t%8]);
+            [[unroll]] for (uint r=0;r<rows;r++) result[r][t]=ink_fma(scales[r]*scale,dots[r][t],result[r][t]);
+        }
+    }
+    [[unroll]] for (uint t=0;t<paths;t++) [[unroll]] for (uint r=0;r<rows;r++) {
+        precise float v=result[r][t];
+#ifdef INK_FMA
+        v+=subgroupShuffleXor(v,4); v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+#else
+        sums[l]=v; barrier();
+        if (lane==0) v=((sums[l]+sums[l+4])+(sums[l+2]+sums[l+6]))+
+                       ((sums[l+1]+sums[l+5])+(sums[l+3]+sums[l+7]));
+        barrier();
+#endif
+        if (lane==0 && id[t]!=~0u) y[id[t]*p.rows+row+8*r]=TYPE==18 ? v*0.25 : v;
+    }
+}
+
+#if defined(INK_FMA) && defined(INK_HALF_WEIGHT)
+// Each weight load supplies both 32-column halves of a block.
+void nvfp4_tile(uint paths,uint desc,uint tile) {
+    const uint rows=6, blocks=WIDTH/32;
+    uint l=gl_LocalInvocationID.x, lane=l%8;
+    uint row=(gl_WorkGroupID.y*8+gl_WorkGroupID.x%8)*(8*rows)+l/8;
+    if (row>=p.rows) return;
+    wbase=(ids[desc]&127u)*p.rows*p.stride;
+    vec2 sum[rows][8];
+    [[unroll]] for (uint r=0;r<rows;r++) [[unroll]] for (uint t=0;t<paths/2;t++) sum[r][t]=vec2(0);
+    for (uint block=0;block<blocks/2;block++) {
+        uvec2 weight[rows];
+        [[unroll]] for (uint r=0;r<rows;r++) weight[r]=fp4_words(row+8*r,lane,block);
+        [[unroll]] for (uint part=0;part<2;part++) {
+            f16vec4 w[rows];
+            float scale[rows];
+            [[unroll]] for (uint r=0;r<rows;r++) {
+                w[r]=fp4_components(weight[r].x>>(16*part));
+                scale[r]=e4m3((weight[r].y>>(8*(2*part+lane/4)))&255u);
+            }
+            uint xb=(tile*blocks+2*block+part)*136;
+            [[unroll]] for (uint t=0;t<paths/2;t++) {
+                uint panel=xb+(t/4)*blocks*136;
+                uint at=panel+8+32*(t%4)+lane;
+                f16vec2 act[4];
+                [[unroll]] for (uint k=0;k<4;k++) act[k]=f16vec2(unpackHalf2x16(x[at+8*k]));
+                vec2 sc=vec2(uintBitsToFloat(x[panel+2*(t%4)]),uintBitsToFloat(x[panel+2*(t%4)+1]));
+                [[unroll]] for (uint r=0;r<rows;r++) {
+                    vec2 dot=fp4_pair_dot(w[r],act);
+                    sum[r][t]=ink_fma(vec4(scale[r]*sc,0,0),vec4(dot,0,0),vec4(sum[r][t],0,0)).xy;
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint t=0;t<paths;t++) [[unroll]] for (uint r=0;r<rows;r++) {
+        precise float v=sum[r][t/2][t%2];
+        v+=subgroupShuffleXor(v,4); v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+        uint id=ids[desc+1+t+t/8];
+        if (lane==0 && id!=~0u) y[id*p.rows+row+8*r]=v;
+    }
+}
+#endif
+
+// Register-block two rows so every activation load feeds two dot products.
+void block_tile(uint tile,uint tile_row,uint lane,uint nt,uint mode) {
+    uint desc=16*nt+1+9*tile, row=16*tile_row+gl_LocalInvocationID.x/8;
+    if (row>=p.rows || (mode!=0 && tile>=ids[16*nt])) return;
+    wbase=mode!=0 ? (ids[desc]&127u)*p.rows*p.stride : 0;
+    bool iq=TYPE==16 || TYPE==17 || TYPE==18 || TYPE==22;
+    uint blocks=iq ? WIDTH/256 : WIDTH/32, span=blocks*(iq ? 74 : 9);
+    uint bytes=TYPE==16 ? 66 : TYPE==17 ? 74 : TYPE==18 ? 98 : 82;
+    [[unroll]] for (uint t=0;t<8;t++) {
+        path[t]=mode!=0 ? ids[desc+1+t] : 8*tile+t<nt ? 8*tile+t : ~0u;
+        uint id=path[t]==~0u ? path[0] : path[t];
+        input_base[t]=(mode==1 ? id/8 : id)*span;
+    }
+    bool second=path[4]!=~0u;
+    float result[2][8];
+    [[unroll]] for (uint r=0;r<2;r++) [[unroll]] for (uint t=0;t<8;t++) result[r][t]=0;
+    for (uint b=0;b<blocks;b++) {
+        int dots[2][8];
+        [[unroll]] for (uint r=0;r<2;r++) [[unroll]] for (uint t=0;t<8;t++) dots[r][t]=0;
+        float ws[2];
+        [[unroll]] for (uint g=0;g<(iq ? 8 : 1);g++) {
+            int weight[2], mult[2];
+            [[unroll]] for (uint r=0;r<2;r++) {
+                weight[r]=tile_weight(row+8*r,b,g,lane,iq,bytes,mult[r],ws[r]);
+            }
+            [[unroll]] for (uint t=0;t<8;t++) if (t<4 || second) {
+                uint xoff=input_base[t]+(iq ? 74*b+2+8*g : 9*b+1)+lane;
+                uint act=x[xoff];
+                [[unroll]] for (uint r=0;r<2;r++) dots[r][t]+=mult[r]*dot4(weight[r],act);
+            }
+        }
+        [[unroll]] for (uint t=0;t<8;t++) if (t<4 || second) {
+            uint xw=x[input_base[t]+(iq ? 74 : 9)*b];
+            float scale=iq ? uintBitsToFloat(xw) : unpackHalf2x16(xw).x;
+            [[unroll]] for (uint r=0;r<2;r++) result[r][t]=ink_fma(ws[r]*scale,float(dots[r][t]),result[r][t]);
+        }
+    }
+    uint l=gl_LocalInvocationID.x;
+    [[unroll]] for (uint r=0;r<2;r++) {
+#ifdef INK_FMA
+        [[unroll]] for (uint t=0;t<8;t++) if (t<4 || second) {
+            precise float v=result[r][t];
+            v+=subgroupShuffleXor(v,4); v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+            if (lane==0 && path[t]!=~0u) y[path[t]*p.rows+row+8*r]=TYPE==18 ? v*0.25 : v;
+        }
+#else
+        tile_sum[l]=vec4(result[r][0],result[r][1],result[r][2],result[r][3]);
+        if (second) tile_extra[l]=vec4(result[r][4],result[r][5],result[r][6],result[r][7]);
+        barrier();
+        if (lane<4) { tile_sum[l]+=tile_sum[l+4]; if (second) tile_extra[l]+=tile_extra[l+4]; }
+        barrier();
+        if (lane==0) {
+            precise vec4 v=(tile_sum[l]+tile_sum[l+2])+(tile_sum[l+1]+tile_sum[l+3]);
+            [[unroll]] for (uint t=0;t<4;t++) if (path[t]!=~0u) y[path[t]*p.rows+row+8*r]=TYPE==18 ? v[t]*0.25 : v[t];
+            if (second) {
+                v=(tile_extra[l]+tile_extra[l+2])+(tile_extra[l+1]+tile_extra[l+3]);
+                [[unroll]] for (uint t=0;t<4;t++) if (path[t+4]!=~0u) y[path[t+4]*p.rows+row+8*r]=TYPE==18 ? v[t]*0.25 : v[t];
+            }
+        }
+        barrier();
+#endif
+    }
+}
+// Unpack each K-quant word once for the whole token tile. Keep the minimum
+// correction on its original lanes until the final reduction.
+void k_tile(uint paths,uint tile,uint row,uint lane,uint nt,uint mode,bool paired) {
+#ifdef INK_MIN_TILE
+    const bool separate_min=true;
+#else
+    const bool separate_min=false;
+#endif
+    uint id[16], input_at[16], bytes=TYPE==12 ? 144 : TYPE==13 ? 176 : 210;
+    if (mode!=0) {
+        uint base=16*nt+1+9*(tile/2);
+        if (tile/2>=ids[16*nt]) return;
+        wbase=(ids[base]&127u)*p.rows*p.stride;
+        [[unroll]] for (uint t=0;t<paths;t++) id[t]=ids[base+1+4*(tile%2)+t];
+    } else {
+        wbase=0;
+        [[unroll]] for (uint t=0;t<paths;t++) id[t]=paths*tile+t<nt ? paths*tile+t : ~0u;
+    }
+    if (id[0]==~0u) return;
+    float sum[16], minimum[16];
+    [[unroll]] for (uint t=0;t<paths;t++) {
+        uint src=id[t]==~0u ? id[0] : id[t];
+        input_at[t]=(mode==1 ? src/8 : src)*(WIDTH/256)*74;
+        sum[t]=0; minimum[t]=0;
+    }
+    for (uint b=0;b<WIDTH/256;b++) {
+        uint off=row*p.stride+b*bytes;
+        uint panel=(tile*(paths/8)*(WIDTH/256)+b)*1096;
+        float partial[16]; int dot[16], minus[16];
+        [[unroll]] for (uint t=0;t<paths;t++) { partial[t]=0; dot[t]=0; minus[t]=0; }
+        [[unroll]] for (uint g=0;g<8;g++) {
+            int sc,mn=0;
+            if (TYPE==14) sc=int(byte_at(off+192+2*g+lane/4)^128u)-128;
+            else if (g<4) { sc=int(byte_at(off+4+g)&63u); mn=int(byte_at(off+8+g)&63u); }
+            else {
+                sc=int((byte_at(off+8+g)&15u)|((byte_at(off+g)>>6)<<4));
+                mn=int((byte_at(off+8+g)>>4)|((byte_at(off+4+g)>>6)<<4));
+            }
+            int code=int(k_codes(TYPE,off,g,lane));
+            if (paired) {
+                vec4 weight;
+                [[unroll]] for (uint k=0;k<4;k++) weight[k]=float(sc*bitfieldExtract(code,int(8*k),8));
+                [[unroll]] for (uint t=0;t<paths/2;t++) {
+                    uint at=panel+(t/4)*(WIDTH/256)*1096+8+128*g+32*(t%4)+lane;
+                    [[unroll]] for (uint j=0;j<2;j++) if (TYPE==14 && g==4) {
+                        // Sixteen Q6 products always fit the binary32 integer significand.
+                        dot[2*t+j]=int(partial[2*t+j]); partial[2*t+j]=0;
+                    }
+                    [[unroll]] for (uint k=0;k<4;k++) {
+                        vec2 act=unpackHalf2x16(x[at+8*k]);
+                        partial[2*t]=fma(weight[k],act.x,partial[2*t]);
+                        partial[2*t+1]=fma(weight[k],act.y,partial[2*t+1]);
+                    }
+                }
+            }
+            [[unroll]] for (uint t=0;t<paths;t++) {
+                uint xb=mode==0 ? (min(tile*paths+t,nt-1)*(WIDTH/256)+b)*74 : input_at[t]+b*74;
+                if (!paired) dot[t]+=sc*dot4(code,x[xb+2+8*g+lane]);
+                if (!separate_min && ((TYPE==12 && lane==g/2) || (TYPE==13 && lane==0))) {
+                    int bs=int(x[paired ? panel+(t/8)*(WIDTH/256)*1096+1032+8*g+t%8 : xb+66+g]);
+                    minus[t]+=mn*(bitfieldExtract(bs,0,16)+bitfieldExtract(bs,16,16));
+                }
+            }
+        }
+#ifdef INK_MIN_TILE
+        // Two groups feed each Q4 minimum lane. For Q5, sum the eight
+        // integer corrections before the original lane-zero FMA.
+        if (TYPE!=14) {
+            uint first=TYPE==12 ? 2*lane : lane;
+            uint groups=TYPE==12 ? 2 : 1;
+            int m[2];
+            [[unroll]] for (uint j=0;j<groups;j++) {
+                uint g=first+j;
+                m[j]=int(g<4 ? (byte_at(off+8+g)&63u) :
+                            (byte_at(off+8+g)>>4)|((byte_at(off+4+g)>>6)<<4));
+            }
+            if (TYPE==13 || lane<4) [[unroll]] for (uint t=0;t<paths;t++) {
+                uint xb=mode==0 ? (min(tile*paths+t,nt-1)*(WIDTH/256)+b)*74 : input_at[t]+b*74;
+                uint bp=paired ? panel+(t/8)*(WIDTH/256)*1096+1032+t%8 : xb+66;
+                int part=0;
+                [[unroll]] for (uint j=0;j<groups;j++) {
+                    uint g=first+j;
+                    int word=int(x[bp+(paired ? 8*g : g)]);
+                    part+=m[j]*(bitfieldExtract(word,0,16)+(word>>16));
+                }
+                if (TYPE==13) {
+                    part+=subgroupShuffleXor(part,4);
+                    part+=subgroupShuffleXor(part,2);
+                    part+=subgroupShuffleXor(part,1);
+                    if (lane!=0) part=0;
+                }
+                minus[t]=part;
+            }
+        }
+#endif
+        float ws=unpackHalf2x16(halfword(off+(TYPE==14 ? 208 : 0))).x;
+        float ms=TYPE==14 ? 0 : -unpackHalf2x16(halfword(off+2)).x;
+        [[unroll]] for (uint t=0;t<paths;t++) {
+            uint xb=mode==0 ? (min(tile*paths+t,nt-1)*(WIDTH/256)+b)*74 : input_at[t]+b*74;
+            if (paired) { dot[t]+=int(partial[t]); xb=panel+(t/8)*(WIDTH/256)*1096+t%8; }
+            if (TYPE==14) {
+                int bs=int(x[xb+(paired ? 1032+8*lane : 66+lane)]);
+                dot[t]-=32*((int(byte_at(off+192+2*lane)^128u)-128)*bitfieldExtract(bs,0,16)+
+                            (int(byte_at(off+193+2*lane)^128u)-128)*bitfieldExtract(bs,16,16));
+            }
+            float xd=uintBitsToFloat(x[xb]);
+            sum[t]=ink_fma(ws*xd,float(dot[t]),sum[t]);
+            if (TYPE!=14) minimum[t]=ink_fma(ms*xd,float(minus[t]),minimum[t]);
+        }
+    }
+    [[unroll]] for (uint t=0;t<paths;t++) {
+        precise float v=sum[t], m=minimum[t];
+#ifdef INK_FMA
+        v+=subgroupShuffleXor(v,4); v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+        if (TYPE!=14) { m+=subgroupShuffleXor(m,2); m+=subgroupShuffleXor(m,1); v+=m; }
+#else
+        uint l=gl_LocalInvocationID.x;
+        sums[l]=v; mins[l]=m; barrier();
+        if (lane==0) {
+            v=((sums[l]+sums[l+4])+(sums[l+2]+sums[l+6]))+
+              ((sums[l+1]+sums[l+5])+(sums[l+3]+sums[l+7]));
+            if (TYPE!=14) v+=(mins[l]+mins[l+2])+(mins[l+1]+mins[l+3]);
+        }
+        barrier();
+#endif
+        if (lane==0 && id[t]!=~0u) y[id[t]*p.rows+row]=v;
+    }
+}
+void main() {
+#ifdef INK_IQ_TILE_I16
+    uint tile=gl_WorkGroupID.x/8, nt=p.route>>8;
+    if (tile>=ids[16*nt]) return;
+    uint desc=16*nt+1+9*tile, flags=ids[desc];
+    if ((flags&256u)!=0) return;
+    if ((flags&128u)!=0) paired_tile(16,4);
+    else if (ids[desc+5]==~0u) paired_tile(4,4);
+    else paired_tile(8,4);
+#else
+    if (TYPE>=12 && TYPE<=14) {
+        uint tile=gl_WorkGroupID.x/8, lane=gl_LocalInvocationID.x%8;
+        uint row=(gl_WorkGroupID.y*8+gl_WorkGroupID.x%8)*8+gl_LocalInvocationID.x/8;
+        uint nt=p.route>>8, mode=p.route&15u;
+        if (row>=p.rows) return;
+        if ((p.route&16u)!=0) {
+            if (nt%16==0) k_tile(16,tile,row,lane,nt,0,true);
+            else k_tile(8,tile,row,lane,nt,0,true);
+        } else if (mode!=0) k_tile(4,tile,row,lane,nt,mode,false);
+        else k_tile(TYPE==14 ? 16 : 8,tile,row,lane,nt,0,false);
+        return;
+    }
+    if (TYPE==20) { iq4_tile(); return; }
+    if ((p.route&16u)!=0) {
+        uint tile=gl_WorkGroupID.x/8, nt=p.route>>8;
+        bool routed=(p.route&15u)!=0;
+        if (routed && tile>=ids[16*nt]) return;
+        uint desc=16*nt+1+9*tile;
+        if (routed && (p.route&32u)!=0 && (ids[desc]&256u)!=0) return;
+#if defined(INK_FMA) && defined(INK_HALF_WEIGHT)
+        if (nv_tile) {
+            if ((ids[desc]&128u)!=0) nvfp4_tile(16,desc,tile);
+            else if (ids[desc+5]==~0u) nvfp4_tile(4,desc,tile);
+            else nvfp4_tile(8,desc,tile);
+            return;
+        }
+#endif
+        if (TYPE==8 && (p.route&64u)!=0) paired_tile(16,4);
+        else if ((p.route&32u)!=0 && (!routed || (ids[desc]&128u)!=0)) paired_tile(16,3);
+        else if (routed && ids[desc+5]==~0u) paired_tile(4,4);
+        else paired_tile(8,4);
+        return;
+    }
+    uint tile=gl_WorkGroupID.x/8, nt=p.route>>8, mode=p.route&255u;
+    uint tile_row=gl_WorkGroupID.y*8+gl_WorkGroupID.x%8, lane=gl_LocalInvocationID.x%8;
+    bool iq=TYPE==16 || TYPE==17 || TYPE==18 || TYPE==22;
+    if ((iq || TYPE==8 || TYPE==40) && p.rows%16==0) {
+        block_tile(tile,tile_row,lane,nt,mode);
+        return;
+    }
+    uint row=tile_row*8+gl_LocalInvocationID.x/8;
+    if ((row&~7u)>=p.rows) return;
+    bool packed=iq || TYPE==8 || TYPE==40;
+    uint span=packed ? (iq ? WIDTH/256*74 : WIDTH/32*9) : WIDTH;
+    if (mode!=0) {
+        uint base=nt*16;
+        uint half_tile=tile%2;
+        tile/=2;
+        if (tile>=ids[base]) return;
+        uint desc=base+1+9*tile;
+        wbase=(ids[desc]&127u)*p.rows*p.stride;
+        [[unroll]] for (uint t=0;t<4;t++) path[t]=ids[desc+1+4*half_tile+t];
+        if (path[0]==~0u) return;
+    } else {
+        wbase=0;
+        [[unroll]] for (uint t=0;t<4;t++) path[t]=4*tile+t<nt ? 4*tile+t : ~0u;
+    }
+    [[unroll]] for (uint t=0;t<4;t++) {
+        uint idx=path[t]==~0u ? path[0] : path[t];
+        row_out[t]=idx*p.rows+row;
+        input_base[t]=(mode==1 ? idx/8 : idx)*span;
+    }
+    vec4 sum=vec4(0);
+    if (iq) {
+        uint bytes=TYPE==16 ? 66 : TYPE==17 ? 74 : TYPE==18 ? 98 : 82;
+        for (uint b=0;b<WIDTH/256;b++) {
+            uint off=row*p.stride+b*bytes;
+            ivec4 dot=ivec4(0);
+            [[unroll]] for (uint g=0;g<8;g++) {
+                uint sc;
+                int grid=iq_grid(TYPE,off,row,b,g,lane,sc);
+                [[unroll]] for (uint t=0;t<4;t++)
+                    dot[t]+=int(2*sc+1)*dot4(grid,x[input_base[t]+b*74+2+8*g+lane]);
+            }
+            float ws=iq_scale(row,b,bytes,off)*(TYPE==18 ? 1 : 0.125);
+            vec4 sc;
+            [[unroll]] for (uint t=0;t<4;t++) sc[t]=ws*uintBitsToFloat(x[input_base[t]+74*b]);
+            sum=accum(sc,dot,sum);
+        }
+    } else if (TYPE==8 || TYPE==40) {
+        for (uint b=0;b<WIDTH/32;b++) {
+            float ws; uint weight;
+            packed_block(row,lane,b,weight,ws);
+            vec4 sc; ivec4 dot;
+            [[unroll]] for (uint t=0;t<4;t++) {
+                uint xb=input_base[t]+9*b;
+                sc[t]=ws*unpackHalf2x16(x[xb]).x;
+                dot[t]=dot4(int(weight),x[xb+1+lane]);
+            }
+            sum=accum(sc,dot,sum);
+        }
+    } else {
+        vec4 partial[4];
+        [[unroll]] for (uint k=0;k<4;k++) partial[k]=vec4(0);
+        for (uint i=lane;i<WIDTH;i+=32) {
+            [[unroll]] for (uint k=0;k<4;k++) {
+                uint col=i+8*k, idx=row*WIDTH+col;
+                float v=TYPE==0 ? float_weight(row,col) : uintBitsToFloat((w[idx/2]>>((col%2)*16))<<16);
+                vec4 act;
+                [[unroll]] for (uint t=0;t<4;t++) {
+                    uint bits=x[input_base[t]+col];
+                    if (TYPE==30) bits=(bits+32767u+((bits>>16)&1u))&0xffff0000u;
+                    act[t]=uintBitsToFloat(bits);
+                }
+                partial[k]=ink_fma(vec4(v),act,partial[k]);
+            }
+        }
+        precise vec4 v=(partial[0]+partial[2])+(partial[1]+partial[3]); sum=v;
+    }
+    uint l=gl_LocalInvocationID.x;
+#ifdef INK_FMA
+    precise vec4 v=sum+subgroupShuffleXor(sum,4);
+    v+=subgroupShuffleXor(v,TYPE==0 ? 1 : 2); v+=subgroupShuffleXor(v,TYPE==0 ? 2 : 1);
+    if (TYPE==18) v*=0.25;
+    if (lane==0) [[unroll]] for (uint t=0;t<4;t++) if (path[t]!=~0u) y[row_out[t]]=v[t];
+#else
+    tile_sum[l]=sum;
+    barrier();
+    if (lane<4) tile_sum[l]+=tile_sum[l+4];
+    barrier();
+    if (lane==0) {
+        precise vec4 v=TYPE==0 ? (tile_sum[l]+tile_sum[l+1])+(tile_sum[l+2]+tile_sum[l+3]) :
+                                (tile_sum[l]+tile_sum[l+2])+(tile_sum[l+1]+tile_sum[l+3]);
+        if (TYPE==18) v*=0.25;
+        [[unroll]] for (uint t=0;t<4;t++) if (path[t]!=~0u) y[row_out[t]]=v[t];
+    }
+#endif
+#endif
+}
+#elif defined(INK_IQ_DECODE)
+void main() {
+    uint l=gl_LocalInvocationID.x, lane=l%8, row=8*gl_WorkGroupID.x+l/8;
+    uint token=gl_WorkGroupID.z, rank=gl_WorkGroupID.y;
+    uint input_row=p.route==2 ? 8*token+rank : token;
+    xbase=input_row*(WIDTH/256)*74;
+    wbase=p.route==0 ? 0 : ids[16*token+rank]*p.rows*p.stride;
+    if (TYPE==18 || TYPE==22) {
+        uint src=gl_SubgroupInvocationID&~7u;
+        uint base=wbase/4+gl_WorkGroupID.x*2*iq_bytes*(WIDTH/256);
+        precise float sum=0;
+        [[unroll]] for (uint b=0;b<WIDTH/256;b++) {
+            uint off=base+b*2*iq_bytes, xb=xbase+b*74;
+            uint low=w[off+l], high=w[off+64+l], control=w[off+128+(TYPE==18 ? l : l/2)];
+            int acc=0;
+            [[unroll]] for (uint h=0;h<2;h++) {
+                uint peer=src+(lane&~1u)+h;
+                uint signs=subgroupShuffle(TYPE==18 ? control : high,peer);
+                uint codes=TYPE==18 ? (h==0 ? low : high) : subgroupShuffle(low,peer);
+                [[unroll]] for (uint k=0;k<4;k++) {
+                    uint g=4*h+k, ctl=subgroupShuffle(control,src+(TYPE==18 ? g : g&~1u));
+                    uint sign=signs>>((TYPE==18 ? 7 : 8)*k), code=(codes>>(8*k))&255u;
+                    uint sc, grid;
+                    if (TYPE==18) {
+                        sign&=127u; sign|=(bitCount(sign)&1u)<<7;
+                        sc=ctl>>28; grid=1536+code;
+                    } else {
+                        ctl>>=16*(g%2);
+                        sc=(ctl>>(8+4*(lane/4)))&15u;
+                        grid=1792+2*(code|((ctl<<(8-2*(lane/2)))&768u))+lane%2;
+                    }
+                    int val=signed_grid(tables[grid],(sign>>(4*(lane%2)))&15u);
+                    acc+=int(2*sc+1)*dot4(val,x[xb+2+8*g+lane]);
+                }
+            }
+            float ws=unpackHalf2x16(w[off+2*iq_bytes-4+l/16]>>((row%2)*16)).x;
+            sum=ink_fma((TYPE==18 ? ws : ws*0.125)*uintBitsToFloat(x[xb]),float(acc),sum);
+        }
+        sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+        if (lane==0) y[(p.route==0 ? token : 8*token+rank)*p.rows+row]=TYPE==18 ? sum*0.25 : sum;
+        return;
+    }
+    uint words=2*iq_bytes*(WIDTH/256), base=wbase/4+gl_WorkGroupID.x*words;
+    for (uint i=l;i<words;i+=64) iq_rows[i]=w[base+i];
+    barrier();
+    precise float sum=iq_row(row,lane);
+    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+    if (lane==0 && row<p.rows)
+        y[(p.route==0 ? token : 8*token+rank)*p.rows+row]=TYPE==18 ? sum*0.25 : sum;
+}
+#else
+void main() {
+    uint lane=gl_LocalInvocationID.x, j=lane%8, row=8*gl_WorkGroupID.x+lane/8;
+    uint token=gl_WorkGroupID.z, rank=gl_WorkGroupID.y, ranks=p.route==0 ? 1 : 8;
+    uint input_row=token*(p.route==2 ? 8 : 1)+(p.route==2 ? rank : 0);
+    bool q8=TYPE==8 || TYPE==20 || TYPE==40;
+    xbase=input_row*(q8 ? (WIDTH/32)*9 : (TYPE==0 || TYPE==30) ? WIDTH : (WIDTH/256)*74);
+    wbase=p.route==0 ? 0 : ids[token*16+rank]*p.rows*p.stride;
+    if ((TYPE==0 || TYPE==30) && WIDTH>=1024 && p.rows<=128) {
+        uint row=gl_WorkGroupID.x*2+lane/32, j=lane%32;
+        float val=0;
+#ifdef INK_FMA
+        const uint steps=FORMAT==41 && WIDTH==4608 ? 36 : 8;
+#else
+        const uint steps=8;
+#endif
+        for (uint chunk=j;chunk<WIDTH;chunk+=32*steps) {
+          [[unroll]] for (uint part=0;part<steps;part++) {
+            uint col=chunk+32*part;
+            uint bits=x[xbase+col], idx=row*WIDTH+col;
+            float weight=TYPE==0 ? float_weight(row,col) : uintBitsToFloat((w[idx/2]>>((col%2)*16))<<16);
+            if (TYPE==30) bits=(bits+32767u+((bits>>16)&1u))&0xffff0000u;
+            val=ink_fma(weight,uintBitsToFloat(bits),val);
+          }
+        }
+#ifdef INK_FMA
+        precise float v=val+subgroupShuffleXor(val,16); v+=subgroupShuffleXor(v,8); v+=subgroupShuffleXor(v,4);
+        v+=subgroupShuffleXor(v,TYPE==0 ? 1 : 2); v+=subgroupShuffleXor(v,TYPE==0 ? 2 : 1);
+        if (j==0) y[token*p.rows+row]=v;
+#else
+        sums[lane]=val; barrier();
+        if (j<8) {
+            precise float r=(sums[lane]+sums[lane+16])+(sums[lane+8]+sums[lane+24]);
+            sums[lane]=r;
+        }
+        barrier();
+        if (j<4) sums[lane]+=sums[lane+4];
+        barrier();
+        if (j==0) {
+            precise float r=TYPE==0 ? (sums[lane]+sums[lane+1])+(sums[lane+2]+sums[lane+3])
+                                    : (sums[lane]+sums[lane+2])+(sums[lane+1]+sums[lane+3]);
+            y[token*p.rows+row]=r;
+        }
+#endif
+        return;
+    }
+    precise float sum=0; float minimum=0;
+    if (row<p.rows && (TYPE==0 || TYPE==30)) {
+        float s[4]=float[4](0,0,0,0);
+        for (uint i=j;i<WIDTH;i+=32)
+            for (uint k=0;k<4;k++) {
+                uint col=i+8*k;
+                if (TYPE==0) s[k]=ink_fma(float_weight(row,col),uintBitsToFloat(x[xbase+col]),s[k]);
+                else {
+                    uint wx=w[(row*WIDTH+col)/2]>>((col%2)*16), xx=x[xbase+col];
+                    float v=uintBitsToFloat((xx+32767u+((xx>>16)&1u))&0xffff0000u);
+                    s[k]=ink_fma(uintBitsToFloat(wx<<16),v,s[k]);
+                }
+            }
+        sum=(s[0]+s[2])+(s[1]+s[3]);
+    } else if (row<p.rows && (TYPE==16 || TYPE==17 || TYPE==18 || TYPE==22)) {
+        sum=iq_row(row,j);
+    } else if (row<p.rows && TYPE>=12 && TYPE<=14) {
+        sum=k_row(row,j,minimum);
+    } else if (TYPE==20) {
+        if (row<p.rows) for (uint b=j;b<WIDTH/32;b+=8) {
+            uint off=row*p.stride+b*18;
+            int acc=0;
+#ifdef INK_DOT
+            [[unroll]] for (uint k=0;k<8;k++) {
+                int weight;
+                if (WIDTH==1152) weight=iq4_weight(wbase/4+row*(p.stride/4),b,k);
+                else {
+                    uint n=(word(off+2+4*(k%4))>>(4*(k/4)))&0x0f0f0f0fu;
+                    uint pair=(n|(n>>4))&0x00ff00ffu;
+                    weight=int(tables[4096+(pair&255u)]|(tables[4096+(pair>>16)]<<16));
+                }
+                acc+=dot4(weight,x[xbase+9*b+1+k]);
+            }
+#else
+            for (uint k=0;k<32;k++) {
+                int a=bitfieldExtract(int(x[xbase+9*b+1+k/4]),int(8*(k%4)),8);
+                acc+=iq4[(byte_at(off+2+k%16)>>(4*(k/16)))&15u]*a;
+            }
+#endif
+            iq4dots[(lane/8)*(WIDTH/32)+b]=float(acc)*unpackHalf2x16(x[xbase+9*b]).x;
+            float scale=unpackHalf2x16(halfword(off)).x;
+#ifdef INK_DOT
+            if (WIDTH==1152) scale=iq4_scale(wbase/4+row*(p.stride/4),b);
+#endif
+            iq4scales[(lane/8)*(WIDTH/32)+b]=scale;
+        }
+        barrier();
+        if (j==0 && row<p.rows) {
+            for (uint b=0;b<WIDTH/32;b++) sum+=iq4dots[(lane/8)*(WIDTH/32)+b]*iq4scales[(lane/8)*(WIDTH/32)+b];
+            y[(token*ranks+rank)*p.rows+row]=sum;
+        }
+        return;
+    } else if (row<p.rows) {
+        for (uint chunk=0;chunk<WIDTH/32;chunk+=4) {
+            [[unroll]] for (uint phase=0;phase<4;phase++) {
+            uint b=chunk+phase;
+            if (b>=WIDTH/32) break;
+            uint off=row*p.stride+(TYPE==8 ? b*34 : (b/2)*36);
+            uint g=2*(b%2)+j/4;
+            int dot=0;
+            uint packed=x[xbase+b*9+1+j];
+#ifdef INK_DOT
+            uint weight; float d;
+            packed_block(row,j,b,weight,d);
+            dot=dot4(int(weight),packed);
+#else
+            for (uint a=0;a<4;a++) {
+                uint i=4*j+a;
+                int weight;
+                if (TYPE==8) weight=int(byte_at(off+2+i)^128u)-128;
+                else weight=fp4[(byte_at(off+4+g*8+i%8)>>(i%16>=8 ? 4 : 0))&15u];
+                dot+=weight*bitfieldExtract(int(packed),int(8*a),8);
+            }
+            float d=TYPE==8 ? unpackHalf2x16(byte_at(off)|(byte_at(off+1)<<8)).x : e4m3(byte_at(off+g));
+#endif
+            sum=ink_fma(d*unpackHalf2x16(x[xbase+b*9]).x,float(dot),sum);
+            }
+        }
+    }
+#ifdef INK_FMA
+    sum+=subgroupShuffleXor(sum,4);
+    sum+=subgroupShuffleXor(sum,TYPE==0 ? 1 : 2); sum+=subgroupShuffleXor(sum,TYPE==0 ? 2 : 1);
+    if (TYPE==12 || TYPE==13) { precise float m=minimum+subgroupShuffleXor(minimum,2); m+=subgroupShuffleXor(m,1); sum+=m; }
+    if (j==0 && row<p.rows) y[(token*ranks+rank)*p.rows+row]=TYPE==18 ? sum*0.25 : sum;
+#else
+    sums[lane]=sum; mins[lane]=minimum; barrier();
+    if (j<4) sums[lane]+=sums[lane+4];
+    barrier();
+    if (j==0 && row<p.rows) {
+        precise float result=TYPE==0 ? (sums[lane]+sums[lane+1])+(sums[lane+2]+sums[lane+3])
+                                      : (sums[lane]+sums[lane+2])+(sums[lane+1]+sums[lane+3]);
+        if (TYPE==18) result*=0.25;
+        if (TYPE==12 || TYPE==13) result+=(mins[lane]+mins[lane+2])+(mins[lane+1]+mins[lane+3]);
+        y[(token*ranks+rank)*p.rows+row]=result;
+    }
+#endif
+}
+
+#endif

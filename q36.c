@@ -86,6 +86,7 @@ typedef enum {
     Q36_VARIANT_35B_A3B,
     Q36_VARIANT_27B,
     Q36_VARIANT_FLASH_NEXT,
+    Q36_VARIANT_INKLING,
 } q36_variant;
 
 typedef struct {
@@ -278,6 +279,7 @@ static const gguf_type_info gguf_types[] = {
     [26] = {"i32", 1, 4},
     [29] = {"iq1_m", 256, 56},
     [30] = {"bf16", 1, 2},
+    [40] = {"nvfp4", 64, 36},
     [42] = {"q2_0", 64, 18},
 };
 
@@ -301,6 +303,7 @@ enum {
     Q36_TENSOR_I32 = 26,
     Q36_TENSOR_IQ1_M = 29,
     Q36_TENSOR_BF16 = 30,
+    Q36_TENSOR_NVFP4 = 40,
     Q36_TENSOR_Q2_0 = 42,
 };
 
@@ -482,6 +485,8 @@ typedef struct q36_vocab {
     int vision_end_id;
     int image_pad_id;
     int video_pad_id;
+    bool inkling;
+    int content_text_id;
     bool add_bos;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
@@ -577,6 +582,7 @@ static const char *q36_dump_names[Q36_DUMP_COUNT] = {
 };
 
 struct q36_engine {
+    struct ink_weights *ink;
     q36_dist_options distributed;
     q36_dist_engine *dist;
     uint32_t layer_start, layer_end;
@@ -1218,7 +1224,7 @@ static bool q36_backend_supports_ssd_streaming(q36_backend backend) {
 
 
 static bool q36_engine_uses_vulkan_runtime(const q36_engine *e) {
-    return e && e->variant != Q36_VARIANT_FLASH_NEXT && q36_backend_uses_graph(e->backend);
+    return e && !e->ink && e->variant != Q36_VARIANT_FLASH_NEXT && q36_backend_uses_graph(e->backend);
 }
 
 static void q36_die(const char *msg) {
@@ -1345,6 +1351,7 @@ bool q36_think_mode_enabled(q36_think_mode mode) {
 
 const char *q36_think_mode_name(q36_think_mode mode) {
     switch (mode) {
+    case Q36_THINK_MINIMAL: return "minimal";
     case Q36_THINK_NONE: return "none";
     case Q36_THINK_HIGH: return "high";
     case Q36_THINK_MAX: return "max";
@@ -1353,6 +1360,27 @@ const char *q36_think_mode_name(q36_think_mode mode) {
     case Q36_THINK_XHIGH: return "xhigh";
     default: return "unknown";
     }
+}
+
+bool q36_parse_think_option(const char *name, q36_think_mode *mode) {
+    if (!strcmp(name, "nothink")) *mode = Q36_THINK_NONE;
+    else if (!strcmp(name, "think")) *mode = Q36_THINK_HIGH;
+    else if (!strncmp(name, "think-", 6)) {
+        for (int i = Q36_THINK_HIGH; i <= Q36_THINK_MINIMAL; i++) {
+            if (strcmp(name + 6, q36_think_mode_name(i))) continue;
+            *mode = i;
+            return true;
+        }
+        return false;
+    } else return false;
+    return true;
+}
+
+/* Inkling's max is an alias for xhigh, independent of context size.
+ * Qwen uses a separate long-context max prompt and treats minimal as low. */
+q36_think_mode q36_model_think_mode(q36_engine *e, q36_think_mode mode) {
+    if (q36_engine_is_inkling(e)) return mode == Q36_THINK_MAX ? Q36_THINK_XHIGH : mode;
+    return mode == Q36_THINK_MINIMAL ? Q36_THINK_LOW : mode;
 }
 
 const char *q36_qwen38_effort_instruction(q36_think_mode mode) {
@@ -1530,6 +1558,21 @@ static uint64_t q36_vulkan_scratch_bytes(
     return bytes;
 }
 
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+static uint64_t ink_vk_scratch_bytes(unsigned nt,unsigned context,unsigned fmt);
+#endif
+static uint64_t ink_vk_rows(unsigned n) {
+    return ((uint64_t)n+31)&~31ull;
+}
+
+static uint32_t ink_kv_row_bytes(q36_kv_cache_type k, q36_kv_cache_type v) {
+    return q36_kv_cache_row_bytes(k,1024) + q36_kv_cache_row_bytes(v,1024);
+}
+
+static unsigned ink_vk_batch(unsigned requested) {
+    return requested && requested<512 ? requested : 512;
+}
+
 q36_context_memory q36_context_memory_estimate_configured(
         q36_backend backend,
         int ctx_size,
@@ -1542,6 +1585,27 @@ q36_context_memory q36_context_memory_estimate_configured(
     uint32_t gpu_prefill_cap = q36_default_gpu_prefill_cap();
 #endif
     if (ctx_size <= 0) return m;
+    if (g_q36_shape.variant == Q36_VARIANT_INKLING) {
+        uint32_t window = ctx_size < 1024 ? (uint32_t)ctx_size : 1024;
+        m.prefill_cap = 1;
+        m.raw_cap = ctx_size;
+        uint32_t row = ink_kv_row_bytes(cache_type_k,cache_type_v);
+        m.raw_bytes = (8ull*ctx_size + 40ull*window)*row;
+        m.compressed_bytes = 48ull*(2*1024+2*2304)*3*sizeof(float);
+        m.scratch_bytes = (2ull*Q36_N_VOCAB + ctx_size)*sizeof(float);
+        if (backend == Q36_BACKEND_VULKAN) {
+            m.prefill_cap=ink_vk_batch(prefill_chunk);
+            if (m.prefill_cap>(unsigned)ctx_size) m.prefill_cap=ctx_size;
+            unsigned ring=1024+(m.prefill_cap<32 ? m.prefill_cap : 32)-1;
+            if (ring>(unsigned)ctx_size) ring=ctx_size;
+            m.raw_bytes=(8*ink_vk_rows(ctx_size)+40*ink_vk_rows(ring))*row;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+            m.scratch_bytes=ink_vk_scratch_bytes(m.prefill_cap,ctx_size,cache_type_k+3*cache_type_v);
+#endif
+        }
+        m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
+        return m;
+    }
     if (g_q36_shape.variant == Q36_VARIANT_FLASH_NEXT) {
         m.prefill_cap = 1;
         m.raw_cap = ctx_size;
@@ -1916,6 +1980,14 @@ float q36_quant_dot_q8_0(const void *a, const void *b, int n) {
     return q36_sum8(sums);
 }
 
+static const int8_t q36_fp4[16] = {0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+
+static float q36_nvfp4_scale(uint8_t v) {
+    unsigned e = (v >> 3) & 15u, m = v & 7u;
+    if (v == 127) return 0;
+    return e ? ldexpf(8 + m, (int)e - 11) : ldexpf(m, -10);
+}
+
 /* IQ4_NL and Q2_0 use 32-element activation scales, including when a
  * weight block spans two activation blocks. Keep the dot integer until
  * applying those scales, as in the GGUF CPU kernels. */
@@ -1926,6 +1998,28 @@ bool q36_quant_dot_q8_0_type(uint32_t type, const void *weights,
     static const int8_t values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
     if (!w || !x || !out || n % 32) return false;
     if (type == Q36_TENSOR_Q8_0) { *out = q36_quant_dot_q8_0(weights,activation,n); return true; }
+    if (type == Q36_TENSOR_NVFP4) {
+        if (n % 64) return false;
+        float lanes[8] = {0};
+        for (uint32_t b = 0; b < n/64; b++, w += 36) {
+            for (int g = 0; g < 4; g++) {
+                const q36_block_q8_0 *q = x + 2*b + g/2;
+                const int8_t *a = q->qs + 16*(g%2);
+                float scale = q36_nvfp4_scale(w[g])*q36_f16_to_f32(q->d);
+                for (int j = 0; j < 16; j += 4) {
+                    int dot = 0;
+                    for (int k = j; k < j+4; k++) {
+                        uint8_t v = w[4+8*g+k%8];
+                        dot += q36_fp4[(v >> (k<8 ? 0 : 4))&15]*a[k];
+                    }
+                    int lane = 4*(g%2)+j/4;
+                    lanes[lane] = fmaf(scale,(float)dot,lanes[lane]);
+                }
+            }
+        }
+        *out = q36_sum8(lanes);
+        return true;
+    }
     if (type != Q36_TENSOR_IQ4_NL && type != Q36_TENSOR_Q2_0) return false;
     if (type == Q36_TENSOR_Q2_0 && n % 64) return false;
     float sum = 0;
@@ -2179,6 +2273,15 @@ float q36_quant_dot_bf16(const void *weights, const float *x, uint32_t n) {
 
 static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float *dst, uint32_t n) {
     switch (type) {
+    case Q36_TENSOR_NVFP4:
+        if (n % 64) return false;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *b = src + i/64*36;
+            unsigned g = (i%64)/16;
+            uint8_t v = b[4+g*8+i%8];
+            dst[i] = q36_nvfp4_scale(b[g]) * q36_fp4[(v >> ((i&8) ? 4 : 0)) & 15];
+        }
+        return true;
     case Q36_TENSOR_Q2_0: {
         if (n % 64) return false;
         for (uint32_t b = 0; b < n / 64; b++, src += 18) {
@@ -2755,7 +2858,8 @@ static bool q36_tensor_type_supports_q8k_dot(uint32_t type) {
 }
 
 static bool q36_tensor_type_supports_q8_0_dot(uint32_t type) {
-    return type == Q36_TENSOR_Q8_0 || type == Q36_TENSOR_IQ4_NL || type == Q36_TENSOR_Q2_0;
+    return type == Q36_TENSOR_Q8_0 || type == Q36_TENSOR_IQ4_NL ||
+           type == Q36_TENSOR_Q2_0 || type == Q36_TENSOR_NVFP4;
 }
 
 static bool q36_tensor_type_supports_prequant_dot(uint32_t type) {
@@ -4323,7 +4427,7 @@ static const float *q36_vision_f32(const q36_model *m, const q36_tensor *t,
 
 static void q36_vision_layer_norm(float *out, const float *x,
                                   const float *weight, const float *bias,
-                                  uint32_t rows, uint32_t width) {
+                                  uint32_t rows, uint32_t width, float eps) {
     for (uint32_t r = 0; r < rows; r++) {
         const float *xr = x + (uint64_t)r * width;
         float *yr = out + (uint64_t)r * width;
@@ -4334,7 +4438,7 @@ static void q36_vision_layer_norm(float *out, const float *x,
             double d = xr[i] - mean;
             variance += d * d;
         }
-        float inv = 1.0f / sqrtf((float)(variance / width) + 1.0e-6f);
+        float inv = 1.0f / sqrtf((float)(variance / width) + eps);
         for (uint32_t i = 0; i < width; i++)
             yr[i] = (xr[i] - (float)mean) * inv * weight[i] + bias[i];
     }
@@ -4351,7 +4455,7 @@ static void q36_vision_gelu_bias(float *x, const float *bias,
                                  uint32_t rows, uint32_t width) {
     const float k = 0.7071067811865475f;
     for (uint64_t i = 0, n = (uint64_t)rows * width; i < n; i++) {
-        float v = x[i] + bias[i % width];
+        float v = bias ? x[i] + bias[i % width] : x[i];
         x[i] = 0.5f * v * (1.0f + erff(v * k));
     }
 }
@@ -4360,52 +4464,54 @@ typedef struct {
     const float *qkv;
     float *out;
     uint32_t rows;
+    uint32_t head_dim;
 } q36_vision_attn_ctx;
 
 static void q36_vision_attention_worker(void *opaque, uint64_t row0, uint64_t row1) {
     q36_vision_attn_ctx *c = opaque;
-    const float scale = 1.0f / sqrtf(72.0f);
+    const uint32_t dim = c->head_dim, width = 16u * dim;
+    const float scale = 1.0f / sqrtf((float)dim);
     for (uint64_t job = row0; job < row1; job++) {
         uint32_t row = (uint32_t)(job / 16u), head = (uint32_t)(job % 16u);
-        const float *q = c->qkv + (uint64_t)row * 3456u + head * 72u;
-        float *dst = c->out + (uint64_t)row * 1152u + head * 72u;
+        const float *q = c->qkv + (uint64_t)row * 3u * width + head * dim;
+        float *dst = c->out + (uint64_t)row * width + head * dim;
         float max_score = -INFINITY, denom = 0.0f;
-        memset(dst, 0, 72u * sizeof(*dst));
+        memset(dst, 0, dim * sizeof(*dst));
         for (uint32_t kr = 0; kr < c->rows; kr++) {
-            const float *k = c->qkv + (uint64_t)kr * 3456u + 1152u + head * 72u;
-            const float *v = c->qkv + (uint64_t)kr * 3456u + 2304u + head * 72u;
+            const float *k = c->qkv + (uint64_t)kr * 3u * width + width + head * dim;
+            const float *v = k + width;
             float score = 0.0f;
-            for (uint32_t d = 0; d < 72u; d++) score += q[d] * k[d];
+            for (uint32_t d = 0; d < dim; d++) score += q[d] * k[d];
             score *= scale;
             float next = fmaxf(max_score, score);
             float old_scale = isfinite(max_score) ? expf(max_score - next) : 0.0f;
             float new_scale = expf(score - next);
             denom = denom * old_scale + new_scale;
-            for (uint32_t d = 0; d < 72u; d++)
+            for (uint32_t d = 0; d < dim; d++)
                 dst[d] = dst[d] * old_scale + new_scale * v[d];
             max_score = next;
         }
-        for (uint32_t d = 0; d < 72u; d++) dst[d] /= denom;
+        for (uint32_t d = 0; d < dim; d++) dst[d] /= denom;
     }
 }
 
 static bool q36_vision_attention(q36_engine *e, const float *qkv,
-                                 float *out, uint32_t rows) {
+                                 float *out, uint32_t rows, uint32_t head_dim) {
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
     if (e->backend == Q36_BACKEND_VULKAN) {
-        uint64_t qkv_bytes = (uint64_t)rows * 3456u * sizeof(float);
-        uint64_t out_bytes = (uint64_t)rows * 1152u * sizeof(float);
+        uint64_t out_bytes = (uint64_t)rows * 16u * head_dim * sizeof(float);
+        uint64_t qkv_bytes = 3u * out_bytes;
         q36_gpu_tensor *gqkv = q36_gpu_tensor_alloc_uninitialized(qkv_bytes);
         q36_gpu_tensor *gout = q36_gpu_tensor_alloc_uninitialized(out_bytes);
         int ok = gqkv && gout && q36_gpu_tensor_write(gqkv, 0, qkv, qkv_bytes) &&
-            q36_gpu_vision_attention(gout, gqkv, rows) &&
+            q36_gpu_vision_attention(gout, gqkv, rows, head_dim) &&
             q36_gpu_tensor_read(gout, 0, out, out_bytes);
         q36_gpu_tensor_free(gqkv);
         q36_gpu_tensor_free(gout);
         return ok != 0;
     }
 #endif
-    q36_vision_attn_ctx ac = {qkv, out, rows};
+    q36_vision_attn_ctx ac = {qkv, out, rows, head_dim};
     q36_parallel_for_rows((uint64_t)rows * 16u, 8, e->n_threads,
                           q36_vision_attention_worker, &ac);
     return true;
@@ -4439,6 +4545,162 @@ static q36_tensor *q36_vision_tensorf(const q36_model *m, uint32_t layer,
     int n = snprintf(name, sizeof(name), "v.blk.%u.%s", layer, suffix);
     if (n < 0 || (size_t)n >= sizeof(name)) return NULL;
     return model_find_tensor(m, name);
+}
+
+static void q36_vision_drop_pages(const q36_model *m) {
+#ifdef MADV_DONTNEED
+    madvise((void *)m->map, (size_t)m->size, MADV_DONTNEED);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+    posix_fadvise(m->fd, 0, (off_t)m->size, POSIX_FADV_DONTNEED);
+#endif
+}
+
+enum { INK_V_WIDTH = 1024, INK_V_FF = 4096, INK_V_LAYERS = 23, INK_V_POS = 32 };
+
+static void ink_vision_position(float *x, const float *position, uint32_t w, uint32_t h) {
+    for (uint32_t y = 0; y < h; y++) {
+        float iy = fminf(INK_V_POS - 1, fmaxf(0, (y + 0.5f) * INK_V_POS / h - 0.5f));
+        uint32_t y0 = (uint32_t)iy, y1 = y0 + (y0 + 1 < INK_V_POS);
+        float dy = iy - y0;
+        for (uint32_t z = 0; z < w; z++) {
+            float ix = fminf(INK_V_POS - 1, fmaxf(0, (z + 0.5f) * INK_V_POS / w - 0.5f));
+            uint32_t x0 = (uint32_t)ix, x1 = x0 + (x0 + 1 < INK_V_POS);
+            float dx = ix - x0;
+            const float *a = position + (y0 * INK_V_POS + x0) * INK_V_WIDTH;
+            const float *b = position + (y0 * INK_V_POS + x1) * INK_V_WIDTH;
+            const float *c = position + (y1 * INK_V_POS + x0) * INK_V_WIDTH;
+            const float *d = position + (y1 * INK_V_POS + x1) * INK_V_WIDTH;
+            for (uint32_t i = 0; i < INK_V_WIDTH; i++)
+                x[i] += a[i] * (1-dx) * (1-dy) + b[i] * dx * (1-dy) +
+                        c[i] * (1-dx) * dy + d[i] * dx * dy;
+            x += INK_V_WIDTH;
+        }
+    }
+}
+
+static void ink_vision_rope(float *qkv, uint32_t rows, uint32_t w) {
+    float freq[16];
+    for (unsigned i = 0; i < 16; i++) freq[i] = powf(10000.0f, -(float)i / 16);
+    // Leave CLS at (0, 0). Each patch starts at (1, 1) plus its grid offset.
+    for (uint32_t r = 1; r < rows; r++) {
+        uint32_t pos[2] = {(r-1) % w + 1, (r-1) / w + 1};
+        for (unsigned axis = 0; axis < 2; axis++) for (unsigned i = 0; i < 16; i++) {
+            float angle = pos[axis] * freq[i], cs = cosf(angle), sn = sinf(angle);
+            float *v = qkv + (size_t)r * 3 * INK_V_WIDTH + axis * 32 + i * 2;
+            for (unsigned h = 0; h < 32; h++, v += 64) {
+                float a = v[0], b = v[1];
+                v[0] = a * cs - b * sn;
+                v[1] = b * cs + a * sn;
+            }
+        }
+    }
+}
+
+static bool ink_vision_layer(q36_engine *e, uint32_t il, uint32_t rows, uint32_t w,
+                             float *x, float *norm, float *qkv, float *work, float *wide) {
+    const q36_model *m = &e->vision_model;
+    const char *norm_names[] = {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"};
+    const float *ln[4];
+    for (unsigned i = 0; i < 4; i++)
+        if (!(ln[i] = q36_vision_f32(m, q36_vision_tensorf(m, il, norm_names[i]), INK_V_WIDTH))) return false;
+    const float *ls1 = q36_vision_f32(m, q36_vision_tensorf(m, il, "ls1.weight"), INK_V_WIDTH);
+    const float *ls2 = q36_vision_f32(m, q36_vision_tensorf(m, il, "ls2.weight"), INK_V_WIDTH);
+    const float *ab = q36_vision_f32(m, q36_vision_tensorf(m, il, "attn_out.bias"), INK_V_WIDTH);
+    const float *ub = q36_vision_f32(m, q36_vision_tensorf(m, il, "ffn_up.bias"), INK_V_FF);
+    const float *db = q36_vision_f32(m, q36_vision_tensorf(m, il, "ffn_down.bias"), INK_V_WIDTH);
+    if (!ls1 || !ls2 || !ab || !ub || !db) return false;
+
+    q36_vision_layer_norm(norm, x, ln[0], ln[1], rows, INK_V_WIDTH, 1e-5f);
+    const char *weights[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
+    const char *biases[] = {"attn_q.bias", "attn_k.bias", "attn_v.bias"};
+    for (unsigned p = 0; p < 3; p++) {
+        const float *bias = q36_vision_f32(m, q36_vision_tensorf(m, il, biases[p]), INK_V_WIDTH);
+        if (!bias || !q36_vision_mm(e, q36_vision_tensorf(m, il, weights[p]), norm, work,
+                                   rows, INK_V_WIDTH, INK_V_WIDTH, false)) return false;
+        for (uint32_t r = 0; r < rows; r++) for (uint32_t i = 0; i < INK_V_WIDTH; i++)
+            qkv[((size_t)r * 3 + p) * INK_V_WIDTH + i] = work[(size_t)r * INK_V_WIDTH + i] + bias[i];
+    }
+    ink_vision_rope(qkv, rows, w);
+    if (!q36_vision_attention(e, qkv, work, rows, 64u) ||
+        !q36_vision_mm(e, q36_vision_tensorf(m, il, "attn_out.weight"), work, norm,
+                       rows, INK_V_WIDTH, INK_V_WIDTH, false)) return false;
+    for (size_t i = 0; i < (size_t)rows * INK_V_WIDTH; i++)
+        x[i] += (norm[i] + ab[i % INK_V_WIDTH]) * ls1[i % INK_V_WIDTH];
+    q36_vision_layer_norm(norm, x, ln[2], ln[3], rows, INK_V_WIDTH, 1e-5f);
+    if (!q36_vision_mm(e, q36_vision_tensorf(m, il, "ffn_up.weight"), norm, wide,
+                       rows, INK_V_WIDTH, INK_V_FF, false)) return false;
+    q36_vision_gelu_bias(wide, ub, rows, INK_V_FF);
+    if (!q36_vision_mm(e, q36_vision_tensorf(m, il, "ffn_down.weight"), wide, norm,
+                       rows, INK_V_FF, INK_V_WIDTH, false)) return false;
+    for (size_t i = 0; i < (size_t)rows * INK_V_WIDTH; i++)
+        x[i] += (norm[i] + db[i % INK_V_WIDTH]) * ls2[i % INK_V_WIDTH];
+    return true;
+}
+
+static int ink_vision_encode(q36_engine *e, const q36_image *image,
+                             q36_vision_embedding *out, char *err, size_t errlen) {
+    const q36_model *m = &e->vision_model;
+    q36_image_patches patches;
+    if (!q36_image_preprocess_inkling(&patches, image, err, errlen)) return 0;
+    const uint32_t rows = patches.patch_count + 1, w = patches.grid_width, h = patches.grid_height;
+    const uint32_t merged = patches.image_token_count;
+    size_t base = (size_t)rows * INK_V_WIDTH;
+    float *x = malloc(base * sizeof(float)), *norm = malloc(base * sizeof(float));
+    float *work = malloc(base * sizeof(float)), *qkv = malloc(3 * base * sizeof(float));
+    float *wide = malloc((size_t)rows * INK_V_FF * sizeof(float));
+    const char *failure = "unable to allocate Inkling vision workspace";
+    if (!x || !norm || !work || !qkv || !wide) goto done;
+
+    const float *cls = q36_vision_f32(m, model_find_tensor(m, "v.class_embd"), INK_V_WIDTH);
+    const float *cls_pos = q36_vision_f32(m, model_find_tensor(m, "v.class_position_embd.weight"), INK_V_WIDTH);
+    const float *pos = q36_vision_f32(m, model_find_tensor(m, "v.position_embd.weight"), INK_V_WIDTH * INK_V_POS * INK_V_POS);
+    const float *pre_w = q36_vision_f32(m, model_find_tensor(m, "v.pre_ln.weight"), INK_V_WIDTH);
+    const float *pre_b = q36_vision_f32(m, model_find_tensor(m, "v.pre_ln.bias"), INK_V_WIDTH);
+    q36_tensor *patch = model_find_tensor(m, "v.patch_embd.weight");
+    failure = "invalid Inkling vision input tensors";
+    if (!cls || !cls_pos || !pos || !pre_w || !pre_b || !patch || patch->ndim != 4 ||
+        patch->dim[0] != 20 || patch->dim[1] != 20 || patch->dim[2] != 3 || patch->dim[3] != INK_V_WIDTH ||
+        !q36_vision_mm(e, patch, patches.patches, x + INK_V_WIDTH,
+                       rows - 1, 20 * 20 * 3, INK_V_WIDTH, false)) goto done;
+    for (unsigned i = 0; i < INK_V_WIDTH; i++) x[i] = cls[i] + cls_pos[i];
+    ink_vision_position(x + INK_V_WIDTH, pos, w, h);
+    q36_vision_layer_norm(x, x, pre_w, pre_b, rows, INK_V_WIDTH, 1e-5f);
+    failure = "Inkling vision encoder layer failed";
+    for (unsigned il = 0; il < INK_V_LAYERS; il++)
+        if (!ink_vision_layer(e, il, rows, w, x, norm, qkv, work, wide)) goto done;
+
+    // Merge 2x2 tiles in raster order after discarding CLS.
+    float *tiles = qkv;
+    for (uint32_t y = 0; y < h; y += 2) for (uint32_t z = 0; z < w; z += 2)
+        for (uint32_t dy = 0; dy < 2; dy++) {
+            memcpy(tiles, x + (size_t)(1 + (y + dy) * w + z) * INK_V_WIDTH, 2u * INK_V_WIDTH * sizeof(float));
+            tiles += 2u * INK_V_WIDTH;
+        }
+    failure = "Inkling vision projector failed";
+    if (!q36_vision_mm(e, model_find_tensor(m, "mm.1.weight"), qkv, wide,
+                       merged, INK_V_FF, INK_V_FF, false)) goto done;
+    q36_vision_gelu_bias(wide, NULL, merged, INK_V_FF);
+    out->data = malloc((size_t)merged * Q36_N_EMBD * sizeof(float));
+    if (!out->data || !q36_vision_mm(e, model_find_tensor(m, "mm.2.weight"), wide, out->data,
+                                     merged, INK_V_FF, Q36_N_EMBD, false)) {
+        free(out->data);
+        out->data = NULL;
+        goto done;
+    }
+    out->token_count = merged;
+    out->grid_width = w / 2;
+    out->grid_height = h / 2;
+    out->width = image->width;
+    out->height = image->height;
+    memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
+    failure = NULL;
+done:
+    free(x); free(norm); free(work); free(qkv); free(wide);
+    q36_image_patches_free(&patches);
+    q36_vision_drop_pages(m);
+    if (failure && err && errlen) snprintf(err, errlen, "%s", failure);
+    return !failure;
 }
 
 static int q36_vision_encode_image(q36_engine *e, const q36_image *image,
@@ -4520,15 +4782,15 @@ static int q36_vision_encode_image(q36_engine *e, const q36_image *image,
             if (err && errlen) snprintf(err, errlen, "invalid vision block %u", il);
             goto done;
         }
-        q36_vision_layer_norm(norm, x, ln1wp, ln1bp, rows, 1152u);
+        q36_vision_layer_norm(norm, x, ln1wp, ln1bp, rows, 1152u, 1.0e-6f);
         if (!q36_vision_mm(e, qkvw, norm, qkv, rows, 1152u, 3456u, false)) goto bad_mm;
         q36_vision_bias_residual(qkv, qkvbp, NULL, rows, 3456u);
         q36_vision_rope(qkv, rows, patches.grid_width);
-        if (!q36_vision_attention(e, qkv, work, rows)) goto bad_mm;
+        if (!q36_vision_attention(e, qkv, work, rows, 72u)) goto bad_mm;
         if (!q36_vision_mm(e, outw, work, norm, rows, 1152u, 1152u, false)) goto bad_mm;
         q36_vision_bias_residual(norm, outbp, x, rows, 1152u);
         memcpy(x, norm, base_values * sizeof(*x));
-        q36_vision_layer_norm(norm, x, ln2wp, ln2bp, rows, 1152u);
+        q36_vision_layer_norm(norm, x, ln2wp, ln2bp, rows, 1152u, 1.0e-6f);
         if (!q36_vision_mm(e, upw, norm, wide, rows, 1152u, 4304u, false)) goto bad_mm;
         q36_vision_gelu_bias(wide, upbp, rows, 4304u);
         if (!q36_vision_mm(e, downw, wide, norm, rows, 4304u, 1152u, false)) goto bad_mm;
@@ -4552,7 +4814,7 @@ bad_mm:
             if (err && errlen) snprintf(err, errlen, "invalid vision merger tensors");
             goto done;
         }
-        q36_vision_layer_norm(norm, x, postw, postb, rows, 1152u);
+        q36_vision_layer_norm(norm, x, postw, postb, rows, 1152u, 1.0e-6f);
         memcpy(merged_in, norm, base_values * sizeof(*norm));
         if (!q36_vision_mm(e, mm0, merged_in, wide, merged, 4608u, 4608u, false)) goto merger_bad;
         q36_vision_gelu_bias(wide, mm0b, merged, 4608u);
@@ -4579,12 +4841,7 @@ merger_bad:
 done:
     free(x); free(norm); free(qkv); free(work); free(wide);
     q36_image_patches_free(&patches);
-#ifdef MADV_DONTNEED
-    madvise((void *)m->map, (size_t)m->size, MADV_DONTNEED);
-#endif
-#ifdef POSIX_FADV_DONTNEED
-    posix_fadvise(m->fd, 0, (off_t)m->size, POSIX_FADV_DONTNEED);
-#endif
+    q36_vision_drop_pages(m);
     return ok;
 }
 
@@ -5893,10 +6150,32 @@ static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
 #ifndef Q36_METAL
         if (input_fd >= 0) cached = q36_gpu_cache_model_range_from_fd(
             e->model.map,e->model.size,t->abs_offset,t->bytes,input_fd) != 0;
+        else if (e->ink && t!=e->weights.token_embd && t->ndim>=2 && t->dim[1]%8==0 &&
+            ((t->type==Q36_TENSOR_F32 && ((t->dim[0]==64 && t->dim[1]%64==0) ||
+              (t->dim[0]==4608 && t->dim[1]==64) || (t->dim[0]==2304 && t->dim[1]==128))) ||
+             (t->type==Q36_TENSOR_IQ4_NL && t->dim[0]==1152) || t->type==Q36_TENSOR_Q8_0 ||
+             t->type==Q36_TENSOR_NVFP4 || t->type==Q36_TENSOR_IQ3_XXS ||
+             t->type==Q36_TENSOR_IQ2_S || t->type==Q36_TENSOR_IQ2_XS || t->type==Q36_TENSOR_IQ2_XXS))
+            cached=q36_gpu_inkling_cache(e->model.map,e->model.size,t->abs_offset,t->bytes,t->type,t->dim[0]);
         else
 #endif
         cached = q36_gpu_cache_model_range(e->model.map,e->model.size,t->abs_offset,t->bytes,NULL) != 0;
         if (cached) {
+#ifdef MADV_DONTNEED
+            /* Inkling stages these weights into UMA. Release complete source
+             * pages after the copy, while keeping CPU embeddings mapped. */
+            if (e->ink && t->bytes >= (1u<<20)) {
+                size_t page = (size_t)getpagesize();
+                uint64_t begin = ((t->abs_offset+page-1)/page)*page;
+                uint64_t end = (t->abs_offset+t->bytes)/page*page;
+                if (end > begin) {
+                    madvise((void *)(e->model.map+begin),end-begin,MADV_DONTNEED);
+#ifdef POSIX_FADV_DONTNEED
+                    posix_fadvise(e->model.fd,begin,end-begin,POSIX_FADV_DONTNEED);
+#endif
+                }
+            }
+#endif
             resident_bytes += t->bytes;
             resident_tensors++;
         } else {
@@ -5938,6 +6217,7 @@ static bool q36_vulkan_prewarm_weights(const q36_engine *e) {
 #endif
 
 #include "q36_qwen4_model.inc"
+#include "q36_inkling_model.inc"
 
 static void config_validate_model(const q36_model *m) {
     char key[128];
@@ -5948,6 +6228,10 @@ static void config_validate_model(const q36_model *m) {
     q36_str arch = required_string(m, "general.architecture");
     q36_str tok_model = required_string(m, "tokenizer.ggml.model");
     q36_str tok_pre = required_string(m, "tokenizer.ggml.pre");
+    if (q36_streq(arch, "inkling2_loop")) {
+        ink_config(m);
+        return;
+    }
     if (q36_streq(arch, "qwen4exp")) {
         q36_q4_config(m);
         return;
@@ -9715,8 +9999,15 @@ static bool q36_mtp_pick(q36_session *s, int excluded_id, int *token, float *mar
 #endif
 
 #include "q36_qwen4.inc"
+#include "q36_inkling.inc"
+#include "q36_inkling_gpu.inc"
 
 static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool compute_logits) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN)
+        return ink_vk_forward(s,&token,NULL,1,pos,compute_logits);
+#endif
+    if (s->engine->ink) return ink_forward(s, token, pos, compute_logits);
     if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) return q36_q4_forward(s, token, pos, compute_logits);
     q36_engine *e;
     q36_cpu_runtime *rt;
@@ -9927,6 +10218,12 @@ static int bpe_rank(const q36_vocab *vocab, const owned_str *a, const owned_str 
 static void bpe_emit_piece(const q36_vocab *vocab, q36_str raw_piece, token_vec *out) {
     uint64_t encoded_len = 0;
     char *encoded = byte_encode(raw_piece, &encoded_len);
+    int whole;
+    if (vocab->inkling && table_get(&vocab->token_to_id, encoded, encoded_len, &whole)) {
+        q36_tokens_push(out, whole);
+        free(encoded);
+        return;
+    }
     int n_sym = 0;
     int cap_sym = 32;
     owned_str *sym = xcalloc((size_t)cap_sym, sizeof(sym[0]));
@@ -10038,7 +10335,10 @@ static uint64_t qwen_consume_letters(const char *s, uint64_t len, uint64_t pos) 
     return pos;
 }
 
+#include "q36_inkling_tokenizer.inc"
+
 static void bpe_tokenize_text(const q36_vocab *vocab, const char *text, token_vec *out) {
+    if (vocab->inkling) { ink_tokenize(vocab,text,out); return; }
     uint64_t len = strlen(text);
     uint64_t pos = 0;
     while (pos < len) {
@@ -10162,6 +10462,24 @@ static void vocab_load(q36_vocab *vocab, const q36_model *model) {
         q36_str merge;
         if (!cursor_string(&c, &merge)) q36_die(c.error);
         table_put(&vocab->merge_rank, merge, (int)i);
+    }
+    if (g_q36_shape.variant == Q36_VARIANT_INKLING) {
+        if ((uint32_t)vocab->n_vocab != Q36_N_VOCAB) q36_die("invalid Inkling vocabulary");
+        vocab->inkling = true;
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab_lookup(vocab, "<|content_model_end_sampling|>");
+        config_expect_u32("tokenizer.ggml.eos_token_id",
+            required_u32(model, "tokenizer.ggml.eos_token_id"), vocab->eos_id);
+        vocab->im_start_id = vocab_lookup(vocab, "<|message_model|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|end_message|>");
+        vocab->content_text_id = vocab_lookup(vocab, "<|content_text|>");
+        vocab->think_start_id = vocab_lookup(vocab, "<|content_thinking|>");
+        vocab->think_end_id = vocab->im_end_id;
+        vocab->vision_start_id = vocab_lookup(vocab, "<|content_image|>");
+        vocab->vision_end_id = vocab->im_end_id;
+        vocab->image_pad_id = vocab_lookup(vocab, "<|unused_200054|>");
+        vocab->video_pad_id = -1;
+        return;
     }
     vocab->bos_id = (int)required_u32(model, "tokenizer.ggml.bos_token_id");
     vocab->eos_id = (int)required_u32(model, "tokenizer.ggml.eos_token_id");
@@ -10300,14 +10618,28 @@ static void chat_append_close_role(q36_engine *e, token_vec *tokens) {
     bpe_tokenize_text(&e->vocab, "\n", tokens);
 }
 
+static const char *ink_chat_role(const char *role) {
+    return !strcmp(role, "system") ? "<|message_system|>" :
+           !strcmp(role, "assistant") ? "<|message_model|>" :
+           !strcmp(role, "user") ? "<|message_user|>" : "<|message_tool|>";
+}
+
 void q36_chat_append_max_effort_prefix(q36_engine *e, q36_tokens *tokens) {
-    bpe_tokenize_text(&e->vocab, Q36_REASONING_EFFORT_MAX_PREFIX, tokens);
+    if (!e->ink) bpe_tokenize_text(&e->vocab, Q36_REASONING_EFFORT_MAX_PREFIX, tokens);
 }
 
 void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role, const char *content) {
     if (!role) role = "user";
     if (!content) content = "";
     if (!strcmp(role, "developer")) role = "system";
+    if (e->ink) {
+        q36_tokenize_rendered_chat(e,ink_chat_role(role),tokens);
+        q36_tokenize_rendered_chat(e,"<|content_text|>",tokens);
+        q36_tokenize_rendered_chat(e,content,tokens);
+        q36_tokens_push(tokens,e->vocab.im_end_id);
+        if (!strcmp(role,"assistant")) q36_tokens_push(tokens,e->vocab.eos_id);
+        return;
+    }
     if (!strcmp(role, "tool") || !strcmp(role, "function")) {
         char *text = q36_chat_content_text(content, false);
         chat_append_open_role(e, tokens, "user");
@@ -10347,6 +10679,16 @@ int q36_chat_append_multimodal_message(q36_engine *e, q36_tokens *tokens,
         return 1;
     }
     bool tool = !strcmp(role, "tool");
+    if (e->ink) {
+        if (!tool && strcmp(role, "user")) goto invalid;
+        for (size_t i = 0; i <= image_count; i++) {
+            if (parts[i] && parts[i][0]) q36_chat_append_message(e, tokens, role, parts[i]);
+            if (i == image_count) break;
+            q36_tokenize_rendered_chat(e, ink_chat_role(role), tokens);
+            if (!q36_prompt_append_vision(e, tokens, &spans[i], &images[i], err, errlen)) return 0;
+        }
+        return 1;
+    }
     chat_append_open_role(e, tokens, tool ? "user" : role);
     if (tool) q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
     for (size_t i = 0; i <= image_count; i++) {
@@ -10368,6 +10710,13 @@ int q36_chat_append_vision_message(q36_engine *e, q36_tokens *tokens,
                                     char *err, size_t errlen) {
     if (!e || !tokens || !span || !embedding) return 0;
     char *text = q36_chat_content_text(content, true);
+    if (e->ink) {
+        const char *parts[] = {NULL, text};
+        int ok = q36_chat_append_multimodal_message(e, tokens, role ? role : "user",
+                                                   parts, embedding, 1, span, err, errlen);
+        free(text);
+        return ok;
+    }
     chat_append_open_role(e, tokens, role ? role : "user");
     if (text[0]) q36_tokenize_rendered_chat(e, text, tokens);
     free(text);
@@ -10378,6 +10727,48 @@ int q36_chat_append_vision_message(q36_engine *e, q36_tokens *tokens,
 }
 
 void q36_chat_append_assistant_prefix(q36_engine *e, q36_tokens *tokens, q36_think_mode think_mode) {
+    if (e->ink) {
+        /* Emit the effort message between leading system messages and the
+         * first user turn, as specified by the embedded chat template. */
+        int system = vocab_lookup(&e->vocab,"<|message_system|>");
+        int at = 0, prev = -1;
+        while (at < tokens->len && tokens->v[at] == system) {
+            prev = at++;
+            while (at < tokens->len && tokens->v[at++] != e->vocab.im_end_id) {}
+        }
+
+        static const char *levels[] = {
+            [Q36_THINK_NONE] = "0", [Q36_THINK_MINIMAL] = "0.1", [Q36_THINK_LOW] = "0.2",
+            [Q36_THINK_MEDIUM] = "0.7", [Q36_THINK_HIGH] = "0.9", [Q36_THINK_XHIGH] = "0.99"
+        };
+        int level = q36_model_think_mode(e, think_mode);
+        char effort[64];
+        q36_tokens prefix = {0};
+        int replace = 0;
+        /* Later turns can change effort. Replace the previous template
+         * message only if it exactly matches a native level. */
+        for (int i = 0; prev >= 0 && i <= Q36_THINK_MINIMAL; i++) {
+            if (!levels[i]) continue;
+            prefix.len = 0;
+            snprintf(effort,sizeof(effort),"Thinking effort level: %s",levels[i]);
+            q36_chat_append_message(e,&prefix,"system",effort);
+            if (at-prev != prefix.len || memcmp(tokens->v+prev,prefix.v,prefix.len*sizeof(int))) continue;
+            if (i == level) { q36_tokens_free(&prefix); return; }
+            replace = prefix.len;
+            break;
+        }
+        prefix.len = 0;
+        snprintf(effort,sizeof(effort),"Thinking effort level: %s",levels[level]);
+        q36_chat_append_message(e,&prefix,"system",effort);
+        int n = tokens->len;
+        for (int i = replace; i < prefix.len; i++) q36_tokens_push(tokens,0);
+        memmove(tokens->v+at-replace+prefix.len,tokens->v+at,(n-at)*sizeof(int));
+        tokens->len = n-replace+prefix.len;
+        at -= replace;
+        memcpy(tokens->v+at,prefix.v,prefix.len*sizeof(int));
+        q36_tokens_free(&prefix);
+        return;
+    }
     chat_append_open_role(e, tokens, "assistant");
     if (think_mode == Q36_THINK_NONE) {
         q36_tokenize_rendered_chat(e, "<think>\n\n</think>\n\n", tokens);
@@ -10491,6 +10882,28 @@ char *q36_token_text(q36_engine *e, int token, size_t *len) {
     if (len) *len = n;
     return out;
 }
+
+/* Convert native chat framing only for display. Transcripts, logprobs and
+ * checkpoint replay keep the model's original tokens. */
+char *q36_chat_token_text(q36_engine *e, int token, bool show_thinking, bool *thinking, size_t *len) {
+    if (!e || !e->vocab.inkling || !thinking) return q36_token_text(e,token,len);
+    const q36_vocab *v = &e->vocab;
+    const char *piece = "";
+    if (token == v->think_start_id) {
+        if (show_thinking) piece = "<think>";
+        *thinking = true;
+    } else if (token == v->im_end_id || token == v->content_text_id) {
+        if (show_thinking && *thinking) piece = "</think>";
+        *thinking = false;
+    } else if (token != v->im_start_id && (show_thinking || !*thinking)) {
+        return q36_token_text(e,token,len);
+    }
+    if (len) *len = strlen(piece);
+    return q36_strdup(piece);
+}
+
+bool q36_engine_is_inkling(q36_engine *e) { return e && e->ink; }
+int q36_token_think_end(q36_engine *e) { return e ? e->vocab.think_end_id : -1; }
 
 int q36_token_eos(q36_engine *e) {
     return e ? e->vocab.eos_id : -1;
@@ -10962,6 +11375,35 @@ static bool q36_load_activation_dump(q36_engine *e) {
     return true;
 }
 
+static bool q36_load_vision(q36_engine *e, const char *path) {
+    if (!path || !path[0]) return true;
+    q36_model *m = &e->vision_model;
+    model_open(m, path, false);
+    q36_str arch, projector;
+    q36_tensor *projection = model_find_tensor(m, "mm.2.weight");
+    if (!model_get_string(m, "general.architecture", &arch) || !q36_streq(arch, "clip") ||
+        !model_get_string(m, e->ink ? "clip.vision.projector_type" : "clip.projector_type", &projector) ||
+        !q36_streq(projector, e->ink ? "inkling2v" : "qwen3vl_merger") ||
+        !projection || projection->type != Q36_TENSOR_F16 || projection->ndim != 2 ||
+        projection->dim[0] != (e->ink ? INK_V_FF : 4608u) || projection->dim[1] != Q36_N_EMBD) {
+        fprintf(stderr, "q36: vision sidecar does not match the language model\n");
+        return false;
+    }
+#ifdef MADV_RANDOM
+    madvise((void *)m->map, (size_t)m->size, MADV_RANDOM);
+#endif
+    q36_vision_drop_pages(m);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (e->backend == Q36_BACKEND_VULKAN && !q36_gpu_vision_stream_init(m->max_tensor_bytes)) {
+        fprintf(stderr, "q36: unable to allocate streamed vision weight buffer\n");
+        return false;
+    }
+#endif
+    e->vision_ready = true;
+    fprintf(stderr, "q36: vision sidecar mapped from disk: %s\n", path);
+    return true;
+}
+
 int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     q36_engine *e;
     if (!out || !opt || !opt->model_path || !opt->model_path[0]) return 1;
@@ -11057,6 +11499,40 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
     e->variant = g_q36_shape.variant;
+    if (e->variant == Q36_VARIANT_INKLING) {
+        if (e->backend == Q36_BACKEND_METAL ||
+            (opt->vision_path && e->backend != Q36_BACKEND_VULKAN) || opt->mtp_path ||
+            opt->directional_steering_file || getenv("Q36_GRAPH_DUMP_PREFIX") || e->ssd_streaming ||
+            q36_dist_enabled(&e->distributed) || !q36_kv_cache_row_bytes(e->cache_type_k,32) ||
+            !q36_kv_cache_row_bytes(e->cache_type_v,32)) {
+            fprintf(stderr, "q36: unsupported Inkling engine options\n");
+            q36_engine_close(e);
+            return 1;
+        }
+        vocab_load(&e->vocab, &e->model);
+        e->ink = ink_bind(&e->model);
+        e->routed_quant_bits = q36_quant_bits_from_type(e->ink->layer[0].gate_up->type);
+        if (!q36_load_vision(e, opt->vision_path)) {
+            q36_engine_close(e);
+            return 1;
+        }
+
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend == Q36_BACKEND_VULKAN) {
+            e->weights.token_embd = (q36_tensor *)e->ink->embd;
+            e->weights.output = (q36_tensor *)e->ink->output;
+            if (!q36_vulkan_set_model_spans(e) || !q36_vulkan_prewarm_weights(e) || !q36_gpu_finish_model_cache()) {
+                fprintf(stderr,"q36: unable to make Inkling weights resident on one device\n");
+                q36_engine_close(e);
+                return 1;
+            }
+        }
+#endif
+        e->cpu_prefill_cap = 1;
+        q36_cpu_threads_reserve(e->n_threads);
+        *out = e;
+        return 0;
+    }
     uint32_t file_type = 0;
     model_get_u32(&e->model,"general.file_type",&file_type);
     e->precise_prefill = Q36_MODEL_DENSE && file_type == Q36_GGUF_FTYPE_Q6_K;
@@ -11086,34 +11562,9 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         q36_engine_close(e);
         return 1;
     }
-    if (opt->vision_path && opt->vision_path[0]) {
-        model_open(&e->vision_model, opt->vision_path, false);
-        q36_str arch = required_string(&e->vision_model, "general.architecture");
-        q36_str projector = required_string(&e->vision_model, "clip.projector_type");
-        q36_tensor *projection = model_find_tensor(&e->vision_model, "mm.2.weight");
-        if (!q36_streq(arch, "clip") || !q36_streq(projector, "qwen3vl_merger") ||
-            !projection || projection->type != Q36_TENSOR_F16 ||
-            projection->dim[0] != 4608u || projection->dim[1] != Q36_N_EMBD) {
-            fprintf(stderr, "q36: vision sidecar does not match the language model\n");
-            q36_engine_close(e);
-            return 1;
-        }
-#ifdef MADV_RANDOM
-        madvise((void *)e->vision_model.map, (size_t)e->vision_model.size, MADV_RANDOM);
-#endif
-#ifdef MADV_DONTNEED
-        madvise((void *)e->vision_model.map, (size_t)e->vision_model.size, MADV_DONTNEED);
-#endif
-#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
-        if (e->backend == Q36_BACKEND_VULKAN &&
-            !q36_gpu_vision_stream_init(e->vision_model.max_tensor_bytes)) {
-            fprintf(stderr, "q36: unable to allocate streamed vision weight buffer\n");
-            q36_engine_close(e);
-            return 1;
-        }
-#endif
-        e->vision_ready = true;
-        fprintf(stderr, "q36: vision sidecar mapped from disk: %s\n", opt->vision_path);
+    if (!q36_load_vision(e, opt->vision_path)) {
+        q36_engine_close(e);
+        return 1;
     }
     if (e->variant == Q36_VARIANT_FLASH_NEXT) {
         if (e->backend == Q36_BACKEND_METAL || opt->mtp_path || opt->vision_path ||
@@ -11397,6 +11848,7 @@ void q36_engine_close(q36_engine *e) {
     q36_gpu_tensor_free(e->session_batch_logits);
     if (q36_backend_uses_graph(e->backend)) q36_gpu_cleanup();
 #endif
+    free(e->ink);
     free(e->directional_steering_dirs);
     vocab_free(&e->vocab);
     model_close(&e->vision_model);
@@ -11432,11 +11884,12 @@ static int q36_engine_vision_encode(q36_engine *e, q36_image *image,
         if (err && errlen) snprintf(err, errlen, "vision is not enabled; pass --vision FILE");
         return 0;
     }
-    if (!q36_engine_uses_vulkan_runtime(e)) {
+    if (e->ink ? e->backend != Q36_BACKEND_VULKAN : !q36_engine_uses_vulkan_runtime(e)) {
         if (err && errlen) snprintf(err, errlen, "vision requires the Vulkan backend");
         return 0;
     }
-    return q36_vision_encode_image(e, image, out, err, errlen);
+    return e->ink ? ink_vision_encode(e, image, out, err, errlen) :
+                    q36_vision_encode_image(e, image, out, err, errlen);
 }
 
 int q36_engine_vision_encode_file(q36_engine *e, const char *path,
@@ -11499,6 +11952,7 @@ int q36_engine_set_power(q36_engine *e, int power_percent) {
 }
 
 const char *q36_engine_model_name(q36_engine *e) {
+    if (e && e->ink) return "inkling-2-mini";
     if (e && e->variant == Q36_VARIANT_FLASH_NEXT) return "qwen3.8-flash-next";
     if (e && e->variant == Q36_VARIANT_27B) return "qwen3.8-27b";
     return "qwen3.6-35b-a3b";
@@ -11506,6 +11960,7 @@ const char *q36_engine_model_name(q36_engine *e) {
 
 int q36_engine_model_id(q36_engine *e) {
     /* Different dense weights must never restore each other's KV state. */
+    if (e && e->ink) return 6;
     if (e && e->variant == Q36_VARIANT_FLASH_NEXT) return 5;
     if (e && e->variant == Q36_VARIANT_27B && e->gsq_rco) return 4;
     return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
@@ -11519,6 +11974,10 @@ void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
                                   int *top_k, float *top_p, float *min_p) {
     (void)e;
     if (!temperature || !top_k || !top_p || !min_p) return;
+    if (e && e->ink) {
+        *temperature = 1; *top_k = 0; *top_p = 1; *min_p = 0;
+        return;
+    }
     *temperature = Q36_DEFAULT_TEMPERATURE;
     *top_k = 0;
     *top_p = Q36_DEFAULT_TOP_P;
@@ -11692,7 +12151,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0 || ctx_size > Q36_CONTEXT_ALLOC_MAX) return 1;
     uint64_t reserved = 0;
 #ifndef Q36_NO_GPU
-    if (e->variant != Q36_VARIANT_FLASH_NEXT && !q36_streaming_reserve_session(e, ctx_size, &reserved)) {
+    if (!e->ink && e->variant != Q36_VARIANT_FLASH_NEXT && !q36_streaming_reserve_session(e, ctx_size, &reserved)) {
         fprintf(stderr, "q36: requested context leaves insufficient SSD streaming memory\n");
         return 1;
     }
@@ -11708,7 +12167,13 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     memset(s->logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->logits));
     s->logits_host_valid = true;
     s->gpu_top2_valid = false;
-    if (e->variant == Q36_VARIANT_FLASH_NEXT) {
+    if (e->ink) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (e->backend==Q36_BACKEND_VULKAN) s->runtime=ink_vk_create(e);
+        else
+#endif
+        s->runtime = xcalloc(1, sizeof(ink_state));
+    } else if (e->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_q4_state *rt = xcalloc(1, sizeof(*rt));
         q36_q4_state_init(rt, ctx_size < 256 ? (uint32_t)ctx_size : 256);
         s->runtime = rt;
@@ -11775,7 +12240,13 @@ void q36_session_free(q36_session *s) {
     s->engine->session_bytes -= s->reserved_context_bytes;
     s->engine->live_sessions--;
     q36_tokens_free(&s->checkpoint);
-    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+    if (s->engine->ink) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (s->engine->backend==Q36_BACKEND_VULKAN) ink_vk_free(s->runtime);
+        else
+#endif
+        ink_free(s->runtime);
+    } else if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_q4_state_free(s->runtime);
         free(s->runtime);
     } else if (q36_engine_uses_vulkan_runtime(s->engine)) {
@@ -11805,6 +12276,10 @@ int q36_session_power(q36_session *s) {
 static bool q36_session_reserve_kv(q36_session *s, uint32_t need,
                                    uint32_t rows) {
     if (!s || need > (uint32_t)s->ctx_size) return false;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN) return ink_vk_reserve(s,need);
+#endif
+    if (s->engine->ink) return ink_reserve(s, need);
     if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) return q36_q4_reserve(s->runtime, need);
 #ifdef Q36_NO_GPU
     (void)rows;
@@ -11912,14 +12387,27 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
             if (err && errlen) snprintf(err, errlen, "interrupted");
             return Q36_SESSION_SYNC_INTERRUPTED;
         }
-        if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
-            if (!q36_q4_reserve(s->runtime, (uint32_t)i + 1) ||
-                !q36_q4_forward(s, prompt->v[i], (uint32_t)i, i + 1 == prompt->len)) {
-                if (err && errlen) snprintf(err, errlen, "Flash Next prefill failed at token %d", i);
+        if (s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+            unsigned n=1;
+            bool ok;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+            if (s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN) {
+                n=ink_vk_batch(s->engine->prefill_cap_override);
+                if (n>(unsigned)(prompt->len-i)) n=prompt->len-i;
+                /* The prefix length is known. Allocate its pages once across
+                 * all prefill chunks so retired KV buffers do not pile up. */
+                ok=q36_session_reserve_kv(s,prompt->len,i) &&
+                   ink_vk_forward(s,prompt->v+i,NULL,n,i,i+n==(unsigned)prompt->len);
+            } else
+#endif
+            ok=q36_session_reserve_kv(s,i+1,i) &&
+               q36_forward_token_cpu(s,prompt->v[i],i,i+1==prompt->len);
+            if (!ok) {
+                if (err && errlen) snprintf(err, errlen, "prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 return 1;
             }
-            q36_tokens_push(&s->checkpoint, prompt->v[i++]);
+            for (unsigned j=0;j<n;j++) q36_tokens_push(&s->checkpoint,prompt->v[i++]);
             s->checkpoint_valid = true;
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
             if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_chunk", i, prompt->len);
@@ -12043,7 +12531,8 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
         if (err && errlen) snprintf(err, errlen, "invalid vision sync arguments");
         return 1;
     }
-    if (!q36_engine_uses_vulkan_runtime(s->engine)) {
+    bool ink = s->engine->ink != NULL;
+    if (ink ? s->engine->backend != Q36_BACKEND_VULKAN : !q36_engine_uses_vulkan_runtime(s->engine)) {
         if (err && errlen) snprintf(err, errlen, "vision prompts require the Vulkan backend");
         return 1;
     }
@@ -12098,6 +12587,12 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
 
 
 #ifndef Q36_NO_GPU
+    uint32_t cap;
+#ifndef Q36_METAL
+    if (ink) cap = ink_vk_batch(s->engine->prefill_cap_override);
+    else
+#endif
+        cap = ((q36_vulkan_runtime *)s->runtime)->prefill_cap;
     if (!reuse) q36_gpu_stream_expert_cache_reset_route_hotness();
     for (size_t k = first_image; k < image_count; k++) {
         const q36_vision_span *span = &images[k];
@@ -12107,20 +12602,20 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
         if (rc != 0) return rc;
         pos = prefix.len;
         uint32_t base = (uint32_t)((int32_t)pos + s->rope_delta);
-        uint32_t *positions = malloc((uint64_t)span->embedding.token_count *
-                                     3u * sizeof(*positions));
-        if (!positions) {
-            if (err && errlen) snprintf(err, errlen,
-                                        "unable to allocate vision positions");
-            return 1;
-        }
-        for (uint32_t i = 0; i < span->embedding.token_count; i++) {
-            positions[i * 3u] = base;
-            positions[i * 3u + 1u] = base + i / span->embedding.grid_width;
-            positions[i * 3u + 2u] = base + i % span->embedding.grid_width;
+        uint32_t *positions = NULL;
+        if (!ink) {
+            positions = malloc((uint64_t)span->embedding.token_count * 3u * sizeof(*positions));
+            if (!positions) {
+                if (err && errlen) snprintf(err, errlen, "unable to allocate vision positions");
+                return 1;
+            }
+            for (uint32_t i = 0; i < span->embedding.token_count; i++) {
+                positions[i * 3u] = base;
+                positions[i * 3u + 1u] = base + i / span->embedding.grid_width;
+                positions[i * 3u + 2u] = base + i % span->embedding.grid_width;
+            }
         }
         uint32_t done = 0;
-        q36_vulkan_runtime *rt = s->runtime;
         while (done < span->embedding.token_count) {
             if (s->cancel && s->cancel(s->cancel_ud)) {
                 if (err && errlen) snprintf(err, errlen, "interrupted");
@@ -12128,15 +12623,19 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
                 return Q36_SESSION_SYNC_INTERRUPTED;
             }
             uint32_t n = span->embedding.token_count - done;
-            if (n > rt->prefill_cap) n = rt->prefill_cap;
-            if (!q36_session_reserve_kv(s, (uint32_t)pos + n,
-                                        (uint32_t)s->checkpoint.len) ||
-                !q36_forward_embeddings_vulkan(
-                    s, prompt->v + pos,
-                    span->embedding.data + (uint64_t)done * Q36_N_EMBD,
-                    positions + (uint64_t)done * 3u,
-                    n, (uint32_t)pos,
-                    pos + (int)n == prompt->len)) {
+            if (n > cap) n = cap;
+            const float *embedding = span->embedding.data + (uint64_t)done * Q36_N_EMBD;
+            bool logits = pos + (int)n == prompt->len;
+            bool ok = q36_session_reserve_kv(s, (uint32_t)pos + n, (uint32_t)s->checkpoint.len);
+            if (ok) {
+#ifndef Q36_METAL
+                if (ink) ok = ink_vk_forward(s, NULL, embedding, n, pos, logits);
+                else
+#endif
+                    ok = q36_forward_embeddings_vulkan(s, prompt->v + pos, embedding,
+                            positions + (uint64_t)done * 3u, n, (uint32_t)pos, logits);
+            }
+            if (!ok) {
                 if (err && errlen) snprintf(err, errlen,
                                              "vision prefill failed at token %d", pos);
                 s->checkpoint_valid = false;
@@ -12152,9 +12651,11 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
             if (s->display_progress) s->display_progress(s->display_progress_ud, "prefill_chunk", pos, prompt->len);
         }
         free(positions);
-        uint32_t extent = span->embedding.grid_width > span->embedding.grid_height ?
-                          span->embedding.grid_width : span->embedding.grid_height;
-        s->rope_delta = (int32_t)(base + extent) - pos;
+        if (!ink) {
+            uint32_t extent = span->embedding.grid_width > span->embedding.grid_height ?
+                              span->embedding.grid_width : span->embedding.grid_height;
+            s->rope_delta = (int32_t)(base + extent) - pos;
+        }
         s->vision_spans[k] = *span;
         s->vision_spans[k].embedding.data = NULL;
         s->vision_count = k + 1;
@@ -12212,6 +12713,12 @@ static bool q36_session_ensure_logits_host(q36_session *s) {
     if (s->logits_host_valid) return true;
 #ifndef Q36_NO_GPU
 #if !defined(Q36_METAL)
+    if (s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN) {
+        ink_vk *g=s->runtime;
+        if (!s->gpu_top2_valid || !g || !q36_gpu_tensor_read(g->buf[IV_LOGITS],0,s->logits,INK_VOCAB*4)) return false;
+        s->logits_host_valid=true;
+        return true;
+    }
     if (s->engine->variant==Q36_VARIANT_FLASH_NEXT && s->engine->backend==Q36_BACKEND_VULKAN) {
         q36_q4_state *st=s->runtime;
         q36_q4_gpu *g=st ? st->gpu : NULL;
@@ -12466,7 +12973,7 @@ static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
     const char *enabled = getenv("Q36_VK_SESSION_BATCH");
     if ((enabled && enabled[0] && !strcmp(enabled, "0")) ||
         !items || count < 2 || count > 8 || !e ||
-        !q36_backend_uses_graph(e->backend) || e->ssd_streaming || e->activation_dump_prefix) {
+        !q36_engine_uses_vulkan_runtime(e) || e->ssd_streaming || e->activation_dump_prefix) {
         return false;
     }
     for (int i = 0; i < count; i++) {
@@ -12892,6 +13399,10 @@ static void q36_session_reset_runtime(q36_session *s) {
     s->slice_spec_n = 0;
     s->logits_host_valid = false;
     s->gpu_top2_valid = false;
+    if (s->engine->ink) {
+        if (s->engine->backend==Q36_BACKEND_CPU) ink_reset(s->runtime);
+        return;
+    }
     if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_q4_state *rt = s->runtime;
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
@@ -12957,6 +13468,50 @@ void q36_session_rewind(q36_session *s, int pos) {
 
 int q36_session_pos(q36_session *s) {
     return s ? s->checkpoint.len : 0;
+}
+
+uint64_t q36_session_kv_bytes(const q36_session *s) {
+    if (!s || !s->runtime) return 0;
+    uint64_t bytes = 0;
+    if (s->engine->ink) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (s->engine->backend==Q36_BACKEND_VULKAN) {
+            const ink_vk *g = s->runtime;
+            for (int i=0;i<INK_SLOTS;i++) bytes += q36_gpu_tensor_bytes(g->kv[i]);
+            return bytes;
+        }
+#endif
+        const ink_state *st = s->runtime;
+        uint32_t sliding = st->cap < INK_WINDOW ? st->cap : INK_WINDOW;
+        return (8ull*st->cap + 40ull*sliding) *
+               ink_kv_row_bytes(s->engine->cache_type_k,s->engine->cache_type_v);
+    }
+    if (s->engine->variant==Q36_VARIANT_FLASH_NEXT) {
+        const q36_q4_state *st = s->runtime;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (st->gpu) {
+            const q36_q4_gpu *g = st->gpu;
+            for (uint32_t il=3;il<Q36_N_LAYER;il+=4)
+                bytes += q36_gpu_tensor_bytes(g->k[il]) + q36_gpu_tensor_bytes(g->value[il]);
+            return bytes;
+        }
+#endif
+        return (uint64_t)(Q36_N_LAYER/4)*st->cap*2*Q36_N_HEAD_KV*Q36_N_HEAD_DIM*sizeof(float);
+    }
+#ifndef Q36_NO_GPU
+    if (q36_engine_uses_vulkan_runtime(s->engine)) {
+        const q36_vulkan_runtime *rt = s->runtime;
+        for (uint32_t il=0;il<Q36_N_LAYER;il++)
+            bytes += q36_gpu_tensor_bytes(rt->full[il].k) + q36_gpu_tensor_bytes(rt->full[il].v);
+        return bytes + q36_gpu_tensor_bytes(rt->mtp_full.k) + q36_gpu_tensor_bytes(rt->mtp_full.v);
+    }
+#endif
+    const q36_cpu_runtime *rt = s->runtime;
+    for (uint32_t il=0;il<Q36_N_LAYER;il++) {
+        const q36_full_attn_cache *c = &rt->full[il];
+        bytes += (uint64_t)c->cap*(c->k_row_bytes+c->v_row_bytes);
+    }
+    return bytes;
 }
 
 int q36_session_ctx(q36_session *s) {
@@ -13154,7 +13709,7 @@ static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
 uint64_t q36_session_payload_bytes(q36_session *s) {
     if (!s || s->vision_state) return 0;
     uint32_t rows = (uint32_t)s->checkpoint.len;
-    if (s->dist || s->engine->variant == Q36_VARIANT_FLASH_NEXT)
+    if (s->dist || s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT)
         return sizeof(q36_payload_header) + (uint64_t)rows * sizeof(int32_t);
     bool typed = s->engine &&
         (s->engine->cache_type_k != Q36_KV_CACHE_F16 ||
@@ -13285,7 +13840,7 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
     /* Replay restores PLE history as well as recurrent and attention state. */
-    if (s->dist || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+    if (s->dist || s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_payload_header h = {Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_TOKEN_ONLY, rows};
         return q36_payload_write_bytes(fp, &h, sizeof(h), err, errlen) ||
                q36_payload_write_bytes(fp, s->checkpoint.v,
@@ -13444,8 +13999,8 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         q36_payload_set_err(err, errlen, "pipeline restore requires a token-only checkpoint");
         return 1;
     }
-    if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
-        q36_payload_set_err(err,errlen,"Flash Next requires a token replay checkpoint");
+    if (s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
+        q36_payload_set_err(err,errlen,"this model requires a token replay checkpoint");
         return 1;
     }
     if (version != Q36_PAYLOAD_VERSION && version != Q36_PAYLOAD_VERSION_TYPED_KV && version != Q36_PAYLOAD_VERSION_MTP) {
@@ -13724,9 +14279,10 @@ void q36_engine_distributed_info(q36_engine *e, q36_dist_model_info *info) {
 #ifndef Q36_NO_GPU
     if (q36_engine_uses_vulkan_runtime(e)) info->prefill_cap = q36_engine_gpu_prefill_cap(e);
 #endif
+    if (e->ink && e->backend==Q36_BACKEND_VULKAN) info->prefill_cap=ink_vk_batch(e->prefill_cap_override);
     info->context_size = e->context_size;
     info->mtp = e->mtp_ready;
-    info->speculation = e->variant != Q36_VARIANT_FLASH_NEXT &&
+    info->speculation = !e->ink && e->variant != Q36_VARIANT_FLASH_NEXT &&
                         e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming;
     if (e->variant == Q36_VARIANT_FLASH_NEXT) {
         info->prefill_cap=1;
@@ -13770,7 +14326,7 @@ int q36_session_eval_layer_slice(q36_session *s, const int *tokens,
         uint32_t n_tokens, uint32_t pos0, uint32_t layer_start, uint32_t layer_end,
         const float *input_hidden, float *output_hidden, bool output_logits,
         float *logits, char *err, size_t errlen) {
-    if (!s || !tokens || !n_tokens || layer_start != s->engine->layer_start ||
+    if (!s || s->engine->ink || !tokens || !n_tokens || layer_start != s->engine->layer_start ||
         layer_end != s->engine->layer_end || pos0 != s->slice_pos ||
         pos0 > (uint32_t)s->ctx_size || n_tokens > (uint32_t)s->ctx_size - pos0 ||
         (layer_start != 0 && !input_hidden) ||
@@ -13842,7 +14398,7 @@ fail:
  * tail. Transfer that exact row, rather than normalizing it again elsewhere. */
 int q36_session_read_final_hidden(q36_session *s, uint32_t n_tokens,
         float *hidden, char *err, size_t errlen) {
-    if (!s || !s->runtime || !hidden || !n_tokens ||
+    if (!s || s->engine->ink || !s->runtime || !hidden || !n_tokens ||
         s->engine->layer_end + 1u != Q36_N_LAYER) goto fail;
     if (s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_q4_state *st = s->runtime;
@@ -13883,7 +14439,7 @@ fail:
 
 int q36_session_project_logits(q36_session *s, const float *hidden,
         float *logits, char *err, size_t errlen) {
-    if (!s || !s->runtime || !hidden || (!logits && !s->slice_spec_active)) goto fail;
+    if (!s || s->engine->ink || !s->runtime || !hidden || (!logits && !s->slice_spec_active)) goto fail;
     q36_engine *e = s->engine;
     if (e->variant == Q36_VARIANT_FLASH_NEXT) {
         if (!logits) goto fail;
@@ -13980,7 +14536,7 @@ int q36_session_pipeline_mtp_catchup(q36_session *s, const int *tokens,
 
 int q36_session_pipeline_spec_begin(q36_session *s, char *err, size_t errlen) {
 #ifndef Q36_NO_GPU
-    if (!s || s->engine->variant == Q36_VARIANT_FLASH_NEXT ||
+    if (!s || !q36_engine_uses_vulkan_runtime(s->engine) ||
         s->slice_spec_active || s->engine->backend != Q36_BACKEND_VULKAN ||
         s->engine->ssd_streaming) goto fail;
     q36_vulkan_runtime *rt = s->runtime;

@@ -20,6 +20,8 @@ TARGETS = {
     '27b-iq3-xxs': ['DENSE_SMALL_FILE'],
     'flash-next': ['FLASH_FILE', 'FLASH_NGRAM_FILE'],
     'qwen38-flash-next': ['FLASH_FILE', 'FLASH_NGRAM_FILE'],
+    'inkling-2-mini': ['INKLING_FILE'],
+    'inkling-2-mini-vision': ['INKLING_VISION_FILE'],
     'qwen36-vision': ['VISION_FILE'],
     'qwen38-vision': ['DENSE_VISION_FILE'],
 }
@@ -96,8 +98,11 @@ with out.open('ab') as dst:
                     self.assertEqual((self.out / FILES[key]).read_bytes(), PAYLOAD)
                 if 'vision' in target:
                     self.assertFalse(self.link.is_symlink())
-                    repo = ('unsloth/Qwen3.6-35B-A3B-GGUF' if target == 'qwen36-vision'
-                            else 'unsloth/Qwen3.8-27B-GGUF')
+                    repo = {
+                        'inkling-2-mini-vision': 'unsloth/Inkling-2-Mini-GGUF',
+                        'qwen36-vision': 'unsloth/Qwen3.6-35B-A3B-GGUF',
+                        'qwen38-vision': 'unsloth/Qwen3.8-27B-GGUF',
+                    }[target]
                     self.assertEqual(self.log.read_text().splitlines()[-1],
                                      f'https://huggingface.co/{repo}/resolve/main/mmproj-F16.gguf')
                 else:

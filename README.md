@@ -3,7 +3,7 @@
 </p>
 
 **QuarkStar** is a small native inference engine for **Qwen3.6-35B-A3B**,
-**Qwen3.8-27B**, and **Qwen3.8 Flash Next**.
+**Qwen3.8-27B**, **Qwen3.8 Flash Next**, and **Inkling 2 Mini**.
 It is self-contained and deliberately narrow, not a general GGUF runner.
 Use the GGUF files the project provides; they are part of the project itself.
 The main paths are model-specific Vulkan and Metal graph executors with
@@ -173,6 +173,20 @@ Leave memory for the context and runtime buffers as well as the model.
 See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
 on a smaller Mac.
 
+## Inkling 2 Mini
+
+Run Inkling 2 Mini UD-IQ3_XXS on one Vulkan board. The CPU reference backend
+also supports text inference.
+
+```sh
+./download_model.sh inkling-2-mini
+./q36 --vulkan -m gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf
+```
+
+For images, run `./download_model.sh inkling-2-mini-vision` and add
+`--vision gguf/Inkling-2-Mini-mmproj-F16.gguf`. The projector streams its
+weights from disk on demand. See [Inkling client setup](docs/CLIENTS.md#inkling-2-mini-on-one-board).
+
 ## Qwen3.8 Flash Next
 
 The `qwen4exp` text model runs on CPU and Vulkan. The GSQ-RCO Coder pack with
@@ -338,8 +352,8 @@ On Apple Silicon, use `make metal` for the last command.
 
 `q36-agent` runs inference directly, without a separate HTTP server. It keeps
 the transcript and live model state together, shows prefill progress, and
-uses Qwen's native tool format. Built-in tools cover files, search, shell
-commands, processes, and the web.
+uses the model's native tool format. Built-in tools cover files, search,
+shell commands, processes, and the web.
 
 ```sh
 ./q36-agent
@@ -367,18 +381,17 @@ targets, and matching encoders. Vision currently requires Vulkan. With the
 encoder passed as `--vision FILE`, use `/read image.png` in the CLI or
 `view_image` in the agent.
 
-Speculative decoding is opt-in with `--mtp`. Both supported model families
-include an embedded head. It can improve generation, but the gain depends on
-the workload. Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for
-setup and the difference between opportunistic and ordinary sampling.
+Speculative decoding is opt-in with `--mtp` on models with an embedded head.
+Performance depends on the workload. Read [speculative decoding](docs/SPECULATIVE_DECODING.md)
+for setup and the difference between opportunistic and ordinary sampling.
 
 ### Output and power
 
 Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
 answers, and `--think` or `/think` to enable it again. The normal sampling
 defaults are temperature 1, top-p 1, and min-p 0.05; `--temp 0` selects
-greedy output. Qwen3.8 also has reasoning effort levels; see the
-[agent guide](docs/AGENT.md#generation-and-thinking) and
+greedy output. Qwen3.8 and Inkling 2 Mini also support reasoning effort levels.
+See the [agent guide](docs/AGENT.md#generation-and-thinking) and
 [server controls](docs/SERVER.md#thinking-modes).
 
 For BC-250 clocks and thermal limits, use the system governor described in

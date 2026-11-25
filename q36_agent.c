@@ -37,6 +37,11 @@
 #include <sys/xattr.h>
 #endif
 
+static void *xmalloc(size_t n);
+static void *xrealloc(void *p, size_t n);
+static char *xstrdup(const char *s);
+#include "q36_tool_json.h"
+
 /* This is intentionally not in linenoise.h, but it is part of the existing
  * multiplexed editor implementation.  The agent uses it only to restore text
  * after Enter is pressed while the model is still busy. */
@@ -116,7 +121,7 @@ typedef struct {
     int power_percent;
     q36_think_mode think_mode;
     int thinking_budget;
-    bool qwen38;
+    bool effort_levels;
     char error[256];
 } agent_status;
 
@@ -295,6 +300,7 @@ typedef struct {
 } agent_tool_text_part;
 
 typedef struct {
+    const char *name; /* Borrowed from the parsed call until the result is appended. */
     agent_tool_text_part *parts;
     size_t part_count;
     size_t part_cap;
@@ -312,6 +318,7 @@ typedef enum {
 } agent_qwen_tool_state;
 
 typedef struct {
+    inkling_tool_stream native;
     agent_qwen_tool_state state;
     char search_tail[64];
     size_t search_len;
@@ -757,23 +764,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--think")) {
-            c.gen.think_mode = Q36_THINK_HIGH;
-            c.gen.think_mode_set = true;
-        } else if (!strcmp(arg, "--think-low")) {
-            c.gen.think_mode = Q36_THINK_LOW;
-            c.gen.think_mode_set = true;
-        } else if (!strcmp(arg, "--think-medium")) {
-            c.gen.think_mode = Q36_THINK_MEDIUM;
-            c.gen.think_mode_set = true;
-        } else if (!strcmp(arg, "--think-xhigh")) {
-            c.gen.think_mode = Q36_THINK_XHIGH;
-            c.gen.think_mode_set = true;
-        } else if (!strcmp(arg, "--think-max")) {
-            c.gen.think_mode = Q36_THINK_MAX;
-            c.gen.think_mode_set = true;
-        } else if (!strcmp(arg, "--nothink")) {
-            c.gen.think_mode = Q36_THINK_NONE;
+        } else if (!strncmp(arg, "--", 2) && q36_parse_think_option(arg + 2, &c.gen.think_mode)) {
             c.gen.think_mode_set = true;
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
@@ -938,10 +929,11 @@ static void agent_resolve_thinking_config(agent_config *cfg, bool qwen38) {
         cfg->gen.think_mode = q36_qwen38_mode_for_budget(cfg->gen.thinking_budget);
 }
 
-static q36_think_mode agent_next_think_mode(q36_think_mode mode, bool qwen38) {
-    if (!qwen38) return mode == Q36_THINK_NONE ? Q36_THINK_HIGH : Q36_THINK_NONE;
+static q36_think_mode agent_next_think_mode(q36_think_mode mode, bool levels, bool inkling) {
+    if (!levels) return mode == Q36_THINK_NONE ? Q36_THINK_HIGH : Q36_THINK_NONE;
     switch (mode) {
-    case Q36_THINK_NONE: return Q36_THINK_LOW;
+    case Q36_THINK_NONE: return inkling ? Q36_THINK_MINIMAL : Q36_THINK_LOW;
+    case Q36_THINK_XHIGH: return inkling ? Q36_THINK_NONE : Q36_THINK_LOW;
     case Q36_THINK_LOW: return Q36_THINK_MEDIUM;
     case Q36_THINK_MEDIUM: return Q36_THINK_HIGH;
     case Q36_THINK_HIGH: return Q36_THINK_XHIGH;
@@ -949,8 +941,8 @@ static q36_think_mode agent_next_think_mode(q36_think_mode mode, bool qwen38) {
     }
 }
 
-static void agent_cycle_think_mode(agent_config *cfg, bool qwen38) {
-    cfg->gen.think_mode = agent_next_think_mode(cfg->gen.think_mode, qwen38);
+static void agent_cycle_think_mode(agent_config *cfg, bool levels, bool inkling) {
+    cfg->gen.think_mode = agent_next_think_mode(cfg->gen.think_mode, levels, inkling);
     cfg->gen.think_mode_set = true;
 }
 
@@ -1485,6 +1477,23 @@ static char *agent_build_system_prompt_reminder(bool edit_upto, bool vision) {
 static void agent_append_system_prompt(q36_engine *engine, q36_tokens *tokens,
                                        const char *extra, bool *thinking,
                                        bool edit_upto) {
+    if (q36_engine_is_inkling(engine)) {
+        char *tools = agent_build_tools_prompt(edit_upto, q36_engine_has_vision(engine));
+        char *schemas = strstr(tools, "<tools>");
+        if (schemas) {
+            inkling_append_tools(engine, tokens, schemas + strlen("<tools>"));
+            *schemas = '\0';
+        }
+        char *instructions = strstr(tools, "Read defaults to a bounded chunk:");
+        q36_chat_append_message(engine, tokens, "system",
+            "You are a coding agent in a local workspace. Use the declared tools for file and system work.");
+        if (instructions) q36_chat_append_message(engine, tokens, "system", instructions);
+        char *plain = agent_chat_control_text(extra, thinking);
+        if (*plain) q36_chat_append_message(engine, tokens, "system", plain);
+        free(plain);
+        free(tools);
+        return;
+    }
     /* The built-in prompt is trusted Q36 control text.  User supplied system
      * text remains ordinary chat content. */
     char *prompt = agent_build_system_prompt(extra, thinking, edit_upto,
@@ -1529,6 +1538,12 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
+    if (q36_engine_is_inkling(w->engine)) {
+        agent_append_system_prompt(w->engine, &w->transcript, w->cfg->gen.system,
+                                   &w->thinking_enabled, w->cfg->edit_upto);
+        agent_worker_note_system_prompt_seen(w);
+        return;
+    }
     char *reminder = agent_build_system_prompt_reminder(w->cfg->edit_upto,
                                                         q36_engine_has_vision(w->engine));
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
@@ -1783,6 +1798,7 @@ static const char *agent_tool_arg_value(const agent_tool_call *call, const char 
 
 static void agent_qwen_tool_parser_free(agent_qwen_tool_parser *p) {
     if (!p) return;
+    inkling_tool_reset(&p->native);
     free(p->raw);
     agent_tool_call_free(&p->current);
     free(p->param_name);
@@ -5022,6 +5038,13 @@ static char *agent_session_title_from_prompt(const char *prompt,
  * that render to the terminal pass an explicit display budget. */
 static char *agent_session_title_from_text(const char *text, size_t text_len,
                                            size_t max_bytes) {
+    const char *native = text ? strstr(text, "<|message_user|><|content_text|>") : NULL;
+    if (native && !strncmp(text, "<|message_", 10)) {
+        native += strlen("<|message_user|><|content_text|>");
+        const char *end = strstr(native, "<|end_message|>");
+        return agent_session_title_from_span(native, end ? end : text + text_len,
+                                             max_bytes, "(empty user prompt)");
+    }
     static const char user_mark[] = "<|im_start|>user\n";
     static const char assistant_mark[] = "<|im_start|>assistant\n";
     const char *p = text ? strstr(text, user_mark) : NULL;
@@ -5507,6 +5530,43 @@ static void agent_history_render_text(agent_worker *w, const char *text,
     }
 }
 
+/* Replay native frames through the same terminal renderer as live output. */
+static char *agent_inkling_history(agent_worker *w, size_t *len) {
+    buf history = {0};
+    inkling_tool_stream stream = {0};
+    bool assistant = false, user = false, content = false;
+    for (int i = 0; i < w->transcript.len; i++) {
+        int token = w->transcript.v[i];
+        size_t n;
+        char *piece = q36_token_text(w->engine, token, &n);
+        if (!strcmp(piece, "<|message_model|>")) {
+            if (!assistant) buf_puts(&history, "<|im_start|>assistant\n");
+            assistant = true;
+        } else if (token == q36_token_eos(w->engine)) {
+            buf_puts(&history, "<|im_end|>\n");
+            assistant = false;
+        } else if (!assistant) {
+            if (!strcmp(piece, "<|message_user|>") || !strcmp(piece, "<|message_tool|>")) {
+                buf_puts(&history, "<|im_start|>user\n");
+                user = true;
+            } else if (!strcmp(piece, "<|end_message|>")) {
+                if (user) buf_puts(&history, "<|im_end|>\n");
+                user = content = false;
+            } else if (!strcmp(piece, "<|content_text|>")) content = user;
+            else if (content) buf_append(&history, piece, n);
+        }
+        free(piece);
+        if (assistant) {
+            piece = inkling_tool_piece(&stream, w->engine, token, true, &n);
+            buf_append(&history, piece, n);
+            free(piece);
+        }
+    }
+    inkling_tool_reset(&stream);
+    *len = history.len;
+    return buf_take(&history);
+}
+
 /* Render recent saved transcript text without mutating the live session. */
 static bool agent_worker_show_history(agent_worker *w, int user_turns,
                                       char *err, size_t err_len) {
@@ -5515,8 +5575,8 @@ static bool agent_worker_show_history(agent_worker *w, int user_turns,
         return false;
     }
     size_t text_len = 0;
-    char *text = q36_kvstore_render_tokens_text(w->engine, &w->transcript,
-                                                &text_len);
+    char *text = q36_engine_is_inkling(w->engine) ? agent_inkling_history(w, &text_len) :
+        q36_kvstore_render_tokens_text(w->engine, &w->transcript, &text_len);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
         return false;
@@ -7248,31 +7308,34 @@ static void test_agent_thinking_budget_modes(void) {
     AGENT_TEST_ASSERT(cfg.gen.thinking_budget == 50000);
 
     q36_think_mode mode = Q36_THINK_NONE;
-    mode = agent_next_think_mode(mode, true);
+    mode = agent_next_think_mode(mode, true, false);
     AGENT_TEST_ASSERT(mode == Q36_THINK_LOW);
-    mode = agent_next_think_mode(mode, true);
+    mode = agent_next_think_mode(mode, true, false);
     AGENT_TEST_ASSERT(mode == Q36_THINK_MEDIUM);
-    mode = agent_next_think_mode(mode, true);
+    mode = agent_next_think_mode(mode, true, false);
     AGENT_TEST_ASSERT(mode == Q36_THINK_HIGH);
-    mode = agent_next_think_mode(mode, true);
+    mode = agent_next_think_mode(mode, true, false);
     AGENT_TEST_ASSERT(mode == Q36_THINK_XHIGH);
-    mode = agent_next_think_mode(mode, true);
+    mode = agent_next_think_mode(mode, true, false);
     AGENT_TEST_ASSERT(mode == Q36_THINK_LOW);
-    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_NONE, false) == Q36_THINK_HIGH);
-    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_HIGH, false) == Q36_THINK_NONE);
+    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_NONE, false, false) == Q36_THINK_HIGH);
+    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_HIGH, false, false) == Q36_THINK_NONE);
+    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_NONE, true, true) == Q36_THINK_MINIMAL);
+    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_MINIMAL, true, true) == Q36_THINK_LOW);
+    AGENT_TEST_ASSERT(agent_next_think_mode(Q36_THINK_XHIGH, true, true) == Q36_THINK_NONE);
 
     cfg = parse_options(1, defv);
     agent_resolve_thinking_config(&cfg, true);
-    agent_cycle_think_mode(&cfg, true);
+    agent_cycle_think_mode(&cfg, true, false);
     AGENT_TEST_ASSERT(cfg.gen.think_mode == Q36_THINK_LOW);
     AGENT_TEST_ASSERT(cfg.gen.thinking_budget == 50000);
-    agent_cycle_think_mode(&cfg, true);
+    agent_cycle_think_mode(&cfg, true, false);
     AGENT_TEST_ASSERT(cfg.gen.think_mode == Q36_THINK_MEDIUM);
     AGENT_TEST_ASSERT(cfg.gen.thinking_budget == 50000);
 
     cfg = parse_options(3, lowv);
     agent_resolve_thinking_config(&cfg, true);
-    agent_cycle_think_mode(&cfg, true);
+    agent_cycle_think_mode(&cfg, true, false);
     AGENT_TEST_ASSERT(cfg.gen.think_mode == Q36_THINK_MEDIUM);
     AGENT_TEST_ASSERT(cfg.gen.thinking_budget == 8000);
 }
@@ -8850,6 +8913,7 @@ static agent_tool_observation agent_execute_tool_observation(
             agent_tool_observation_puts(&obs, "\n");
         free(res);
     }
+    if (calls->len == 1) obs.name = calls->v[0].name;
     if (calls->len == 0)
         agent_tool_observation_puts(&obs, "Tool error: empty tool call block\n");
     return obs;
@@ -8910,10 +8974,22 @@ static bool agent_tool_observation_build(agent_worker *w,
         }
     }
     q36_tokens_copy(tokens, &w->transcript);
-    bool ok = q36_chat_append_multimodal_message(
-        w->engine, tokens, "tool",
-        parts, images, obs->image_count, spans,
-        err, err_len) != 0;
+    bool ok = true;
+    if (q36_engine_is_inkling(w->engine)) {
+        for (size_t i = 0; i <= obs->image_count; i++) {
+            if (!obs->image_count || (parts[i] && parts[i][0]))
+                inkling_append_result(w->engine, tokens, obs->name, parts[i]);
+            if (i == obs->image_count) break;
+            inkling_append_tool_header(w->engine, tokens, obs->name);
+            if (!q36_prompt_append_vision(w->engine, tokens, &spans[i], &images[i], err, err_len)) {
+                ok = false;
+                break;
+            }
+        }
+    } else {
+        ok = q36_chat_append_multimodal_message(w->engine, tokens, "tool",
+            parts, images, obs->image_count, spans, err, err_len) != 0;
+    }
     free(parts);
     if (!ok) {
         for (size_t i = 0; i < obs->image_count; i++) {
@@ -9036,7 +9112,8 @@ static int agent_compact_tail_start(agent_worker *w, int bottom, int sys_len) {
     if (budget > AGENT_COMPACT_TAIL_CAP_TOKENS) budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
     if (budget < 1) budget = 1;
     q36_tokens user = {0};
-    q36_tokenize_rendered_chat(w->engine, "<|im_start|>user\n", &user);
+    q36_tokenize_rendered_chat(w->engine, q36_engine_is_inkling(w->engine) ?
+                             "<|message_user|>" : "<|im_start|>user\n", &user);
     int start = agent_compact_tail_boundary(&w->transcript, bottom, sys_len, budget, &user);
     q36_tokens_free(&user);
     return start;
@@ -9135,7 +9212,8 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     q36_tokens summary_suffix = {0};
     q36_chat_append_message(w->engine, &summary_suffix, "user", prompt_text);
     free(prompt_text);
-    q36_chat_append_assistant_prefix(w->engine, &summary_suffix, Q36_THINK_NONE);
+    bool inkling = q36_engine_is_inkling(w->engine);
+    if (!inkling) q36_chat_append_assistant_prefix(w->engine, &summary_suffix, Q36_THINK_NONE);
     const int ctx = w->cfg->gen.ctx_size;
     int summary_budget = agent_compact_summary_budget(ctx);
     int summary_bottom = bottom;
@@ -9155,23 +9233,33 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     agent_tokens_append_range(&prompt, &w->transcript, 0, summary_bottom);
     /* A bounded prefix may end inside a user message, thinking, or code.
      * Close it only in the private summary prompt; the real tail is untouched. */
-    int im_start = agent_special_token_id(w->engine, "<|im_start|>");
-    int im_end = agent_special_token_id(w->engine, "<|im_end|>");
-    int think_start = agent_special_token_id(w->engine, "<think>");
-    int think_end = agent_special_token_id(w->engine, "</think>");
-    bool message_open = false, think_open = false;
+    int im_start = agent_special_token_id(w->engine, inkling ? "<|message_model|>" : "<|im_start|>");
+    int im_end = agent_special_token_id(w->engine, inkling ? "<|end_message|>" : "<|im_end|>");
+    int think_start = agent_special_token_id(w->engine, inkling ? "<|content_thinking|>" : "<think>");
+    int think_end = q36_token_think_end(w->engine);
+    int user = inkling ? agent_special_token_id(w->engine, "<|message_user|>") : im_start;
+    int sys_id = inkling ? agent_special_token_id(w->engine, "<|message_system|>") : im_start;
+    int tool = inkling ? agent_special_token_id(w->engine, "<|message_tool|>") : im_start;
+    bool message_open = false, think_open = false, assistant = false;
     for (int i = 0; i < prompt.len; i++) {
         int token = prompt.v[i];
-        if (token == im_start) { message_open = true; think_open = false; }
+        if (token == im_start || token == user || token == sys_id || token == tool) {
+            message_open = true;
+            think_open = false;
+            assistant = token == im_start;
+        }
         if (token == im_end) { message_open = false; think_open = false; }
         if (token == think_start) think_open = true;
         if (token == think_end) think_open = false;
+        if (token == q36_token_eos(w->engine)) assistant = false;
     }
     if (message_open) {
-        if (think_open) q36_tokenize_rendered_chat(w->engine, "</think>\n", &prompt);
-        q36_tokenize_rendered_chat(w->engine, "<|im_end|>\n", &prompt);
+        if (!inkling && think_open) q36_tokenize_rendered_chat(w->engine, "</think>\n", &prompt);
+        q36_tokenize_rendered_chat(w->engine, inkling ? "<|end_message|>" : "<|im_end|>\n", &prompt);
     }
+    if (inkling && assistant) q36_tokens_push(&prompt, q36_token_eos(w->engine));
     agent_tokens_append_range(&prompt, &summary_suffix, 0, summary_suffix.len);
+    if (inkling) q36_chat_append_assistant_prefix(w->engine, &prompt, Q36_THINK_NONE);
     q36_tokens_free(&summary_suffix);
     agent_trace(w, "compaction summary prefix=%d total=%d retained_unsummarized=%d",
                 summary_bottom, bottom, bottom - summary_bottom);
@@ -9236,6 +9324,7 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
      * cannot accidentally continue from the private compaction exchange. */
     agent_buf summary = {0};
     char eval_err[160] = {0};
+    bool native_thinking = false;
     int think_end_id = agent_special_token_id(w->engine, "</think>");
     double t0 = now_sec();
     for (int i = 0; i < summary_max; i++) {
@@ -9268,7 +9357,7 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
         }
 
         size_t text_len = 0;
-        char *text = q36_token_text(w->engine, token, &text_len);
+        char *text = q36_chat_token_text(w->engine, token, false, &native_thinking, &text_len);
         agent_buf_append(&summary, text, text_len);
         agent_publish(w, text, text_len);
         free(text);
@@ -9314,6 +9403,8 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     tail_start = agent_compact_image_boundary(w->images, w->image_count, tail_start);
     q36_tokens compacted = {0};
     q36_tokens_copy(&compacted, &sys);
+    if (inkling) q36_chat_append_assistant_prefix(w->engine, &compacted,
+        w->thinking_enabled ? enabled_think_mode(w->cfg) : Q36_THINK_NONE);
 
     agent_buf summary_msg = {0};
     agent_buf_puts(&summary_msg,
@@ -9331,18 +9422,20 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
      * partial word or code line. A synthetic user request to "continue" can
      * make the model skip the unfinished fragment or start a different task. */
     if (open_assistant && tail_start > *open_assistant) {
-        int think_start = agent_special_token_id(w->engine, "<think>");
-        int think_end = agent_special_token_id(w->engine, "</think>");
         bool in_think = false;
         for (int i = *open_assistant; i < tail_start; i++) {
             if (w->transcript.v[i] == think_start) in_think = true;
             if (w->transcript.v[i] == think_end) in_think = false;
         }
         resumed_start = compacted.len;
-        q36_chat_append_assistant_prefix(w->engine, &compacted,
-            in_think ? Q36_THINK_HIGH : Q36_THINK_NONE);
+        if (inkling)
+            q36_tokenize_rendered_chat(w->engine, in_think ? "<|message_model|><|content_thinking|>" :
+                                      "<|message_model|><|content_text|>", &compacted);
+        else q36_chat_append_assistant_prefix(w->engine, &compacted,
+                                              in_think ? Q36_THINK_HIGH : Q36_THINK_NONE);
     } else if (tail_start < bottom &&
-        w->transcript.v[tail_start] != agent_special_token_id(w->engine, "<|im_start|>")) {
+        w->transcript.v[tail_start] != user && w->transcript.v[tail_start] != im_start &&
+        w->transcript.v[tail_start] != sys_id && w->transcript.v[tail_start] != tool) {
         q36_chat_append_message(w->engine, &compacted, "user",
             "[Verbatim tail of the previous conversation; it may begin mid-message.]\n");
     }
@@ -9564,6 +9657,11 @@ static void worker_emit_generated_token(agent_worker *w, int token,
     size_t text_len = 0;
     char *text = q36_token_text(w->engine, token, &text_len);
     agent_trace_token(w, token, text, text_len, *generated + 1);
+    if (q36_engine_is_inkling(w->engine)) {
+        free(text);
+        text = inkling_tool_piece(&stream->parser->native, w->engine, token,
+                                  stream->renderer->format_thinking, &text_len);
+    }
     agent_stream_text(stream, text, text_len, false);
     free(text);
     (*generated)++;
@@ -9783,9 +9881,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
         q36_think_mode think_mode = w->thinking_enabled ?
             enabled_think_mode(cfg) : Q36_THINK_NONE;
-        const int assistant_start = resume_assistant ? resume_start : w->transcript.len;
-        if (!resume_assistant)
+        int assistant_start = resume_assistant ? resume_start : w->transcript.len;
+        if (!resume_assistant) {
             q36_chat_append_assistant_prefix(w->engine, &w->transcript, think_mode);
+            if (q36_engine_is_inkling(w->engine)) assistant_start = w->transcript.len;
+        }
 
         const q36_tokens *prompt_for_sync = &w->transcript;
         int old_pos = q36_session_pos(w->session);
@@ -9849,7 +9949,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         bool use_color = isatty(STDOUT_FILENO) != 0;
-        bool in_think = resume_assistant ? resume_in_think : q36_think_mode_enabled(think_mode);
+        bool in_think = resume_assistant ? resume_in_think : q36_session_in_think(w->session);
         resume_assistant = false;
         agent_token_renderer renderer = {
             .engine = w->engine,
@@ -9860,7 +9960,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             .use_color = use_color,
             .last_output_newline = true,
         };
-        agent_qwen_tool_parser qwen_tool = {.state = AGENT_QWEN_TOOL_SEARCH};
+        agent_qwen_tool_parser qwen_tool = {.state = AGENT_QWEN_TOOL_SEARCH, .native.thinking = in_think};
         agent_stream_renderer stream = {
             .renderer = &renderer,
             .parser = &qwen_tool,
@@ -9883,7 +9983,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         pthread_mutex_unlock(&w->mu);
 
         bool status_greedy_sampling = false;
-        int think_close_id = agent_special_token_id(w->engine, "</think>");
+        int think_close_id = q36_token_think_end(w->engine);
         int think_close_start = cfg->gen.thinking_budget;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
@@ -10490,7 +10590,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.power_percent = worker_status_power_locked(w);
     w->status.think_mode = w->cfg->gen.think_mode;
     w->status.thinking_budget = w->cfg->gen.thinking_budget;
-    w->status.qwen38 = q36_engine_is_qwen38(w->engine);
+    w->status.effort_levels = q36_engine_is_qwen38(w->engine) || q36_engine_is_inkling(w->engine);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -10503,7 +10603,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.power_percent = worker_status_power_locked(w);
     w->status.think_mode = w->cfg->gen.think_mode;
     w->status.thinking_budget = w->cfg->gen.thinking_budget;
-    w->status.qwen38 = q36_engine_is_qwen38(w->engine);
+    w->status.effort_levels = q36_engine_is_qwen38(w->engine) || q36_engine_is_inkling(w->engine);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -10698,7 +10798,7 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     }
     size_t n = strlen(buf);
     const char *mode = st->think_mode == Q36_THINK_NONE ? "off" :
-                       st->qwen38 ? q36_think_mode_name(st->think_mode) : "on";
+                       st->effort_levels ? q36_think_mode_name(st->think_mode) : "on";
     if (n < len) {
         if (st->think_mode == Q36_THINK_NONE)
             snprintf(buf + n, len - n, " | think %s (Tab)", mode);
@@ -12348,8 +12448,7 @@ resume_editor:
         {
             editor_take_queued_byte(&editor, '\t');
             pthread_mutex_lock(&worker.mu);
-            bool qwen38 = q36_engine_is_qwen38(worker.engine);
-            agent_cycle_think_mode(cfg, qwen38);
+            agent_cycle_think_mode(cfg, worker.status.effort_levels, q36_engine_is_inkling(worker.engine));
             worker.thinking_enabled = cfg->gen.think_mode != Q36_THINK_NONE;
             agent_wake_locked(&worker);
             pthread_mutex_unlock(&worker.mu);
@@ -12767,6 +12866,7 @@ int main(int argc, char **argv) {
     q36_engine *engine = NULL;
     cfg.engine.context_size = cfg.gen.ctx_size;
     if (q36_engine_open(&engine, &cfg.engine) != 0) return 1;
+    cfg.gen.think_mode = q36_model_think_mode(engine, cfg.gen.think_mode);
     agent_resolve_thinking_config(&cfg, q36_engine_is_qwen38(engine));
     if (cfg.chdir_path) {
         if (chdir(workdir) != 0) {

@@ -477,3 +477,53 @@ int q36_image_preprocess_qwen3vl(
     out->patches = patches;
     return 1;
 }
+
+int q36_image_preprocess_inkling(q36_image_patches *out, const q36_image *image,
+                                char *error, size_t error_cap) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !image->rgb || !image->width || !image->height) {
+        q36_image_error(error, error_cap, "invalid Inkling image parameters");
+        return 0;
+    }
+
+    enum { patch = 20, align = 2 * patch, max_pixels = 640 * 640 };
+    uint32_t w = image->width, h = image->height;
+    uint32_t pw = (w + align - 1u) / align * align;
+    uint32_t ph = (h + align - 1u) / align * align;
+    float *resized = NULL;
+    if ((uint64_t)pw * ph > max_pixels) {
+        double scale = sqrt((double)max_pixels / ((double)w * h));
+        scale = fmin(scale, (double)(max_pixels / align) / (w > h ? w : h));
+        pw = w = (uint32_t)fmax(1.0, floor(w * scale / align)) * align;
+        ph = h = (uint32_t)fmax(1.0, floor(h * scale / align)) * align;
+        resized = malloc((size_t)w * h * 3u * sizeof(*resized));
+        if (!resized) goto oom;
+        q36_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                               resized, w, h, w);
+    }
+    float *patches = malloc((size_t)pw * ph * 3u * sizeof(*patches));
+    if (!patches) goto oom;
+    size_t n = 0;
+    for (uint32_t py = 0; py < ph; py += patch)
+        for (uint32_t px = 0; px < pw; px += patch)
+            for (uint32_t c = 0; c < 3; c++)
+                for (uint32_t y = py; y < py + patch; y++)
+                    for (uint32_t x = px; x < px + patch; x++) {
+                        size_t i = ((size_t)y * w + x) * 3u + c;
+                        float v = y >= h || x >= w ? -1.0f : resized ? resized[i] : image->rgb[i];
+                        patches[n++] = (v - 127.5f) / 127.5f;
+                    }
+    free(resized);
+    *out = (q36_image_patches){
+        .content_width = w, .content_height = h, .padded_width = pw, .padded_height = ph,
+        .grid_width = pw / patch, .grid_height = ph / patch,
+        .patch_count = pw * ph / (patch * patch),
+        .image_token_count = pw * ph / (align * align), .patches = patches,
+    };
+    return 1;
+oom:
+    free(resized);
+    q36_image_error(error, error_cap, "unable to allocate Inkling vision patches");
+    return 0;
+}

@@ -5,6 +5,7 @@ REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
 DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 FLASH_REPO="Ninnix96/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-gguf"
+INKLING_REPO="unsloth/Inkling-2-Mini-GGUF"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 Q4_FILE="Qwen3.6-35B-A3B-IQ4XS-Q4K-Q8.gguf"
@@ -13,9 +14,11 @@ DENSE_Q6_FILE="Qwen3.8-27B-UD-Q6_K.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
 FLASH_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf"
 FLASH_NGRAM_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00002-of-00002.gguf"
+INKLING_FILE="Inkling-2-Mini-UD-IQ3_XXS.gguf"
 VISION_REMOTE="mmproj-F16.gguf"
 VISION_FILE="Qwen3.6-35B-A3B-mmproj-F16.gguf"
 DENSE_VISION_FILE="Qwen3.8-27B-mmproj-F16.gguf"
+INKLING_VISION_FILE="Inkling-2-Mini-mmproj-F16.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${Q36_GGUF_DIR:-"$ROOT/gguf"}
@@ -36,6 +39,8 @@ Usage:
   ./download_model.sh 27b-q6 [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh flash-next [--token TOKEN]
+  ./download_model.sh inkling-2-mini [--token TOKEN]
+  ./download_model.sh inkling-2-mini-vision [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
 
@@ -69,6 +74,13 @@ Targets:
        Downloads both required GGUF shards, about 50.8 GB in total.
        Keep them together and pass the first shard with -m. The n-gram
        shard stays on the coordinator in distributed mode. No MTP head.
+
+  inkling-2-mini
+       Inkling-2-Mini UD-IQ3_XXS from $INKLING_REPO, about 10.9 GiB.
+
+  inkling-2-mini-vision
+       Inkling-2-Mini F16 vision projector from $INKLING_REPO.
+       It is downloaded as $INKLING_VISION_FILE for disk-streamed Vulkan vision.
 
   qwen36-vision
        Qwen3.6 35B A3B F16 vision projector from $VISION_REPO.
@@ -122,6 +134,13 @@ case "$MODEL" in
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     27b-q6) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_Q6_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
+    inkling-2-mini) MODEL_REPO=$INKLING_REPO; MODEL_FILE=$INKLING_FILE ;;
+    inkling-2-mini-vision|inkling-vision)
+        MODEL_REPO=$INKLING_REPO
+        MODEL_REMOTE=$VISION_REMOTE
+        MODEL_FILE=$INKLING_VISION_FILE
+        LINK_MODEL=0
+        ;;
     flash-next|qwen38-flash-next)
         MODEL_REPO=$FLASH_REPO
         MODEL_FILE=$FLASH_FILE
@@ -213,6 +232,10 @@ artifact_identity() {
             expected_bytes=28800138432
             expected_sha=316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
             ;;
+        "$INKLING_FILE")
+            expected_bytes=11663310784
+            expected_sha=fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657
+            ;;
         "$VISION_FILE")
             expected_bytes=899283680
             expected_sha=8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f
@@ -220,6 +243,10 @@ artifact_identity() {
         "$DENSE_VISION_FILE")
             expected_bytes=927607488
             expected_sha=cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e
+            ;;
+        "$INKLING_VISION_FILE")
+            expected_bytes=639348160
+            expected_sha=3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f
             ;;
         *)
             echo "Missing artifact identity: $1" >&2
@@ -299,6 +326,10 @@ elif [ "$MODEL" = "qwen38-vision" ]; then
     echo
     echo "Vision projector downloaded. Use it with the dense model:"
     echo "  ./q36 -m $OUT_DIR/$DENSE_FILE --vision $OUT_DIR/$DENSE_VISION_FILE"
+elif [ "$MODEL_FILE" = "$INKLING_VISION_FILE" ]; then
+    echo
+    echo "Vision projector downloaded. Use it with Inkling-2-Mini:"
+    echo "  ./q36 --vulkan -m \"$OUT_DIR/$INKLING_FILE\" --vision \"$OUT_DIR/$INKLING_VISION_FILE\""
 elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" q36moe.gguf

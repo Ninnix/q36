@@ -1747,12 +1747,8 @@ static eval_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
-        } else if (!strcmp(arg, "--think")) {
-            c.think_mode = Q36_THINK_HIGH;
-        } else if (!strcmp(arg, "--think-max")) {
-            c.think_mode = Q36_THINK_MAX;
-        } else if (!strcmp(arg, "--nothink")) {
-            c.think_mode = Q36_THINK_NONE;
+        } else if (!strncmp(arg, "--", 2) && q36_parse_think_option(arg + 2, &c.think_mode)) {
+            continue;
         } else if (!strcmp(arg, "--plain")) {
             c.plain = true;
         } else if (!strcmp(arg, "--self-test-extractors")) {
@@ -4198,16 +4194,15 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
     ui->speed_tps = 0.0;
     byte_buf raw = {0};
     bool plain_in_think = q36_think_mode_enabled(think_mode);
-    bool generation_in_think = q36_think_mode_enabled(think_mode);
+    bool generation_in_think = q36_session_in_think(session);
+    bool native_thinking = false;
     eval_think_close_info think_close = {0};
-    q36_tokens think_close_tokens = {0};
-    if (generation_in_think) q36_tokenize_text(engine, "</think>", &think_close_tokens);
+    int close_id = q36_token_think_end(engine);
     if (!tty && plain_in_think) plain_set_thinking_color(use_plain_color);
     tui_refresh(ui, "thinking");
 
     const int eos = q36_token_eos(engine);
     double t0 = ui->phase_start_sec;
-    int forced_close_pos = -1;
     for (int i = 0; i < generation_limit; i++) {
         if (tty) {
             tui_consume_input(ui);
@@ -4221,7 +4216,6 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
                                  prompt_tokens, ui->generated, generation_limit, now_sec() - t0, "?",
                                  &think_close);
                 free(question);
-                q36_tokens_free(&think_close_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_QUIT;
             }
@@ -4235,7 +4229,6 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
                                  prompt_tokens, ui->generated, generation_limit, now_sec() - t0, "?",
                                  &think_close);
                 free(question);
-                q36_tokens_free(&think_close_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
@@ -4254,7 +4247,6 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
                                  prompt_tokens, ui->generated, generation_limit, now_sec() - t0, "?",
                                  &think_close);
                 free(question);
-                q36_tokens_free(&think_close_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_QUIT;
             }
@@ -4268,7 +4260,6 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
                                  prompt_tokens, ui->generated, generation_limit, now_sec() - t0, "?",
                                  &think_close);
                 free(question);
-                q36_tokens_free(&think_close_tokens);
                 buf_free(&raw);
                 return EVAL_RUN_SWITCH;
             }
@@ -4286,21 +4277,15 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
          * top of the distribution.  The hard limit is a uniform benchmark rule:
          * leave a fixed answer reserve instead of failing a case because all
          * tokens were spent before the visible answer could start. */
-        if (generation_in_think && think_close_tokens.len > 0) {
-            if (forced_close_pos >= 0) {
-                token = think_close_tokens.v[forced_close_pos++];
-                if (forced_close_pos >= think_close_tokens.len) forced_close_pos = -1;
-            } else if (remaining_budget <= cfg->hard_limit_reply_budget) {
+        if (generation_in_think && close_id >= 0) {
+            if (remaining_budget <= cfg->hard_limit_reply_budget) {
                 close_kind = EVAL_THINK_CLOSE_HARD;
-                token = think_close_tokens.v[0];
-                forced_close_pos = think_close_tokens.len > 1 ? 1 : -1;
-            } else if (remaining_budget <= cfg->soft_limit_reply_budget &&
-                       think_close_tokens.len == 1) {
-                close_rank = token_rank_in_top(session, think_close_tokens.v[0],
-                                               cfg->soft_limit_think_close_rank);
+                token = close_id;
+            } else if (remaining_budget <= cfg->soft_limit_reply_budget) {
+                close_rank = token_rank_in_top(session, close_id, cfg->soft_limit_think_close_rank);
                 if (close_rank > 0) {
                     close_kind = EVAL_THINK_CLOSE_SOFT;
-                    token = think_close_tokens.v[0];
+                    token = close_id;
                 }
             }
         }
@@ -4330,18 +4315,19 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
                              now_sec() - t0, "?",
                              &think_close);
             free(question);
-            q36_tokens_free(&think_close_tokens);
             buf_free(&raw);
             return EVAL_RUN_ERROR;
         }
 
         size_t len = 0;
-        char *text = q36_token_text(engine, token, &len);
+        char *text = q36_chat_token_text(engine, token, q36_think_mode_enabled(think_mode),
+                                         &native_thinking, &len);
         buf_append(&raw, text, len);
         ui->generated++;
         ui->generated_tokens[idx] = ui->generated;
         tui_run_clock_tick(ui);
-        if (generation_in_think && raw.v && strstr(raw.v, "</think>")) {
+        if (native_thinking) generation_in_think = true;
+        if (generation_in_think && token == close_id) {
             generation_in_think = false;
             if (think_close.kind == EVAL_THINK_CLOSE_NONE) {
                 think_close.kind = EVAL_THINK_CLOSE_NATURAL;
@@ -4402,7 +4388,6 @@ static eval_run_result run_one_case(q36_engine *engine, q36_session *session,
 
     if (tty && cfg->pause_ms > 0) usleep((useconds_t)cfg->pause_ms * 1000);
     free(question);
-    q36_tokens_free(&think_close_tokens);
     buf_free(&raw);
     return EVAL_RUN_OK;
 }
@@ -4745,6 +4730,7 @@ int main(int argc, char **argv) {
         free(cases);
         return 1;
     }
+    cfg.think_mode = q36_model_think_mode(engine, cfg.think_mode);
     int max_prompt_tokens = 0;
     int max_prompt_case = -1;
     int max_generation_tokens = eval_max_generation_budget(&cfg, cases, ncases);

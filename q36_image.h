@@ -37,6 +37,9 @@ int q36_image_preprocess_qwen3vl(q36_image_patches *out,
                                  const q36_image *image,
                                  uint32_t max_patches,
                                  char *error, size_t error_cap);
+int q36_image_preprocess_inkling(q36_image_patches *out,
+                                 const q36_image *image,
+                                 char *error, size_t error_cap);
 void q36_image_patches_free(q36_image_patches *patches);
 
 #endif

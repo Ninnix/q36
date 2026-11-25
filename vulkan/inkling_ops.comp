@@ -1,0 +1,1108 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_control_flow_attributes : require
+#include "reference_math.glsl"
+#ifdef INK_FMA
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions=["SPV_KHR_fma"],capabilities=[6030],id=4427)
+float ink_fma(float a,float b,float c);
+spirv_instruction(extensions=["SPV_KHR_fma"],capabilities=[6030],id=4427)
+vec4 ink_fma(vec4 a,vec4 b,vec4 c);
+#endif
+#include "expf.glsl"
+#ifndef INK_FMA
+#define ink_fma q36_router_fma
+#endif
+layout(local_size_x=128,local_size_x_id=1) in;
+layout(binding=0) buffer Output { float a[]; };
+layout(binding=1) readonly buffer Input { float b[]; };
+layout(binding=2) buffer State { float c[]; };
+layout(binding=3) readonly buffer D { float d[]; };
+#ifdef INK_FMA
+layout(binding=3) readonly buffer KeyPair { uvec2 kv_pairs[]; };
+#endif
+layout(binding=4) buffer E { float e[]; };
+layout(binding=5) readonly buffer F { float f[]; };
+layout(push_constant) uniform Push { uint op,n,k,j,m,t,u,v; } p;
+// Specialize the operation and both cache types when building the pipeline.
+layout(constant_id=0) const uint MODE=0;
+const uint code=MODE%64, KT=(MODE/64)%3, VT=(MODE/192)%3;
+const bool key_interleaved=MODE>=64*9;
+const bool tiled=code>=31 && code<=33;
+const uint OP=code==31 ? 30 : code==32 ? 7 : code==33 ? 8 : code;
+shared double sums[gl_WorkGroupSize.x];
+shared vec4 mix_state[OP==1 || OP==23 ? 576 : 1], mix_query[OP==1 || OP==23 ? 576 : 1];
+shared float lanes[OP==7 ? gl_WorkGroupSize.x : 128], weight[5];
+const uint width=2304;
+double total(double val, uint l) {
+#ifdef INK_FMA
+    for (uint step=gl_SubgroupSize/2;step!=0;step/=2)
+        val+=packDouble2x32(subgroupShuffleXor(unpackDouble2x32(val),step));
+    if (subgroupElect()) sums[gl_SubgroupID]=val;
+    barrier();
+    double sum=sums[0]+sums[1];
+    for (uint i=2;i<gl_NumSubgroups;i+=2) sum+=sums[i]+sums[i+1];
+    return sum;
+#else
+    sums[l]=val; barrier();
+    for (uint j=gl_WorkGroupSize.x/2;j>0;j/=2) { if (l<j) sums[l]+=sums[l+j]; barrier(); }
+    return sums[0];
+#endif
+}
+// The FMA residual selects the nearest binary32 neighbor of the hardware
+// estimate. Extreme operands use the existing double-precision path.
+float ink_div(float a,float b) {
+#ifdef INK_FMA
+    if (a>=1e-12 && a<=1e12 && b>=1e-12 && b<=1e12) {
+        float y=a/b;
+        y=ink_fma(ink_fma(-y,b,a),1/b,y);
+        float rem=ink_fma(-y,b,a);
+        uint bits=floatBitsToUint(y);
+        float next=uintBitsToFloat(rem<0 ? bits-1 : bits+1);
+        float half_ulp=b*abs(next-y), residual=2*abs(rem);
+        if (residual>half_ulp || (residual==half_ulp && (bits&1u)!=0)) y=next;
+        return y;
+    }
+#endif
+    return q36_router_round(double(a)/double(b));
+}
+float ink_sqrt(float x) {
+#ifdef INK_FMA
+    if (x>=1e-12 && x<=1e12) {
+        float y=sqrt(x);
+        y=ink_fma(0.5/y,ink_fma(-y,y,x),y);
+        float rem=ink_fma(-y,y,x);
+        uint bits=floatBitsToUint(y);
+        float next=uintBitsToFloat(rem<0 ? bits-1 : bits+1);
+        if (rem<0 ? -rem>=y*(y-next) : rem>y*(next-y)) y=next;
+        return y;
+    }
+#endif
+    return q36_router_round(sqrt(double(x)));
+}
+float clip_head(float x, double ss, float limit) {
+    float scale=ink_div(1,max(ink_sqrt(q36_router_round(ss)),limit));
+    precise float v=(x*scale)*limit;
+    return v;
+}
+float inv_norm(double sum, uint n) {
+    precise float mean=q36_router_round(sum/double(n))+1e-6;
+    return ink_div(1,ink_sqrt(mean));
+}
+double square(float x) { precise float s=x*x; return double(s); }
+float hsum8(float v[8]) {
+    precise float r=((v[0]+v[4])+(v[2]+v[6]))+((v[1]+v[5])+(v[3]+v[7]));
+    return r;
+}
+/* The [7/6] Pade approximant on [-0.625,0.625]. Carry its numerator
+ * and denominator through four double-angle steps, then divide once. */
+float ink_tanh_ref(float x) {
+    if (abs(x)>=10) return sign(x);
+    double v=double(x)*0.0625LF, z=v*v;
+    double n=v*(1.0LF+z*(17325.0LF/135135.0LF+z*(378.0LF/135135.0LF+z/135135.0LF)));
+    double d=1.0LF+z*(62370.0LF/135135.0LF+z*(3150.0LF/135135.0LF+z*(28.0LF/135135.0LF)));
+    [[unroll]] for (int j=0;j<4;j++) { double a=2.0LF*n*d; d=d*d+n*n; n=a; }
+    return float(n/d);
+}
+#ifdef INK_FMA
+// Reduce around an integer, then use tanh(a+b). A double reciprocal
+// refinement supplies the float result except immediately beside a midpoint.
+float ink_tanh(float x) {
+    if (!(abs(x)<10)) return isnan(x) ? x : sign(x);
+    if (abs(x)<0.00006103515625) return x;
+    const double center[11]=double[11](
+        0.0LF, 0.76159415595576485LF, 0.9640275800758169LF,
+        0.99505475368673046LF, 0.99932929973906703LF, 0.99990920426259511LF,
+        0.99998771165079559LF, 0.99999833694394469LF, 0.99999977492967584LF,
+        0.999999969540041LF, 0.99999999587769273LF);
+    int k=int(abs(x)+0.5);
+    double v=double(abs(x))-double(k), z=v*v, t=center[k];
+    double n=v*(1.0LF+z*(17325.0LF/135135.0LF+z*(378.0LF/135135.0LF+z/135135.0LF)));
+    double den=1.0LF+z*(62370.0LF/135135.0LF+z*(3150.0LF/135135.0LF+z*(28.0LF/135135.0LF)));
+    double num=fma(t,den,n);
+    den=fma(t,n,den);
+    double inv=double(1.0/float(den));
+    double val=(num*inv)*fma(-den,inv,2.0LF);
+    uint tail=unpackDouble2x32(val).x&0x1fffffffu;
+    if (abs(int(tail)-0x10000000)<2048) return ink_tanh_ref(x);
+    return uintBitsToFloat(floatBitsToUint(float(val))|(floatBitsToUint(x)&0x80000000u));
+}
+#else
+#define ink_tanh ink_tanh_ref
+#endif
+float sig(float x) { precise float den=1+q36_router_exp(-x); return ink_div(1,den); }
+#ifdef INK_FMA
+float ink_vector_exp(float x) {
+    if (!(x>=-80 && x<=80)) return q36_router_exp(x);
+    precise float z=fma(x,1.4426950216293335,12582912.0), n=z-12582912.0;
+    precise float r=ink_fma(-n,1.428606765330187e-6,ink_fma(-n,0.693145751953125,x));
+    float scale=uintBitsToFloat((floatBitsToUint(z)<<23)+0x3f800000u);
+    precise float rr=r*r, tail=0.99999940395355225*r;
+    float a=ink_fma(0.0082473903894424438,r,0.041899766772985458);
+    float b=ink_fma(0.16668395698070526,r,0.49999126791954041);
+    return ink_fma(ink_fma(ink_fma(a,rr,b),rr,tail),scale,scale);
+}
+#else
+#define ink_vector_exp q36_router_vector_exp
+#endif
+// A page stores 32 rows. Keep packed scales in their own plane so each
+// writer owns a complete word. Interleave V across time for the value sum.
+uint data_words(uint type) { return 512u>>type; }
+uint row_words(uint type) { return data_words(type)+(type==0 ? 0 : 16); }
+uint cache_word(uint pos,bool value,bool scale,uint word) {
+    uint base=(pos/32)*32*(row_words(KT)+row_words(VT));
+    uint type=value ? VT : KT;
+    if (value) base+=32*row_words(KT);
+    if (scale) base+=32*data_words(type);
+    // Put adjacent keys' words together for the paired decode loads.
+    if (key_interleaved && !value) return base+32*word+pos%32;
+    if (value) return base+(word/4)*128+(pos%32)*4+word%4;
+    return base+(pos%32)*(scale ? 16 : data_words(type))+word;
+}
+
+shared float kv_inv[4];
+shared uint kv_scale[4];
+int quant4(float x,float inv) {
+    precise float q=x*inv+8.5;
+    return clamp(int(q),0,15);
+}
+void store_head(float x,uint ch,bool value,uint pos,uint l) {
+    double ss=total(square(x),l);
+    lanes[l]=value ? x*inv_norm(ss,128) : clip_head(x,ss,22.62741661);
+    barrier();
+    uint type=value ? VT : KT;
+    if (type==0) {
+        if (l%2==0) a[cache_word(pos,value,false,ch/2)]=
+            uintBitsToFloat(q36_half(lanes[l])|(q36_half(lanes[l+1])<<16));
+        return;
+    }
+    uint block=l/32;
+    if (l%32==0) {
+        float extreme=lanes[l];
+        for (uint j=1;j<32;j++)
+            if (abs(lanes[l+j])>abs(extreme)) extreme=lanes[l+j];
+        float d=type==1 ? q36_div(abs(extreme),127) : extreme*(-0.125);
+        float inv=d==0 ? 0 : q36_div(1,d);
+        if (type==2) {
+            // Match the CPU KV encoder's quarter-step least-squares scale fit.
+            double num=0;
+            int den=0;
+            for (uint j=0;j<32;j++) {
+                int q=quant4(lanes[l+j],inv)-8;
+                num+=double(lanes[l+j])*double(q);
+                den+=q*q;
+            }
+            if (den!=0) {
+                precise float refined=d+(float(num/double(den))-d)*0.25;
+                d=refined;
+                inv=d==0 ? 0 : q36_div(1,d);
+            }
+        }
+        kv_inv[block]=inv;
+        kv_scale[block]=q36_half(d);
+    }
+    barrier();
+    if (l%64==0) a[cache_word(pos,value,true,ch/64)]=
+        uintBitsToFloat(kv_scale[block]|(kv_scale[block+1]<<16));
+    uint pack=type==1 ? 4 : 8;
+    if (l%pack==0) {
+        uint bits=0;
+        for (uint j=0;j<pack;j++) {
+            float v=lanes[l+j], inv=kv_inv[block];
+            if (type==1) bits|=(uint(int(roundEven(v*inv)))&255)<<(8*j);
+            else bits|=uint(quant4(v,inv))<<(4*j);
+        }
+        a[cache_word(pos,value,false,ch/pack)]=uintBitsToFloat(bits);
+    }
+}
+
+float cache_key(uint pos,uint ch) {
+    uint packed=floatBitsToUint(d[cache_word(pos,false,false,ch/(2u<<KT))]);
+    if (KT==0) return unpackHalf2x16(packed)[ch%2];
+    vec2 scales=unpackHalf2x16(floatBitsToUint(d[cache_word(pos,false,true,ch/64)]));
+    int q=KT==1 ? bitfieldExtract(int(packed),int(ch%4)*8,8) : int((packed>>(ch%8*4))&15)-8;
+    return float(q)*scales[(ch/32)%2];
+}
+
+#ifdef INK_FMA
+void cache_key_pair(uint key,uint kh,uint lane,out vec2 v[4][4]) {
+    [[unroll]] for (uint k=0;k<4;k++) {
+        uint ch=kh*128+lane+32*k;
+        vec2 sc;
+        if (KT!=0) {
+            uvec2 scale=kv_pairs[cache_word(key,false,true,ch/64)/2];
+            sc=vec2(unpackHalf2x16(scale.x)[k%2],unpackHalf2x16(scale.y)[k%2]);
+        }
+        [[unroll]] for (uint u=0;u<4;u++) {
+            uvec2 packed=kv_pairs[cache_word(key,false,false,(ch+8*u)/(2u<<KT))/2];
+            if (KT==0) {
+                v[u][k]=vec2(unpackHalf2x16(packed.x)[lane%2],unpackHalf2x16(packed.y)[lane%2]);
+            } else {
+                ivec2 q=KT==1 ? bitfieldExtract(ivec2(packed),int((lane%4)*8),8) :
+                    ivec2((packed>>(4*(lane%8)))&15u)-8;
+                v[u][k]=vec2(q)*sc;
+            }
+        }
+    }
+}
+
+vec2 score_key_pair(vec2 v[4][4],uint query,uint lane) {
+    vec2 dot[4]={vec2(0),vec2(0),vec2(0),vec2(0)};
+    [[unroll]] for (uint k=0;k<4;k++) [[unroll]] for (uint u=0;u<4;u++) {
+        float q=b[query+lane+8*u+32*k];
+        dot[u]=ink_fma(vec4(q),vec4(v[u][k],0,0),vec4(dot[u],0,0)).xy;
+    }
+    precise vec2 sum=(dot[0]+dot[1])+(dot[2]+dot[3]);
+    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+    return sum;
+}
+#endif
+
+vec2 cache_value_at(uint data,uint scale,uint pair) {
+    uint packed=floatBitsToUint(c[data]);
+    if (VT==0) return unpackHalf2x16(packed);
+    vec2 scales=unpackHalf2x16(floatBitsToUint(c[scale]));
+    int shift=int(pair%2)*16;
+    ivec2 q=VT==1 ? ivec2(bitfieldExtract(int(packed),shift,8),bitfieldExtract(int(packed),shift+8,8)) :
+        ivec2((packed>>(pair%4*8))&15,(packed>>(pair%4*8+4))&15)-8;
+    return vec2(q)*scales[(pair/16)%2];
+}
+vec2 cache_value(uint pos,uint pair) {
+    return cache_value_at(cache_word(pos,true,false,pair/(1u<<VT)),
+                          cache_word(pos,true,true,pair/32),pair);
+}
+shared vec4 score_query[OP==25 ? 96 : 1];
+shared float score_relative[OP==25 ? 48 : 1];
+shared vec2 values[OP==24 || OP==8 ? 128 : 1];
+vec2 value_sum(vec2 acc,uint l) {
+    values[l]=acc; barrier();
+    if (l<32) {
+        precise vec2 v=(values[l]+values[l+32])+(values[l+64]+values[l+96]);
+        values[l]=v;
+    }
+    barrier();
+    precise vec2 v=vec2(0);
+    if (l<4) v=((values[l]+values[l+16])+(values[l+8]+values[l+24]))+
+               ((values[l+4]+values[l+20])+(values[l+12]+values[l+28]));
+    barrier();
+    return v;
+}
+shared float probabilities[8];
+shared uint selected[8], starts[128];
+void pack_q8(uint dst,uint l,float value,bool valid) {
+    lanes[l]=value; barrier();
+    float maximum=abs(value);
+#ifdef INK_FMA
+    for (uint j=16;j!=0;j/=2) maximum=max(maximum,subgroupShuffleXor(maximum,j));
+#else
+    for (uint j=0;j<32;j++) maximum=max(maximum,abs(lanes[(l&~31u)+j]));
+#endif
+    float inv=maximum==0 ? 0 : ink_div(127,maximum);
+    uint sub=l%32;
+    if (valid && sub==0) a[dst]=uintBitsToFloat(q36_half(ink_div(maximum,127)));
+    if (valid && sub%4==0) {
+        uint packed=0;
+        for (uint k=0;k<4;k++) packed|=(uint(int(roundEven(lanes[l+k]*inv)))&255u)<<(8*k);
+        a[dst+1+sub/4]=uintBitsToFloat(packed);
+    }
+}
+float routed_output(uint token,uint channel) {
+    precise float sum=0;
+    for (uint r=0;r<8;r++) {
+        uint route=16*token+r;
+        float scale=p.k!=0 ? d[floatBitsToUint(c[route])] : 1;
+        sum+=(b[(8*token+r)*p.n+channel]*scale)*c[route+8];
+    }
+    return sum;
+}
+
+// Store four successive terms of each host FMA chain in one LDS vector.
+// The whole workgroup fetches both vectors even when only eight lanes sum them.
+float mix_dot(uint chains,uint token,uint g,uint l) {
+    uint src=(p.n-1-g)*width, oc=token*width;
+    vec4 state[5]; double ss=0;
+    [[unroll]] for (uint k=0;k<5;k++) {
+        uint v=k*128+l;
+        if (v>=width/4) continue;
+        uint base=(v/chains)*(4*chains)+v%chains;
+        vec4 q;
+        [[unroll]] for (uint i=0;i<4;i++) {
+            uint j=base+i*chains;
+            state[k][i]=g==p.n ? c[oc+j] : b[token*4*width+src+j];
+            q[i]=d[p.k+j];
+            if (OP==23 && g==p.n) ss+=square(state[k][i]);
+        }
+        mix_query[v]=q;
+    }
+    float scale=1;
+    if (OP==23 && g==p.n) scale=inv_norm(total(ss,l),width);
+    [[unroll]] for (uint k=0;k<5;k++) {
+        uint v=k*128+l;
+        if (v>=width/4) continue;
+        precise vec4 x=state[k]*scale;
+        mix_state[v]=x;
+        if (OP==23 && g==p.n) {
+            uint base=(v/chains)*(4*chains)+v%chains;
+            [[unroll]] for (uint i=0;i<4;i++) e[oc+base+i*chains]=x[i];
+        }
+    }
+    barrier();
+    float dot=0;
+    if (l<chains) for (uint k=l;k<width/4;k+=chains) {
+        vec4 x=mix_state[k], q=mix_query[k];
+        [[unroll]] for (uint i=0;i<4;i++) dot=ink_fma(x[i],q[i],dot);
+    }
+    return dot;
+}
+
+#ifdef INK_FMA
+shared float route_score[OP==14 ? 32 : 1];
+shared uint route_id[OP==14 ? 32 : 1];
+
+void route_merge(inout float score,inout uint id,uint width,uint lane) {
+    for (uint shift=width/2;shift!=0;shift/=2) {
+        float other_score=subgroupShuffleXor(score,shift);
+        uint other_id=subgroupShuffleXor(id,shift);
+        bool other_first=other_score>score || (other_score==score && other_id<id);
+        bool pick_first=((lane&width)==0)==((lane&shift)==0);
+        if (pick_first==other_first) {
+            score=other_score;
+            id=other_id;
+        }
+    }
+}
+#endif
+
+void main() {
+    uint l=gl_LocalInvocationID.x, g=gl_WorkGroupID.x+65535*gl_WorkGroupID.y, i=g*128+l;
+    uint token=gl_WorkGroupID.z*(OP==30 ? 16 : OP==6 ? 8 : OP==8 ? 2 : 1);
+    uint pos=p.n+token;
+    uint window=tiled ? 0 : p.k, heads=tiled ? p.k : 24;
+    uint first_head=tiled ? p.m : 0; // KV head index
+    uint len=window==0 ? pos+1 : min(pos+1,window);
+    uint maxlen=window==0 ? p.n+p.u : min(p.n+p.u,window);
+    uint oa=0, ob=0, oc=0, od=0, of=0;
+    if (OP==0) { oa=token*p.t; ob=token*p.n*p.v; }
+    if (OP==1 || OP==23) { oa=token*5; ob=token*4*width; oc=token*width; }
+    if (OP==2) { oa=token*width; ob=token*5; oc=token*4*width; od=token*width; }
+    if (OP==5) { ob=(token+p.t)*1024; oc=ob; }
+    if (OP==6 || OP==25 || OP==30) { oa=token*heads*maxlen; ob=(p.t+token)*3072; oc=(p.t+token)*384; of=(p.t+token)*24; }
+    if (OP==7) oa=token*heads*maxlen;
+    if (OP==8) { oa=(p.t+token)*3072; ob=token*heads*maxlen; od=oa; }
+    if (OP==12) { oa=token*width; ob=oa; oc=oa; od=oa; }
+    if (OP==10) { oa=token*8*p.n; ob=oa*2; oc=token*16; }
+    if (OP==14) { oa=token*16; ob=token*128; }
+    if (OP==0) { // per-head RMS with optional gamma
+        double ss=0;
+        if (p.n==width) {
+            const uint count=width/gl_WorkGroupSize.x;
+            float value[count];
+            [[unroll]] for (uint k=0;k<count;k++) {
+                value[k]=b[ob+gl_WorkGroupSize.x*k+l];
+                ss+=square(value[k]);
+            }
+            float scale=inv_norm(total(ss,l),width);
+            [[unroll]] for (uint k=0;k<count;k++) {
+                uint j=gl_WorkGroupSize.x*k+l;
+                precise float x=value[k]*scale;
+                a[oa+p.j+j]=p.k!=0 ? x*c[j] : x;
+                if (p.m!=0) a[oa+width+j]=d[(4*token+p.m-1)*width+j]*e[4*token+p.m-1];
+            }
+        } else {
+            float x=l<p.n ? b[ob+g*p.n+l] : 0;
+            float scale=inv_norm(total(square(x),l),p.n);
+            if (l<p.n) a[oa+g*p.n+l]=x*scale;
+        }
+    } else if (OP==1 || OP==23) {
+        uint chains=p.m!=0 && p.n==3 ? 8 : 32;
+        float dot=chains==8 ? mix_dot(8,token,g,l) : mix_dot(32,token,g,l);
+#ifdef INK_FMA
+        precise float q=dot;
+        if (chains==32) {
+            q+=subgroupShuffleXor(q,16); q+=subgroupShuffleXor(q,8); q+=subgroupShuffleXor(q,4);
+            q+=subgroupShuffleXor(q,1); q+=subgroupShuffleXor(q,2);
+        } else { q+=subgroupShuffleXor(q,4); q+=subgroupShuffleXor(q,2); q+=subgroupShuffleXor(q,1); }
+        if (l==0) a[oa+g]=q*uintBitsToFloat(p.j);
+#else
+        lanes[l]=dot; barrier();
+        if (l==0) {
+            precise float s=0;
+            if (chains==8) {
+                float q[8]; for (uint j=0;j<8;j++) q[j]=lanes[j];
+                s=hsum8(q);
+            } else {
+                precise float q[8];
+                for (uint j=0;j<8;j++) q[j]=(lanes[j]+lanes[j+16])+(lanes[j+8]+lanes[j+24]);
+                for (uint j=0;j<4;j++) q[j]+=q[j+4];
+                s=(q[0]+q[1])+(q[2]+q[3]);
+            }
+            a[oa+g]=s*uintBitsToFloat(p.j);
+        }
+#endif
+    } else if (OP==2) {
+        float top=b[ob];
+        for (uint k=1;k<=p.n;k++) top=max(top,b[ob+k]);
+#ifdef INK_FMA
+        float prob=q36_router_exp(b[ob+min(gl_SubgroupInvocationID,p.n)]-top);
+        double den=0;
+        for (uint k=0;k<=p.n;k++) den+=double(subgroupShuffle(prob,k));
+        if (l<=p.n) weight[l]=prob*q36_router_round(1.0LF/den);
+#else
+        if (l==0) {
+            double den=0;
+            for (uint k=0;k<=p.n;k++) { weight[k]=q36_router_exp(b[ob+k]-top); den+=weight[k]; }
+            float inv=q36_router_round(1.0LF/den);
+            for (uint k=0;k<=p.n;k++) weight[k]*=inv;
+        }
+#endif
+        barrier();
+        precise float sum=0;
+        for (uint k=0;k<=p.n;k++) {
+            float x=k==p.n ? d[od+i] : c[oc+(p.n-1-k)*width+i];
+            if (p.n>=3 && k<4) sum+=x*weight[k]; else sum=ink_fma(x,weight[k],sum);
+        }
+        a[oa+i]=sum;
+    } else if (OP==3 || OP==11) {
+        // Each channel belongs to one workgroup. Capture the three samples
+        // crossing each time partition before overwriting the in-place input.
+        uint parts=p.u>=8 ? 8 : p.u>=4 ? 4 : 1, channels=128/parts;
+        uint part=l/channels, ch=g*channels+l%channels;
+        if (ch>=p.n) return;
+        uint begin=part*p.u/parts, end=(part+1)*p.u/parts;
+        uint hist=3*((OP==3 ? p.k : p.j)+ch);
+        vec3 prev;
+        for (int k=0;k<3;k++) {
+            int t=int(begin)+k-3;
+            if (t>=0) prev[k]=OP==3 ? a[uint(t)*p.n+ch] : routed_output(uint(t),ch);
+            else if (p.m==0) prev[k]=0;
+            else prev[k]=OP==3 ? c[hist+uint(t+3)] : e[hist+uint(t+3)];
+        }
+        if (parts>1) { memoryBarrierBuffer(); barrier(); }
+        uint w=4*ch;
+        vec4 taps=OP==3 ? vec4(b[w],b[w+1],b[w+2],b[w+3]) : vec4(f[w],f[w+1],f[w+2],f[w+3]);
+        for (uint t=begin;t<end;t++) {
+            uint at=t*p.n+ch;
+            float now=OP==3 ? a[at] : routed_output(t,ch);
+            precise float sum=prev.x*taps.x+prev.y*taps.y+prev.z*taps.z+now*taps.w;
+            if (OP==3 && (p.j&1)!=0) {
+                uint k=t*32+(ch/128)*4;
+                sum+=now*d[k]; sum+=prev.z*d[k+1]; sum+=prev.y*d[k+2]; sum+=prev.x*d[k+3];
+            }
+            precise float outv=(now+sum)*uintBitsToFloat(p.t);
+            if (OP==11) outv=a[at]+outv;
+            else if ((p.j&2)!=0) outv+=e[at];
+            a[at]=outv;
+            prev=vec3(prev.yz,now);
+        }
+        if (part+1==parts) for (uint k=0;k<3;k++) {
+            if (OP==3) c[hist+k]=prev[k]; else e[hist+k]=prev[k];
+        }
+    } else if (OP==4) {
+        bool relative=g>=24;
+        uint n=relative ? 16 : 128, head=(g%24)*n, at=token*24*n+head+l;
+        float x=0;
+        if (l<n) {
+            x=relative ? c[at]*d[head+l] : a[at]*b[head+l];
+            if (!relative) e[at]=sig(e[at]);
+        }
+        float v=clip_head(x,total(square(x),l),relative ? 8 : 22.62741661);
+        if (l<n) {
+            v*=p.t+token>8192 && p.t!=0 ? 1+0.1*log(float(p.t+token)/8192) : 1;
+            if (relative) c[at]=v; else a[at]=v;
+        }
+    } else if (OP==5) {
+        bool value=g>=8;
+        uint ch=(g%8)*128+l;
+        float x=value ? c[oc+ch] : b[ob+ch];
+        store_head(x,ch,value,pos%p.j,l);
+#ifdef INK_FMA
+    } else if (OP==34) {
+        const uint tile_size=gl_WorkGroupSize.x/4;
+        uint tiles=(len+tile_size-1)/tile_size, kh=g/tiles, lane=l%8;
+        uint key=(g%tiles)*tile_size+2*(l/8);
+        vec2 kv[4][4];
+        if (key+1<len) {
+            cache_key_pair(key,kh,lane,kv);
+        } else {
+            [[unroll]] for (uint u=0;u<4;u++) [[unroll]] for (uint t=0;t<4;t++)
+                kv[u][t]=vec2(key<len ? cache_key(key,kh*128+lane+8*u+32*t) : 0,0);
+        }
+        precise vec2 bias=vec2(0);
+        uint dist=len-1-key;
+        if (lane<3 && dist<=1024) {
+            [[unroll]] for (uint i=0;i<16;i++) {
+                float q=c[(3*kh+lane)*16+i];
+                bias.x+=q*(dist<1024 ? e[dist*16+i] : 0);
+                bias.y+=q*(dist>0 ? e[(dist-1)*16+i] : 0);
+            }
+        }
+        [[unroll]] for (uint h=0;h<3;h++) {
+            uint head=3*kh+h;
+            vec2 total=score_key_pair(kv,head*128,lane);
+            vec2 relative=subgroupShuffle(bias,(gl_SubgroupInvocationID&~7u)+h);
+            precise vec2 result=total*uintBitsToFloat(p.m)+(relative-vec2(f[head]));
+            if (lane==0 && key<len) {
+                uint outp=head*len+key;
+                a[outp]=result.x;
+                if (key+1<len) a[outp+1]=result.y;
+            }
+        }
+#endif
+    } else if (OP==6 || OP==25 || OP==30) {
+        // A key and its relative-position weights serve three query heads.
+        const uint queries=OP==25 ? 1 : OP==30 ? 16 : 8;
+        uint first=pos+1-len, nq=min(queries,p.u-token), count=len+nq-1;
+        uint tiles=(count+15)/16, kh=g/tiles, lane=l%8, key=(g%tiles)*16+l/8;
+        if (3*kh>=heads) return;
+        kh+=first_head;
+        float scale=tiled ? uintBitsToFloat(0x3db504f3u) : uintBitsToFloat(p.m);
+        uint logical=first+key, phys=first%p.j+key;
+        if (phys>=p.j) phys-=p.j;
+#ifdef INK_FMA
+        // Outside the relative-bias window, a pair of tiles shares each query
+        // across 32 keys. Both tiles are wholly below the causal diagonal.
+        uint tile=g%tiles;
+        if (OP==30 && KT==1 && VT==2 && window==0 && pos>=4096 && nq==16 && (tile/2+1)*32+1024<=len) {
+            if ((tile&1)!=0) return;
+            vec4 keys[2][4];
+            [[unroll]] for (uint j=0;j<2;j++) [[unroll]] for (uint k=0;k<4;k++)
+                [[unroll]] for (uint u=0;u<4;u++)
+                    keys[j][k][u]=cache_key(key+16*j,kh*128+lane+8*u+32*k);
+            for (uint z=0;z<16;z++) [[unroll]] for (uint h=0;h<3;h++) {
+                uint head=3*kh+h;
+                vec4 dot[2]={vec4(0),vec4(0)};
+                [[unroll]] for (uint k=0;k<4;k++) {
+                    vec4 query;
+                    [[unroll]] for (uint u=0;u<4;u++) query[u]=b[ob+z*3072+head*128+lane+8*u+32*k];
+                    [[unroll]] for (uint j=0;j<2;j++) dot[j]=ink_fma(query,keys[j][k],dot[j]);
+                }
+                [[unroll]] for (uint j=0;j<2;j++) {
+                    precise float q=(dot[j].x+dot[j].y)+(dot[j].z+dot[j].w);
+                    q+=subgroupShuffleXor(q,4); q+=subgroupShuffleXor(q,2); q+=subgroupShuffleXor(q,1);
+                    if (lane==0) {
+                        precise float score=q*scale+(0.0-f[of+24*z+head]);
+                        a[oa+z*heads*maxlen+(head-3*first_head)*(pos+z+1)+key+16*j]=score;
+                    }
+                }
+            }
+            return;
+        }
+#endif
+        // All sixteen keys use the same three decode queries.
+        if (OP==25) {
+            if (l<96) {
+                uint base=ob+(3*kh+l/32)*128+32*((l/8)%4)+l%8;
+                vec4 query;
+                [[unroll]] for (uint u=0;u<4;u++) query[u]=b[base+8*u];
+                score_query[l]=query;
+            }
+            if (l<48) score_relative[l]=c[oc+48*kh+l];
+            barrier();
+        }
+        vec4 kv[4];
+        if (key<count) [[unroll]] for (uint k=0;k<4;k++) [[unroll]] for (uint u=0;u<4;u++)
+            kv[k][u]=cache_key(phys,kh*128+lane+8*u+32*k);
+#ifdef INK_FMA
+        // Give each lane a query (or a decode head) for the relative dot.
+        // The sixteen-query tile accumulates each bias on lane zero.
+        precise float biases[3]={0,0,0};
+        uint zrel=OP==25 ? 0 : lane, dist=pos+zrel-logical;
+        if (OP!=30 && zrel<nq && dist<1024 && (OP!=25 || lane<3)) {
+            [[unroll]] for (uint k=0;k<16;k++) {
+                float v=e[dist*16+k];
+                if (OP==25) biases[0]+=score_relative[lane*16+k]*v;
+                else [[unroll]] for (uint h=0;h<3;h++) biases[h]+=c[oc+zrel*384+kh*48+h*16+k]*v;
+            }
+        }
+        const bool scalar_bias=OP==30;
+#else
+        const bool scalar_bias=true;
+#endif
+        [[unroll]] for (uint z=0;z<queries;z++) if (z<nq) {
+            uint end=pos+z, length=window==0 ? end+1 : min(end+1,window), lo=end+1-length;
+            uint distance=end-logical;
+            bool valid=logical>=lo && logical<=end;
+            float relative[16];
+            if (scalar_bias && lane==0 && valid && distance<1024)
+                [[unroll]] for (uint k=0;k<16;k++) relative[k]=e[16*distance+k];
+            [[unroll]] for (uint part=0;part<3;part++) {
+                uint h=3*kh+part;
+                vec4 dot=vec4(0);
+                if (valid) [[unroll]] for (uint k=0;k<4;k++) {
+                    vec4 query;
+                    if (OP==25) query=score_query[32*part+8*k+lane];
+                    else [[unroll]] for (uint u=0;u<4;u++) query[u]=b[ob+z*3072+h*128+lane+8*u+32*k];
+#ifdef INK_FMA
+                    dot=ink_fma(query,kv[k],dot);
+#else
+                    [[unroll]] for (uint u=0;u<4;u++) dot[u]=ink_fma(query[u],kv[k][u],dot[u]);
+#endif
+                }
+                precise float q=(dot.x+dot.y)+(dot.z+dot.w);
+#ifdef INK_FMA
+                q+=subgroupShuffleXor(q,4); q+=subgroupShuffleXor(q,2); q+=subgroupShuffleXor(q,1);
+#else
+                lanes[l]=q; barrier();
+                if (lane==0) {
+                    float pieces[8];
+                    for (uint k=0;k<8;k++) pieces[k]=lanes[l+k];
+                    q=hsum8(pieces);
+                }
+                barrier();
+#endif
+                precise float bias=0;
+#ifdef INK_FMA
+                if (!scalar_bias) bias=subgroupShuffle(OP==25 ? biases[0] : biases[part],
+                    (gl_SubgroupInvocationID&~7u)+(OP==25 ? part : z));
+#endif
+                if (lane==0 && valid) {
+                    if (scalar_bias && distance<1024) [[unroll]] for (uint k=0;k<16;k++)
+                        bias+=(OP==25 ? score_relative[16*part+k] : c[oc+z*384+16*h+k])*relative[k];
+                    precise float score=q*scale+(bias-f[of+24*z+h]);
+                    a[oa+z*heads*maxlen+(h-3*first_head)*length+logical-lo]=score;
+                }
+            }
+        }
+    } else if (OP==7) { // include the query's zero-valued sink in the denominator
+        uint row=g*len;
+        float top=0;
+        for (uint j=l;j<len;j+=gl_WorkGroupSize.x) top=max(top,a[oa+row+j]);
+#ifdef INK_FMA
+        uint lane=gl_SubgroupInvocationID, wg=gl_WorkGroupSize.x;
+        for (uint j=gl_SubgroupSize/2;j>0;j/=2) top=max(top,subgroupShuffleXor(top,j));
+        if (lane==0) lanes[gl_SubgroupID]=top;
+        barrier();
+        if (gl_SubgroupID==0) {
+            float v=lane<gl_NumSubgroups ? lanes[lane] : 0;
+            for (uint j=gl_SubgroupSize/2;j>0;j/=2) v=max(v,subgroupShuffleXor(v,j));
+            if (lane==0) lanes[0]=v;
+        }
+        barrier(); top=lanes[0];
+        if (tiled) {
+            // Write each exponential once. The value scan applies the inverse
+            // after the whole row, including its zero-valued sink, is summed.
+            double z=0;
+            for (uint base=0;base<len;base+=wg) {
+                uint j=base+l;
+                float q=j<len ? ink_vector_exp(a[oa+row+j]-top) : 0;
+                if (j<len) a[oa+row+j]=q;
+                precise float v=q+subgroupShuffleXor(q,4);
+                v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+                if ((lane&7)==0) z+=double(v);
+            }
+            float inv=q36_router_round(1.0LF/(total(z,l)+double(q36_router_exp(-top))));
+            if (l==0) c[(p.t+token)*24+3*first_head+g]=inv;
+            return;
+        }
+        // Keep up to eight probabilities per lane in registers. Longer rows
+        // use the score buffer for the tail.
+        float result[8];
+        double z=0;
+        [[unroll]] for (uint k=0;k<8;k++) if (k*wg<len) {
+            uint base=k*wg;
+            uint j=base+l;
+            float q=j<len ? ink_vector_exp(a[oa+row+j]-top) : 0;
+            result[k]=q;
+            precise float v=q+subgroupShuffleXor(q,4);
+            v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+            if ((lane&7)==0) z+=double(v);
+        }
+        for (uint base=8*wg;base<len;base+=wg) {
+            uint j=base+l;
+            float q=j<len ? ink_vector_exp(a[oa+row+j]-top) : 0;
+            if (j<len) a[oa+row+j]=q;
+            precise float v=q+subgroupShuffleXor(q,4);
+            v+=subgroupShuffleXor(v,2); v+=subgroupShuffleXor(v,1);
+            if ((lane&7)==0) z+=double(v);
+        }
+        float inv=q36_router_round(1.0LF/(total(z,l)+double(q36_router_exp(-top))));
+        [[unroll]] for (uint k=0;k<8;k++) if (k*wg+l<len) a[oa+row+k*wg+l]=result[k]*inv;
+        for (uint j=8*wg+l;j<len;j+=wg) a[oa+row+j]*=inv;
+#else
+        lanes[l]=top; barrier();
+        for (uint j=gl_WorkGroupSize.x/2;j>0;j/=2) { if (l<j) lanes[l]=max(lanes[l],lanes[l+j]); barrier(); }
+        top=lanes[0];
+        double z=0;
+        for (uint j=8*l;j<len;j+=8*gl_WorkGroupSize.x) {
+            float q[8];
+            for (uint k=0;k<8;k++) {
+                q[k]=j+k<len ? ink_vector_exp(a[oa+row+j+k]-top) : 0;
+                if (j+k<len) a[oa+row+j+k]=q[k];
+            }
+            z+=double(hsum8(q));
+        }
+        float inv=q36_router_round(1.0LF/(total(z,l)+double(q36_router_exp(-top))));
+        if (tiled) {
+            if (l==0) c[(p.t+token)*24+3*first_head+g]=inv;
+        } else {
+            memoryBarrierBuffer(); barrier();
+            for (uint j=l;j<len;j+=gl_WorkGroupSize.x) a[oa+row+j]*=inv;
+        }
+#endif
+    } else if (OP==8 && tiled) {
+        // A lane owns eight value channels at a fixed time modulo 32.
+        // Its three query heads share each unpacked value.
+        uint kh=first_head+g/4, ch=(g%4)*32+(l%4)*8, time=l/4;
+        uint pair=kh*64+ch/2, stride=32*(row_words(KT)+row_words(VT));
+        uint data=cache_word(time,true,false,pair/(1u<<VT)), scale=cache_word(time,true,true,pair/32);
+        vec2 acc[2][3][4];
+        uint row[2][3];
+        float inv[2][3];
+        [[unroll]] for (uint z=0;z<2;z++) [[unroll]] for (uint h=0;h<3;h++) {
+            // Duplicate the last query for an odd tile. Only live rows are stored.
+            uint q=min(token+z,p.u-1);
+            row[z][h]=q*heads*maxlen+(3*(g/4)+h)*(p.n+q+1);
+            inv[z][h]=f[(p.t+q)*24+3*kh+h];
+            [[unroll]] for (uint u=0;u<4;u++) acc[z][h][u]=vec2(0);
+        }
+        uint page=0, stop=(pos+1)/128*4;
+        for (;page<stop;page+=4) {
+            [[unroll]] for (uint j=0;j<4;j++) {
+                uint off=(page+j)*stride, t=(page+j)*32+time;
+                vec2 v[4];
+                [[unroll]] for (uint u=0;u<4;u++)
+                    v[u]=cache_value_at(data+off+u/(1u<<VT),scale+off,pair+u);
+                [[unroll]] for (uint z=0;z<2;z++) [[unroll]] for (uint h=0;h<3;h++) {
+                    precise float w=b[row[z][h]+t]*inv[z][h];
+                    [[unroll]] for (uint u=0;u<4;u++) {
+                        acc[z][h][u].x=ink_fma(w,v[u].x,acc[z][h][u].x);
+                        acc[z][h][u].y=ink_fma(w,v[u].y,acc[z][h][u].y);
+                    }
+                }
+            }
+        }
+        [[unroll]] for (uint z=0;z<2;z++) if (token+z<p.u) [[unroll]] for (uint h=0;h<3;h++) {
+            for (uint t=page*32+time;t<=pos+z;t+=32) {
+                precise float w=b[row[z][h]+t]*inv[z][h];
+                [[unroll]] for (uint u=0;u<4;u++) {
+                    vec2 v=cache_value(t,pair+u);
+                    acc[z][h][u].x=ink_fma(w,v.x,acc[z][h][u].x);
+                    acc[z][h][u].y=ink_fma(w,v.y,acc[z][h][u].y);
+                }
+            }
+            [[unroll]] for (uint u=0;u<4;u++) {
+                vec2 v=value_sum(acc[z][h][u],l);
+                if (time==0) {
+                    uint dst=(p.t+token+z)*3072+(3*kh+h)*128+ch+2*u;
+                    a[dst]=v.x*d[dst]; a[dst+1]=v.y*d[dst+1];
+                }
+            }
+        }
+#ifdef INK_FMA
+    } else if (OP==8 && p.m!=0) {
+        // Share eight value channels across three heads and two queries,
+        // preserving the modulo-32 FMA chains when the local window wraps.
+        uint kh=g/4, ch=(g%4)*32+(l%4)*8, time=l/4;
+        uint pair=kh*64+ch/2, first=pos+1-len, start=first%p.j;
+        uint nq=min(2,p.u-token), lo[2], length[2], row[2];
+        vec2 acc[2][3][4];
+        [[unroll]] for (uint z=0;z<2;z++) {
+            length[z]=window==0 ? pos+z+1 : min(pos+z+1,window);
+            lo[z]=pos+z+1-length[z];
+            row[z]=ob+z*heads*maxlen+3*kh*length[z];
+            [[unroll]] for (uint h=0;h<3;h++)
+                [[unroll]] for (uint u=0;u<4;u++) acc[z][h][u]=vec2(0);
+        }
+        for (uint t=(first&~31u)+time;t<pos+nq;t+=32) {
+            if (t<first) continue;
+            uint phys=start+t-first;
+            if (phys>=p.j) phys-=p.j;
+            uint data=cache_word(phys,true,false,pair/(1u<<VT)), scale=cache_word(phys,true,true,pair/32);
+            vec2 v[4];
+            if (VT==2) {
+                uint word=floatBitsToUint(c[data]);
+                float sc=unpackHalf2x16(floatBitsToUint(c[scale]))[(pair/16)%2];
+                [[unroll]] for (uint u=0;u<4;u++) {
+                    uint bits=word>>(8*u);
+                    v[u]=vec2(ivec2(bits&15,(bits>>4)&15)-8)*sc;
+                }
+            } else {
+                [[unroll]] for (uint u=0;u<4;u++)
+                    v[u]=cache_value_at(data+u/(1u<<VT),scale,pair+u);
+            }
+            [[unroll]] for (uint z=0;z<2;z++) if (z<nq && t>=lo[z] && t<=pos+z)
+                [[unroll]] for (uint h=0;h<3;h++) {
+                    float w=b[row[z]+h*length[z]+t-lo[z]];
+                    [[unroll]] for (uint u=0;u<4;u++) {
+                        acc[z][h][u].x=ink_fma(w,v[u].x,acc[z][h][u].x);
+                        acc[z][h][u].y=ink_fma(w,v[u].y,acc[z][h][u].y);
+                    }
+                }
+        }
+        [[unroll]] for (uint z=0;z<2;z++) if (z<nq)
+            [[unroll]] for (uint h=0;h<3;h++) [[unroll]] for (uint u=0;u<4;u++) {
+                vec2 v=value_sum(acc[z][h][u],l);
+                if (time==0) {
+                    uint dst=oa+z*3072+(3*kh+h)*128+ch+2*u;
+                    a[dst]=v.x*d[dst]; a[dst+1]=v.y*d[dst+1];
+                }
+            }
+#endif
+    } else if (OP==8 || OP==24) {
+        uint kh=g/16, pair=(g%16)*4+l%4, time=l/4, first=pos+1-len;
+        uint start=first%p.j, head=kh*3;
+        const uint queries=OP==24 ? 1 : 2;
+        uint nq=min(queries,p.u-token), lo[queries], row[queries], length[queries];
+        vec2 acc[queries][3];
+        [[unroll]] for (uint z=0;z<queries;z++) {
+            uint end=pos+z;
+            length[z]=p.k==0 ? end+1 : min(end+1,p.k);
+            lo[z]=end+1-length[z];
+            row[z]=ob+z*heads*maxlen+head*length[z];
+            [[unroll]] for (uint h=0;h<3;h++) acc[z][h]=vec2(0);
+        }
+        uint next=(first&~31u)+time;
+#ifdef INK_FMA
+        // Full attention starts at page zero. Scan four complete pages at a
+        // time without wrap or causal checks; retain each lane's FMA order.
+        if (KT==1 && VT==2 && p.k==0 && pos>=4096) {
+            uint stop=(pos+1)&~127u, stride=32*(row_words(KT)+row_words(VT));
+            uint ch=kh*64+pair;
+            uint data=cache_word(time,true,false,ch/(1u<<VT)), scale=cache_word(time,true,true,ch/32);
+            for (uint page=0;next<stop;next+=128,page+=4) {
+                [[unroll]] for (uint j=0;j<4;j++) {
+                    uint off=(page+j)*stride, t=next+32*j;
+                    vec2 v=cache_value_at(data+off,scale+off,ch);
+                    [[unroll]] for (uint z=0;z<queries;z++) if (OP==24 || z<nq)
+                        [[unroll]] for (uint h=0;h<3;h++) {
+                            float w=b[row[z]+h*length[z]+t];
+                            acc[z][h].x=ink_fma(w,v.x,acc[z][h].x);
+                            acc[z][h].y=ink_fma(w,v.y,acc[z][h].y);
+                        }
+                }
+            }
+        }
+#endif
+        for (uint t=next;t<pos+nq;t+=32) {
+            if (t<first) continue;
+            uint phys=start+t-first;
+            if (phys>=p.j) phys-=p.j;
+            vec2 v=cache_value(phys,kh*64+pair);
+            [[unroll]] for (uint z=0;z<queries;z++) if (z<nq && t>=lo[z] && t<=pos+z) {
+                [[unroll]] for (uint h=0;h<3;h++) {
+                    float w=b[row[z]+h*length[z]+t-lo[z]];
+                    acc[z][h].x=ink_fma(w,v.x,acc[z][h].x);
+                    acc[z][h].y=ink_fma(w,v.y,acc[z][h].y);
+                }
+            }
+        }
+        [[unroll]] for (uint z=0;z<queries;z++) if (z<nq) [[unroll]] for (uint h=0;h<3;h++) {
+            vec2 v=value_sum(acc[z][h],l);
+            if (time==0) {
+                uint dst=oa+z*3072+(head+h)*128+2*pair;
+                a[dst]=v.x*d[dst]; a[dst+1]=v.y*d[dst+1];
+            }
+        }
+    } else if (OP==9) {
+        uint stream=4*token+p.j;
+        a[(2*token+1)*width+i]=b[stream*width+i]*c[stream];
+    } else if (OP==10 && i<8*p.n) {
+        uint rank=i/p.n, id=floatBitsToUint(c[oc+rank]), base=rank*2*p.n+i%p.n;
+        float sc=p.k!=0 ? d[od+id] : 1, gate=b[ob+base]*sc, up=b[ob+base+p.n]*sc;
+        precise float act=(4*ink_tanh(gate*0.25))*sig(gate);
+        precise float value=act*(25*ink_tanh(up*0.04));
+        if (p.m!=0) pack_q8(((oa+i)/32)*9,l,value,true); else a[oa+i]=value;
+    } else if (OP==12 && i<p.n) {
+        precise float v=(e[oa+i]-ink_tanh(d[od+i])*e[oa+i])+ink_tanh(c[oc+i])*b[(token*4+p.j)*width+i];
+        a[oa+i]=v;
+    } else if (OP==13 && i<p.n) a[oa+i]=30*ink_tanh(a[oa+i]*(1.0/30.0));
+    else if (OP==14) {
+#ifdef INK_FMA
+        if (gl_SubgroupSize==32) {
+            // Merge the four subgroup top eights. Equal scores keep expert ID order.
+            float prob=sig(b[ob+l]), score=prob+c[oc+l];
+            uint lane=gl_SubgroupInvocationID, id=l;
+            lanes[l]=prob;
+            [[unroll]] for (uint width=2;width<=32;width*=2) route_merge(score,id,width,lane);
+            if (lane<8) {
+                uint at=gl_SubgroupID*8+(gl_SubgroupID%2==0 ? lane : 7-lane);
+                route_score[at]=score;
+                route_id[at]=id;
+            }
+            barrier();
+            if (gl_SubgroupID==0) {
+                score=route_score[lane]; id=route_id[lane];
+                route_merge(score,id,16,lane);
+                route_merge(score,id,32,lane);
+                prob=lanes[id];
+                double sum=0;
+                [[unroll]] for (uint j=0;j<8;j++) sum+=double(subgroupShuffle(prob,j));
+                if (lane<8) {
+                    precise float den=q36_router_round(sum)+1e-20;
+                    a[oa+lane]=uintBitsToFloat(id);
+                    a[oa+8+lane]=q36_router_round(double(prob)/double(den))*8;
+                }
+            }
+            return;
+        }
+#endif
+        float prob=sig(b[ob+l]), score=prob+c[oc+l];
+        lanes[l]=score; barrier();
+        uint rank=0;
+        for (uint j=0;j<128;j++) rank+=uint(lanes[j]>score || (lanes[j]==score && j<l));
+        if (rank<8) { probabilities[rank]=prob; selected[rank]=l; }
+        barrier();
+        if (l<8) {
+            double sum=0;
+            for (uint j=0;j<8;j++) sum+=probabilities[j];
+            a[oa+l]=uintBitsToFloat(selected[l]);
+            precise float den=q36_router_round(sum)+1e-20;
+            a[oa+8+l]=q36_router_round(double(probabilities[l])/double(den))*8;
+        }
+    } else if (OP==15 && i<p.n) {
+        a[oa+token*p.k+p.m+i]=b[ob+token*p.j+p.t+i];
+    } else if (OP==16) {
+        uint block=g*4+l/32, base=token*p.n;
+        // All Inkling projection widths are multiples of 64. Pad the final
+        // half-group in shared memory and suppress writes past the row.
+        float v=block<p.n/32 ? b[base+block*32+l%32] : 0;
+        pack_q8((base/32+block)*9,l,v,block<p.n/32);
+    } else if (OP==17) {
+        uint base=16*p.u;
+        starts[l]=0; barrier();
+        for (uint i=l;i<8*p.u;i+=128) atomicAdd(starts[floatBitsToUint(a[(i/8)*16+i%8])],1);
+        barrier();
+        uint count=starts[l], groups=(count+7)/8;
+        starts[l]=groups; barrier();
+        for (uint step=1;step<128;step*=2) {
+            uint v=l>=step ? starts[l-step] : 0; barrier();
+            starts[l]+=v; barrier();
+        }
+        uint end=starts[l], first=end-groups;
+        if (l==127) a[base]=uintBitsToFloat(end);
+        // Pair adjacent tiles when at least thirteen routes share the weights.
+        for (uint g=first;g<end;g++) {
+            uint index=g-first, pair=index/2<(count+3)/16 ? (index%2==0 ? 128 : 256) : 0;
+            a[base+1+9*g]=uintBitsToFloat(l|pair);
+        }
+        if (count%8!=0) for (uint i=count%8;i<8;i++) a[base+2+9*(end-1)+i]=uintBitsToFloat(~0u);
+        starts[l]=first*8; barrier();
+        for (uint i=l;i<8*p.u;i+=128) {
+            uint expert=floatBitsToUint(a[(i/8)*16+i%8]);
+            uint slot=atomicAdd(starts[expert],1);
+            a[base+2+9*(slot/8)+slot%8]=uintBitsToFloat(i);
+        }
+    } else if (OP==18) {
+        uint msg=(token*4+g)*width;
+        uint state=token*width;
+        if (l<64) {
+            uint src=l/32;
+            float dot=0;
+            for (uint start=l%32;start<width;start+=256)
+                [[unroll]] for (uint k=0;k<8;k++) {
+                    uint j=start+k*32;
+                    dot=ink_fma(src==0 ? b[state+j] : d[state+j],e[g*width+j],dot);
+                }
+            lanes[l]=dot;
+        }
+        barrier();
+        if (l<2) {
+            precise float q[8]; uint z=32*l;
+            for (uint j=0;j<8;j++) q[j]=(lanes[z+j]+lanes[z+j+16])+(lanes[z+j+8]+lanes[z+j+24]);
+            for (uint j=0;j<4;j++) q[j]+=q[j+4];
+            weight[l]=((q[0]+q[1])+(q[2]+q[3]))*uintBitsToFloat(p.j);
+        }
+        barrier();
+        if (l==0) {
+            float top=max(weight[0],weight[1]), lo=q36_router_exp(weight[0]-top), hi=q36_router_exp(weight[1]-top);
+            float inv=q36_router_round(1.0LF/(double(lo)+double(hi)));
+            weight[0]=lo*inv; weight[1]=hi*inv;
+        }
+        barrier();
+        double ss=0;
+        for (uint j=l;j<width;j+=128) {
+            precise float x=weight[0]*b[state+j]+weight[1]*d[state+j];
+            a[msg+j]=x; ss+=square(x);
+        }
+        float inv=inv_norm(total(ss,l),width);
+        if (l==0) c[p.m!=0 ? (g/4)*64+g%4 : 4*token+g]=inv;
+    } else if ((OP==19 || OP==27) && i<width) {
+        uint off=(i/64)*4096+i%64, src=token*64;
+        float gain[8], forget[8];
+        [[unroll]] for (uint j=0;j<8;j++) {
+            float v[4], f[4];
+            [[unroll]] for (uint k=0;k<4;k++) {
+                uint col=j+8*k, at=off+col*64;
+                float g0,f0,g1,f1;
+                if (OP==27) {
+                    uint off=(i/64)*2048+col*64+i%64;
+                    uint gain=floatBitsToUint(c[off]), forget=floatBitsToUint(d[off]);
+                    g0=uintBitsToFloat(gain<<16); g1=uintBitsToFloat(gain&0xffff0000u);
+                    f0=uintBitsToFloat(forget<<16); f1=uintBitsToFloat(forget&0xffff0000u);
+                } else {
+                    g0=c[at]; g1=c[at+2048]; f0=d[at]; f1=d[at+2048];
+                }
+                precise float a=g0*b[src+col], z=f0*b[src+col];
+                v[k]=ink_fma(g1,b[src+col+32],a);
+                f[k]=ink_fma(f1,b[src+col+32],z);
+            }
+            precise float gv=(v[0]+v[2])+(v[1]+v[3]), fv=(f[0]+f[2])+(f[1]+f[3]);
+            gain[j]=gv; forget[j]=fv;
+        }
+        [[unroll]] for (uint j=0;j<4;j++) { gain[j]+=gain[j+4]; forget[j]+=forget[j+4]; }
+        precise float v=(gain[0]+gain[1])+(gain[2]+gain[3]), forget_gate=(forget[0]+forget[1])+(forget[2]+forget[3]);
+        uint dst=token*width+i;
+        precise float outv=(f[dst]-ink_tanh(forget_gate)*f[dst])+ink_tanh(v)*e[(token*4+p.j)*width+i];
+        a[dst]=outv;
+    } else if (OP==28) {
+        const uint count=width/gl_WorkGroupSize.x;
+        float value[count]; double ss=0;
+        [[unroll]] for (uint k=0;k<count;k++) {
+            value[k]=b[g*p.k+k*gl_WorkGroupSize.x+l];
+            ss+=square(value[k]);
+        }
+        float scale=inv_norm(total(ss,l),width);
+        [[unroll]] for (uint k=0;k<count;k++) {
+            uint ch=k*gl_WorkGroupSize.x+l, dst=g*p.j+ch;
+            precise float x=value[k]*scale;
+            if (p.m!=0) { a[dst]=x; a[dst+width]=c[g*width+ch]*d[g]; }
+            else a[dst]=x*(g==0 ? c[ch] : g==1 ? d[ch] : e[ch]);
+        }
+    } else if (OP==20) {
+        uint h=3*(p.j+i);
+        float h0=p.m==0 ? 0 : e[h], h1=p.m==0 ? 0 : e[h+1], h2=p.m==0 ? 0 : e[h+2];
+        float now=routed_output(0,i);
+        precise float conv=h0*f[4*i]+h1*f[4*i+1]+h2*f[4*i+2]+now*f[4*i+3];
+        a[i]+=(now+conv)*uintBitsToFloat(p.t);
+        e[h]=h1; e[h+1]=h2; e[h+2]=now;
+    } else if (OP==21 || OP==22 || OP==29) {
+        bool value=OP==22 || (OP==29 && g>=8);
+        uint ch=(g%8)*128+l, h=(p.k+(OP==29 ? i : ch))*3;
+        float h0=p.n==0 ? 0 : c[h], h1=p.n==0 ? 0 : c[h+1], h2=p.n==0 ? 0 : c[h+2];
+        float now=OP==29 && value ? f[ch] : b[ch];
+        uint w=4*ch;
+        vec4 taps=OP==29 && value ? vec4(e[w],e[w+1],e[w+2],e[w+3]) : vec4(d[w],d[w+1],d[w+2],d[w+3]);
+        precise float conv=h0*taps.x+h1*taps.y+h2*taps.z+now*taps.w;
+        if (OP!=29) {
+            conv+=now*e[4*g]; conv+=h2*e[4*g+1]; conv+=h1*e[4*g+2]; conv+=h0*e[4*g+3];
+        }
+        c[h]=h1; c[h+1]=h2; c[h+2]=now;
+        precise float val=(now+conv)*uintBitsToFloat(p.t);
+        store_head(val,ch,value,p.n%p.j,l);
+    } else if (OP==26 || OP==35) {
+        uint tile=gl_WorkGroupID.z, base=16*p.u;
+        if (p.j!=0 && tile>=floatBitsToUint(c[base])) return;
+        uint desc=base+2+9*tile, step=p.k!=0 ? 8 : 1, stride=p.k!=0 ? 74 : 9;
+        uint block=g/step, groups=p.n/(32*step), pair=l/32, j=l%8, k=(l/8)%4;
+        uint at=(tile*groups+block)*(8+128*step+(p.k==2 ? 64 : 0));
+        ivec2 val;
+        for (uint side=0;side<2;side++) {
+            uint id=p.j==0 ? min(8*tile+2*pair+side,p.u-1) : floatBitsToUint(c[desc+2*pair+side]);
+            if (id==~0u) id=floatBitsToUint(c[desc]);
+            uint src=((p.j==1 ? id/8 : id)*groups+block)*stride;
+            int word=floatBitsToInt(b[src+(p.k!=0 ? 2 : 1)+8*(g%step)+j]);
+            val[side]=bitfieldExtract(word,int(8*k),8);
+            if (p.k==2 && l%32==0) a[at+1032+8*(g%step)+2*pair+side]=b[src+66+g%step];
+            if (g%step==0 && l%32==0)
+                a[at+2*pair+side]=p.k!=0 ? b[src] : unpackHalf2x16(floatBitsToUint(b[src])).x;
+        }
+        uint packed;
+        if (OP==35) {
+            uvec2 bits=uvec2(val)&65535u;
+            packed=bits.x|(bits.y<<16);
+        } else packed=packHalf2x16(vec2(val));
+        a[at+8+128*(g%step)+l]=uintBitsToFloat(packed);
+    }
+}
