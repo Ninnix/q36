@@ -6,75 +6,6 @@ MTP is opt-in. It drafts several tokens and verifies them against the target
 model. Plain decoding remains the default; speedups depend on the prompt,
 context, and accepted draft length.
 
-## Inkling 2 Mini on the BC-250
-
-Download `inkling-2-mini` and `inkling-2-mini-dspark` with
-`download_model.sh`. In `q36`, `q36-server`, or `q36-agent`, pass the target
-GGUF with `-m` and the 333 MB draft GGUF with `--mtp FILE`. The three-layer
-head shares Inkling's token embedding and output projection. Each block begins
-with a target token and can propose up to seven more. The target checks the
-proposals and commits their matching prefix.
-
-At the default `--mtp-margin 0`, the head drafts from a shortlist built from
-its learned vocabulary bias and recent tokens. The target scores its full
-vocabulary during verification. The draft and verifier share attention
-scratch, and verification extends the committed convolution history in place.
-When the draft cache capacity exceeds 8K, its full-attention layer uses the
-most recent 4,096 tokens. Target verification uses the full context.
-
-The head starts with four positions.
-After a miss or a shortened block, it verifies an uncertain first proposal
-alongside the target anchor. A rejected probe reduces the next block to two
-positions. Two-position probes use a second draft mask for context.
-A matching pair lets the block grow again. The probe keeps its
-lower confidence threshold until a longer prefix is accepted. An unambiguous
-prompt suffix can supply a longer tail. If its first proposal fails
-verification, Inkling skips the next four suffix matches.
-
-`Q36_DSPARK_PAUSE=0` is the default with the adaptive margin. Values
-from 1 to 12 set the pause length after repeated misses, with 12 restoring
-the previous behavior. An explicit positive `--mtp-margin` selects the
-trained head alone and retains the twelve-token pause unless overridden.
-Set `Q36_MTP_LOOKUP_OFF=1` to use the head alone with the adaptive margin.
-
-For greedy generation use `--temp 0`. At positive temperature, opportunistic
-sampling draws each block's first token from the target and checks greedy
-tails. Use `--no-mtp-opportunistic` for ordinary target sampling. The head
-runs on a single BC-250 Vulkan device. Image-conditioned requests use ordinary
-target decode.
-
-On one BC-250 with Q8_0 keys and Q4_0 values, six held-out short questions
-averaged 49.76 t/s plain and 58.35 t/s with the head alone. Six questions
-after 2K or 4K documents averaged 45.76 and 61.30 t/s, respectively. The
-slowest question in each set gained 1.07× and 1.13×. Each answer generated
-96 greedy tokens and matched plain decode on both runs.
-
-With the previous twelve-token pause, six unfinished C and Python functions
-averaged 50.41 t/s plain and 82.55 t/s with the head alone (1.64×).
-An 8K C-file continuation spent its first 55 tokens finishing a comment and
-gained 1.08× with lookup. At a 4K struct-field list, lookup-assisted decode reached
-64.52 t/s against 46.38 t/s plain. The head added about 352 MiB of resident GPU
-memory during 2K decode.
-
-`make test-inkling-dspark` checks greedy and sampled-anchor replay against
-serial target logits, including rejected proposals and restored checkpoints.
-The following command takes three workload files with at least 4,096 tokens each.
-
-```sh
-python3 tests/bench_inkling_dspark.py prose.txt source.c reasoning.txt --no-lookup
-```
-
-The benchmark measures plain and speculative generation at 128, 2,048 and
-4,096 tokens. It reports each result and aggregates by elapsed decode time.
-Use `--completion 116 queue.c` to add a run starting after token 116 of
-that file. Choosing a position inside a function distinguishes code completion
-from continuing a comment or documentation.
-Omit `--no-lookup` to include matching continuations from the prompt.
-`--repeats 3` repeats each measurement and alternates which arm runs first.
-`--min-speedup 1.5` checks the requested ratio in every measured case.
-Set `Q36_BENCH_SPEC_TRACE=1` to see committed tokens per call at each frontier.
-`Q36_MTP_STATS=1` also counts low-confidence and paused single-token steps.
-
 ## Enable MTP
 
 The Qwen3.6 `q2` download includes its MTP support in the main GGUF;
@@ -131,6 +62,15 @@ widths up to eight. MTP also matches a separate ordinary engine with MTP disable
 The IQ2_XXS/Q2_K MoE target also verifies rows together, retaining ordinary
 decode routing, shared-expert and recurrent arithmetic. Other MoE tensor
 mixes and SSD streaming retain scalar verification.
+
+## Inkling 2 Mini on the BC-250
+
+Download `inkling-2-mini` and `inkling-2-mini-dspark` with
+`download_model.sh`. In `q36`, `q36-server`, or `q36-agent`, pass the target
+GGUF with `-m` and the 333 MB draft GGUF with `--mtp FILE`. The three-layer
+head shares Inkling's token embedding and output projection. Each block begins
+with a target token and can propose up to seven more. The target checks the
+proposals and commits their matching prefix.
 
 ## Sampling
 
