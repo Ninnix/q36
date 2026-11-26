@@ -31,7 +31,9 @@ layout(constant_id=0) const uint MODE=0;
 const uint code=MODE%64, KT=(MODE/64)%3, VT=(MODE/192)%3;
 const bool key_interleaved=MODE>=64*9;
 const bool tiled=code>=31 && code<=33;
-const uint OP=code==31 ? 30 : code==32 ? 7 : code==33 ? 8 : code;
+const bool verify_kv=code>=37 && code<=39;
+const uint OP=code==31 ? 30 : code==32 ? 7 : code==33 ? 8 :
+              code==37 ? 21 : code==38 ? 22 : code==39 ? 29 : code==40 ? 3 : code==41 ? 11 : code;
 shared double sums[gl_WorkGroupSize.x];
 shared vec4 mix_state[OP==1 || OP==23 ? 576 : 1], mix_query[OP==1 || OP==23 ? 576 : 1];
 shared float lanes[OP==7 ? gl_WorkGroupSize.x : 128], weight[5];
@@ -358,6 +360,7 @@ float mix_dot(uint chains,uint token,uint g,uint l) {
 }
 
 #ifdef INK_FMA
+shared float mix_live[OP==36 ? 2304 : 1];
 shared float route_score[OP==14 ? 32 : 1];
 shared uint route_id[OP==14 ? 32 : 1];
 
@@ -464,6 +467,73 @@ void main() {
             if (p.n>=3 && k<4) sum+=x*weight[k]; else sum=ink_fma(x,weight[k],sum);
         }
         a[oa+i]=sum;
+#ifdef INK_FMA
+    } else if (OP==36) {
+        uint chains=p.m!=0 && p.n==3 ? 8 : 32;
+        uint row=token*width, blocks=4*row;
+        if (p.t!=0) {
+            vec4 live[5];
+            double ss=0;
+            [[unroll]] for (uint k=0;k<5;k++) {
+                uint v=k*128+l;
+                if (v>=width/4) continue;
+                uint base=(v/chains)*(4*chains)+v%chains;
+                [[unroll]] for (uint j=0;j<4;j++) {
+                    float x=c[row+base+j*chains];
+                    live[k][j]=x;
+                    ss+=square(x);
+                }
+            }
+            float scale=inv_norm(total(ss,l),width);
+            [[unroll]] for (uint k=0;k<5;k++) {
+                uint v=k*128+l;
+                if (v>=width/4) continue;
+                uint base=(v/chains)*(4*chains)+v%chains;
+                [[unroll]] for (uint j=0;j<4;j++) {
+                    uint at=base+j*chains;
+                    precise float x=live[k][j]*scale;
+                    e[row+at]=x;
+                    mix_live[at]=x;
+                }
+            }
+            barrier();
+        }
+        // Distribute scores across subgroups while preserving the host's FMA chains.
+        for (uint k=l/chains;k<=p.n;k+=128/chains) {
+            uint lane=l%chains, base=blocks+(p.n-1-k)*width;
+            float dot=0;
+            for (uint j=lane;j<width;j+=4*chains)
+                [[unroll]] for (uint u=0;u<4;u++) {
+                    uint at=j+u*chains;
+                    float x=k!=p.n ? b[base+at] : p.t!=0 ? mix_live[at] : c[row+at];
+                    dot=ink_fma(x,d[p.k+at],dot);
+                }
+            precise float q=dot;
+            if (chains==32) {
+                q+=subgroupShuffleXor(q,16); q+=subgroupShuffleXor(q,8); q+=subgroupShuffleXor(q,4);
+                q+=subgroupShuffleXor(q,1); q+=subgroupShuffleXor(q,2);
+            } else { q+=subgroupShuffleXor(q,4); q+=subgroupShuffleXor(q,2); q+=subgroupShuffleXor(q,1); }
+            if (lane==0) lanes[k]=q*uintBitsToFloat(p.j);
+        }
+        barrier();
+        if (l<32) {
+            float top=lanes[0];
+            for (uint k=1;k<=p.n;k++) top=max(top,lanes[k]);
+            float prob=q36_router_exp(lanes[min(l,p.n)]-top);
+            double den=0;
+            for (uint k=0;k<=p.n;k++) den+=double(subgroupShuffle(prob,k));
+            if (l<=p.n) weight[l]=prob*q36_router_round(1.0LF/den);
+        }
+        barrier();
+        for (uint at=l;at<width;at+=128) {
+            precise float sum=0;
+            for (uint k=0;k<=p.n;k++) {
+                float x=k!=p.n ? b[blocks+(p.n-1-k)*width+at] : p.t!=0 ? mix_live[at] : c[row+at];
+                if (p.n>=3 && k<4) sum+=x*weight[k]; else sum=ink_fma(x,weight[k],sum);
+            }
+            a[row+at]=sum;
+        }
+#endif
     } else if (OP==3 || OP==11) {
         // Each channel belongs to one workgroup. Capture the three samples
         // crossing each time partition before overwriting the in-place input.
@@ -495,8 +565,13 @@ void main() {
             else if ((p.j&2)!=0) outv+=e[at];
             a[at]=outv;
             prev=vec3(prev.yz,now);
+            // A verifier history appends one row per candidate for prefix rollback.
+            const uint historyWords=3*48*(2*1024+2*2304);
+            if (code==40) c[historyWords+t*(historyWords/3)+hist/3]=now;
+            if (code==41) e[historyWords+t*(historyWords/3)+hist/3]=now;
         }
-        if (part+1==parts) for (uint k=0;k<3;k++) {
+        // Prefix commit still needs the old samples after verification.
+        if (part+1==parts && code!=40 && code!=41) for (uint k=0;k<3;k++) {
             if (OP==3) c[hist+k]=prev[k]; else e[hist+k]=prev[k];
         }
     } else if (OP==4) {
@@ -907,7 +982,7 @@ void main() {
     } else if (OP==12 && i<p.n) {
         precise float v=(e[oa+i]-ink_tanh(d[od+i])*e[oa+i])+ink_tanh(c[oc+i])*b[(token*4+p.j)*width+i];
         a[oa+i]=v;
-    } else if (OP==13 && i<p.n) a[oa+i]=30*ink_tanh(a[oa+i]*(1.0/30.0));
+    } else if (OP==13 && i<p.n) a[token*p.n+i]=p.k!=0 && i>=p.k ? -1.0/0.0 : 30*ink_tanh(a[token*p.n+i]*(1.0/30.0));
     else if (OP==14) {
 #ifdef INK_FMA
         if (gl_SubgroupSize==32) {
@@ -1070,17 +1145,33 @@ void main() {
     } else if (OP==21 || OP==22 || OP==29) {
         bool value=OP==22 || (OP==29 && g>=8);
         uint ch=(g%8)*128+l, h=(p.k+(OP==29 ? i : ch))*3;
-        float h0=p.n==0 ? 0 : c[h], h1=p.n==0 ? 0 : c[h+1], h2=p.n==0 ? 0 : c[h+2];
-        float now=OP==29 && value ? f[ch] : b[ch];
-        uint w=4*ch;
-        vec4 taps=OP==29 && value ? vec4(e[w],e[w+1],e[w+2],e[w+3]) : vec4(d[w],d[w+1],d[w+2],d[w+3]);
-        precise float conv=h0*taps.x+h1*taps.y+h2*taps.z+now*taps.w;
-        if (OP!=29) {
-            conv+=now*e[4*g]; conv+=h2*e[4*g+1]; conv+=h1*e[4*g+2]; conv+=h0*e[4*g+3];
+        bool separate=OP==29 && value;
+        uint t=verify_kv ? token : 0;
+        vec3 prev;
+        if (!verify_kv) prev=p.n==0 ? vec3(0) : vec3(c[h],c[h+1],c[h+2]);
+        else for (int j=0;j<3;j++) {
+            int row=int(t)+j-3;
+            if (row<0) prev[j]=p.n==0 ? 0 : c[h+uint(row+3)];
+            else prev[j]=separate ? f[uint(row)*1024+ch] : b[uint(row)*1024+ch];
         }
-        c[h]=h1; c[h+1]=h2; c[h+2]=now;
+        uint w=4*ch;
+        vec4 taps=separate ? vec4(e[w],e[w+1],e[w+2],e[w+3]) : vec4(d[w],d[w+1],d[w+2],d[w+3]);
+        float now=separate ? f[t*1024+ch] : b[t*1024+ch];
+        precise float conv=prev.x*taps.x+prev.y*taps.y+prev.z*taps.z+now*taps.w;
+        if (OP!=29) {
+            uint k=t*32+4*g;
+            conv+=now*e[k]; conv+=prev.z*e[k+1]; conv+=prev.y*e[k+2]; conv+=prev.x*e[k+3];
+        }
         precise float val=(now+conv)*uintBitsToFloat(p.t);
-        store_head(val,ch,value,p.n%p.j,l);
+        store_head(val,ch,value,(p.n+t)%p.j,l);
+        if (!verify_kv) {
+            c[h]=prev.y; c[h+1]=prev.z; c[h+2]=now;
+        } else {
+            // Verification rows share the pre-block history. Commit its new
+            // tail after the target has selected the accepted prefix.
+            const uint channels=48*(2*1024+2*2304);
+            c[(3+token)*channels+h/3]=now;
+        }
     } else if (OP==26 || OP==35) {
         uint tile=gl_WorkGroupID.z, base=16*p.u;
         if (p.j!=0 && tile>=floatBitsToUint(c[base])) return;

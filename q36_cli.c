@@ -91,7 +91,7 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp [FILE]\n"
-        "      Enable tuned MTP; omit FILE to use the embedded head in -m.\n"
+        "      Use the Inkling DSpark file or a Qwen MTP head. Omit FILE for embedded Qwen MTP.\n"
         "  --prefix-file FILE\n"
         "      Preload complete USER:/ASSISTANT: conversation pairs.\n"
         "  --vision FILE\n"
@@ -1396,6 +1396,18 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
                     *sep = '\0';
                     user_prompt = trim_inplace(sep + 1);
                 }
+            }
+            char expanded[PATH_MAX];
+            const char *home_dir = getenv("HOME");
+            if (path[0] == '~' && (path[1] == '/' || path[1] == '\0') &&
+                home_dir && home_dir[0]) {
+                int len = snprintf(expanded, sizeof(expanded), "%s%s", home_dir, path + 1);
+                if (len < 0 || len >= (int)sizeof(expanded)) {
+                    fprintf(stderr, "q36: /read path is too long\n");
+                    linenoiseFree(line);
+                    continue;
+                }
+                path = expanded;
             }
             if (!path[0]) {
                 fprintf(stderr, "q36: /read needs a file path\n");

@@ -46,6 +46,16 @@ int q36_gpu_cached_matmul(q36_gpu_tensor *out, const q36_gpu_tensor *x,
     const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
     uint64_t row_offset, uint32_t type, uint32_t width, uint32_t rows,
     uint32_t row_bytes, uint32_t tokens, uint32_t out_stride, const q36_gpu_tensor *prepared_q8);
+int q36_gpu_dspark_supported(void);
+int q36_gpu_plan_extra_weights(const uint64_t *sizes, unsigned count);
+int q36_gpu_dspark_op(unsigned op, q36_gpu_tensor *out, const q36_gpu_tensor *b,
+    const q36_gpu_tensor *c, const q36_gpu_tensor *d, unsigned n, unsigned k,
+    unsigned pos, unsigned cap, unsigned window, unsigned nt, unsigned gx, unsigned gy, unsigned gz);
+int q36_gpu_inkling_draft_vocab(q36_gpu_tensor *out,const q36_gpu_tensor *x,
+        const q36_gpu_tensor *weights,const q36_gpu_tensor *ids,
+        unsigned type,unsigned width,unsigned stride,unsigned rows,unsigned tokens);
+int q36_gpu_inkling_verify_matmul(q36_gpu_tensor *out, const q36_gpu_tensor *x,
+    const q36_gpu_tensor *w, unsigned type, unsigned width, unsigned rows, unsigned tokens);
 int q36_gpu_inkling_packed(void);
 int q36_gpu_inkling_tiled(unsigned kv_format);
 int q36_gpu_inkling_cache(const void *map,uint64_t size,uint64_t offset,uint64_t bytes,
@@ -53,7 +63,7 @@ int q36_gpu_inkling_cache(const void *map,uint64_t size,uint64_t offset,uint64_t
 int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t params[8], unsigned kv_format);
 int q36_gpu_inkling_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
     q36_gpu_tensor *weights, q36_gpu_tensor *routes, uint32_t type, uint32_t width,
-    uint32_t rows, uint32_t stride, uint32_t mode, uint32_t tokens);
+    uint32_t rows, uint32_t stride, uint32_t mode, uint32_t tokens, bool verify);
 int q36_gpu_qwen4_native(void);
 uint32_t q36_gpu_submit_limit(uint32_t count);
 int q36_gpu_qwen4_delta(q36_gpu_tensor *const tensors[6], uint32_t tokens);

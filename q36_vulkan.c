@@ -21,7 +21,7 @@
 
 enum {
     Q36_VK_QK8_0 = 32,
-    Q36_VK_INK_OPS = 36,
+    Q36_VK_INK_OPS = 42,
     Q36_VK_INK_KEY_INTERLEAVED = 64*9,
     Q36_VK_INK_NV_TILE = 64*8192,
     Q36_VK_TENSOR_F32     = 0,
@@ -300,8 +300,10 @@ typedef struct {
     q36_vk_kernel moe_matvec;
     q36_vk_kernel moe_iq4_xs_single;
     q36_vk_kernel moe_q4_k_single;
+    q36_vk_kernel dspark, inkling_q8_verify[7], inkling_draft_vocab[3][7];
     q36_vk_kernel inkling_ops[9][Q36_VK_INK_OPS], inkling_matvec[42][5], inkling_tile[42][5];
     q36_vk_kernel inkling_iq2_tile, inkling_iq3_tile_i16, inkling_nv_tile, inkling_min_tile[2][5];
+    q36_vk_kernel inkling_expert_verify[3];
     q36_vk_kernel moe_matvec_fast;
     q36_vk_kernel dense_iq3_xxs_decode;
     q36_vk_kernel dense_iq3_xxs_decode_batch[7];
@@ -567,7 +569,7 @@ enum {
 };
 static bool q36_vk_batch_recording;
 static uint32_t q36_vk_batch_count;
-static uint32_t q36_vk_batch_limit=Q36_VK_BATCH_FLUSH_AT;
+static __thread uint32_t q36_vk_batch_limit=Q36_VK_BATCH_FLUSH_AT;
 static q36_gpu_tensor *q36_vk_retired[Q36_VK_RETIRE_CAP];
 static uint32_t q36_vk_retired_n;
 
@@ -3365,7 +3367,7 @@ int q36_gpu_init(void) {
     q36_vk.moe_matvec_fast = Q36_VK_KERNEL("vulkan/moe_matvec_fast.spv", 6, 36, 1u << 4);
     q36_vk_verify_kernels(q36_vk.dense_iq3_xxs_decode_batch, "vulkan/dense_iq3_xxs_verify.spv", 4, 20);
     for (unsigned fmt=0;fmt<9;fmt++) for (unsigned i=0;i<Q36_VK_INK_OPS;i++) {
-        q36_vk.inkling_ops[fmt][i]=Q36_VK_KERNEL("vulkan/inkling_ops.spv",6,32,i==32 ? 5 : i==4 ? 21 : i==11 || i==20 || i==23 ? 17 : i==3 || i==18 || i==21 || i==22 || i==29 ? 5 : 1);
+        q36_vk.inkling_ops[fmt][i]=Q36_VK_KERNEL("vulkan/inkling_ops.spv",6,32,i==32 ? 5 : i==4 ? 21 : i==11 || i==20 || i==23 || i==36 || i==41 ? 17 : i==3 || i==18 || i==21 || i==22 || i==29 || (i>=37 && i<=40) ? 5 : 1);
         q36_vk.inkling_ops[fmt][i].tokens=i+64*fmt;
     }
     q36_vk.dense_iq3_xxs_decode = Q36_VK_KERNEL("vulkan/dense_iq3_xxs_decode.spv", 4, 16, 1u << 2);
@@ -3820,12 +3822,25 @@ int q36_gpu_init(void) {
         }
     }
 
+    q36_vk.dspark=Q36_VK_KERNEL("vulkan/inkling_dspark.spv",4,32,1);
+    const char *draft_vocab[]={"vulkan/inkling_draft_q4k.spv","vulkan/inkling_draft_q5k.spv","vulkan/inkling_draft_q6k.spv"};
+    for (unsigned type=0;type<3;type++) for (unsigned n=0;n<7;n++) {
+        q36_vk_kernel *k=&q36_vk.inkling_draft_vocab[type][n];
+        *k=Q36_VK_KERNEL(draft_vocab[type],4,28,4);
+        k->tokens=n+1;
+    }
+    q36_vk_verify_kernels(q36_vk.inkling_q8_verify,"vulkan/inkling_q8_verify.spv",3,16);
     q36_vk.ink_tiled=ink_fma && q36_vk.bc250;
     if (ink_fma) for (unsigned fmt=0;fmt<9;fmt++) for (unsigned i=0;i<Q36_VK_INK_OPS;i++) {
         q36_vk.inkling_ops[fmt][i].path="vulkan/inkling_ops_fma.spv";
-        if (q36_vk.ink_tiled && (i==5 || i==6 || i==21 || i==25 || i==29 || i==30 || i==31 || i==34))
+        if (q36_vk.ink_tiled && (i==5 || i==6 || i==21 || i==25 || i==29 || i==30 || i==31 || i==34 || i==37 || i==39))
             q36_vk.inkling_ops[fmt][i].tokens+=Q36_VK_INK_KEY_INTERLEAVED;
     }
+    const char *expert_verify="vulkan/inkling_expert_verify.spv";
+    /* One wave covers all eight top-8 routes in a speculative block. */
+    bool pair_experts=q36_vk.ink_tiled && q36_vk.subgroup_size==64 &&
+        (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
+        q36_vk_shader_has_capability(expert_verify,64);
     for (unsigned i=0;i<42;i++) for (unsigned j=0;j<5;j++) {
         const unsigned widths[]={64,1152,2304,3072,4608};
         q36_vk.inkling_matvec[i][j]=Q36_VK_KERNEL(ink_fma ? "vulkan/inkling_matvec_fma.spv" : q36_vk.have_int_dot ?
@@ -3840,6 +3855,11 @@ int q36_gpu_init(void) {
         q36_vk.inkling_tile[i][j].tokens=i+64*widths[j];
         if (ink_fma && q36_vk.bc250 && q36_vk.have_f16 && i==22 && widths[j]==2304)
             q36_vk.inkling_iq2_tile=q36_vk.inkling_tile[i][j];
+        if (pair_experts && (((i==18 || i==22) && widths[j]==2304) || (i==40 && widths[j]==1152))) {
+            q36_vk_kernel *k=&q36_vk.inkling_expert_verify[i==18 ? 0 : i==22 ? 1 : 2];
+            *k=q36_vk.inkling_matvec[i][j];
+            k->path=expert_verify;
+        }
         if (q36_vk.ink_tiled && q36_vk.have_f16 && i==40 && widths[j]==1152 &&
             q36_vk_shader_has_capability(q36_vk.inkling_tile[i][j].path,9)) {
             q36_vk.inkling_nv_tile=q36_vk.inkling_tile[i][j];
@@ -4041,9 +4061,14 @@ void q36_gpu_cleanup(void) {
         q36_vk_kernel_destroy(&q36_vk.dense_iq3_xxs_small[i]);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_xxs_bm64_mmq);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_xxs_decode_r4);
+    q36_vk_kernel_destroy(&q36_vk.dspark);
+    for (unsigned type=0;type<3;type++) for (unsigned n=0;n<7;n++)
+        q36_vk_kernel_destroy(&q36_vk.inkling_draft_vocab[type][n]);
+    for (unsigned i=0;i<7;i++) q36_vk_kernel_destroy(&q36_vk.inkling_q8_verify[i]);
     q36_vk_kernel_destroy(&q36_vk.inkling_iq2_tile);
     q36_vk_kernel_destroy(&q36_vk.inkling_iq3_tile_i16);
     q36_vk_kernel_destroy(&q36_vk.inkling_nv_tile);
+    for (unsigned i=0;i<3;i++) q36_vk_kernel_destroy(&q36_vk.inkling_expert_verify[i]);
     for (unsigned t=0;t<2;t++) for (unsigned i=0;i<5;i++) q36_vk_kernel_destroy(&q36_vk.inkling_min_tile[t][i]);
     for (unsigned fmt=0;fmt<9;fmt++) for (unsigned i=0;i<Q36_VK_INK_OPS;i++) q36_vk_kernel_destroy(&q36_vk.inkling_ops[fmt][i]);
     for (unsigned i=0;i<42;i++) for (unsigned j=0;j<5;j++) {
@@ -5210,13 +5235,13 @@ static bool q36_vk_use_q8_mm_f16_out32(void) {
  * the decode matvec, not to the prefill GEMM, so speculative rows equal
  * plain greedy decode. Session-sync small extends must keep the GEMM or
  * warm resume would stop matching the chunked cold rebuild. */
-static bool q36_vk_micro_batch;
+static __thread bool q36_vk_micro_batch;
 
 void q36_gpu_set_micro_batch(bool enabled) {
     q36_vk_micro_batch = enabled;
-    if (!enabled || q36_vk.mtp_prepared ||
-        q36_vk.subgroup_size != 64u || !q36_vk.have_int_dot) return;
+    if (!enabled || q36_vk.subgroup_size != 64u || !q36_vk.have_int_dot) return;
     pthread_mutex_lock(&q36_vk_mu);
+    if (q36_vk.mtp_prepared) { pthread_mutex_unlock(&q36_vk_mu); return; }
     q36_vk_kernel_init(&q36_vk.matmul_q8_0_f32b_nx);
     if (q36_vk.bc250 && q36_vk_env_default_on("Q36_VK_Q8_VERIFY"))
         for (unsigned i = 0; i < 7; i++)
@@ -7033,16 +7058,16 @@ int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t p[8], un
     if (!(op>=31 || op==5 || op==6 || op==8 || op==21 || op==22 || op==24 || op==25 || op==29 || op==30))
         kv_format=0;
     if (op==32) kv_format=7; /* Shared softmax pipeline for the head tiles. */
-    if (op==35) kv_format=0;
+    if (op==35 || op==36 || op==40 || op==41) kv_format=0;
     const q36_gpu_tensor *b[6];
     for (int i=0;i<6;i++) b[i]=tensors[i] ? tensors[i] : tensors[0];
     pthread_mutex_lock(&q36_vk_mu);
     unsigned groups=p[7];
     static const char *names[]={"ink_rms","ink_mix_score","ink_mix","ink_conv","ink_clip","ink_store",
         "ink_score","ink_softmax","ink_value","ink_message_norm","ink_situ","ink_routed_conv","ink_control","ink_logits",
-        "ink_route","ink_copy","ink_q8","ink_group","ink_messages","ink_gates","ink_expert_residual","ink_k_store","ink_v_store","ink_norm_mix_score","ink_value_decode","ink_score_decode","ink_expert_pack","ink_gates_bf16","ink_qkv_norm","ink_kv_store","ink_score_long","ink_score_tile","ink_softmax_tile","ink_value_tile","ink_score_decode_pair","ink_expert_pack_i16"};
+        "ink_route","ink_copy","ink_q8","ink_group","ink_messages","ink_gates","ink_expert_residual","ink_k_store","ink_v_store","ink_norm_mix_score","ink_value_decode","ink_score_decode","ink_expert_pack","ink_gates_bf16","ink_qkv_norm","ink_kv_store","ink_score_long","ink_score_tile","ink_softmax_tile","ink_value_tile","ink_score_decode_pair","ink_expert_pack_i16","ink_depth_mix","ink_verify_k_store","ink_verify_v_store","ink_verify_kv_store","ink_verify_conv","ink_verify_routed_conv"};
     unsigned z=p[6];
-    if (p[0]==3 || p[0]==11) {
+    if (op==3 || op==11 || op==40 || op==41) {
         unsigned channels=z>=8 ? 16 : z>=4 ? 32 : 128;
         groups=(groups+channels-1)/channels;
         z=1;
@@ -7058,9 +7083,71 @@ int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t p[8], un
     return ok;
 }
 
+int q36_gpu_dspark_supported(void) {
+    return q36_vk.ink_tiled && q36_vk.subgroup_size==64;
+}
+
+int q36_gpu_plan_extra_weights(const uint64_t *sizes,unsigned count) {
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok=q36_vk_arena_plan_unlocked(sizes,count);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+
+int q36_gpu_dspark_op(unsigned op,q36_gpu_tensor *out,const q36_gpu_tensor *b,
+        const q36_gpu_tensor *c,const q36_gpu_tensor *d,unsigned n,unsigned k,
+        unsigned pos,unsigned cap,unsigned window,unsigned nt,unsigned gx,unsigned gy,unsigned gz) {
+    const q36_gpu_tensor *buf[]={out,b ? b : out,c ? c : out,d ? d : out};
+    uint32_t p[]={op,n,k,pos,cap,window,nt,0};
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok=q36_vk_run_unlocked("ink_dspark",&q36_vk.dspark,buf,p,sizeof(p),gx,gy,gz);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+
+int q36_gpu_inkling_draft_vocab(q36_gpu_tensor *out,const q36_gpu_tensor *x,
+        const q36_gpu_tensor *weights,const q36_gpu_tensor *ids,
+        unsigned type,unsigned width,unsigned stride,unsigned rows,unsigned tokens) {
+    if (type<Q36_VK_TENSOR_Q4_K || type>Q36_VK_TENSOR_Q6_K ||
+        !width || width%Q36_VK_QK_K || !rows || rows%4 || rows>stride ||
+        tokens<1 || tokens>7 || !weights ||
+        !q36_gpu_tensor_range_ok(ids,0,4ull*rows) ||
+        !q36_gpu_tensor_range_ok(out,0,4ull*((uint64_t)(tokens-1)*stride+rows))) return 0;
+    unsigned blocks=width/Q36_VK_QK_K, row_bytes=blocks*q36_vk_kquant_row_bytes(type);
+    struct { uint32_t width,rows,nt,blocks,row_bytes,type; float scale; } p={width,stride,tokens,blocks,row_bytes,type,1};
+    const q36_gpu_tensor *buf[]={weights,x,out,ids};
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok=q36_vk_run_unlocked("ink_draft_vocab",&q36_vk.inkling_draft_vocab[type-Q36_VK_TENSOR_Q4_K][tokens-1],
+                               buf,&p,sizeof(p),rows/4,1,1);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+int q36_gpu_inkling_verify_matmul(q36_gpu_tensor *out,const q36_gpu_tensor *x,
+        const q36_gpu_tensor *w,unsigned type,unsigned width,unsigned rows,unsigned tokens) {
+    if (!w || tokens<2 || tokens>8) return 0;
+    const q36_gpu_tensor *buf[]={w,x,out};
+    if (type==Q36_VK_TENSOR_Q8_0) {
+        if (rows%8 || width%32) return 0;
+        uint32_t p[]={width,rows,0,0};
+        pthread_mutex_lock(&q36_vk_mu);
+        int ok=q36_vk_run_unlocked("ink_verify_q8",&q36_vk.inkling_q8_verify[tokens-2],
+                                   buf,p,sizeof(p),rows/8,1,1);
+        pthread_mutex_unlock(&q36_vk_mu);
+        return ok;
+    }
+    if (type<12 || type>14 || rows%4 || width%256) return 0;
+    unsigned blocks=width/256, stride=blocks*(type==12 ? 144 : type==13 ? 176 : 210);
+    struct { uint32_t width,rows,nt,blocks,stride,type; float scale; } p={width,rows,tokens,blocks,stride,type,1};
+    pthread_mutex_lock(&q36_vk_mu);
+    int ok=q36_vk_run_unlocked("ink_verify_dense",&q36_vk.dense_kquant_verify[type-10][tokens-2],
+                               buf,&p,sizeof(p),rows/4,1,1);
+    pthread_mutex_unlock(&q36_vk_mu);
+    return ok;
+}
+
 int q36_gpu_inkling_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
         q36_gpu_tensor *weights, q36_gpu_tensor *routes, uint32_t type, uint32_t width,
-        uint32_t rows, uint32_t stride, uint32_t mode, uint32_t tokens) {
+        uint32_t rows, uint32_t stride, uint32_t mode, uint32_t tokens, bool verify) {
     if (type>=41) return 0;
     bool paired=(mode&16)!=0;
     mode&=15;
@@ -7068,7 +7155,8 @@ int q36_gpu_inkling_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
     pthread_mutex_lock(&q36_vk_mu);
     const q36_gpu_tensor *b[5]={weights,x,out,q36_vk_ink_tables_unlocked(),routes ? routes : x};
     const char *name=q36_vk_prof_matmul_shape(type,tokens,width,rows,"inkling_matvec",mode);
-    bool tile=q36_vk.have_int_dot && tokens>=4 && rows%8==0 &&
+    bool serial=verify && (mode || ((type==0 || type==30) && width>=1024 && rows<=128));
+    bool tile=!serial && q36_vk.have_int_dot && tokens>=4 && rows%8==0 &&
         (type==0 || type==30 || type==8 || (type==20 && width==1152) || type==40 || (type>=12 && type<=14) || type==16 || type==17 || type==18 || type==22);
     unsigned wi=width==64 ? 0 : width==1152 ? 1 : width==2304 ? 2 : width==3072 ? 3 : 4;
     bool wide=rows%16==0 && (type==8 || type==40 || type==16 || type==17 || type==18 || type==22);
@@ -7112,6 +7200,11 @@ int q36_gpu_inkling_matvec(q36_gpu_tensor *out, const q36_gpu_tensor *x,
             kernel=&q36_vk.inkling_min_tile[type-12][wi];
     }
     if (nv_tile) kernel=&q36_vk.inkling_nv_tile;
+    if (verify && tokens<=8 && rows%8==0 &&
+        ((mode==1 && width==2304 && (type==18 || type==22)) || (mode==2 && width==1152 && type==40))) {
+        q36_vk_kernel *expert=&q36_vk.inkling_expert_verify[type==18 ? 0 : type==22 ? 1 : 2];
+        if (expert->path) kernel=expert;
+    }
     if (iq3_i16) kernel=&q36_vk.inkling_iq3_tile_i16;
     int ok=b[3] && q36_vk_run_unlocked(name,kernel,
         b,p,sizeof(p),tile ? 8*groups : (rows+nr-1)/nr,tile ? (rows+8*tile_rows-1)/(8*tile_rows) : mode ? 8 : 1,tile ? 1 : groups);

@@ -21,6 +21,7 @@ LLAMA_CPP_DIR ?= llama.cpp
 LLAMA_BUILD_DIR ?= $(LLAMA_CPP_DIR)/build
 REFERENCE_MODEL ?= gguf/Qwen3.6-35B-A3B-Q8_0.gguf
 INKLING_MODEL ?= gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf
+INKLING_DSPARK ?= gguf/Inkling-2-Mini-DSpark-333M.gguf
 QWEN27B_MODEL ?= gguf/Qwen3.8-27B-UD-IQ3_S.gguf
 QWEN27B_PROMPT ?= tests/long_context_story_prompt.txt
 QWEN27B_GEN ?= 128
@@ -71,9 +72,9 @@ VULKAN_SHADERS := \
 	vulkan/stream_q2_0.spv \
 	vulkan/stream_bf16.spv \
 	vulkan/stream_bf16_split.spv \
-	vulkan/inkling_ops.spv vulkan/inkling_matvec.spv vulkan/inkling_matvec_dot.spv vulkan/inkling_tile.spv \
+	vulkan/inkling_ops.spv vulkan/inkling_dspark.spv vulkan/inkling_q8_verify.spv vulkan/inkling_matvec.spv vulkan/inkling_matvec_dot.spv vulkan/inkling_tile.spv \
 	vulkan/inkling_matvec_fma.spv vulkan/inkling_matvec_iq.spv vulkan/inkling_tile_fma.spv vulkan/inkling_tile_half.spv vulkan/inkling_ops_fma.spv \
-	vulkan/inkling_tile_min.spv vulkan/inkling_matvec_i16_tile.spv \
+	vulkan/inkling_tile_min.spv vulkan/inkling_matvec_i16_tile.spv vulkan/inkling_expert_verify.spv \
 	vulkan/stream_matvec.spv \
 	vulkan/qwen4_ops.spv \
 	vulkan/gdn_front.spv \
@@ -279,6 +280,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_q4k_verify.spv \
 	vulkan/dense_q5k_verify.spv \
 	vulkan/dense_q6k_verify.spv \
+	vulkan/inkling_draft_q4k.spv vulkan/inkling_draft_q5k.spv vulkan/inkling_draft_q6k.spv \
 	vulkan/dense_q5k_prefill.spv \
 	vulkan/dense_q6k_prefill.spv \
 	vulkan/dense_iq4_nl_prefill.spv \
@@ -366,6 +368,9 @@ vulkan/dense_extra_verify.spv: vulkan/dense_extra_decode.comp
 
 vulkan/dense_q%k_verify.spv: vulkan/dense_kquant_decode.comp Makefile
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 -DQ36_Q$*K_ONLY=1 $< -o $@
+
+vulkan/inkling_draft_q%k.spv: vulkan/dense_kquant_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 -DQ36_VOCAB_MAP=1 -DQ36_Q$*K_ONLY=1 $< -o $@
 
 vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 $< -o $@
@@ -882,6 +887,8 @@ vulkan/inkling_matvec_fma.spv: vulkan/inkling_matvec.comp vulkan/inkling_matvec_
 	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_FMA=1 -o $@ $< || cp vulkan/inkling_matvec_dot.spv $@
 vulkan/inkling_matvec_iq.spv: vulkan/inkling_matvec.comp vulkan/inkling_matvec_dot.spv
 	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_FMA=1 -DINK_IQ_DECODE=1 -o $@ $< || cp vulkan/inkling_matvec_dot.spv $@
+vulkan/inkling_expert_verify.spv: vulkan/inkling_matvec.comp vulkan/inkling_matvec_iq.spv
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_FMA=1 -DINK_IQ_DECODE=1 -DINK_EXPERT_PAIRS=1 -o $@ $< || cp vulkan/inkling_matvec_iq.spv $@
 vulkan/inkling_tile_fma.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile.spv
 	$(GLSLC) -O --target-env=vulkan1.1 -DINK_DOT=1 -DINK_TILE=1 -DINK_FMA=1 -o $@ $< || cp vulkan/inkling_tile.spv $@
 vulkan/inkling_tile_half.spv: vulkan/inkling_matvec.comp vulkan/inkling_tile_fma.spv
@@ -897,6 +904,12 @@ vulkan/inkling_matvec_dot.spv: vulkan/inkling_matvec.comp
 
 vulkan/%.spv: vulkan/%.comp
 	$(GLSLC) -O -o $@ $<
+
+vulkan/inkling_dspark.spv: vulkan/inkling_dspark.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/inkling_q8_verify.spv: vulkan/inkling_q8_verify.comp vulkan/expf.glsl
+	$(GLSLC) -O --target-env=vulkan1.1 -DINK_FMA=1 -o $@ $< || $(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/stream_bf16.spv: vulkan/stream_bf16.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -1071,6 +1084,12 @@ test-inkling-vulkan-parity: q36_test
 	@test -r "$(INKLING_MODEL)"
 	Q36_TEST_VK_CACHE_TYPE_K=$${Q36_TEST_VK_CACHE_TYPE_K:-f16} Q36_TEST_VK_CACHE_TYPE_V=$${Q36_TEST_VK_CACHE_TYPE_V:-f16} \
 	Q36_TEST_REQUIRE_BACKEND=1 Q36_TEST_THREADS=16 ./q36_test --vulkan-cpu-parity --model "$(INKLING_MODEL)" --case short
+
+.PHONY: test-inkling-dspark
+test-inkling-dspark: q36_test
+	@test -r "$(INKLING_MODEL)" && test -r "$(INKLING_DSPARK)"
+	Q36_TEST_MTP="$(INKLING_DSPARK)" Q36_TEST_MTP_DRAFT=8 Q36_TEST_MTP_TOKENS=32 \
+	Q36_TEST_MTP_COMPACT=1 Q36_TEST_THREADS=16 ./q36_test --model "$(INKLING_MODEL)" --mtp-verifier --mtp-opportunistic
 
 test-inkling-kv-parity: test-inkling-vulkan-parity
 	@set -e; for pair in q8_0/q8_0 q8_0/q4_0 q4_0/q4_0; do \
@@ -1289,7 +1308,7 @@ tests/test_distributed_model: tests/test_distributed_model.c q36_distributed.h q
 tests/test_distributed_mtp: tests/test_distributed_mtp.c q36_distributed.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
 
-MODEL_INCLUDES := q36_inkling.inc q36_inkling_gpu.inc q36_inkling_model.inc q36_inkling_tokenizer.inc \
+MODEL_INCLUDES := q36_inkling_dspark.inc q36_inkling.inc q36_inkling_gpu.inc q36_inkling_model.inc q36_inkling_tokenizer.inc \
                   q36_qwen4.inc q36_qwen4_model.inc q36_qwen4_gpu.inc q36_qwen4_batch.inc q36_ssd_route.inc
 
 q36_cpu.o q36_gpu_core.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_sampling_test_core.o: $(MODEL_INCLUDES)

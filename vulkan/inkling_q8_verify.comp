@@ -1,0 +1,49 @@
+#version 460
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef INK_FMA
+#extension GL_EXT_spirv_intrinsics : require
+spirv_instruction(extensions=["SPV_KHR_fma"],capabilities=[6030],id=4427)
+float ink_fma(float a,float b,float c);
+#else
+#extension GL_GOOGLE_include_directive : require
+#include "expf.glsl"
+#define ink_fma q36_router_fma
+#endif
+
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint NT=2;
+layout(binding=0) readonly buffer Weight { uint w[]; };
+layout(binding=1) readonly buffer Input { uint x[]; };
+layout(binding=2) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Push { uint width,rows,stride,route; } p;
+
+void addBlock(uint block,uint blocks,uint tile,uint row,uint lane,inout float acc[NT]) {
+    uint base=(tile*blocks+block)*68;
+    int weight=int(w[base+8*row+lane]);
+    float scale=unpackHalf2x16(w[base+64+row/2]>>(16*(row%2))).x;
+    [[unroll]] for (uint t=0;t<NT;t++) {
+        uint src=(t*blocks+block)*9;
+        float d=scale*unpackHalf2x16(x[src]).x;
+        acc[t]=ink_fma(d,float(dotPacked4x8EXT(weight,int(x[src+1+lane]))),acc[t]);
+    }
+}
+
+// Issue independent weight loads ahead of each row's ordered FMA chain.
+void main() {
+    uint lane=gl_LocalInvocationID.x%8,row=gl_LocalInvocationID.x/8;
+    uint tile=gl_WorkGroupID.x,blocks=p.width/32;
+    float acc[NT];
+    [[unroll]] for (uint t=0;t<NT;t++) acc[t]=0;
+    uint b=0;
+    for (;b+8<=blocks;b+=8)
+        [[unroll]] for (uint k=0;k<8;k++) addBlock(b+k,blocks,tile,row,lane,acc);
+    for (;b<blocks;b++) addBlock(b,blocks,tile,row,lane,acc);
+    [[unroll]] for (uint t=0;t<NT;t++) {
+        precise float sum=acc[t]+subgroupShuffleXor(acc[t],4);
+        sum+=subgroupShuffleXor(sum,2);
+        sum+=subgroupShuffleXor(sum,1);
+        if (lane==0) y[t*p.rows+8*tile+row]=sum;
+    }
+}

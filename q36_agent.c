@@ -366,10 +366,22 @@ typedef struct {
     bool code_param_active;
 } agent_tool_visualizer;
 
+typedef enum {
+    AGENT_INKLING_PREVIEW_OPEN,
+    AGENT_INKLING_PREVIEW_KEY,
+    AGENT_INKLING_PREVIEW_STRING,
+    AGENT_INKLING_PREVIEW_SEPARATOR,
+    AGENT_INKLING_PREVIEW_DONE,
+} agent_inkling_preview_state;
+
 typedef struct {
     agent_token_renderer *renderer;
     agent_qwen_tool_parser *parser;
     agent_tool_visualizer viz;
+    agent_inkling_preview_state native_preview;
+    size_t native_preview_offset;
+    bool native_preview_args;
+    bool native_preview_active;
     bool in_think;
     bool qwen_tool_active;
     bool qwen_tool_ignored;
@@ -3959,6 +3971,8 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
     if (finish) {
         agent_stream_flush_start_tail(sr);
         sr->post_think_gap = false;
+        if (sr->native_preview_active)
+            agent_tool_viz_finish(sr, "[tool call interrupted]\n");
         if (sr->qwen_tool_active) {
             if (sr->qwen_tool_ignored) {
                 agent_stream_finish_ignored_qwen_tool(
@@ -3975,6 +3989,142 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
                 sr, "tool calling is not allowed inside <think></think>");
         }
     }
+}
+
+static void agent_inkling_preview_value(agent_stream_renderer *sr, const char *value) {
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++)
+        if ((*p >= ' ' && *p != 0x7f) || *p == '\n' || *p == '\r' || *p == '\t')
+            agent_tool_viz_param_raw_byte(sr, (char)*p);
+}
+
+/* Wait for a full escape, including a possible UTF-16 surrogate pair. */
+static size_t agent_inkling_escape_len(const char *p, size_t len) {
+    if (len < 2) return 0;
+    if (p[1] != 'u') return 2;
+    if (len < 6) return 0;
+    const char *next = p;
+    uint32_t hi, lo;
+    if (!json_u16(&next, &hi) || hi < 0xd800 || hi > 0xdbff) return 6;
+    if (len == 6 || (next[0] == '\\' && len == 7)) return 0;
+    if (next[0] != '\\' || next[1] != 'u') return 6;
+    if (len < 12) return 0;
+    return json_u16(&next, &lo) && lo >= 0xdc00 && lo <= 0xdfff ? 12 : 6;
+}
+
+/* Project native arguments while they arrive. Execution still requires the
+ * validated, closed native call from inkling_tool_piece(). */
+static void agent_inkling_preview_feed(agent_stream_renderer *sr, const buf *body) {
+    if (!sr->native_preview_active || !body->len) return;
+    const char *p = body->ptr + sr->native_preview_offset;
+    const char *end = body->ptr + body->len;
+    agent_tool_viz_restore_param_color(sr);
+    while (p < end && sr->native_preview != AGENT_INKLING_PREVIEW_DONE) {
+        if (sr->native_preview == AGENT_INKLING_PREVIEW_STRING) {
+            if (*p == '"') {
+                agent_tool_viz_param_end(sr);
+                sr->native_preview = AGENT_INKLING_PREVIEW_SEPARATOR;
+                p++;
+            } else if (*p == '\\') {
+                size_t n = agent_inkling_escape_len(p, (size_t)(end - p));
+                if (!n) break;
+                char quoted[15] = {'"'}, *value = NULL;
+                memcpy(quoted + 1, p, n);
+                quoted[n + 1] = '"';
+                const char *escape = quoted;
+                if (!json_string(&escape, &value)) break;
+                agent_inkling_preview_value(sr, value);
+                free(value);
+                p += n;
+            } else {
+                if ((unsigned char)*p >= ' ' && *p != 0x7f)
+                    agent_tool_viz_param_raw_byte(sr, *p);
+                p++;
+            }
+            continue;
+        }
+
+        json_ws(&p);
+        if (p == end) break;
+        if (sr->native_preview == AGENT_INKLING_PREVIEW_OPEN) {
+            if (*p++ != '{') break;
+            sr->native_preview = AGENT_INKLING_PREVIEW_KEY;
+        } else if (*p == '}') {
+            p++;
+            sr->native_preview = sr->native_preview_args ?
+                AGENT_INKLING_PREVIEW_SEPARATOR : AGENT_INKLING_PREVIEW_DONE;
+            sr->native_preview_args = false;
+        } else if (sr->native_preview == AGENT_INKLING_PREVIEW_SEPARATOR) {
+            if (*p != ',') break;
+            p++;
+            sr->native_preview = AGENT_INKLING_PREVIEW_KEY;
+        } else {
+            const char *value = p;
+            char *key = NULL;
+            if (!json_string(&value, &key)) break;
+            json_ws(&value);
+            if (*value == ':') { value++; json_ws(&value); }
+            else value = end;
+            if (value == end) {
+                free(key);
+                break;
+            }
+            const char *next = value;
+            if (!sr->native_preview_args && !strcmp(key, "args") && *value == '{') {
+                sr->native_preview_args = true;
+                p = value + 1;
+            } else if (sr->native_preview_args && *value == '"') {
+                agent_tool_viz_param_begin(sr, key);
+                sr->native_preview = AGENT_INKLING_PREVIEW_STRING;
+                p = value + 1;
+            } else {
+                bool complete = json_skip_value(&next);
+                if (complete) json_ws(&next);
+                if (!complete || (*next != ',' && *next != '}')) {
+                    free(key);
+                    break;
+                }
+                if (sr->native_preview_args) {
+                    char *raw = json_minify_raw_value(value);
+                    agent_tool_viz_param_begin(sr, key);
+                    agent_inkling_preview_value(sr, raw);
+                    agent_tool_viz_param_end(sr);
+                    free(raw);
+                }
+                sr->native_preview = AGENT_INKLING_PREVIEW_SEPARATOR;
+                p = next;
+            }
+            free(key);
+        }
+    }
+    sr->native_preview_offset = (size_t)(p - body->ptr);
+}
+
+static void agent_inkling_preview_start(agent_stream_renderer *sr, const char *name) {
+    agent_stream_flush_start_tail(sr);
+    sr->post_think_gap = false;
+    sr->native_preview_active = true;
+    sr->native_preview = AGENT_INKLING_PREVIEW_OPEN;
+    sr->native_preview_offset = 0;
+    sr->native_preview_args = false;
+    agent_tool_viz_start(sr);
+    agent_tool_viz_tool(sr, name);
+}
+
+static void agent_inkling_preview_finish(agent_stream_renderer *sr, const char *xml, size_t len) {
+    agent_qwen_tool_parser *p = sr->parser;
+    if (len) {
+        agent_qwen_tool_start(p);
+        size_t opening = p->raw_len;
+        agent_qwen_tool_raw_append(p, xml + opening, len - opening);
+        agent_qwen_tool_parse(p);
+    }
+    if (p->state != AGENT_QWEN_TOOL_DONE) {
+        agent_qwen_tool_set_error(p, "invalid Inkling tool call");
+        agent_tool_viz_finish(sr, "[invalid Inkling tool call]\n");
+    } else {
+        agent_tool_viz_finish(sr, NULL);
+    }
+    sr->native_preview_active = false;
 }
 
 /* ============================================================================
@@ -3996,6 +4146,24 @@ static void worker_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now_sec() - w->progress_started_at;
     w->status.prefill_tps =
         done > 0 && elapsed > 0.0 ? (double)done / elapsed : 0.0;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void worker_begin_prefill(agent_worker *w, agent_worker_state state,
+                                int cached, int total) {
+    pthread_mutex_lock(&w->mu);
+    if (state == AGENT_WORKER_PREFILL && w->status.state != state)
+        w->status.prefill_label = agent_next_prefill_label();
+    w->status.state = state;
+    w->progress_base = cached;
+    w->progress_started_at = now_sec();
+    w->status.prefill_done = 0;
+    w->status.prefill_total = total - cached;
+    w->status.prefill_tps = 0.0;
+    w->status.generated = 0;
+    w->status.gen_tps = 0.0;
+    w->status.greedy_sampling = false;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 }
@@ -4746,6 +4914,11 @@ static int agent_session_sync(agent_worker *w, const q36_tokens *tokens,
     return rc;
 }
 
+static int agent_session_cached_tokens(agent_worker *w, const q36_tokens *tokens) {
+    int common = q36_session_common_prefix(w->session, tokens);
+    return common == q36_session_pos(w->session) ? common : 0;
+}
+
 /* Synchronize the live Q36 session to a transcript.  This is the agent's main
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the Q36 session rebuilds from the
@@ -4753,28 +4926,9 @@ static int agent_session_sync(agent_worker *w, const q36_tokens *tokens,
 static int agent_worker_sync_tokens(agent_worker *w, const q36_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len) {
-    int old_pos = q36_session_pos(w->session);
-    int common = q36_session_common_prefix(w->session, tokens);
-    int cached = common == old_pos && tokens->len >= old_pos ? common : 0;
-    int suffix = tokens->len - cached;
-    if (suffix < 0) suffix = tokens->len;
-
-    if (publish_progress) {
-        pthread_mutex_lock(&w->mu);
-        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
-            w->status.prefill_label : agent_next_prefill_label();
-        w->status.state = AGENT_WORKER_PREFILL;
-        w->progress_base = cached;
-        w->progress_started_at = now_sec();
-        w->status.prefill_done = 0;
-        w->status.prefill_total = suffix;
-        w->status.prefill_label = prefill_label;
-        w->status.prefill_tps = 0.0;
-        w->status.generated = 0;
-        w->status.gen_tps = 0.0;
-        agent_wake_locked(w);
-        pthread_mutex_unlock(&w->mu);
-    }
+    if (publish_progress)
+        worker_begin_prefill(w, AGENT_WORKER_PREFILL,
+                             agent_session_cached_tokens(w, tokens), tokens->len);
 
     q36_session_set_progress(w->session, publish_progress ? worker_progress_cb : NULL,
                              publish_progress ? w : NULL);
@@ -9213,7 +9367,12 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     q36_chat_append_message(w->engine, &summary_suffix, "user", prompt_text);
     free(prompt_text);
     bool inkling = q36_engine_is_inkling(w->engine);
-    if (!inkling) q36_chat_append_assistant_prefix(w->engine, &summary_suffix, Q36_THINK_NONE);
+    /* The native effort message precedes the conversation. Starting a text
+     * frame here lets us summarize directly while reusing the live prefix. */
+    if (inkling)
+        q36_tokenize_rendered_chat(w->engine, "<|message_model|><|content_text|>", &summary_suffix);
+    else
+        q36_chat_append_assistant_prefix(w->engine, &summary_suffix, Q36_THINK_NONE);
     const int ctx = w->cfg->gen.ctx_size;
     int summary_budget = agent_compact_summary_budget(ctx);
     int summary_bottom = bottom;
@@ -9259,22 +9418,11 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
     }
     if (inkling && assistant) q36_tokens_push(&prompt, q36_token_eos(w->engine));
     agent_tokens_append_range(&prompt, &summary_suffix, 0, summary_suffix.len);
-    if (inkling) q36_chat_append_assistant_prefix(w->engine, &prompt, Q36_THINK_NONE);
     q36_tokens_free(&summary_suffix);
-    agent_trace(w, "compaction summary prefix=%d total=%d retained_unsummarized=%d",
-                summary_bottom, bottom, bottom - summary_bottom);
-
-    pthread_mutex_lock(&w->mu);
-    w->status.state = AGENT_WORKER_COMPACTING;
-    w->progress_started_at = now_sec();
-    w->status.prefill_done = 0;
-    w->status.prefill_total = 0;
-    w->status.prefill_tps = 0.0;
-    w->status.generated = 0;
-    w->status.gen_tps = 0.0;
-    w->status.greedy_sampling = false;
-    agent_wake_locked(w);
-    pthread_mutex_unlock(&w->mu);
+    int cached = agent_session_cached_tokens(w, &prompt);
+    agent_trace(w, "compaction summary prefix=%d total=%d retained_unsummarized=%d cached=%d prefill=%d",
+                summary_bottom, bottom, bottom - summary_bottom, cached, prompt.len - cached);
+    worker_begin_prefill(w, AGENT_WORKER_COMPACTING, cached, prompt.len);
 
     int summary_room = w->cfg->gen.ctx_size - prompt.len - 1;
     if (summary_room < 256) {
@@ -9341,7 +9489,7 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
             return false;
         }
         int token = q36_session_argmax(w->session);
-        if (token == q36_token_eos(w->engine)) break;
+        if (token == q36_token_eos(w->engine) || (inkling && token == im_end)) break;
         if (token == think_end_id) {
             agent_trace(w, "compaction summary stopped before control token id=%d", token);
             break;
@@ -9577,7 +9725,8 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
 
 static bool agent_stream_generating_tool(const agent_stream_renderer *sr) {
     return sr && !sr->qwen_tool_ignored &&
-           (sr->qwen_tool_active || sr->qwen_tool_start_len > 1);
+           (sr->qwen_tool_active || sr->qwen_tool_start_len > 1 ||
+            (sr->parser && sr->parser->native.in_body));
 }
 
 static bool agent_mtp_boundary_text(const char *text, size_t len) {
@@ -9658,11 +9807,24 @@ static void worker_emit_generated_token(agent_worker *w, int token,
     char *text = q36_token_text(w->engine, token, &text_len);
     agent_trace_token(w, token, text, text_len, *generated + 1);
     if (q36_engine_is_inkling(w->engine)) {
+        inkling_tool_stream *native = &stream->parser->native;
         free(text);
-        text = inkling_tool_piece(&stream->parser->native, w->engine, token,
+        text = inkling_tool_piece(native, w->engine, token,
                                   stream->renderer->format_thinking, &text_len);
+        if (native->in_body && !stream->native_preview_active &&
+            !stream->in_think && !stream->qwen_tool_active &&
+            stream->parser->state == AGENT_QWEN_TOOL_SEARCH &&
+            native->header.len && !strpbrk(native->header.ptr, "<>= \t\r\n"))
+            agent_inkling_preview_start(stream, native->header.ptr);
+        if (stream->native_preview_active) {
+            if (native->in_body) agent_inkling_preview_feed(stream, &native->body);
+            else agent_inkling_preview_finish(stream, text, text_len);
+        } else {
+            agent_stream_text(stream, text, text_len, false);
+        }
+    } else {
+        agent_stream_text(stream, text, text_len, false);
     }
-    agent_stream_text(stream, text, text_len, false);
     free(text);
     (*generated)++;
 
@@ -9752,7 +9914,7 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 
 static bool agent_stream_compaction_needs_lookahead(const agent_stream_renderer *sr) {
     return !sr->qwen_tool_active && sr->parser->state == AGENT_QWEN_TOOL_SEARCH &&
-           (sr->pending_len || sr->qwen_tool_start_len);
+           (sr->pending_len || sr->qwen_tool_start_len || sr->parser->native.in_header);
 }
 
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
@@ -9888,9 +10050,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         }
 
         const q36_tokens *prompt_for_sync = &w->transcript;
-        int old_pos = q36_session_pos(w->session);
-        int common = q36_session_common_prefix(w->session, &w->transcript);
-        int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
+        int cached = agent_session_cached_tokens(w, &w->transcript);
 
         int suffix = prompt_for_sync->len - cached;
         agent_trace(w, "prefill tool_round=%d transcript=%d prompt=%d cached=%d suffix=%d think=%s",
@@ -9898,21 +10058,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     cached, suffix, q36_think_mode_name(think_mode));
         agent_trace_tokens(w, "prefill_suffix", prompt_for_sync, cached);
 
-        pthread_mutex_lock(&w->mu);
-        unsigned prefill_label = w->status.state == AGENT_WORKER_PREFILL ?
-            w->status.prefill_label : agent_next_prefill_label();
-        w->status.state = AGENT_WORKER_PREFILL;
-        w->progress_base = cached;
-        w->progress_started_at = now_sec();
-        w->status.prefill_done = 0;
-        w->status.prefill_total = suffix;
-        w->status.prefill_label = prefill_label;
-        w->status.prefill_tps = 0.0;
-        w->status.generated = 0;
-        w->status.gen_tps = 0.0;
-        w->status.greedy_sampling = false;
-        agent_wake_locked(w);
-        pthread_mutex_unlock(&w->mu);
+        worker_begin_prefill(w, AGENT_WORKER_PREFILL, cached, prompt_for_sync->len);
 
         char err[160];
         q36_session_set_progress(w->session, worker_progress_cb, w);
@@ -10091,7 +10237,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                     tool_round, generated, carried_generation, context_limited,
                     stream.unsteered_tool_tokens);
         bool interrupted = worker_should_interrupt(w);
-        const bool partial_tool = stream.qwen_tool_active || stream.qwen_tool_start_len > 0 ||
+        const bool partial_native_tool = qwen_tool.native.in_body ||
+            (qwen_tool.native.in_header && qwen_tool.native.header.len);
+        const bool partial_tool = partial_native_tool ||
+                                  stream.qwen_tool_active || stream.qwen_tool_start_len > 0 ||
                                   qwen_tool.state != AGENT_QWEN_TOOL_SEARCH;
         agent_stream_text(&stream, NULL, 0, true);
         renderer_finish(&renderer);
@@ -10148,6 +10297,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                      "tool calling is not allowed inside <think></think>");
         } else if (!malformed_tool && qwen_tool.state == AGENT_QWEN_TOOL_ERROR) {
             malformed_tool = true;
+        } else if (!got_tool && partial_native_tool) {
+            malformed_tool = true;
+            snprintf(qwen_tool.error, sizeof(qwen_tool.error),
+                     "incomplete Inkling tool call");
         } else if (!got_tool && !malformed_tool && !early_tool_error &&
                    !interrupted &&
                    (qwen_tool.state == AGENT_QWEN_TOOL_STRUCTURAL ||
@@ -10176,15 +10329,17 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 "edit old selector failed before new was generated");
             agent_tool_observation_puts(&observation, "\n");
         } else if (malformed_tool) {
+            bool inkling = q36_engine_is_inkling(w->engine);
             agent_tool_observation_puts(
-                &observation, "Tool error: invalid Qwen tool call: ");
+                &observation, inkling ? "Tool error: invalid Inkling tool call: " :
+                                        "Tool error: invalid Qwen tool call: ");
             agent_tool_observation_puts(
                 &observation, qwen_tool.error[0] ? qwen_tool.error : "parse error");
             agent_tool_observation_puts(&observation, "\n");
             if (stream.qwen_tool_in_think)
                 agent_tool_observation_puts(&observation,
                     "Close thinking with </think> before retrying the tool call.\n");
-            agent_tool_observation_puts(
+            if (!inkling) agent_tool_observation_puts(
                 &observation, agent_qwen_tool_syntax_reminder);
         } else {
             agent_tool_observation_free(&observation);
@@ -10779,8 +10934,13 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
                  st->greedy_sampling ? " ❄️" : "", st->gen_tps, power);
         break;
     case AGENT_WORKER_COMPACTING:
-        snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
-                 used, total_ctx, st->generated, st->gen_tps, power);
+        if (st->prefill_done < st->prefill_total)
+            snprintf(buf, len, "ctx %s/%s | COMPACTING prefill %d/%d %.1f t/s%s",
+                     used, total_ctx, st->prefill_done, st->prefill_total,
+                     st->prefill_tps, power);
+        else
+            snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
+                     used, total_ctx, st->generated, st->gen_tps, power);
         break;
     case AGENT_WORKER_SAVING:
         snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);

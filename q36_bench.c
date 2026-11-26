@@ -99,7 +99,7 @@ static void usage(FILE *fp) {
         "                         Default: Vulkan/Metal resident q4_0, otherwise f16\n"
         "  --warm-weights         Touch mapped tensor pages before benchmarking.\n"
         "  --warmup               Untimed prefill and 8 decode tokens at every frontier.\n"
-        "  --mtp FILE             Optional MTP support GGUF: the greedy decode runs\n"
+        "  --mtp FILE             Optional DSpark or MTP support GGUF. Greedy decode uses\n"
         "                         the speculative path when --mtp-draft > 1.\n"
         "  --mtp-draft N          Max MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F         MTP draft confidence gate. Default: 3.0\n"

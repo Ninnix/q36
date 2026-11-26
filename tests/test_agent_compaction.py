@@ -41,17 +41,19 @@ trace = out / "agent.trace"
 master, slave = pty.openpty()
 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
 cmd = [str(args.binary.resolve()), "-m", str(args.model.resolve()),
-       "--vulkan", "--ssd-streaming", "--ctx", str(args.ctx), "--think" if args.think else "--nothink",
+       "--vulkan", "--ctx", str(args.ctx), "--think" if args.think else "--nothink",
        "--temp", "0", "--tokens", str(args.tokens),
        "--seed", "12345", "--chdir", str(project), "--trace", str(trace)]
 if args.vision:
     cmd += ["--vision", str(args.vision.resolve())]
 if args.prefix_file:
     cmd += ["--prefix-file", str(args.prefix_file.resolve())]
-if args.mtp:
-    cmd += ["--mtp"]
 if args.dspark:
-    cmd += ["--dspark", "--mtp-model", str(args.dspark.resolve())]
+    cmd += ["--mtp", str(args.dspark.resolve())]
+else:
+    cmd += ["--ssd-streaming"]
+    if args.mtp:
+        cmd += ["--mtp"]
 (out / "command.json").write_text(json.dumps(cmd))
 proc = subprocess.Popen(cmd, cwd=root, stdin=slave, stdout=slave, stderr=slave,
                         env=dict(os.environ, Q36_AGENT_CACHE_DIR=str(cache), TERM="xterm-256color"), start_new_session=True)

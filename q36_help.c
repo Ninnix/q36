@@ -177,7 +177,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--prefill-chunk N",
         "GPU graph prefill chunk size. Default: auto; resident GPU resolves to 1024.");
     if (tool == Q36_HELP_Q36 || tool == Q36_HELP_AGENT || tool == Q36_HELP_SERVER) {
-        opt(fp, c, "--mtp [FILE]", "Enable MTP; omit FILE for the embedded head in -m.");
+        opt(fp, c, "--mtp [FILE]", "Use an Inkling DSpark or Qwen MTP head. Omit FILE for embedded Qwen MTP.");
         opt(fp, c, "--mtp-draft N", "Maximum MTP block tokens. Default: 8");
         opt(fp, c, "--mtp-margin F", "Draft confidence margin. Default: 0 (adaptive depth)");
         opt(fp, c, "--mtp-opportunistic", "Default with --mtp: sample block starts, accept greedy tails; biases sampling.");

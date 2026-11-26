@@ -183,6 +183,11 @@ also supports text inference.
 ./q36 --vulkan -m gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf
 ```
 
+For speculative decoding on a single BC-250, run
+`./download_model.sh inkling-2-mini-dspark` and add
+`--mtp gguf/Inkling-2-Mini-DSpark-333M.gguf` to the CLI, server, or agent.
+See [Inkling DSpark setup and sampling](docs/SPECULATIVE_DECODING.md#inkling-2-mini-on-the-bc-250).
+
 For images, run `./download_model.sh inkling-2-mini-vision` and add
 `--vision gguf/Inkling-2-Mini-mmproj-F16.gguf`. The projector streams its
 weights from disk on demand. See [Inkling client setup](docs/CLIENTS.md#inkling-2-mini-on-one-board).
@@ -381,7 +386,7 @@ targets, and matching encoders. Vision currently requires Vulkan. With the
 encoder passed as `--vision FILE`, use `/read image.png` in the CLI or
 `view_image` in the agent.
 
-Speculative decoding is opt-in with `--mtp` on models with an embedded head.
+Use `--mtp` for embedded Qwen heads or `--mtp FILE` for the separate Inkling DSpark head.
 Performance depends on the workload. Read [speculative decoding](docs/SPECULATIVE_DECODING.md)
 for setup and the difference between opportunistic and ordinary sampling.
 

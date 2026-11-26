@@ -8361,15 +8361,23 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     if (limit > 512) limit = 512;
     int ctx = frontier > 0 ? frontier + limit + 32 : 4096;
     bool compact = getenv("Q36_TEST_MTP_COMPACT") != NULL;
+    const char *threads = getenv("Q36_TEST_THREADS");
     q36_engine_options opt = {
         .model_path = test_model_path(),
         .mtp_path = test_mtp_path(),
         .backend = Q36_BACKEND_VULKAN,
+        .n_threads = threads ? atoi(threads) : 0,
         .mtp_draft_tokens = draft,
         .mtp_margin = 0.0f,
         .cache_type_k = compact ? Q36_KV_CACHE_Q8_0 : Q36_KV_CACHE_F16,
         .cache_type_v = compact ? Q36_KV_CACHE_Q4_0 : Q36_KV_CACHE_F16,
     };
+    const char *cache_k=getenv("Q36_TEST_CACHE_TYPE_K"), *cache_v=getenv("Q36_TEST_CACHE_TYPE_V");
+    if ((cache_k && !q36_parse_kv_cache_type(cache_k,&opt.cache_type_k)) ||
+        (cache_v && !q36_parse_kv_cache_type(cache_v,&opt.cache_type_v))) {
+        TEST_ASSERT(false);
+        return;
+    }
     q36_engine *engine = NULL;
     q36_session *spec = NULL;
     q36_session *plain = NULL;
@@ -8385,6 +8393,8 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     int longest = 0;
     bool restored_generated = false;
     float worst_gap = 0.0f, worst_logits = 0.0f;
+    q36_session_snapshot witness={0};
+    int witness_anchor=-1, witness_budget=8;
 
     TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
     if (!engine) return;
@@ -8415,7 +8425,8 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     TEST_ASSERT(payload != NULL);
     if (payload) {
         uint64_t bytes = q36_session_payload_bytes(spec);
-        TEST_ASSERT(bytes > sizeof(int32_t) * (uint64_t)prompt.len + 1024);
+        if (q36_engine_is_inkling(engine)) TEST_ASSERT(bytes==sizeof(uint32_t)*(3u+prompt.len));
+        else TEST_ASSERT(bytes > sizeof(int32_t) * (uint64_t)prompt.len + 1024);
         TEST_ASSERT(q36_session_save_payload(spec, payload, err, sizeof(err)) == 0);
         TEST_ASSERT((uint64_t)ftell(payload) == bytes);
         rewind(payload);
@@ -8446,6 +8457,8 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
         }
         if (first < 0 || first == q36_token_eos(engine)) break;
         int accepted[17];
+        if (q36_engine_is_inkling(engine) && witness_anchor<0)
+            TEST_ASSERT(q36_session_save_snapshot(spec,&witness,err,sizeof(err))==0);
         int n = (frontier > 0 ? q36_session_eval_speculative_argmax_excluding : q36_session_eval_speculative_argmax)(
             spec, first, limit - committed, q36_token_eos(engine),
             accepted, (int)(sizeof(accepted) / sizeof(accepted[0])),
@@ -8456,6 +8469,10 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
             break;
         }
         TEST_ASSERT(accepted[0] == first);
+        if (n>1 && witness.ptr && witness_anchor<0) {
+            witness_anchor=first;
+            witness_budget=limit-committed;
+        }
         if (n > 1) multi++;
         if (n > longest) longest = n;
         if (n > 1 && n < q36_engine_mtp_draft_tokens(engine)) partial++;
@@ -8501,8 +8518,26 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
             if (saved) {
                 uint64_t bytes = q36_session_payload_bytes(spec);
                 TEST_ASSERT(q36_session_save_payload(spec, saved, err, sizeof(err)) == 0);
+                int replay_anchor=-1, replay_count=0, replay_tokens[8];
+                if (sampled && !frontier && q36_engine_is_inkling(engine)) {
+                    replay_anchor=q36_session_argmax(spec);
+                    replay_count=q36_session_eval_speculative_argmax(spec,replay_anchor,8,
+                        q36_token_eos(engine),replay_tokens,8,err,sizeof(err));
+                    TEST_ASSERT(replay_count>0);
+                }
                 rewind(saved);
                 TEST_ASSERT(q36_session_load_payload(spec, saved, bytes, err, sizeof(err)) == 0);
+                if (replay_count>0) {
+                    int again[8];
+                    int n=q36_session_eval_speculative_argmax(spec,replay_anchor,8,
+                        q36_token_eos(engine),again,8,err,sizeof(err));
+                    bool same=n==replay_count && !memcmp(again,replay_tokens,n*sizeof(*again));
+                    if (!same) fprintf(stderr,"q36-test: restored draft at %d accepted %d tokens, expected %d\n",
+                                       committed,n,replay_count);
+                    TEST_ASSERT(same);
+                    rewind(saved);
+                    TEST_ASSERT(q36_session_load_payload(spec,saved,bytes,err,sizeof(err))==0);
+                }
                 fclose(saved);
             }
             restored_generated = true;
@@ -8524,14 +8559,27 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     if (draft > 2) TEST_ASSERT(partial > 0);
     int accepted[17];
     int boundary_calls = 0;
-    int boundary_token = q36_session_argmax(spec);
-    int boundary_n = q36_session_eval_speculative_argmax_with_boundary(spec,
-        boundary_token, 8, -1, accepted, 17,
-        test_mtp_boundary_after_first, &boundary_calls, err, sizeof(err));
+    /* Repeat a block known to have a tail, even when the head has since
+     * paused. The boundary must veto that tail and leave serial logits. */
+    int boundary_token=q36_session_argmax(spec);
+    if (witness_anchor>=0) {
+        TEST_ASSERT(q36_session_load_snapshot(spec,&witness,err,sizeof(err))==0);
+        TEST_ASSERT(q36_session_load_snapshot(plain,&witness,err,sizeof(err))==0);
+        boundary_token=witness_anchor;
+    }
+    int n=q36_session_eval_speculative_argmax_with_boundary(spec,
+        boundary_token,witness_budget,-1,accepted,17,test_mtp_boundary_after_first,
+        &boundary_calls,err,sizeof(err));
+    TEST_ASSERT(n==1 && accepted[0]==boundary_token);
     TEST_ASSERT(boundary_calls >= 2);
-    TEST_ASSERT(boundary_n == 1 && accepted[0] == boundary_token);
-    TEST_ASSERT(q36_session_eval(plain, boundary_token, err, sizeof(err)) == 0);
-    TEST_ASSERT(q36_session_pos(spec) == q36_session_pos(plain));
+    TEST_ASSERT(q36_session_eval(plain,boundary_token,err,sizeof(err))==0);
+    TEST_ASSERT(q36_session_pos(spec)==q36_session_pos(plain));
+    if (q36_engine_is_inkling(engine)) {
+        int pos=q36_session_pos(spec);
+        TEST_ASSERT(q36_session_eval(spec,q36_session_argmax(spec),err,sizeof(err))==0);
+        q36_session_rewind(spec,pos);
+        TEST_ASSERT(q36_session_pos(spec)==pos);
+    }
     const float *boundary_logits = q36_session_logits(spec, NULL);
     const float *plain_logits = q36_session_logits(plain, NULL);
     TEST_ASSERT(boundary_logits && plain_logits);
@@ -8550,6 +8598,7 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
         accepted, 1, err, sizeof(err)) == 1);
 
 done:
+    q36_session_snapshot_free(&witness);
     q36_tokens_free(&prompt);
     q36_session_free(plain);
     q36_session_free(spec);

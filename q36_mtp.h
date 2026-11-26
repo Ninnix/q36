@@ -3,6 +3,9 @@
 
 #include <string.h>
 
+/* Below this top-two logit gap, verify one proposal before drafting further. */
+#define Q36_MTP_PROBE_MARGIN 1.0f
+
 /* Reuse a continuation only when the longest matching suffix is unambiguous.
  * The known first token participates in the match but is not in history yet.
  * Bound the scan so CPU work stays small as the context grows. */
@@ -32,4 +35,18 @@ static inline int q36_mtp_lookup(const int *history, int len, int first,
     return cap;
 }
 
+/* The first token came from the target. Each following token must be the
+ * best allowed token of the preceding verified row. */
+static inline int q36_mtp_accepted_prefix(const int *tokens,const int *tops,
+                                          int count,int eos,int excluded) {
+    if (!count) return 0;
+    int n=1;
+    while (n<count && tokens[n-1]!=eos) {
+        int top=tops[2*(n-1)];
+        if (top==excluded) top=tops[2*(n-1)+1];
+        if (top!=tokens[n]) break;
+        n++;
+    }
+    return n;
+}
 #endif

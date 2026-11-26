@@ -21,6 +21,7 @@ TARGETS = {
     'flash-next': ['FLASH_FILE', 'FLASH_NGRAM_FILE'],
     'qwen38-flash-next': ['FLASH_FILE', 'FLASH_NGRAM_FILE'],
     'inkling-2-mini': ['INKLING_FILE'],
+    'inkling-2-mini-dspark': ['INKLING_DSPARK_FILE'],
     'inkling-2-mini-vision': ['INKLING_VISION_FILE'],
     'qwen36-vision': ['VISION_FILE'],
     'qwen38-vision': ['DENSE_VISION_FILE'],
@@ -105,6 +106,11 @@ with out.open('ab') as dst:
                     }[target]
                     self.assertEqual(self.log.read_text().splitlines()[-1],
                                      f'https://huggingface.co/{repo}/resolve/main/mmproj-F16.gguf')
+                elif target == 'inkling-2-mini-dspark':
+                    self.assertFalse(self.link.is_symlink())
+                    self.assertEqual(self.log.read_text().splitlines()[-1],
+                                     'https://huggingface.co/Ninnix96/Inkling-2-Mini-DSpark-GGUF'
+                                     '/resolve/main/Inkling-2-Mini-DSpark-333M.gguf')
                 else:
                     self.assertEqual(self.link.resolve(), self.out / FILES[keys[0]])
                 calls = self.log.read_text()

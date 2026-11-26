@@ -1,0 +1,157 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x=64) in;
+layout(binding=0) buffer Output { float a[]; };
+layout(binding=1) readonly buffer Input { float b[]; };
+layout(binding=2) readonly buffer Weight { float c[]; };
+layout(binding=3) readonly buffer Extra { float d[]; };
+layout(push_constant) uniform Params { uint op,n,k,pos,cap,window,nt,unused; } p;
+
+uint weightByte(uint offset) {
+    return (floatBitsToUint(c[offset/4]) >> ((offset%4)*8)) & 255;
+}
+int signedByte(uint offset) { return int(weightByte(offset)<<24)>>24; }
+
+// The two RoPE halves share a lane. Cache one packed key and one packed value
+// per lane, so a wave can read a complete attention head in two transactions.
+void rotateHead(uint lane,uint head,uint token) {
+    uint offset=(token*p.n+head)*128;
+    float lo=b[offset+lane],hi=b[offset+lane+64];
+    float scale=inversesqrt(subgroupAdd(lo*lo+hi*hi)/128.0+1e-6);
+    lo*=scale*c[lane];
+    hi*=scale*c[lane+64];
+    float phase=float(p.pos+token)*pow(1000000.0,-float(lane)/64.0);
+    vec2 key=vec2(lo*cos(phase)-hi*sin(phase),hi*cos(phase)+lo*sin(phase));
+    if (p.op==1) {
+        a[offset+lane]=key.x;
+        a[offset+lane+64]=key.y;
+    } else {
+        uint dst=(((p.pos+token)%p.cap)*8+head)*128+lane;
+        a[dst]=uintBitsToFloat(packHalf2x16(key));
+        a[dst+64]=uintBitsToFloat(packHalf2x16(vec2(d[offset+lane],d[offset+lane+64])));
+    }
+}
+
+void attentionTile(uint lane,uint tile,uint head,uint token) {
+    uint start=p.pos>p.window ? p.pos-p.window : 0;
+    uint end=min(p.pos+p.nt,start+(tile+1)*64);
+    uint at=(token*24+head)*128+lane;
+    vec2 query=vec2(b[at],b[at+64]);
+    float maxScore=-1e30,total=0;
+    vec2 acc=vec2(0);
+    for (uint i=start+tile*64;i<end;i++) {
+        uint idx=((i%p.cap)*8+head/3)*128+lane;
+        float score=subgroupAdd(dot(query,unpackHalf2x16(floatBitsToUint(c[idx]))))*0.08838834765;
+        float nextMax=max(maxScore,score),oldWeight=exp(maxScore-nextMax),weight=exp(score-nextMax);
+        acc=acc*oldWeight+unpackHalf2x16(floatBitsToUint(c[idx+64]))*weight;
+        total=total*oldWeight+weight;
+        maxScore=nextMax;
+    }
+    uint dst=((token*24+head)*p.k+tile)*130;
+    a[dst+lane]=acc.x;
+    a[dst+lane+64]=acc.y;
+    if (lane==0) { a[dst+128]=maxScore; a[dst+129]=total; }
+}
+
+void finishAttention(uint lane,uint head,uint token) {
+    float maxScore=-1e30,total=0;
+    vec2 acc=vec2(0);
+    for (uint tile=0;tile<p.k;tile++) {
+        uint src=((token*24+head)*p.k+tile)*130;
+        float score=b[src+128],nextMax=max(maxScore,score);
+        float oldWeight=exp(maxScore-nextMax),weight=exp(score-nextMax);
+        acc=acc*oldWeight+vec2(b[src+lane],b[src+lane+64])*weight;
+        total=total*oldWeight+b[src+129]*weight;
+        maxScore=nextMax;
+    }
+    uint dst=(token*24+head)*128+lane;
+    a[dst]=acc.x/total;
+    a[dst+64]=acc.y/total;
+}
+
+void markovEmbedding(uint feature) {
+    int id=floatBitsToInt(b[2*p.pos]);
+    if (p.pos!=0 && id==int(p.cap)) id=floatBitsToInt(b[2*p.pos+1]);
+    if (p.pos==0) a[feature]=0;
+    // One Q6_K block is the complete Markov embedding of the preceding token.
+    uint row=uint(id)*210,halfBlock=feature/128,part=feature%128/32,lane=feature%32;
+    uint low=weightByte(row+halfBlock*64+(part%2)*32+lane)>>(4*(part/2));
+    uint high=weightByte(row+128+halfBlock*32+lane)>>(2*part);
+    int value=int((low&15)|((high&3)<<4))-32;
+    float scale=unpackHalf2x16(weightByte(row+208)|(weightByte(row+209)<<8)).x;
+    a[256+feature]=scale*float(signedByte(row+192+feature/16))*float(value);
+}
+
+// Select two distinct IDs, breaking ties by vocabulary order. Each wave
+// writes one pair per tile; the final wave reduces those pairs into a proposal.
+void insertScore(float x, uint id, inout float first, inout uint i0, inout float second, inout uint i1) {
+    if (x>first || (x==first && id<i0)) {
+        second=first; i1=i0; first=x; i0=id;
+    } else if (x>second || (x==second && id<i1)) {
+        second=x; i1=id;
+    }
+}
+void selectProposal(uint lane, uint group) {
+    float first=-1.0/0.0,second=first;
+    uint i0=0xffffffffu,i1=i0;
+    if (p.op==5) {
+        for (uint i=group*512+lane; i<min((group+1)*512,p.n); i+=64) {
+            uint id=p.k==0 ? i : floatBitsToUint(c[p.k+i]);
+            if (id==~0u) continue;
+            precise float score=b[i]+(c[i]+d[id]);
+            insertScore(score,id,first,i0,second,i1);
+        }
+    } else {
+        for (uint i=lane;i<p.n;i+=64) {
+            insertScore(b[4*i],floatBitsToUint(b[4*i+1]),first,i0,second,i1);
+            insertScore(b[4*i+2],floatBitsToUint(b[4*i+3]),first,i0,second,i1);
+        }
+    }
+    float top=subgroupMax(first);
+    uint best=subgroupMin(first==top ? i0 : 0xffffffffu);
+    float next=i0==best ? second : first;
+    uint other=i0==best ? i1 : i0;
+    float runner=subgroupMax(next);
+    uint alternate=subgroupMin(next==runner ? other : 0xffffffffu);
+    if (lane!=0) return;
+    if (p.op==5) {
+        a[4*group]=top; a[4*group+1]=uintBitsToFloat(best);
+        a[4*group+2]=runner; a[4*group+3]=uintBitsToFloat(alternate);
+    } else {
+        a[2*p.pos]=uintBitsToFloat(best); a[2*p.pos+1]=uintBitsToFloat(alternate);
+        // The head applies its softcap after the Markov bias. The ranking
+        // survives that transform, but the confidence margin does not.
+        a[16+p.pos]=30.0*(tanh(top/30.0)-tanh(runner/30.0));
+    }
+}
+
+void main() {
+    uint lane=gl_LocalInvocationID.x,group=gl_WorkGroupID.x;
+    uint head=gl_WorkGroupID.y,token=gl_WorkGroupID.z;
+    uint i=group*64+lane;
+    if (p.op==0) {
+        uint dst=token*2304+i;
+        a[dst]=b[dst]*c[0]+b[dst+p.cap]*c[1]+b[dst+2*p.cap]*c[2]+b[dst+3*p.cap]*c[3];
+    } else if (p.op==1 || p.op==2) {
+        rotateHead(lane,group,token);
+    } else if (p.op==3) {
+        attentionTile(lane,group,head,token);
+    } else if (p.op==4) {
+        finishAttention(lane,head,token);
+    } else if (p.op==5 || p.op==10) {
+        selectProposal(lane,group);
+    } else if (p.op==6 && i<p.n) {
+        vec3 old=vec3(a[3*i],a[3*i+1],a[3*i+2]);
+        for (uint j=0;j<3;j++) {
+            int row=int(p.pos+j)-3;
+            a[3*i+j]=row<0 ? old[row+3] : b[(3+uint(row))*p.n+i];
+        }
+    } else if (p.op==8) {
+        float gate=1.0/(1.0+exp(-b[i]-c[i]));
+        float candidate=tanh(b[i+256]+c[i+256]);
+        a[i]=candidate+gate*(a[i]-candidate);
+        a[5120+i]=tanh(b[i+512]+c[i+512]);
+    } else if (p.op==9) {
+        markovEmbedding(i);
+    }
+}

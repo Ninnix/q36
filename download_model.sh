@@ -6,6 +6,7 @@ DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 FLASH_REPO="Ninnix96/Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-gguf"
 INKLING_REPO="unsloth/Inkling-2-Mini-GGUF"
+INKLING_DSPARK_REPO="Ninnix96/Inkling-2-Mini-DSpark-GGUF"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 Q4_FILE="Qwen3.6-35B-A3B-IQ4XS-Q4K-Q8.gguf"
@@ -15,6 +16,7 @@ DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
 FLASH_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00001-of-00002.gguf"
 FLASH_NGRAM_FILE="Qwen3.8-Flash-Next-GSQ-RCO-Coder-22GB-IQ2_XXS-00002-of-00002.gguf"
 INKLING_FILE="Inkling-2-Mini-UD-IQ3_XXS.gguf"
+INKLING_DSPARK_FILE="Inkling-2-Mini-DSpark-333M.gguf"
 VISION_REMOTE="mmproj-F16.gguf"
 VISION_FILE="Qwen3.6-35B-A3B-mmproj-F16.gguf"
 DENSE_VISION_FILE="Qwen3.8-27B-mmproj-F16.gguf"
@@ -40,6 +42,7 @@ Usage:
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh flash-next [--token TOKEN]
   ./download_model.sh inkling-2-mini [--token TOKEN]
+  ./download_model.sh inkling-2-mini-dspark [--token TOKEN]
   ./download_model.sh inkling-2-mini-vision [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
@@ -77,6 +80,11 @@ Targets:
 
   inkling-2-mini
        Inkling-2-Mini UD-IQ3_XXS from $INKLING_REPO, about 10.9 GiB.
+
+  inkling-2-mini-dspark
+       Optional 333 MB speculative decoding head for Inkling-2-Mini
+       from $INKLING_DSPARK_REPO. Pass --mtp "$OUT_DIR/$INKLING_DSPARK_FILE"
+       alongside the Inkling target on a single BC-250.
 
   inkling-2-mini-vision
        Inkling-2-Mini F16 vision projector from $INKLING_REPO.
@@ -135,6 +143,11 @@ case "$MODEL" in
     27b-q6) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_Q6_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
     inkling-2-mini) MODEL_REPO=$INKLING_REPO; MODEL_FILE=$INKLING_FILE ;;
+    inkling-2-mini-dspark)
+        MODEL_REPO=$INKLING_DSPARK_REPO
+        MODEL_FILE=$INKLING_DSPARK_FILE
+        LINK_MODEL=0
+        ;;
     inkling-2-mini-vision|inkling-vision)
         MODEL_REPO=$INKLING_REPO
         MODEL_REMOTE=$VISION_REMOTE
@@ -235,6 +248,10 @@ artifact_identity() {
         "$INKLING_FILE")
             expected_bytes=11663310784
             expected_sha=fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657
+            ;;
+        "$INKLING_DSPARK_FILE")
+            expected_bytes=333053536
+            expected_sha=89cddd423e0b05a55ee97384c6cc3b45e608e683f5a70030892bfceb9dfa6f05
             ;;
         "$VISION_FILE")
             expected_bytes=899283680

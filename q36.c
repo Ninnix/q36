@@ -583,6 +583,7 @@ static const char *q36_dump_names[Q36_DUMP_COUNT] = {
 
 struct q36_engine {
     struct ink_weights *ink;
+    struct ink_dspark_weights *dspark;
     q36_dist_options distributed;
     q36_dist_engine *dist;
     uint32_t layer_start, layer_end;
@@ -650,6 +651,7 @@ struct q36_session {
     q36_engine *engine;
     int ctx_size;
     q36_tokens checkpoint;
+    q36_tokens ink_batches; /* Start and length of each batched prompt segment. */
     bool checkpoint_valid;
     bool vision_state;
     q36_vision_span *vision_spans;
@@ -850,6 +852,7 @@ enum {
     Q36_PAYLOAD_VERSION = 2,
     Q36_PAYLOAD_VERSION_TYPED_KV = 3,
     Q36_PAYLOAD_VERSION_MTP = 4,
+    Q36_PAYLOAD_VERSION_INK_BATCHES = 5,
     Q36_PAYLOAD_U32_FIELDS = 14,
     Q36_PAYLOAD_U32_FIELDS_TYPED_KV = 16,
 };
@@ -868,6 +871,7 @@ static uint64_t q36_mtp_stat_lookup_drafted;
 static uint64_t q36_mtp_stat_lookup_accepted;
 static uint64_t q36_mtp_stat_depth[5];
 static bool q36_mtp_stat_registered;
+static pthread_mutex_t q36_mtp_stat_mu=PTHREAD_MUTEX_INITIALIZER;
 
 static void q36_mtp_stats_report(void) {
     if (!q36_mtp_stat_calls) return;
@@ -884,8 +888,9 @@ static void q36_mtp_stats_report(void) {
             q36_mtp_stat_depth[2], q36_mtp_stat_depth[3], q36_mtp_stat_depth[4]);
 }
 
-static void q36_mtp_stats_add(int drafted, int accepted, bool full, int depth) {
+static void q36_mtp_stats_add(int drafted, int accepted, bool full, int depth, int lookup_start) {
     if (!getenv("Q36_MTP_STATS")) return;
+    pthread_mutex_lock(&q36_mtp_stat_mu);
     if (!q36_mtp_stat_registered) {
         atexit(q36_mtp_stats_report);
         q36_mtp_stat_registered = true;
@@ -895,6 +900,12 @@ static void q36_mtp_stats_add(int drafted, int accepted, bool full, int depth) {
     if (drafted > 0) q36_mtp_stat_drafted += (uint64_t)drafted;
     if (accepted > 0) q36_mtp_stat_accepted += (uint64_t)accepted;
     if (full) q36_mtp_stat_full++;
+    if (lookup_start) {
+        q36_mtp_stat_lookup++;
+        q36_mtp_stat_lookup_drafted += drafted+1-lookup_start;
+        if (accepted>=lookup_start) q36_mtp_stat_lookup_accepted += accepted+1-lookup_start;
+    }
+    pthread_mutex_unlock(&q36_mtp_stat_mu);
 }
 #endif
 
@@ -4547,7 +4558,7 @@ static q36_tensor *q36_vision_tensorf(const q36_model *m, uint32_t layer,
     return model_find_tensor(m, name);
 }
 
-static void q36_vision_drop_pages(const q36_model *m) {
+static void q36_model_drop_pages(const q36_model *m) {
 #ifdef MADV_DONTNEED
     madvise((void *)m->map, (size_t)m->size, MADV_DONTNEED);
 #endif
@@ -4698,7 +4709,7 @@ static int ink_vision_encode(q36_engine *e, const q36_image *image,
 done:
     free(x); free(norm); free(work); free(qkv); free(wide);
     q36_image_patches_free(&patches);
-    q36_vision_drop_pages(m);
+    q36_model_drop_pages(m);
     if (failure && err && errlen) snprintf(err, errlen, "%s", failure);
     return !failure;
 }
@@ -4841,7 +4852,7 @@ merger_bad:
 done:
     free(x); free(norm); free(qkv); free(work); free(wide);
     q36_image_patches_free(&patches);
-    q36_vision_drop_pages(m);
+    q36_model_drop_pages(m);
     return ok;
 }
 
@@ -9999,6 +10010,7 @@ static bool q36_mtp_pick(q36_session *s, int excluded_id, int *token, float *mar
 #endif
 
 #include "q36_qwen4.inc"
+enum { INK_DSPARK_MAX_PAUSE=12 };
 #include "q36_inkling.inc"
 #include "q36_inkling_gpu.inc"
 
@@ -11392,7 +11404,7 @@ static bool q36_load_vision(q36_engine *e, const char *path) {
 #ifdef MADV_RANDOM
     madvise((void *)m->map, (size_t)m->size, MADV_RANDOM);
 #endif
-    q36_vision_drop_pages(m);
+    q36_model_drop_pages(m);
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
     if (e->backend == Q36_BACKEND_VULKAN && !q36_gpu_vision_stream_init(m->max_tensor_bytes)) {
         fprintf(stderr, "q36: unable to allocate streamed vision weight buffer\n");
@@ -11501,7 +11513,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     e->variant = g_q36_shape.variant;
     if (e->variant == Q36_VARIANT_INKLING) {
         if (e->backend == Q36_BACKEND_METAL ||
-            (opt->vision_path && e->backend != Q36_BACKEND_VULKAN) || opt->mtp_path ||
+            ((opt->vision_path || opt->mtp_path) && e->backend != Q36_BACKEND_VULKAN) ||
             opt->directional_steering_file || getenv("Q36_GRAPH_DUMP_PREFIX") || e->ssd_streaming ||
             q36_dist_enabled(&e->distributed) || !q36_kv_cache_row_bytes(e->cache_type_k,32) ||
             !q36_kv_cache_row_bytes(e->cache_type_v,32)) {
@@ -11519,6 +11531,11 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
 
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
         if (e->backend == Q36_BACKEND_VULKAN) {
+            if (opt->mtp_path && !ink_dspark_bind(e,opt->mtp_path)) {
+                fprintf(stderr,"q36: Inkling requires a separate 333 MB DSpark head and a compatible single-board Vulkan device\n");
+                q36_engine_close(e);
+                return 1;
+            }
             e->weights.token_embd = (q36_tensor *)e->ink->embd;
             e->weights.output = (q36_tensor *)e->ink->output;
             if (!q36_vulkan_set_model_spans(e) || !q36_vulkan_prewarm_weights(e) || !q36_gpu_finish_model_cache()) {
@@ -11526,6 +11543,15 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
                 q36_engine_close(e);
                 return 1;
             }
+            if (e->dspark && !ink_dspark_upload(e)) {
+                fprintf(stderr,"q36: unable to upload Inkling DSpark weights\n");
+                q36_engine_close(e);
+                return 1;
+            }
+            e->mtp_ready=e->dspark!=NULL;
+            if (e->mtp_ready && e->mtp_draft_tokens>8) e->mtp_draft_tokens=8;
+            if (e->mtp_ready) fprintf(stderr,"q36: Inkling DSpark head loaded: %s (draft=%d)\n",
+                                      opt->mtp_path,e->mtp_draft_tokens);
         }
 #endif
         e->cpu_prefill_cap = 1;
@@ -11848,6 +11874,7 @@ void q36_engine_close(q36_engine *e) {
     q36_gpu_tensor_free(e->session_batch_logits);
     if (q36_backend_uses_graph(e->backend)) q36_gpu_cleanup();
 #endif
+    free(e->dspark);
     free(e->ink);
     free(e->directional_steering_dirs);
     vocab_free(&e->vocab);
@@ -12169,7 +12196,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     s->gpu_top2_valid = false;
     if (e->ink) {
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
-        if (e->backend==Q36_BACKEND_VULKAN) s->runtime=ink_vk_create(e);
+        if (e->backend==Q36_BACKEND_VULKAN) s->runtime=ink_vk_create(e,ctx_size);
         else
 #endif
         s->runtime = xcalloc(1, sizeof(ink_state));
@@ -12207,7 +12234,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
-    if (e->mtp_ready) {
+    if (e->mtp_ready && !e->dspark) {
         s->mtp_logits = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->mtp_logits));
         memset(s->mtp_logits, 0, (size_t)Q36_N_VOCAB * sizeof(*s->mtp_logits));
 
@@ -12239,6 +12266,7 @@ void q36_session_free(q36_session *s) {
 #endif
     s->engine->session_bytes -= s->reserved_context_bytes;
     s->engine->live_sessions--;
+    q36_tokens_free(&s->ink_batches);
     q36_tokens_free(&s->checkpoint);
     if (s->engine->ink) {
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
@@ -12406,6 +12434,10 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
                 if (err && errlen) snprintf(err, errlen, "prefill failed at token %d", i);
                 s->checkpoint_valid = false;
                 return 1;
+            }
+            if (s->engine->dspark && n>1) {
+                q36_tokens_push(&s->ink_batches,i);
+                q36_tokens_push(&s->ink_batches,n);
             }
             for (unsigned j=0;j<n;j++) q36_tokens_push(&s->checkpoint,prompt->v[i++]);
             s->checkpoint_valid = true;
@@ -13140,6 +13172,138 @@ int q36_sessions_eval_batch_with_prefill(
     return rc;
 }
 
+#ifndef Q36_NO_GPU
+static void q36_mtp_commit_tokens(q36_session *s,const int *tokens,int count,int *accepted) {
+    for (int i=0;i<count;i++) {
+        if (accepted) accepted[i]=tokens[i];
+        q36_tokens_push(&s->checkpoint,tokens[i]);
+    }
+    s->checkpoint_valid=true;
+}
+#endif
+
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+static void ink_dspark_miss(ink_dspark *d) {
+    if (d->retry) d->pause=d->pause_tokens;
+    d->retry=!d->retry;
+}
+
+static int ink_dspark_step(q36_session *s,int first,int budget,int eos,int excluded,int *accepted,
+                           int capacity,q36_token_boundary_fn boundary,void *ud,char *err,size_t errlen) {
+    ink_vk *g=s->runtime;
+    ink_dspark *d=g->draft;
+    int pos=s->checkpoint.len, count=s->engine->mtp_draft_tokens;
+    if (count>8) count=8;
+    if (count>budget) count=budget;
+    if (count>capacity) count=capacity;
+    if (count>s->ctx_size-pos) count=s->ctx_size-pos;
+    if (count>(int)g->batch) count=g->batch;
+    int lookup[8];
+    int copied=count<2 || !pos || s->engine->mtp_margin>0 || getenv("Q36_MTP_LOOKUP_OFF") ? 0 :
+        q36_mtp_lookup(s->checkpoint.v,pos,first,lookup,count);
+    if (copied>=3 && d->lookup_skip) {
+        d->lookup_skip--;
+        copied=0;
+    }
+    if (d->pause && copied<3) {
+        if (count>1 && first!=eos) d->paused_tokens++;
+        d->pause--;
+        count=1;
+    }
+    if (count<2 || !pos || first==eos || (boundary && boundary(ud,first))) {
+        if (q36_session_eval_internal(s,first,err,errlen)) return -1;
+        accepted[0]=first;
+        return 1;
+    }
+    if ((unsigned)first>=INK_VOCAB || !ink_vk_reserve(s,pos+count)) {
+        if (err && errlen) snprintf(err,errlen,"invalid Inkling token or insufficient KV memory");
+        return -1;
+    }
+    int ids[8]={first};
+    float margins[8]={0};
+    float threshold=s->engine->mtp_margin;
+    /* A miss or a shortened block calls for a cheap probe. Full-width
+     * successes keep the stricter filter on predictable continuations. */
+    bool probe=!d->pause_tokens && threshold<=0 &&
+               (d->retry || (d->depth && d->depth<=3));
+    if (threshold<=0) threshold=probe ? Q36_MTP_PROBE_MARGIN : 2.0f;
+    if (!d->depth) d->depth=4;
+    if (copied<3 && (unsigned)count>d->depth) count=d->depth;
+    uint32_t previous=q36_gpu_submit_limit(128);
+    q36_gpu_set_micro_batch(true);
+    /* An unambiguous twelve-token suffix can supply a complete cheap block.
+     * The same target verifier checks it; the trained head handles fresh text. */
+    bool ok=ink_dspark_flush(d,true);
+    if (copied>=3) {
+        memcpy(ids,lookup,copied*sizeof(int));
+        count=copied;
+    } else if (ok) ok=ink_dspark_propose(s,ids,&count,excluded,threshold,probe,margins);
+    bool low_confidence=copied<3 && count==1;
+    for (int i=1;ok && i<count;i++) {
+        if (ids[i]==excluded || (boundary && boundary(ud,ids[i])) ||
+            (copied<=2 && i>=2 && margins[i]<threshold)) count=i;
+        else if (ids[i]==eos) count=i+1;
+    }
+
+    int keep=0;
+    q36_gpu_tensor *history=g->history;
+    uint64_t bytes=q36_gpu_tensor_bytes(history);
+    if (ok && count>=2) {
+        g->verify=true;
+        g->history=d->buf[DS_HISTORY];
+        ok=ink_vk_forward(s,ids,NULL,count,pos,true);
+        g->history=history;
+        g->verify=false;
+        if (ok) {
+            keep=q36_mtp_accepted_prefix(ids,&d->top[0][0],count,eos,excluded);
+            unsigned channels=bytes/(3*sizeof(float));
+            ok=q36_gpu_dspark_op(DS_RESTORE_HISTORY,history,d->buf[DS_HISTORY],NULL,NULL,channels,0,keep,0,0,1,
+                                 (channels+63)/64,1,1);
+            ok=ok && ink_dspark_inject(d,pos,keep) &&
+                q36_gpu_tensor_copy(g->buf[IV_LOGITS],0,d->buf[DS_VOCAB],4ull*(keep-1)*INK_PADDED,4ull*INK_VOCAB);
+            if (ok) q36_tokens_push(&d->flushes,pos+keep-1);
+        }
+    }
+    q36_gpu_set_micro_batch(false);
+    q36_gpu_submit_limit(previous);
+    if (!ok) {
+        q36_session_invalidate(s);
+        if (err && errlen) snprintf(err,errlen,"Inkling DSpark evaluation failed at position %d",pos);
+        return -1;
+    }
+    if (!keep) {
+        if (low_confidence) {
+            d->low_confidence_tokens++;
+            ink_dspark_miss(d);
+        }
+        if (q36_session_eval_internal(s,first,err,errlen)) return -1;
+        accepted[0]=first;
+        return 1;
+    }
+    memcpy(s->gpu_top2,d->top[keep-1],sizeof(s->gpu_top2));
+    s->gpu_top2_valid=true;
+    s->logits_host_valid=false;
+    q36_mtp_commit_tokens(s,ids,keep,accepted);
+    /* Match the next mask block to the continuation the head can predict. */
+    if (copied<3) {
+        if (probe && keep==1) d->depth=2;
+        else if (keep==count && d->depth<8 && (keep>=3 || (probe && keep==2 && d->depth==2)))
+            d->depth=d->depth>6 ? 8 : d->depth+2;
+        else if (keep<count) d->depth=keep<3 ? 3 : keep+1;
+        /* A matching pair can widen the next draft, but it takes a longer
+         * accepted prefix to leave the probe's confidence rule. */
+        if (keep==1) ink_dspark_miss(d);
+        else d->retry=probe && keep==2;
+    } else if (keep==1) {
+        /* After boilerplate diverges, skip the next four suffix matches
+         * before paying for another copied verification block. */
+        d->lookup_skip=4;
+    }
+    q36_mtp_stats_add(count-1,keep-1,keep==count,count,copied>=3 ? 1 : 0);
+    return keep;
+}
+#endif
+
 static int q36_session_eval_speculative_body(q36_session *s, int first_token,
                                         int max_tokens, int eos_token, int excluded_id,
                                         int *accepted, int accepted_cap,
@@ -13148,6 +13312,10 @@ static int q36_session_eval_speculative_body(q36_session *s, int first_token,
     q36_engine *e;
     if (!s || !accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
     e = s->engine;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (e && e->dspark && !s->vision_state)
+        return ink_dspark_step(s,first_token,max_tokens,eos_token,excluded_id,accepted,accepted_cap,boundary,ud,err,errlen);
+#endif
     if (!e || !q36_engine_has_mtp(e) || e->mtp_draft_tokens <= 1 ||
         !q36_engine_uses_vulkan_runtime(e) || s->vision_state) {
         if (q36_session_eval_internal(s, first_token, err, errlen) != 0) return -1;
@@ -13237,7 +13405,7 @@ static int q36_session_eval_speculative_body(q36_session *s, int first_token,
             if (token < 0 || (e->mtp_margin > 0.0f && margin < e->mtp_margin)) break;
             if (boundary && boundary(ud, token)) break;
             /* Keep one proposal as a cheap probe of an uncertain prefix. */
-            if (confident && margin < 1.0f) {
+            if (confident && margin < Q36_MTP_PROBE_MARGIN) {
                 if (verify_n > 1) break;
                 mtp_cap = 2;
             }
@@ -13266,7 +13434,7 @@ static int q36_session_eval_speculative_body(q36_session *s, int first_token,
                 eos_token, excluded_id, err, errlen);
             if (commit_n < 1) return -1;
             for (int i = 0; i < commit_n; i++) accepted[i] = verify[i];
-            q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n, mtp_cap);
+            q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n, mtp_cap, 0);
             return commit_n;
         }
 
@@ -13282,19 +13450,7 @@ static int q36_session_eval_speculative_body(q36_session *s, int first_token,
             return -1;
         }
 
-        commit_n = 1;
-        for (int i = 1; i < verify_n; i++) {
-            int top = row_tops[2 * (i - 1)];
-            if (top == excluded_id) top = row_tops[2 * (i - 1) + 1];
-            if (top != verify[i]) break;
-            commit_n++;
-        }
-        for (int i = 0; i < commit_n; i++) {
-            if (verify[i] == eos_token) {
-                commit_n = i + 1;
-                break;
-            }
-        }
+        commit_n=q36_mtp_accepted_prefix(verify,row_tops,verify_n,eos_token,excluded_id);
 
         if (commit_n < verify_n && !q36_vulkan_replay_recurrent(s, (uint32_t)commit_n)) {
             if (err && errlen) snprintf(err, errlen, "MTP recurrent rollback failed at pos %u", start_pos);
@@ -13324,18 +13480,9 @@ static int q36_session_eval_speculative_body(q36_session *s, int first_token,
             s->logits_host_valid = true;
         }
 
-        for (int i = 0; i < commit_n; i++) {
-            accepted[i] = verify[i];
-            q36_tokens_push(&s->checkpoint, verify[i]);
-        }
-        s->checkpoint_valid = true;
+        q36_mtp_commit_tokens(s,verify,commit_n,accepted);
         q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n,
-                            confident ? verify_n : mtp_cap);
-        if (used_lookup && getenv("Q36_MTP_STATS")) {
-            q36_mtp_stat_lookup++;
-            q36_mtp_stat_lookup_drafted += verify_n - 2;
-            if (commit_n > 2) q36_mtp_stat_lookup_accepted += commit_n - 2;
-        }
+                            confident ? verify_n : mtp_cap, used_lookup ? 2 : 0);
         return commit_n;
     }
 #else
@@ -13400,6 +13547,15 @@ static void q36_session_reset_runtime(q36_session *s) {
     s->logits_host_valid = false;
     s->gpu_top2_valid = false;
     if (s->engine->ink) {
+        s->ink_batches.len=0;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (s->engine->dspark) {
+            ink_dspark *d=((ink_vk *)s->runtime)->draft;
+            d->pending=d->pause=d->depth=d->lookup_skip=0;
+            d->retry=false;
+            d->flushes.len=0;
+        }
+#endif
         if (s->engine->backend==Q36_BACKEND_CPU) ink_reset(s->runtime);
         return;
     }
@@ -13442,6 +13598,35 @@ void q36_session_invalidate(q36_session *s) {
     s->rope_delta = 0;
 }
 
+static int ink_restore_batches(q36_session *s,const int *encoded,unsigned n,char *err,size_t errlen);
+
+enum { INK_TOKEN_BITS=18, INK_TOKEN_MASK=(1<<INK_TOKEN_BITS)-1, INK_FEATURE_END=1<<27 };
+
+static void ink_encode_prefix(const q36_session *s,int *ids,int n) {
+    if (n) memcpy(ids,s->checkpoint.v,(size_t)n*sizeof(*ids));
+    for (int i=0;i<s->ink_batches.len;i+=2) {
+        int start=s->ink_batches.v[i], end=start+s->ink_batches.v[i+1];
+        if (start>=n) break;
+        if (end>n) end=n;
+        for (int j=start;j<end-1;j++) ids[j]=~ids[j];
+    }
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    /* Reproduce the feature projection batches as well as the target prefill.
+     * Their reduction order can change the next sampled block boundary. */
+    if (n && s->engine->dspark) {
+        const ink_dspark *d=((ink_vk *)s->runtime)->draft;
+        for (int j=0;j<d->flushes.len && d->flushes.v[j]<n;j++) {
+            int i=d->flushes.v[j];
+            ids[i]=ids[i]<0 ? ~(~ids[i]|INK_FEATURE_END) : ids[i]|INK_FEATURE_END;
+        }
+        if (n==s->checkpoint.len) {
+            int state=(d->depth|(d->pause<<4)|(d->retry<<8)|(d->lookup_skip<<10))<<INK_TOKEN_BITS;
+            ids[0]=ids[0]<0 ? ~(~ids[0]|state) : ids[0]|state;
+        }
+    }
+#endif
+}
+
 void q36_session_rewind(q36_session *s, int pos) {
     q36_tokens prefix = {0};
     if (!s) return;
@@ -13452,6 +13637,13 @@ void q36_session_rewind(q36_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     if (pos == s->checkpoint.len) return;
+    if (s->engine->dspark) {
+        int *ids=pos ? xmalloc((size_t)pos*sizeof(*ids)) : NULL;
+        ink_encode_prefix(s,ids,pos);
+        if (ink_restore_batches(s,ids,pos,NULL,0)) q36_session_invalidate(s);
+        free(ids);
+        return;
+    }
     for (int i = 0; i < pos; i++) q36_tokens_push(&prefix, s->checkpoint.v[i]);
     q36_session_reset_runtime(s);
 
@@ -13478,6 +13670,7 @@ uint64_t q36_session_kv_bytes(const q36_session *s) {
         if (s->engine->backend==Q36_BACKEND_VULKAN) {
             const ink_vk *g = s->runtime;
             for (int i=0;i<INK_SLOTS;i++) bytes += q36_gpu_tensor_bytes(g->kv[i]);
+            if (g->draft) for (int i=0;i<3;i++) bytes+=q36_gpu_tensor_bytes(g->draft->kv[i]);
             return bytes;
         }
 #endif
@@ -13839,6 +14032,13 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         return 1;
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
+    if (s->engine->dspark) {
+        q36_session_snapshot snap={0};
+        int rc=q36_session_save_snapshot(s,&snap,err,errlen) ||
+               q36_payload_write_bytes(fp,snap.ptr,snap.len,err,errlen);
+        q36_session_snapshot_free(&snap);
+        return rc;
+    }
     /* Replay restores PLE history as well as recurrent and attention state. */
     if (s->dist || s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT) {
         q36_payload_header h = {Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_TOKEN_ONLY, rows};
@@ -13949,6 +14149,62 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+/* A marked token continues the same prefill batch. Single-token decode and
+ * batched prefill have different reduction orders; replay the original groups
+ * to restore the same target logits and the drafter's context features. */
+static int ink_restore_batches(q36_session *s,const int *encoded,unsigned n,char *err,size_t errlen) {
+    if (!s->engine->ink || n>(unsigned)s->ctx_size || (n && encoded[n-1]<0)) {
+        q36_payload_set_err(err,errlen,"incompatible Inkling checkpoint");
+        return 1;
+    }
+    q36_tokens prompt={0};
+    int policy=0;
+    for (unsigned i=0;i<n;i++) {
+        int id=(encoded[i]<0 ? ~encoded[i] : encoded[i]) & ~INK_FEATURE_END;
+        if (!i) { policy=id>>INK_TOKEN_BITS; id&=INK_TOKEN_MASK; }
+        if ((unsigned)id>=INK_VOCAB || (policy&15)>8 || ((policy>>4)&15)>INK_DSPARK_MAX_PAUSE || (policy>>10)>4) {
+            q36_tokens_free(&prompt);
+            q36_payload_set_err(err,errlen,"invalid token in Inkling checkpoint");
+            return 1;
+        }
+        q36_tokens_push(&prompt,id);
+    }
+    q36_session_invalidate(s);
+    for (unsigned i=0;i<n;) {
+        unsigned end=i+1;
+        while (encoded[end-1]<0) end++;
+        prompt.len=end;
+        int rc=end==i+1 ? q36_session_eval_internal(s,prompt.v[i],err,errlen) :
+                          q36_session_prefill_range(s,&prompt,i,err,errlen);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+        if (!rc && s->engine->dspark && (encoded[end-1]&INK_FEATURE_END) &&
+            !ink_dspark_flush(((ink_vk *)s->runtime)->draft,false)) {
+            q36_payload_set_err(err,errlen,"failed to restore Inkling draft features");
+            rc=1;
+        }
+#endif
+        if (rc) {
+            q36_tokens_free(&prompt);
+            q36_session_invalidate(s);
+            return rc;
+        }
+        i=end;
+    }
+    q36_tokens_free(&prompt);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (s->engine->dspark) {
+        ink_dspark *d=((ink_vk *)s->runtime)->draft;
+        d->depth=policy&15;
+        d->pause=(policy>>4)&15;
+        if (d->pause>d->pause_tokens) d->pause=d->pause_tokens;
+        d->retry=(policy>>8)&1;
+        d->lookup_skip=policy>>10;
+    }
+#endif
+    s->checkpoint_valid=true;
+    return 0;
+}
+
 int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         if (err && errlen) snprintf(err, errlen, "invalid payload load arguments");
@@ -13966,6 +14222,17 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
     if (magic != Q36_PAYLOAD_MAGIC) {
         if (err && errlen) snprintf(err, errlen, "unsupported session payload format");
         return 1;
+    }
+    if (version==Q36_PAYLOAD_VERSION_INK_BATCHES) {
+        if (!s->engine->ink || third>(unsigned)s->ctx_size || remaining!=sizeof(int32_t)*(uint64_t)third) {
+            q36_payload_set_err(err,errlen,"invalid Inkling checkpoint size");
+            return 1;
+        }
+        int *encoded=xcalloc(third ? third : 1,sizeof(*encoded));
+        int rc=q36_payload_read_bytes(fp,encoded,remaining,&remaining,err,errlen) ||
+               ink_restore_batches(s,encoded,third,err,errlen);
+        free(encoded);
+        return rc;
     }
     if (version == Q36_PAYLOAD_VERSION_TOKEN_ONLY) {
         uint32_t n_tokens = third;
@@ -14161,11 +14428,12 @@ int q36_session_save_snapshot(q36_session *s, q36_session_snapshot *snap, char *
         snap->cap = bytes;
     }
     hdr.magic = Q36_PAYLOAD_MAGIC;
-    hdr.version = Q36_PAYLOAD_VERSION_TOKEN_ONLY;
+    hdr.version = s->engine->dspark ? Q36_PAYLOAD_VERSION_INK_BATCHES : Q36_PAYLOAD_VERSION_TOKEN_ONLY;
     hdr.n_tokens = (uint32_t)s->checkpoint.len;
     memcpy(snap->ptr, &hdr, sizeof(hdr));
     p = snap->ptr + sizeof(hdr);
-    if (hdr.n_tokens) memcpy(p, s->checkpoint.v, (size_t)hdr.n_tokens * sizeof(int32_t));
+    if (s->engine->dspark) ink_encode_prefix(s,(int32_t *)p,hdr.n_tokens);
+    else if (hdr.n_tokens) memcpy(p, s->checkpoint.v, (size_t)hdr.n_tokens * sizeof(int32_t));
     snap->len = bytes;
     (void)err;
     (void)errlen;
@@ -14181,7 +14449,7 @@ int q36_session_load_snapshot(q36_session *s, const q36_session_snapshot *snap, 
     }
     hdr = (const q36_payload_header *)snap->ptr;
     if (hdr->magic != Q36_PAYLOAD_MAGIC ||
-        hdr->version != Q36_PAYLOAD_VERSION_TOKEN_ONLY)
+        (hdr->version != Q36_PAYLOAD_VERSION_TOKEN_ONLY && hdr->version != Q36_PAYLOAD_VERSION_INK_BATCHES))
     {
         if (err && errlen) snprintf(err, errlen, "unsupported snapshot format");
         return 1;
@@ -14191,6 +14459,8 @@ int q36_session_load_snapshot(q36_session *s, const q36_session_snapshot *snap, 
         return 1;
     }
     tok = (const int32_t *)(snap->ptr + sizeof(*hdr));
+    if (hdr->version==Q36_PAYLOAD_VERSION_INK_BATCHES)
+        return ink_restore_batches(s,tok,hdr->n_tokens,err,errlen);
 
 
     s->checkpoint.len = 0;

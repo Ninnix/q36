@@ -986,6 +986,66 @@ static void test_compaction_boundaries(void) {
     AGENT_TEST_ASSERT(agent_compact_summary_budget(4096) == 512);
     AGENT_TEST_ASSERT(agent_compact_summary_budget(100000) == 4096);
     AGENT_TEST_ASSERT(agent_compact_summary_budget(1024) == 256);
+
+    agent_status status = {.state = AGENT_WORKER_COMPACTING,
+                           .prefill_done = 512, .prefill_total = 1024};
+    char text[160];
+    build_status_text(&status, text, sizeof(text));
+    AGENT_TEST_ASSERT(strstr(text, "COMPACTING prefill 512/1024"));
+    status.prefill_done = status.prefill_total;
+    status.generated = 12;
+    build_status_text(&status, text, sizeof(text));
+    AGENT_TEST_ASSERT(strstr(text, "COMPACTING summary 12 tokens"));
+}
+
+static void test_inkling_tool_preview(void) {
+    agent_tail_capture capture = {.cap = 4096};
+    agent_token_renderer renderer = {.capture = &capture, .last_output_newline = true};
+    agent_qwen_tool_parser parser = {0};
+    agent_stream_renderer stream = {.renderer = &renderer, .parser = &parser};
+    buf body = {0};
+    const char json[] = "{\"args\":{\"path\":\"/tmp/game.js\",\"content\":"
+        "\"'use strict';\\nconst str = \\\"</script> </parameter> \\uD83D\\uDE80\\\";"
+        "\\n\"},\"name\":\"write\"}";
+    const char expected[] = "'use strict';\nconst str = \"</script> </parameter> 🚀\";\n";
+    size_t end = (size_t)(strstr(json, "},\"name\"") - json);
+    agent_inkling_preview_start(&stream, "write");
+    for (size_t i = 0; i < end; i++) {
+        buf_putc(&body, json[i]);
+        agent_inkling_preview_feed(&stream, &body);
+    }
+    char *preview = agent_tail_capture_take(&capture, NULL);
+    AGENT_TEST_ASSERT(strstr(preview, "🛠️ write") && strstr(preview, "path=/tmp/game.js"));
+    AGENT_TEST_ASSERT(strstr(preview, expected));
+    AGENT_TEST_ASSERT(parser.calls.len == 0 && parser.state == AGENT_QWEN_TOOL_SEARCH);
+    free(preview);
+    capture.cap = 4096;
+    buf_puts(&body, json + end);
+    agent_inkling_preview_feed(&stream, &body);
+    char *xml = inkling_call_xml("write", body.ptr);
+    AGENT_TEST_ASSERT(xml != NULL);
+    if (xml) agent_inkling_preview_finish(&stream, xml, strlen(xml));
+    AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_DONE && parser.calls.len == 1);
+    if (parser.calls.len == 1) {
+        const char *content = agent_tool_arg_value(&parser.calls.v[0], "content");
+        AGENT_TEST_ASSERT(content && !strcmp(content, expected));
+    }
+    AGENT_TEST_ASSERT(capture.len == 0);
+    free(agent_tail_capture_take(&capture, NULL));
+    free(xml);
+    buf_free(&body);
+    agent_qwen_tool_parser_free(&parser);
+
+    capture.cap = 4096;
+    agent_inkling_preview_start(&stream, "write");
+    buf_puts(&body, "{\"name\":\"write\",\"args\":{\"content\":\"unfinished");
+    agent_inkling_preview_feed(&stream, &body);
+    agent_stream_text(&stream, NULL, 0, true);
+    preview = agent_tail_capture_take(&capture, NULL);
+    AGENT_TEST_ASSERT(strstr(preview, "unfinished") && strstr(preview, "[tool call interrupted]"));
+    AGENT_TEST_ASSERT(parser.calls.len == 0);
+    free(preview);
+    buf_free(&body);
 }
 
 static void test_observation_error_is_not_context_exhaustion(void) {
@@ -1047,6 +1107,7 @@ int main(int argc, char **argv) {
     test_worker_ownership();
     test_worker_pause_ui_waits();
     test_compaction_boundaries();
+    test_inkling_tool_preview();
     test_mtp_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();

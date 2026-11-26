@@ -1,6 +1,9 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef INK_EXPERT_PAIRS
+#extension GL_KHR_shader_subgroup_ballot : require
+#endif
 #ifdef INK_HALF_WEIGHT
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
@@ -825,45 +828,119 @@ void main() {
 #endif
 }
 #elif defined(INK_IQ_DECODE)
+#ifdef INK_EXPERT_PAIRS
+// Pair consecutive uses of an expert in a verification block. An unmatched
+// route uses the ordinary single-input dot product.
+uint expertPartner(uint path,uint expert) {
+    uint i=gl_SubgroupInvocationID;
+    uvec4 hits=subgroupBallot(i<8*gl_NumWorkGroups.z && ids[16*(i/8)+i%8]==expert);
+    uint word=path/32, bit=1u<<(path%32);
+    uint before=bitCount(hits[word]&(bit-1u));
+    if (word!=0) before+=bitCount(hits.x);
+    if ((before&1u)!=0) return ~0u;
+    if (word!=0) hits.x=0;
+    hits[word]&=~((bit-1u)|bit);
+    if (hits.x!=0) return uint(findLSB(hits.x));
+    if (hits.y!=0) return 32+uint(findLSB(hits.y));
+    return path;
+}
+// Each routed input has its own Q8 scale. The pair shares the FP4 unpack.
+shared uint fp4_decode[TYPE==40 ? 256 : 1];
+int nvWeights(uint bits) {
+    return int(fp4_decode[bits&255u]|(fp4_decode[(bits>>8)&255u]<<16));
+}
+float nvDot(int weight,float scale,uint src,uint lane,float sum) {
+    return ink_fma(scale*unpackHalf2x16(x[src]).x,float(dot4(weight,x[src+1+lane])),sum);
+}
+void nvDownRows(uint row,uint lane,uint path,uint other,bool paired) {
+    precise float sum=0, other_sum=0;
+    for (uint block=0;block<WIDTH/64;block+=2) {
+        [[unroll]] for (uint j=0;j<2;j++) {
+            uint b=block+j, src=path*(WIDTH/32)*9+18*b, src2=other*(WIDTH/32)*9+18*b;
+            uvec2 bits=fp4_words(row,lane,b);
+            uint scales=bits.y>>(8*(lane/4));
+            [[unroll]] for (uint k=0;k<2;k++) {
+                int weight=nvWeights(bits.x>>(16*k));
+                float scale=e4m3((scales>>(16*k))&255u);
+                sum=nvDot(weight,scale,src+9*k,lane,sum);
+                if (paired) other_sum=nvDot(weight,scale,src2+9*k,lane,other_sum);
+            }
+        }
+    }
+    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+    if (lane==0) y[path*p.rows+row]=sum;
+    if (paired) {
+        other_sum+=subgroupShuffleXor(other_sum,4); other_sum+=subgroupShuffleXor(other_sum,2); other_sum+=subgroupShuffleXor(other_sum,1);
+        if (lane==0) y[other*p.rows+row]=other_sum;
+    }
+}
+
+#endif
+void iqGateRows(uint l,uint row,uint path,uint other,bool paired) {
+    uint lane=l%8;
+    uint src=gl_SubgroupInvocationID&~7u;
+    uint base=wbase/4+gl_WorkGroupID.x*2*iq_bytes*(WIDTH/256);
+    precise float sum=0, other_sum=0;
+    [[unroll]] for (uint b=0;b<WIDTH/256;b++) {
+        uint off=base+b*2*iq_bytes, xb=xbase+b*74;
+        uint low=w[off+l], high=w[off+64+l], control=w[off+128+(TYPE==18 ? l : l/2)];
+        uint xb2=(other/8*(WIDTH/256)+b)*74;
+        int acc=0, other_acc=0;
+        [[unroll]] for (uint h=0;h<2;h++) {
+            uint peer=src+(lane&~1u)+h;
+            uint signs=subgroupShuffle(TYPE==18 ? control : high,peer);
+            uint codes=TYPE==18 ? (h==0 ? low : high) : subgroupShuffle(low,peer);
+            [[unroll]] for (uint k=0;k<4;k++) {
+                uint g=4*h+k, ctl=subgroupShuffle(control,src+(TYPE==18 ? g : g&~1u));
+                uint sign=signs>>((TYPE==18 ? 7 : 8)*k), code=(codes>>(8*k))&255u;
+                uint sc, grid;
+                if (TYPE==18) {
+                    sign&=127u; sign|=(bitCount(sign)&1u)<<7;
+                    sc=ctl>>28; grid=1536+code;
+                } else {
+                    ctl>>=16*(g%2);
+                    sc=(ctl>>(8+4*(lane/4)))&15u;
+                    grid=1792+2*(code|((ctl<<(8-2*(lane/2)))&768u))+lane%2;
+                }
+                int val=signed_grid(tables[grid],(sign>>(4*(lane%2)))&15u);
+                uint col=2+8*g+lane;
+                acc+=int(2*sc+1)*dot4(val,x[xb+col]);
+                if (paired) other_acc+=int(2*sc+1)*dot4(val,x[xb2+col]);
+            }
+        }
+        float ws=unpackHalf2x16(w[off+2*iq_bytes-4+l/16]>>((row%2)*16)).x;
+        float scale=TYPE==18 ? ws : ws*0.125;
+        sum=ink_fma(scale*uintBitsToFloat(x[xb]),float(acc),sum);
+        if (paired) other_sum=ink_fma(scale*uintBitsToFloat(x[xb2]),float(other_acc),other_sum);
+    }
+    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+    if (lane==0) y[path*p.rows+row]=TYPE==18 ? sum*0.25 : sum;
+    if (paired) {
+        other_sum+=subgroupShuffleXor(other_sum,4); other_sum+=subgroupShuffleXor(other_sum,2); other_sum+=subgroupShuffleXor(other_sum,1);
+        if (lane==0) y[other*p.rows+row]=TYPE==18 ? other_sum*0.25 : other_sum;
+    }
+}
 void main() {
     uint l=gl_LocalInvocationID.x, lane=l%8, row=8*gl_WorkGroupID.x+l/8;
     uint token=gl_WorkGroupID.z, rank=gl_WorkGroupID.y;
     uint input_row=p.route==2 ? 8*token+rank : token;
     xbase=input_row*(WIDTH/256)*74;
     wbase=p.route==0 ? 0 : ids[16*token+rank]*p.rows*p.stride;
+#ifdef INK_EXPERT_PAIRS
+    uint routed=8*token+rank, other=expertPartner(routed,ids[16*token+rank]);
+    if (other==~0u) return;
+    if (TYPE==40) {
+        for (uint i=l;i<256;i+=64) fp4_decode[i]=tables[3840+i];
+        barrier();
+        if (other==routed) nvDownRows(row,lane,routed,other,false);
+        else nvDownRows(row,lane,routed,other,true);
+        return;
+    }
+    if (other!=routed) { iqGateRows(l,row,routed,other,true); return; }
+#endif
     if (TYPE==18 || TYPE==22) {
-        uint src=gl_SubgroupInvocationID&~7u;
-        uint base=wbase/4+gl_WorkGroupID.x*2*iq_bytes*(WIDTH/256);
-        precise float sum=0;
-        [[unroll]] for (uint b=0;b<WIDTH/256;b++) {
-            uint off=base+b*2*iq_bytes, xb=xbase+b*74;
-            uint low=w[off+l], high=w[off+64+l], control=w[off+128+(TYPE==18 ? l : l/2)];
-            int acc=0;
-            [[unroll]] for (uint h=0;h<2;h++) {
-                uint peer=src+(lane&~1u)+h;
-                uint signs=subgroupShuffle(TYPE==18 ? control : high,peer);
-                uint codes=TYPE==18 ? (h==0 ? low : high) : subgroupShuffle(low,peer);
-                [[unroll]] for (uint k=0;k<4;k++) {
-                    uint g=4*h+k, ctl=subgroupShuffle(control,src+(TYPE==18 ? g : g&~1u));
-                    uint sign=signs>>((TYPE==18 ? 7 : 8)*k), code=(codes>>(8*k))&255u;
-                    uint sc, grid;
-                    if (TYPE==18) {
-                        sign&=127u; sign|=(bitCount(sign)&1u)<<7;
-                        sc=ctl>>28; grid=1536+code;
-                    } else {
-                        ctl>>=16*(g%2);
-                        sc=(ctl>>(8+4*(lane/4)))&15u;
-                        grid=1792+2*(code|((ctl<<(8-2*(lane/2)))&768u))+lane%2;
-                    }
-                    int val=signed_grid(tables[grid],(sign>>(4*(lane%2)))&15u);
-                    acc+=int(2*sc+1)*dot4(val,x[xb+2+8*g+lane]);
-                }
-            }
-            float ws=unpackHalf2x16(w[off+2*iq_bytes-4+l/16]>>((row%2)*16)).x;
-            sum=ink_fma((TYPE==18 ? ws : ws*0.125)*uintBitsToFloat(x[xb]),float(acc),sum);
-        }
-        sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
-        if (lane==0) y[(p.route==0 ? token : 8*token+rank)*p.rows+row]=TYPE==18 ? sum*0.25 : sum;
+        uint path=p.route==0 ? token : 8*token+rank;
+        iqGateRows(l,row,path,path,false);
         return;
     }
     uint words=2*iq_bytes*(WIDTH/256), base=wbase/4+gl_WorkGroupID.x*words;

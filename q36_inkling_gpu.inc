@@ -61,9 +61,21 @@ typedef struct {
     uint32_t cap, nt, batch, allocated, kv_format, kv_row_bytes;
     q36_gpu_tensor *cached[3], *queries;
     q36_gpu_tensor *messages[12], *message_scale[12], *pair[3], *low[3];
-    bool reuse, cached_k;
+    struct ink_dspark *draft;
+    bool verify, reuse, cached_k;
     uint64_t score_bytes;
 } ink_vk;
+
+static bool ink_vk_resize_scores(ink_vk *g,uint64_t bytes) {
+    q36_gpu_tensor *scores=q36_gpu_tensor_alloc_uninitialized(bytes);
+    if (!scores) return false;
+    q36_gpu_tensor_free(g->scores);
+    g->scores=scores;
+    g->score_bytes=bytes;
+    return true;
+}
+
+#include "q36_inkling_dspark.inc"
 
 static uint32_t ink_bits(float f) {
     uint32_t u;
@@ -80,10 +92,11 @@ static void ink_vk_free(ink_vk *g) {
     q36_gpu_tensor_free(g->queries);
     q36_gpu_tensor_free(g->history);
     q36_gpu_tensor_free(g->scores);
+    ink_dspark_free(g->draft);
     free(g);
 }
 
-static ink_vk *ink_vk_create(q36_engine *e) {
+static ink_vk *ink_vk_create(q36_engine *e,unsigned context) {
     ink_vk *g=xcalloc(1,sizeof(*g));
     g->model=&e->model;
     g->kv_format=e->cache_type_k+3*e->cache_type_v;
@@ -91,7 +104,10 @@ static ink_vk *ink_vk_create(q36_engine *e) {
     g->batch=ink_vk_batch(e->prefill_cap_override);
     g->buf[IV_LOGITS]=q36_gpu_tensor_alloc_uninitialized(INK_VOCAB*4);
     if (!g->buf[IV_LOGITS]) goto fail;
-    g->history=q36_gpu_tensor_alloc_uninitialized(INK_SLOTS*(2*INK_K+2*INK_D)*3u*4);
+    if (e->dspark && !(g->draft=ink_dspark_create(e,context))) goto fail;
+    uint64_t bytes=INK_SLOTS*(2*INK_K+2*INK_D)*3u*4;
+    g->history=g->draft ? q36_gpu_tensor_view(g->draft->buf[DS_HISTORY],0,bytes) :
+                          q36_gpu_tensor_alloc_uninitialized(bytes);
     if (g->history) return g;
 fail:
     ink_vk_free(g);
@@ -163,19 +179,13 @@ fail:
 static bool ink_vk_scratch(ink_vk *g, unsigned nt, unsigned end) {
     /* A single decode row needs none of the large prompt panels. Keep small
      * conversational batches warm, release large panels between turns. */
-    bool trim=nt==1 && g->allocated>=64;
+    bool trim=(nt==1 || g->verify) && g->allocated>=64;
     if (nt>g->allocated && !ink_vk_resize_scratch(g,nt)) return false;
     if (trim) (void)ink_vk_resize_scratch(g,nt);
     uint64_t bytes=4*ink_vk_score_words(nt,end,g->kv_format);
     if (bytes>g->score_bytes || (trim && g->score_bytes>4ull*INK_H*g->cap)) {
-        uint64_t required=bytes;
-        bytes=4*ink_vk_score_words(nt,g->cap,g->kv_format);
-        q36_gpu_tensor *v=q36_gpu_tensor_alloc_uninitialized(bytes);
-        if (v) {
-            q36_gpu_tensor_free(g->scores);
-            g->scores=v;
-            g->score_bytes=bytes;
-        } else if (required>g->score_bytes) return false;
+        uint64_t capacity=4*ink_vk_score_words(nt,g->cap,g->kv_format);
+        if (!ink_vk_resize_scores(g,capacity) && bytes>g->score_bytes) return false;
     }
     g->nt=nt;
     return true;
@@ -247,6 +257,9 @@ static bool ink_vk_mul(ink_vk *g, const q36_tensor *t, unsigned mode, unsigned r
         g->cached[1]=x;
         x=buf[0];
     }
+    if (g->verify && !mode && ((t->type>=12 && t->type<=14 && rows%4==0) ||
+        (t->type==Q36_TENSOR_Q8_0 && rows>=128 && rows%8==0)))
+        return q36_gpu_inkling_verify_matmul(out,x,w,t->type,width,rows,g->nt);
     bool iq=t->type==Q36_TENSOR_IQ2_XXS || t->type==Q36_TENSOR_IQ2_XS ||
             t->type==Q36_TENSOR_IQ3_XXS || t->type==Q36_TENSOR_IQ2_S;
     unsigned dense_tiles=(g->nt+7)/8;
@@ -254,7 +267,7 @@ static bool ink_vk_mul(ink_vk *g, const q36_tensor *t, unsigned mode, unsigned r
     uint64_t pair_words=(uint64_t)dense_tiles*(k ? width/256*1096 : width/32*136);
     bool dense=!mode && (k || t->type==Q36_TENSOR_Q8_0) && pair_words<=(uint64_t)g->nt*INK_D;
     bool routed=mode && (iq || t->type==Q36_TENSOR_NVFP4);
-    if (g->nt>=4 && rows%32==0 && (dense || routed) && q36_gpu_inkling_packed()) {
+    if ((!g->verify || !mode) && g->nt>=4 && rows%32==0 && (dense || routed) && q36_gpu_inkling_packed()) {
         q36_gpu_tensor *pairs=g->buf[mode ? IV_ACT : IV_DENSE_PAIRS];
         unsigned tiles=mode ? ink_vk_tiles(g->nt) : dense_tiles;
         unsigned pack=mode==1 && t->type==Q36_TENSOR_IQ3_XXS && width==INK_D && g->nt>=256 ? 35 : 26;
@@ -264,7 +277,7 @@ static bool ink_vk_mul(ink_vk *g, const q36_tensor *t, unsigned mode, unsigned r
         mode|=16;
         x=pairs;
     }
-    return q36_gpu_inkling_matvec(out,x,w,g->buf[IV_ROUTE],t->type,width,rows,stride,mode,g->nt);
+    return q36_gpu_inkling_matvec(out,x,w,g->buf[IV_ROUTE],t->type,width,rows,stride,mode,g->nt,g->verify);
 }
 
 static bool ink_vk_mm(ink_vk *g,const q36_tensor *t,unsigned mode,unsigned rows,
@@ -288,6 +301,10 @@ static bool ink_vk_norm(ink_vk *g, q36_gpu_tensor *out, unsigned offset, q36_gpu
 static bool ink_vk_mix(ink_vk *g, q36_gpu_tensor *out, q36_gpu_tensor *blocks,
         int count, q36_gpu_tensor *cur, const float *query, unsigned queries, unsigned index, bool normalize) {
     q36_gpu_tensor *scratch=g->buf[IV_MIX], *w=ink_vk_weight(g,query,INK_D*queries);
+    /* The fused mixer needs a batch of tokens to fill the GPU. */
+    if (g->nt>=128 && q36_gpu_inkling_tiled(g->kv_format))
+        return ink_vk_op(g,36,1,out,blocks,cur,w,g->buf[IV_LIVE],NULL,
+                         count,index*INK_D,ink_bits(1/sqrtf(INK_D)),queries>1,normalize);
     return ink_vk_op(g,normalize ? 23 : 1,count+1,scratch,blocks,cur,w,g->buf[IV_LIVE],NULL,
                      count,index*INK_D,ink_bits(1/sqrtf(INK_D)),queries>1,0) &&
            ink_vk_op(g,2,INK_D/128,out,scratch,blocks,normalize ? g->buf[IV_LIVE] : cur,NULL,NULL,count,0,0,0,0);
@@ -296,7 +313,7 @@ static bool ink_vk_mix(ink_vk *g, q36_gpu_tensor *out, q36_gpu_tensor *blocks,
 static bool ink_vk_gates(ink_vk *g,const ink_layer *l,unsigned j,q36_gpu_tensor *x,
                          q36_gpu_tensor *dest,q36_gpu_tensor *msg,q36_gpu_tensor *low) {
     q36_gpu_tensor **v=g->buf;
-    if (g->nt==1 && q36_gpu_inkling_packed() &&
+    if ((g->nt==1 || g->verify) && q36_gpu_inkling_packed() &&
         l->ctrl_gain[j]->type==Q36_TENSOR_F32 && l->ctrl_forget[j]->type==Q36_TENSOR_F32) {
         const float *gain=(const float *)(g->model->map+l->ctrl_gain[j]->abs_offset);
         const float *forget=(const float *)(g->model->map+l->ctrl_forget[j]->abs_offset);
@@ -339,7 +356,7 @@ static bool ink_vk_attention_controls(ink_vk *g,const ink_layer *l,q36_gpu_tenso
 
 static bool ink_vk_conv(ink_vk *g, q36_gpu_tensor *x, const float *w, uint32_t n,
         uint32_t offset, q36_gpu_tensor *dynamic, unsigned pos, q36_gpu_tensor *residual) {
-    return ink_vk_op(g,3,n,x,ink_vk_weight(g,w,n*4),g->history,dynamic,residual,NULL,
+    return ink_vk_op(g,g->verify ? 40 : 3,n,x,ink_vk_weight(g,w,n*4),g->history,dynamic,residual,NULL,
         n,offset,(dynamic!=NULL)+2*(residual!=NULL),pos,ink_bits(1/sqrtf(dynamic ? 9 : 5)));
 }
 
@@ -359,14 +376,14 @@ static bool ink_vk_attention(ink_vk *g, const ink_layer *l, unsigned slot, unsig
         ink_vk_mm(g,l->v,0,INK_K,v[shared ? IV_IN_Q : IV_IN_V],v[IV_V]);
     g->reuse=false;
     if (!projected) return false;
-    if (g->nt==1 && !full) {
-        if (!ink_vk_op(g,29,2*INK_KH,kv,v[IV_K],g->history,ink_vk_weight(g,l->conv[0],4*INK_K),
+    if ((g->nt==1 || g->verify) && !full) {
+        if (!ink_vk_op(g,g->verify ? 39 : 29,2*INK_KH,kv,v[IV_K],g->history,ink_vk_weight(g,l->conv[0],4*INK_K),
                 ink_vk_weight(g,l->conv[1],4*INK_K),v[IV_V],pos,hist,cap,0,ink_bits(1/sqrtf(5)))) return false;
     } else for (int j=0;j<2;j++) {
         q36_gpu_tensor *dyn=full ? v[IV_DYNAMIC] : NULL;
         if (full && !ink_vk_mm(g,l->dynamic[j],0,32,v[IV_IN_K+j],dyn)) return false;
-        if (g->nt==1) {
-            if (!ink_vk_op(g,21+j,INK_KH,kv,v[IV_K+j],g->history,ink_vk_weight(g,l->conv[j],4*INK_K),
+        if (g->nt==1 || g->verify) {
+            if (!ink_vk_op(g,(g->verify ? 37 : 21)+j,INK_KH,kv,v[IV_K+j],g->history,ink_vk_weight(g,l->conv[j],4*INK_K),
                 dyn,NULL,pos,hist+j*INK_K,cap,1,ink_bits(1/3.f))) return false;
         } else if (!ink_vk_conv(g,v[IV_K+j],l->conv[j],INK_K,hist+j*INK_K,dyn,pos,NULL)) return false;
     }
@@ -381,7 +398,7 @@ static bool ink_vk_attention(ink_vk *g, const ink_layer *l, unsigned slot, unsig
         bool packed_values=nt>1 && q36_gpu_inkling_tiled(g->kv_format);
         bool tiled=nt>1 && full && pos+j>=4096 && q36_gpu_inkling_tiled(g->kv_format);
         unsigned heads=tiled ? ink_vk_head_tile(g->nt,end) : INK_KH;
-        bool ok=nt==1 || ink_vk_op(g,5,2*INK_KH,kv,v[IV_K],v[IV_V],NULL,NULL,NULL,pos+j,0,cap,0,j);
+        bool ok=nt==1 || g->verify || ink_vk_op(g,5,2*INK_KH,kv,v[IV_K],v[IV_V],NULL,NULL,NULL,pos+j,0,cap,0,j);
         for (unsigned first=0;ok && first<INK_KH;first+=heads) {
             unsigned k=tiled ? 3*heads : window;
             bool paired=full && nt==1 && end>=1024 && q36_gpu_inkling_tiled(g->kv_format);
@@ -407,20 +424,22 @@ static bool ink_vk_moe(ink_vk *g, const ink_layer *l, unsigned slot, unsigned po
     bool packed=l->down->type==Q36_TENSOR_NVFP4 || l->down->type==Q36_TENSOR_IQ4_NL || l->down->type==Q36_TENSOR_Q8_0;
     if (!ink_vk_mm(g,l->router,0,128,v[IV_IN_Q],v[IV_ROUTER]) ||
         !ink_vk_op(g,14,1,v[IV_ROUTE],v[IV_ROUTER],ink_vk_weight(g,l->bias,128),NULL,NULL,NULL,0,0,0,0,0) ||
-        (g->nt>=4 && !ink_vk_op(g,17,1,v[IV_ROUTE],NULL,NULL,NULL,NULL,NULL,0,0,0,0,0)) ||
+        (g->nt>=4 && !g->verify && !ink_vk_op(g,17,1,v[IV_ROUTE],NULL,NULL,NULL,NULL,NULL,0,0,0,0,0)) ||
         !ink_vk_mm(g,l->gate_up,1,2*INK_F,v[IV_IN_Q],v[IV_GU]) ||
         !ink_vk_op(g,10,8*INK_F/128,v[packed ? IV_QUANT : IV_ACT],v[IV_GU],v[IV_ROUTE],ink_vk_weight(g,l->gate_scale,128),
                    NULL,NULL,INK_F,l->gate_scale!=NULL,0,packed,0) ||
         !ink_vk_mul(g,l->down,2,INK_D,v[IV_ACT],v[IV_GU],packed)) return false;
     unsigned hist=slot*(2*INK_K+2*INK_D)+2*INK_K+INK_D;
-    return ink_vk_op(g,g->nt==1 ? 20 : 11,g->nt==1 ? INK_D/128 : INK_D,attn,v[IV_GU],v[IV_ROUTE],ink_vk_weight(g,l->down_scale,128),
+    return ink_vk_op(g,g->nt==1 ? 20 : g->verify ? 41 : 11,g->nt==1 ? INK_D/128 : INK_D,attn,v[IV_GU],v[IV_ROUTE],ink_vk_weight(g,l->down_scale,128),
         g->history,ink_vk_weight(g,l->conv[3],INK_D*4),INK_D,l->down_scale!=NULL,hist,pos,ink_bits(1/sqrtf(5)));
 }
 
 static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embeddings,
                            unsigned nt, unsigned pos, bool logits) {
     ink_vk *g=s->runtime;
+    ink_dspark *draft=s->vision_state || s->engine->mtp_draft_tokens<=1 ? NULL : g->draft;
     ink_weights *w=s->engine->ink;
+    if (draft && (nt>1 || draft->pending==16) && !ink_dspark_flush(draft,g->verify)) return false;
     if (!ink_vk_scratch(g,nt,pos+nt)) return false;
     q36_gpu_tensor **v=g->buf, *cur=v[IV_CUR], *blocks=v[IV_BLOCKS], *attn=v[IV_ATTN], *x=v[IV_IN_Q];
     unsigned count=0;
@@ -437,6 +456,8 @@ static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embed
         if (!ok || !ink_vk_norm(g,cur,0,cur,w->embd_norm,INK_D,1)) return false;
     }
     for (int slot=0;slot<INK_SLOTS;slot++) {
+        if (draft && (slot==5 || slot==23 || slot==41) &&
+            !ink_dspark_tap(draft,(slot-5)/18,cur,nt)) return false;
         unsigned il=ink_physical_layer(slot);
         ink_layer *l=&w->layer[il];
         unsigned queries=l->dynamic[0] ? 3 : 1;
@@ -488,9 +509,24 @@ static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embed
     }
     s->gpu_top2_valid=false;
     s->logits_host_valid=false;
-    if (logits) {
+    if (logits || draft) {
         if (!ink_vk_mix(g,x,blocks,count,cur,w->output_query,1,0,true) ||
             !ink_vk_norm(g,x,0,x,w->output_norm,INK_D,1)) return false;
+        if (draft) {
+            if (!ink_dspark_tap(draft,3,x,nt)) return false;
+            if (g->verify) {
+                q36_gpu_tensor *vocab=draft->buf[DS_VOCAB];
+                return ink_dspark_project(s,x,nt) &&
+                    ink_vk_op(g,13,(INK_PADDED+127)/128,vocab,NULL,NULL,NULL,NULL,NULL,INK_PADDED,INK_VOCAB,0,0,0) &&
+                    q36_gpu_top2_rows_tensor(v[IV_ROUTE],vocab,INK_PADDED,nt,-1) &&
+                    q36_gpu_tensor_read(v[IV_ROUTE],0,draft->top,nt*sizeof(draft->top[0]));
+            }
+            if (nt==1) {
+                if (!draft->pending) draft->pending_pos=pos;
+                draft->pending++;
+            } else if (!ink_dspark_inject(draft,pos,nt)) return false;
+            if (!logits) return true;
+        }
         g->nt=1;
         if (nt>1 && !q36_gpu_tensor_copy(cur,0,x,4ull*(nt-1)*INK_D,4*INK_D)) return false;
         if (!ink_vk_mm(g,w->output,0,INK_VOCAB,nt==1 ? x : cur,v[IV_LOGITS]) ||

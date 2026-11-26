@@ -10237,7 +10237,7 @@ static void usage(FILE *fp) {
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp [FILE]\n"
-        "      Enable tuned MTP; omit FILE to use the embedded head in -m.\n"
+        "      Use the Inkling DSpark file or a Qwen MTP head. Omit FILE for embedded Qwen MTP.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 8\n"
         "  --mtp-opportunistic\n"

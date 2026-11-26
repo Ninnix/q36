@@ -16,6 +16,9 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
 #endif
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+#ifdef Q36_VOCAB_MAP
+layout(set = 0, binding = 3) readonly buffer VocabMap { uint vocab_ids[]; };
+#endif
 #ifdef Q36_I16
 layout(set = 0, binding = 3) readonly buffer Raw { uint raw_values[]; };
 #endif
@@ -450,6 +453,10 @@ void main(void) {
     for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
         [[unroll]] for (uint r = 0u; r < ROWS; r++) {
             uint row = first_row + r;
+#ifdef Q36_VOCAB_MAP
+            row=vocab_ids[row];
+            if (row==~0u) continue;
+#endif
 #if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
 #endif
