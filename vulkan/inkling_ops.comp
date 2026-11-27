@@ -314,7 +314,7 @@ float routed_output(uint token,uint channel) {
     precise float sum=0;
     for (uint r=0;r<8;r++) {
         uint route=16*token+r;
-        float scale=p.k!=0 ? d[floatBitsToUint(c[route])] : 1;
+        float scale=(p.k&1)!=0 ? d[floatBitsToUint(c[route])] : 1;
         sum+=(b[(8*token+r)*p.n+channel]*scale)*c[route+8];
     }
     return sum;
@@ -714,8 +714,8 @@ void main() {
                 sum+=now*d[k]; sum+=prev.z*d[k+1]; sum+=prev.y*d[k+2]; sum+=prev.x*d[k+3];
             }
             precise float outv=(now+sum)*uintBitsToFloat(p.t);
-            if (OP==11) outv=a[at]+outv;
-            else if ((p.j&2)!=0) outv+=e[at];
+            if (OP==11 && (p.k&2)==0) outv=a[at]+outv;
+            if (OP==3 && (p.j&2)!=0) outv+=e[at];
             a[at]=outv;
             prev=vec3(prev.yz,now);
             // A verifier history appends one row per candidate for prefix rollback.
@@ -1293,7 +1293,8 @@ void main() {
         float h0=p.m==0 ? 0 : e[h], h1=p.m==0 ? 0 : e[h+1], h2=p.m==0 ? 0 : e[h+2];
         float now=routed_output(0,i);
         precise float conv=h0*f[4*i]+h1*f[4*i+1]+h2*f[4*i+2]+now*f[4*i+3];
-        a[i]+=(now+conv)*uintBitsToFloat(p.t);
+        if ((p.k&2)!=0) a[i]=(now+conv)*uintBitsToFloat(p.t);
+        else a[i]+=(now+conv)*uintBitsToFloat(p.t);
         e[h]=h1; e[h+1]=h2; e[h+2]=now;
     } else if (OP==21 || OP==22 || OP==29) {
         bool value=OP==22 || (OP==29 && g>=8);

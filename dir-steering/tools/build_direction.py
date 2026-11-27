@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a Q36 directional-steering vector from paired prompt sets.
 
-The extractor asks q36 to dump one hidden activation row per normal transformer
+The extractor asks q36 to dump one hidden activation row per executed transformer
 layer, averages the target and control rows, and writes a flat f32 file.
 At runtime q36 applies:
 
@@ -28,6 +28,7 @@ MODEL_PROFILES = {
     "qwen3.8-27b": (64, 5120),
     "qwen3.6-27b": (64, 5120),
     "qwen3.6-35b-a3b": (40, 2048),
+    "inkling-2-mini": (48, 2304),
 }
 
 

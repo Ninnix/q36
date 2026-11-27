@@ -1,6 +1,7 @@
 # Directional Steering
 
-Directional steering is a runtime activation edit for Q36's dense and MoE models.
+Directional steering is a runtime activation edit for Q36's dense and MoE Qwen
+models and Inkling 2 Mini.
 A steering file is a flat `f32` matrix with one normalized hidden-width direction
 per transformer layer. During inference, q36 can apply the edit after attention outputs,
 FFN outputs, or both:
@@ -264,6 +265,27 @@ Reference: [Refusal in Language Models Is Mediated by a Single Direction](https:
 This implementation follows DS4's per-layer attention/FFN projection rather
 than applying one direction across the entire residual stream.
 
+## Inkling 2 Mini
+
+Use the Inkling profile on CPU or Vulkan. Its bank has 48 rows of 2304 floats,
+indexed by execution slot. Slots 0–17 run physical layers 0–17, slots 18–29
+and 30–41 each repeat layers 6–17, and slots 42–47 run layers 18–23.
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --model gguf/Inkling-2-Mini-UD-IQ3_XXS.gguf --profile inkling-2-mini \
+  --good-file dir-steering/examples/succinct.txt \
+  --bad-file dir-steering/examples/verbose.txt \
+  --limit 16 \
+  --out dir-steering/out/inkling-verbosity.json
+make test-inkling-steering
+```
+
+On BC-250 Vulkan with the IQ3_XXS model, FFN scale `-1` reduced greedy
+answer lengths from 39 to 18 words for DNS, 105 to 22 for cloud formation,
+and 110 to 31 for database indexes. Scale `0` reproduced the three baselines.
+With scale `1` and a 384-token budget, all three longer samples ended mid-answer.
+
 ## Diagnostic Captures
 
 Set `Q36_GRAPH_DUMP_PREFIX` to enable captures. `Q36_GRAPH_DUMP_NAME` accepts
@@ -278,6 +300,10 @@ captures prompt and ordinary decode positions. The default, `last`, captures onl
 prompt token and retains the extractor's `_pos0.bin` naming. Explicit positions
 use their actual `_posN.bin` suffix. Speculative verification does not overwrite
 these captures. Diagnostic captures use ordered session evaluation.
+
+For Inkling, layer numbers refer to execution slots. At the start of each
+six-layer block, Inkling saves the incoming residual for its block mixer, so
+the attention output itself becomes the captured residual after attention.
 
 ```sh
 Q36_GRAPH_DUMP_PREFIX=/tmp/qwen \

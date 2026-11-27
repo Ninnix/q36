@@ -746,6 +746,7 @@ help:
 	@echo "  make q36-quality-score  Build the OpenRouter/Q36 local scorer"
 	@echo "  make test         Build and run tests"
 	@echo "  make test-steering  Test per-session steering and activation captures on the 27B model"
+	@echo "  make test-inkling-steering  Test steering and activation captures on Inkling 2 Mini"
 	@echo "  make test-steering-agent  Test agent tools and cache isolation with the trained 27B direction"
 	@echo "  make test-steering-security  Test a local SQL-injection audit, repair, and regression test"
 	@echo "  make test-steering-server  Test HTTP, streaming, tools, and steering disk-cache separation"
@@ -818,6 +819,9 @@ cpu: q36_cli_cpu.o linenoise_cpu.o q36_server_cpu.o rax_cpu.o q36_bench_cpu.o q3
 
 # --- GPU (default) objects ---
 # q36.c also contains the CPU oracle; preserve its rounding in GPU builds.
+q36_gpu_core.o q36_gpu_core_metal.o q36_gpu_core_metal_test.o q36_cpu.o: \
+	q36_inkling_model.inc q36_inkling.inc q36_inkling_gpu.inc q36_inkling_dspark.inc q36_inkling_tokenizer.inc
+
 q36_gpu_core.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -c -o $@ q36.c
 
@@ -1034,6 +1038,11 @@ test-quick: test
 test-steering: all
 	./q36_test --steering-sessions --model $(QWEN27B_MODEL)
 	python3 tests/test_directional_steering.py --model $(QWEN27B_MODEL)
+
+.PHONY: test-inkling-steering
+test-inkling-steering: q36 q36_test
+	./q36_test --steering-sessions --model "$(INKLING_MODEL)"
+	python3 tests/test_directional_steering.py --backend vulkan --profile inkling-2-mini --model "$(INKLING_MODEL)"
 
 .PHONY: test-steering-agent
 test-steering-agent: all

@@ -8750,7 +8750,8 @@ static void test_steering_sessions(void) {
     q36_engine *engine = NULL;
     TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
     if (!engine) return;
-    int layers = q36_qwen35_n_layer(), width = q36_qwen35_n_embd();
+    int layers = q36_engine_is_inkling(engine) ? 48 : q36_qwen35_n_layer();
+    int width = q36_qwen35_n_embd();
     q36_engine_close(engine);
     engine = NULL;
     size_t count = (size_t)layers * width;

@@ -427,7 +427,8 @@ static bool ink_vk_attention(ink_vk *g, const ink_layer *l, unsigned slot, unsig
         ink_vk_conv(g,attn,l->conv[2],INK_D,hist+2*INK_K,NULL,pos,residual);
 }
 
-static bool ink_vk_moe(ink_vk *g, const ink_layer *l, unsigned slot, unsigned pos,q36_gpu_tensor *attn) {
+static bool ink_vk_moe(ink_vk *g, const ink_layer *l, unsigned slot, unsigned pos,
+                       q36_gpu_tensor *out, bool separate) {
     q36_gpu_tensor **v=g->buf;
     bool packed=l->down->type==Q36_TENSOR_NVFP4 || l->down->type==Q36_TENSOR_IQ4_NL || l->down->type==Q36_TENSOR_Q8_0;
     if (!ink_vk_mm(g,l->router,0,128,v[IV_IN_Q],v[IV_ROUTER]) ||
@@ -438,15 +439,18 @@ static bool ink_vk_moe(ink_vk *g, const ink_layer *l, unsigned slot, unsigned po
                    NULL,NULL,INK_F,l->gate_scale!=NULL,0,packed,0) ||
         !ink_vk_mul(g,l->down,2,INK_D,v[IV_ACT],v[IV_GU],packed)) return false;
     unsigned hist=slot*(2*INK_K+2*INK_D)+2*INK_K+INK_D;
-    return ink_vk_op(g,g->nt==1 ? 20 : g->verify ? 41 : 11,g->nt==1 ? INK_D/128 : INK_D,attn,v[IV_GU],v[IV_ROUTE],ink_vk_weight(g,l->down_scale,128),
-        g->history,ink_vk_weight(g,l->conv[3],INK_D*4),INK_D,l->down_scale!=NULL,hist,pos,ink_bits(1/sqrtf(5)));
+    return ink_vk_op(g,g->nt==1 ? 20 : g->verify ? 41 : 11,g->nt==1 ? INK_D/128 : INK_D,
+        out,v[IV_GU],v[IV_ROUTE],ink_vk_weight(g,l->down_scale,128),g->history,
+        ink_vk_weight(g,l->conv[3],INK_D*4),INK_D,(l->down_scale!=NULL)+2*separate,hist,pos,ink_bits(1/sqrtf(5)));
 }
 
 static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embeddings,
                            unsigned nt, unsigned pos, bool logits) {
+    q36_engine *e=s->engine;
     ink_vk *g=s->runtime;
-    ink_dspark *draft=s->vision_state || s->engine->mtp_draft_tokens<=1 ? NULL : g->draft;
-    ink_weights *w=s->engine->ink;
+    ink_dspark *draft=s->vision_state || e->mtp_draft_tokens<=1 ? NULL : g->draft;
+    ink_weights *w=e->ink;
+    float attn_scale=s->directional_steering_attn_scale, ffn_scale=s->directional_steering_ffn_scale;
     if (draft && (nt>1 || draft->pending==16) && !ink_dspark_flush(draft,g->verify)) return false;
     if (!ink_vk_scratch(g,nt,pos+nt)) return false;
     q36_gpu_tensor **v=g->buf, *cur=v[IV_CUR], *blocks=v[IV_BLOCKS], *attn=v[IV_ATTN], *x=v[IV_IN_Q];
@@ -477,6 +481,7 @@ static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embed
                 !q36_gpu_tensor_copy(cur,0,v[IV_PRELUDE],0,4ull*nt*INK_D)) return false;
             count=1;
         }
+        if (!q36_dump_activation_gpu(s,Q36_DUMP_RESIDUAL_PRE,slot,cur)) return false;
         q36_gpu_tensor *msg=v[IV_MSG], *msg_scale=v[IV_MSG_SCALE];
         if (repeat && nt==1) {
             if (il==6 && (!ink_vk_message_views(g,w) ||
@@ -506,20 +511,41 @@ static bool ink_vk_forward(q36_session *s, const int *tokens, const float *embed
             if (!ink_vk_norm(g,in,0,in,l->norm[j],INK_D,1)) return false;
         }
         if (together && !ink_vk_attention_controls(g,l,queries==1 ? attn : NULL,msg,msg_scale)) return false;
-        if (!ink_vk_attention(g,l,slot,pos,shared,attn,il%6 ? cur : NULL)) return false;
+        if (!q36_dump_activation_gpu(s,Q36_DUMP_ATTN_NORM,slot,x)) return false;
+        /* Steering projects the convolved branch before it joins the residual. */
+        bool separate_attn=attn_scale!=0 || q36_dump_wants(s,Q36_DUMP_ATTN_OUT,slot);
+        if (!ink_vk_attention(g,l,slot,pos,shared,attn,!separate_attn && il%6 ? cur : NULL) ||
+            (attn_scale!=0 && !q36_gpu_directional_steering_project_tensor(
+                attn,e->directional_steering_gpu,slot,INK_D,nt,attn_scale)) ||
+            !q36_dump_activation_gpu(s,Q36_DUMP_ATTN_OUT,slot,attn) ||
+            (separate_attn && il%6 && !q36_gpu_add_tensor(attn,cur,attn,nt*INK_D)) ||
+            !q36_dump_activation_gpu(s,Q36_DUMP_RESIDUAL_ATTN,slot,attn)) return false;
         if (il%6==0) {
             if (!ink_vk_copy(g,blocks,4*INK_D,count++*INK_D,v[IV_LIVE],INK_D,0)) return false;
         }
         if (!ink_vk_mix(g,x,blocks,count,attn,l->ffn_query,1,0,true) ||
             (repeat && !ink_vk_control(g,l,3,x,x,msg,msg_scale)) ||
-            !ink_vk_norm(g,x,0,x,l->ffn_norm,INK_D,1) || !ink_vk_moe(g,l,slot,pos,attn)) return false;
+            !ink_vk_norm(g,x,0,x,l->ffn_norm,INK_D,1) ||
+            !q36_dump_activation_gpu(s,Q36_DUMP_FFN_NORM,slot,x)) return false;
+        bool separate_ffn=ffn_scale!=0 || q36_dump_wants(s,Q36_DUMP_FFN_OUT,slot);
+        if (!ink_vk_moe(g,l,slot,pos,separate_ffn ? cur : attn,separate_ffn)) return false;
+        if (separate_ffn &&
+            ((ffn_scale!=0 && !q36_gpu_directional_steering_project_tensor(
+                cur,e->directional_steering_gpu,slot,INK_D,nt,ffn_scale)) ||
+             !q36_dump_activation_gpu(s,Q36_DUMP_FFN_OUT,slot,cur) ||
+             !q36_gpu_add_tensor(attn,attn,cur,nt*INK_D))) return false;
+        if (!q36_dump_activation_gpu(s,Q36_DUMP_RESIDUAL_POST,slot,attn)) return false;
         q36_gpu_tensor *tmp=cur; cur=attn; attn=tmp;
     }
     s->gpu_top2_valid=false;
     s->logits_host_valid=false;
-    if (logits || draft) {
+    if (logits || draft || q36_dump_wants(s,Q36_DUMP_OUTPUT_NORM,INK_SLOTS-1)) {
         if (!ink_vk_mix(g,x,blocks,count,cur,w->output_query,1,0,true) ||
-            !ink_vk_norm(g,x,0,x,w->output_norm,INK_D,1)) return false;
+            !ink_vk_norm(g,x,0,x,w->output_norm,INK_D,1) ||
+            !q36_dump_activation_gpu(s,Q36_DUMP_OUTPUT_NORM,INK_SLOTS-1,x)) return false;
+    }
+    if (s->dump_active && !q36_dump_activations_gpu(s)) return false;
+    if (logits || draft) {
         if (draft) {
             if (!ink_dspark_tap(draft,3,x,nt)) return false;
             if (g->verify) {

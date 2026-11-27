@@ -15,12 +15,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--q36", default="./q36")
     ap.add_argument("--model", default="gguf/Qwen3.8-27B-UD-IQ3_S.gguf")
-    ap.add_argument("--profile", choices=("qwen3.8-27b", "qwen3.6-35b-a3b"),
+    profiles = {"qwen3.8-27b": (64, 5120), "qwen3.6-35b-a3b": (40, 2048),
+                "inkling-2-mini": (48, 2304)}
+    ap.add_argument("--profile", choices=profiles,
                     default="qwen3.8-27b")
+    ap.add_argument("--backend", choices=("cpu", "vulkan", "metal"))
     args = ap.parse_args()
-    layers, width = (40, 2048) if args.profile == "qwen3.6-35b-a3b" else (64, 5120)
+    layers, width = profiles[args.profile]
+    inkling = args.profile == "inkling-2-mini"
     base = [str(Path(args.q36).resolve()), "-m", str(Path(args.model).resolve()),
             "--ctx", "256", "--nothink", "--temp", "0"]
+    if args.backend:
+        base.append(f"--{args.backend}")
     env = os.environ.copy()
     env.pop("Q36_GRAPH_DUMP_PREFIX", None)
     env.pop("Q36_GRAPH_DUMP_NAME", None)
@@ -82,10 +88,12 @@ def main():
         output = run(steering + ["--inspect"], success=False)
         assert "failed to read directional steering vectors" in output, output
 
-        prompt = ["-p", "Explain DNS.", "--prefill-chunk", "1", "-n", "1"]
-        for component, option, layer in [("ffn_out", "--dir-steering-ffn", 0),
-                                         ("attn_out", "--dir-steering-attn", 0),
-                                         ("attn_out", "--dir-steering-attn", 3)]:
+        chunk = "8" if inkling else "1"
+        prompt = ["-p", "Explain DNS.", "--prefill-chunk", chunk, "-n", "1"]
+        targets = [("ffn_out", "--dir-steering-ffn", 18 if inkling else 0),
+                   ("attn_out", "--dir-steering-attn", 0),
+                   ("attn_out", "--dir-steering-attn", 47 if inkling else 3)]
+        for component, option, layer in targets:
             write_bank(layer)
             prefix = root / f"baseline-{component}-{layer}"
             run(prompt, capture=(prefix, component))
@@ -103,10 +111,14 @@ def main():
                            zip(actual[layer][1:], baseline[layer][1:])) < 1e-4
                 if scale == 0:
                     assert all(a == b for a, b in zip(actual, baseline))
+                if inkling and layer:
+                    assert actual[:layer] == baseline[:layer]
 
         prefix = root / "all-positions"
+        layer = 1 if inkling else 0
+        layer_filter = str(layer)
         output = run(prompt + ["-n", "3"], capture=(prefix, "all"), filters={
-            "Q36_GRAPH_DUMP_LAYER": "0", "Q36_GRAPH_DUMP_POS": "all"})
+            "Q36_GRAPH_DUMP_LAYER": layer_filter, "Q36_GRAPH_DUMP_POS": "all"})
         match = re.search(r"processing (\d+) input tokens", output)
         assert match, output
         prompt_tokens = int(match[1])
@@ -115,9 +127,9 @@ def main():
         files = list(root.glob("all-positions_*.bin"))
         assert len(files) == (prompt_tokens + 3) * len(names), len(files)
 
-        def row_at(prefix, name, pos):
+        def row_at(prefix, name, pos, layer=layer):
             values = array.array("f")
-            values.frombytes(Path(f"{prefix}_{name}-0_pos{pos}.bin").read_bytes())
+            values.frombytes(Path(f"{prefix}_{name}-{layer}_pos{pos}.bin").read_bytes())
             assert len(values) == width and all(math.isfinite(x) for x in values)
             return values
 
@@ -127,16 +139,27 @@ def main():
                                         ("residual_attn", "ffn_out", "residual_post")]:
                 assert max(abs(a + b - c) for a, b, c in
                            zip(values[left], values[right], values[total])) < 1e-4
-        baseline = root / "baseline-ffn_out-0"
+        baseline = root / f"baseline-ffn_out-{targets[0][2]}"
         assert row_at(prefix, "ffn_out", prompt_tokens - 1) == row_at(baseline, "ffn_out", 0)
         selected = root / "selected-position"
         run(prompt, capture=(selected, "all"), filters={
-            "Q36_GRAPH_DUMP_LAYER": "0", "Q36_GRAPH_DUMP_POS": "1"})
+            "Q36_GRAPH_DUMP_LAYER": layer_filter, "Q36_GRAPH_DUMP_POS": "1"})
         assert len(list(root.glob("selected-position_*.bin"))) == len(names)
         for name in names:
             assert row_at(selected, name, 1) == row_at(prefix, name, 1)
+        if inkling:
+            selected = root / "final-slot"
+            run(prompt, capture=(selected, "all"), filters={
+                "Q36_GRAPH_DUMP_LAYER": str(layers - 1), "Q36_GRAPH_DUMP_POS": "1"})
+            row_at(selected, "output_norm", 1, layers - 1)
 
-    print(f"PASS steering ({args.profile}): loading, zero-scale enable, invalid banks, FFN/recurrent/full-attention projection, final prompt capture, layer/position filters, residual identities, /steer and /ctx")
+            selected = root / "first-slot"
+            run(prompt, capture=(selected, "all"), filters={"Q36_GRAPH_DUMP_LAYER": "0"})
+            assert row_at(selected, "residual_attn", 0, 0) == row_at(selected, "attn_out", 0, 0)
+
+    print(f"PASS steering ({args.profile}): loading, zero-scale enable, invalid banks, "
+          "FFN and attention projection, final prompt capture, layer/position filters, "
+          "residual identities, /steer and /ctx")
 
 
 if __name__ == "__main__":

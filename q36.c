@@ -74,6 +74,7 @@ static const char Q36_REASONING_EFFORT_MAX_PREFIX[] =
 
 enum {
     Q36_MAX_LAYER = 64,
+    INK_SLOTS = 48,
     Q36_MTP_MAX_DRAFT = 16,
     Q36_MTP_VERIFY_MAX = Q36_DIST_VERIFY_MAX,
     Q36_MOE_MTP_TENSORS = 20,
@@ -3731,6 +3732,10 @@ static void q36_add_rows(float *dst,
                           n_threads, q36_add_rows_worker, &ctx);
 }
 
+static uint32_t q36_activation_layers(const q36_engine *e) {
+    return e->variant == Q36_VARIANT_INKLING ? INK_SLOTS : Q36_N_LAYER;
+}
+
 static void q36_directional_steering_project_rows(float *x,
                                                    const float *dirs,
                                                    uint32_t layer,
@@ -3773,7 +3778,7 @@ static bool q36_dump_wants(q36_session *s, uint32_t kind, uint32_t layer) {
     q36_engine *e = s->engine;
     return s->dump_active && (e->activation_dump_mask & (1u << kind)) &&
            (e->activation_dump_layer < 0 || (uint32_t)e->activation_dump_layer == layer) &&
-           (kind != Q36_DUMP_OUTPUT_NORM || layer + 1u == Q36_N_LAYER);
+           (kind != Q36_DUMP_OUTPUT_NORM || layer + 1u == q36_activation_layers(e));
 }
 
 static bool q36_dump_write(q36_session *s, uint32_t kind, uint32_t layer,
@@ -3812,7 +3817,8 @@ static bool q36_dump_activation_gpu(q36_session *s, uint32_t kind,
     if (s->dump_count == 1) {
         /* Queue one selected row per stream and layer, then read after the
          * graph finishes. All-position diagnostics use bounded host scratch. */
-        uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] * Q36_N_LAYER + layer;
+        uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] *
+                        q36_activation_layers(s->engine) + layer;
         return q36_gpu_tensor_copy(s->engine->activation_dump_gpu, slot * bytes,
                                    x, s->dump_first * bytes, bytes) != 0;
     }
@@ -3827,13 +3833,14 @@ static bool q36_dump_activation_gpu(q36_session *s, uint32_t kind,
 
 static bool q36_dump_activations_gpu(q36_session *s) {
     if (s->dump_count != 1) return true;
-    uint64_t bytes = (uint64_t)s->engine->activation_dump_slots * Q36_N_LAYER * Q36_N_EMBD * sizeof(float);
+    uint32_t layers = q36_activation_layers(s->engine);
+    uint64_t bytes = (uint64_t)s->engine->activation_dump_slots * layers * Q36_N_EMBD * sizeof(float);
     float *rows = xmalloc((size_t)bytes);
     bool ok = q36_gpu_tensor_read(s->engine->activation_dump_gpu, 0, rows, bytes) != 0;
     for (uint32_t kind = 0; ok && kind < Q36_DUMP_COUNT; kind++) {
-        for (uint32_t il = 0; ok && il < Q36_N_LAYER; il++) {
+        for (uint32_t il = 0; ok && il < layers; il++) {
             if (!q36_dump_wants(s, kind, il)) continue;
-            uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] * Q36_N_LAYER + il;
+            uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] * layers + il;
             ok = q36_dump_write(s, kind, il, s->dump_pos, rows + slot * Q36_N_EMBD);
         }
     }
@@ -11290,7 +11297,8 @@ static bool q36_load_directional_steering(q36_engine *e) {
         fprintf(stderr, "q36: directional steering needs --dir-steering-file\n");
         return false;
     }
-    count = (uint64_t)Q36_N_LAYER * Q36_N_EMBD;
+    uint32_t layers = q36_activation_layers(e);
+    count = (uint64_t)layers * Q36_N_EMBD;
     bytes = count * sizeof(float);
     fp = fopen(e->directional_steering_file, "rb");
     if (!fp) {
@@ -11301,7 +11309,7 @@ static bool q36_load_directional_steering(q36_engine *e) {
     if (fstat(fileno(fp), &st) != 0 || st.st_size < 0 || (uint64_t)st.st_size != bytes) {
         fprintf(stderr,
                 "q36: directional steering file must contain exactly %u x %u f32 values (%" PRIu64 " bytes)\n",
-                Q36_N_LAYER, Q36_N_EMBD, bytes);
+                layers, Q36_N_EMBD, bytes);
         fclose(fp);
         return false;
     }
@@ -11369,7 +11377,7 @@ static bool q36_load_activation_dump(q36_engine *e) {
         char *end = NULL;
         errno = 0;
         long n = strtol(text, &end, 10);
-        long limit = i ? INT32_MAX : (long)Q36_N_LAYER - 1;
+        long limit = i ? INT32_MAX : (long)q36_activation_layers(e) - 1;
         if (errno || *end || n < 0 || n > limit) {
             fprintf(stderr, "q36: invalid %s: %s\n", vars[i], text);
             return false;
@@ -11383,7 +11391,8 @@ static bool q36_load_activation_dump(q36_engine *e) {
 #ifndef Q36_NO_GPU
     if (q36_backend_uses_graph(e->backend)) {
         e->activation_dump_gpu = q36_gpu_tensor_alloc(
-                (uint64_t)e->activation_dump_slots * Q36_N_LAYER * Q36_N_EMBD * sizeof(float));
+                (uint64_t)e->activation_dump_slots * q36_activation_layers(e) *
+                Q36_N_EMBD * sizeof(float));
         if (!e->activation_dump_gpu) return false;
     }
 #endif
@@ -11514,10 +11523,14 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     }
     e->variant = g_q36_shape.variant;
+    if (!q36_load_directional_steering(e) || !q36_load_activation_dump(e)) {
+        q36_engine_close(e);
+        return 1;
+    }
     if (e->variant == Q36_VARIANT_INKLING) {
         if (e->backend == Q36_BACKEND_METAL ||
             ((opt->vision_path || opt->mtp_path) && e->backend != Q36_BACKEND_VULKAN) ||
-            opt->directional_steering_file || getenv("Q36_GRAPH_DUMP_PREFIX") || e->ssd_streaming ||
+            e->ssd_streaming ||
             q36_dist_enabled(&e->distributed) || !q36_kv_cache_row_bytes(e->cache_type_k,32) ||
             !q36_kv_cache_row_bytes(e->cache_type_v,32)) {
             fprintf(stderr, "q36: unsupported Inkling engine options\n");
@@ -11578,16 +11591,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         }
     } else if (strstr(opt->model_path,".q36-resident")) {
         fprintf(stderr,"q36: worker metadata requires its resident weight stream\n");
-        q36_engine_close(e);
-        return 1;
-    }
-    /* The vector bank follows the detected model, including the 64 x 5120
-     * dense model. Load zero-scale banks too so /steer can enable them later. */
-    if (!q36_load_directional_steering(e)) {
-        q36_engine_close(e);
-        return 1;
-    }
-    if (!q36_load_activation_dump(e)) {
         q36_engine_close(e);
         return 1;
     }
@@ -12422,17 +12425,25 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
             unsigned n=1;
             bool ok;
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
-            if (s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN) {
+            bool ink_vulkan=s->engine->ink && s->engine->backend==Q36_BACKEND_VULKAN;
+            if (ink_vulkan) {
                 n=ink_vk_batch(s->engine->prefill_cap_override);
                 if (n>(unsigned)(prompt->len-i)) n=prompt->len-i;
+            }
+#endif
+            bool logits=i+n==(unsigned)prompt->len;
+            q36_dump_select(s,i,n,logits);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+            if (ink_vulkan) {
                 /* The prefix length is known. Allocate its pages once across
                  * all prefill chunks so retired KV buffers do not pile up. */
                 ok=q36_session_reserve_kv(s,prompt->len,i) &&
-                   ink_vk_forward(s,prompt->v+i,NULL,n,i,i+n==(unsigned)prompt->len);
+                   ink_vk_forward(s,prompt->v+i,NULL,n,i,logits);
             } else
 #endif
             ok=q36_session_reserve_kv(s,i+1,i) &&
-               q36_forward_token_cpu(s,prompt->v[i],i,i+1==prompt->len);
+               q36_forward_token_cpu(s,prompt->v[i],i,logits);
+            s->dump_active=false;
             if (!ok) {
                 if (err && errlen) snprintf(err, errlen, "prefill failed at token %d", i);
                 s->checkpoint_valid = false;
@@ -12669,7 +12680,11 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
             bool ok = q36_session_reserve_kv(s, (uint32_t)pos + n, (uint32_t)s->checkpoint.len);
             if (ok) {
 #ifndef Q36_METAL
-                if (ink) ok = ink_vk_forward(s, NULL, embedding, n, pos, logits);
+                if (ink) {
+                    q36_dump_select(s, pos, n, logits);
+                    ok = ink_vk_forward(s, NULL, embedding, n, pos, logits);
+                    s->dump_active = false;
+                }
                 else
 #endif
                     ok = q36_forward_embeddings_vulkan(s, prompt->v + pos, embedding,

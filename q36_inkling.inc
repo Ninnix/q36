@@ -237,7 +237,8 @@ static unsigned ink_physical_layer(int slot) {
 }
 
 static bool ink_forward(q36_session *s, int token, unsigned pos, bool logits) {
-    ink_weights *w = s->engine->ink;
+    q36_engine *e = s->engine;
+    ink_weights *w = e->ink;
     float cur[INK_D], prelude[INK_D], bank[2][INK_D], blocks[4][INK_D];
     if (token < 0 || token >= INK_VOCAB ||
         !q36_tensor_row_to_float(&s->engine->model,w->embd,token,cur,INK_D)) return false;
@@ -256,30 +257,44 @@ static bool ink_forward(q36_session *s, int token, unsigned pos, bool logits) {
             memcpy(cur,prelude,sizeof(cur));
             count = 1;
         }
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_RESIDUAL_PRE,slot,cur)) return false;
         float in[3][INK_D], msg[4][INK_D], attn[INK_D], ffn[INK_D];
         if (repeat) for (int j = 0; j < 4; j++)
             ink_mix(msg[j],bank[0],1,bank[1],l->msg_query+j*INK_D,4);
         for (int j = 0; j < 3; j++) {
             if (!l->attn_query) memcpy(in[j],cur,sizeof(cur));
             else ink_mix(in[j],blocks[0],count,cur,l->attn_query+(l->dynamic[0] ? j*INK_D : 0),l->dynamic[0] ? 3 : 1);
-            if (repeat) ink_control(s->engine,l,j,in[j],msg[j]);
+            if (repeat) ink_control(e,l,j,in[j],msg[j]);
             q36_ref_rms_norm(in[j],in[j],l->norm[j],INK_D,1e-6f);
         }
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_ATTN_NORM,slot,in[0])) return false;
         ink_attention(s,l,slot,pos,in,attn);
+        q36_directional_steering_project_rows(attn,e->directional_steering_dirs,slot,1,
+                                              s->directional_steering_attn_scale);
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_ATTN_OUT,slot,attn)) return false;
         if (il%6 == 0) memcpy(blocks[count++],cur,sizeof(cur));
         else for (int i = 0; i < INK_D; i++) attn[i] += cur[i];
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_RESIDUAL_ATTN,slot,attn)) return false;
         ink_mix(in[0],blocks[0],count,attn,l->ffn_query,1);
-        if (repeat) ink_control(s->engine,l,3,in[0],msg[3]);
+        if (repeat) ink_control(e,l,3,in[0],msg[3]);
         q36_ref_rms_norm(in[0],in[0],l->ffn_norm,INK_D,1e-6f);
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_FFN_NORM,slot,in[0])) return false;
         ink_moe(s,l,slot,in[0],ffn);
+        q36_directional_steering_project_rows(ffn,e->directional_steering_dirs,slot,1,
+                                              s->directional_steering_ffn_scale);
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_FFN_OUT,slot,ffn)) return false;
         for (int i = 0; i < INK_D; i++) cur[i] = attn[i]+ffn[i];
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_RESIDUAL_POST,slot,cur)) return false;
     }
-    if (logits) {
+    if (logits || q36_dump_wants(s,Q36_DUMP_OUTPUT_NORM,INK_SLOTS-1)) {
         float x[INK_D];
         ink_mix(x,blocks[0],count,cur,w->output_query,1);
         q36_ref_rms_norm(x,x,w->output_norm,INK_D,1e-6f);
-        ink_mm(s->engine,w->output,0,INK_VOCAB,x,s->logits);
-        for (int i = 0; i < INK_VOCAB; i++) s->logits[i] = 30*tanhf(s->logits[i]*(1.0f/30));
+        if (!q36_dump_activation_cpu(s,Q36_DUMP_OUTPUT_NORM,INK_SLOTS-1,x)) return false;
+        if (logits) {
+            ink_mm(e,w->output,0,INK_VOCAB,x,s->logits);
+            for (int i = 0; i < INK_VOCAB; i++) s->logits[i] = 30*tanhf(s->logits[i]*(1.0f/30));
+        }
     }
     s->logits_host_valid = logits;
     return true;
