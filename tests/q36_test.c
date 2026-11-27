@@ -5239,6 +5239,58 @@ done:
 #endif
 }
 
+static void test_vulkan_inkling_flash(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    const unsigned fmt = Q36_KV_CACHE_Q8_0 + 3*Q36_KV_CACHE_Q4_0;
+    if (!q36_gpu_init()) return;
+    if (!q36_gpu_inkling_flash_supported(fmt)) {
+        q36_gpu_cleanup();
+        return;
+    }
+
+    enum { keys = 513, spans = 2, pages = (keys+31)/32, page_words = 32*416 };
+    float zero[16*1024] = {0}, gate[3072], got[3072];
+    uint32_t *packed = test_xcalloc(pages*page_words, sizeof(*packed));
+    for (unsigned i = 0; i < sizeof(gate)/sizeof(*gate); i++) gate[i] = 1;
+    /* K is zero. Every packed V value is one, including the last key in
+     * the second split. The zero-valued sink contributes one to the mass. */
+    for (unsigned page = 0; page < pages; page++) {
+        for (unsigned i = 32*272; i < 32*400; i++)
+            packed[page*page_words+i] = 0x99999999u;
+        for (unsigned i = 32*400; i < page_words; i++)
+            packed[page*page_words+i] = 0x3c003c00u;
+    }
+    q36_gpu_tensor *z = q36_gpu_tensor_alloc(sizeof(zero));
+    q36_gpu_tensor *kv = q36_gpu_tensor_alloc(pages*page_words*sizeof(*packed));
+    q36_gpu_tensor *g = q36_gpu_tensor_alloc(sizeof(gate));
+    q36_gpu_tensor *out = q36_gpu_tensor_alloc(sizeof(got));
+    q36_gpu_tensor *parts = q36_gpu_tensor_alloc(24*spans*130*sizeof(float));
+    TEST_ASSERT(z && kv && g && out && parts);
+    if (z && kv && g && out && parts) {
+        const uint32_t tile[8] = {42, keys-1, spans, 0, 0, 0, 1, 8*spans};
+        const uint32_t merge[8] = {43, keys-1, spans, 0, 0, 0, 1, 24};
+        q36_gpu_tensor *tile_buf[6] = {parts, z, z, kv, z, z};
+        q36_gpu_tensor *merge_buf[6] = {out, parts, NULL, g, NULL, NULL};
+        bool ok = q36_gpu_tensor_write(z,0,zero,sizeof(zero)) &&
+                  q36_gpu_tensor_write(kv,0,packed,pages*page_words*sizeof(*packed)) &&
+                  q36_gpu_tensor_write(g,0,gate,sizeof(gate)) &&
+                  q36_gpu_inkling_op(tile_buf,tile,fmt) &&
+                  q36_gpu_inkling_op(merge_buf,merge,fmt) &&
+                  q36_gpu_tensor_read(out,0,got,sizeof(got));
+        for (unsigned i = 0; ok && i < sizeof(got)/sizeof(*got); i++)
+            ok = fabsf(got[i] - (float)keys/(keys+1)) < 1e-6f;
+        TEST_ASSERT(ok);
+    }
+    q36_gpu_tensor_free(parts);
+    q36_gpu_tensor_free(out);
+    q36_gpu_tensor_free(g);
+    q36_gpu_tensor_free(kv);
+    q36_gpu_tensor_free(z);
+    free(packed);
+    q36_gpu_cleanup();
+#endif
+}
+
 static void test_vulkan_kernels(void) {
     test_vulkan_scratch_reuse();
     test_vulkan_router_subgroups();
@@ -5265,6 +5317,7 @@ static void test_vulkan_kernels(void) {
     test_vulkan_swiglu_add();
     test_vulkan_directional_steering();
     test_vulkan_attn_decode_fused();
+    test_vulkan_inkling_flash();
     const uint32_t wide_types[] = {10, 11, 12, 13, 16, 17, 18, 19, 20, 22, 23},
                    wide_bytes[] = {84, 110, 144, 176, 66, 74, 98, 50, 18, 82, 136};
     for (unsigned i = 0; i < sizeof(wide_types) / sizeof(wide_types[0]); i++)

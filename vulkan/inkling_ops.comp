@@ -378,6 +378,155 @@ void route_merge(inout float score,inout uint id,uint width,uint lane) {
 }
 #endif
 
+#ifdef INK_FMA
+float flash_exp(float x) { return exp2(x*1.4426950408889634); }
+const uint flash_heads=3;
+const uint flash_keys=128;
+const uint flash_span=512;
+shared vec4 flash_q[OP==42 ? flash_heads*32 : 1];
+shared float flash_w[OP==42 ? flash_heads*flash_keys : 1];
+
+void flash_tile(uint g,uint l) {
+    uint kh=g/p.k, split=g%p.k;
+    uint start=split*flash_span;
+    uint end=min(p.n+1,start+flash_span);
+    const uint pairs=4, channels=64/pairs;
+    uint h0=3*kh, sub=l%8, col=l%channels;
+    for (uint r=0;r<flash_heads;r++) if (l<32) {
+        uint qi=(h0+r)*128+(l/8)*32+sub;
+        flash_q[32*r+l]=vec4(b[qi],b[qi+8],b[qi+16],b[qi+24]);
+    }
+    barrier();
+
+    float top[flash_heads], den[flash_heads];
+    vec2 value[flash_heads][pairs];
+    [[unroll]] for (uint r=0;r<flash_heads;r++) {
+        top[r]=0; den[r]=0;
+        [[unroll]] for (uint u=0;u<pairs;u++) value[r][u]=vec2(0);
+    }
+    // Each workgroup keeps a score tile in LDS and emits one PV sum,
+    // maximum and exponential mass per query head for its split.
+    for (uint base=start;base<end;base+=flash_keys) {
+        for (uint tile=0;tile<flash_keys;tile+=16) {
+            uint key=base+tile+2*(l/8);
+            vec2 kv[4][4];
+            if (key<end) cache_key_pair(key,kh,sub,kv);
+            [[unroll]] for (uint r=0;r<flash_heads;r++) {
+                vec2 score=vec2(-1.0/0.0);
+                if (key<end) {
+                    vec2 dot[4]={vec2(0),vec2(0),vec2(0),vec2(0)};
+                    [[unroll]] for (uint k=0;k<4;k++) {
+                        vec4 q=flash_q[32*r+8*k+sub];
+                        [[unroll]] for (uint u=0;u<4;u++)
+                            dot[u]=ink_fma(vec4(q[u]),vec4(kv[u][k],0,0),vec4(dot[u],0,0)).xy;
+                    }
+                    precise vec2 sum=(dot[0]+dot[1])+(dot[2]+dot[3]);
+                    sum+=subgroupShuffleXor(sum,4); sum+=subgroupShuffleXor(sum,2); sum+=subgroupShuffleXor(sum,1);
+                    if (sub==0) {
+                        uint h=h0+r;
+                        uint dist=p.n-key;
+                        precise vec2 bias=vec2(0);
+                        if (dist<=1024) [[unroll]] for (uint i=0;i<16;i++) {
+                            float q=c[16*h+i];
+                            bias.x+=q*(dist<1024 ? e[16*dist+i] : 0);
+                            bias.y+=q*(dist>0 ? e[16*(dist-1)+i] : 0);
+                        }
+                        precise vec2 s=sum*uintBitsToFloat(0x3db504f3u)+(bias-vec2(f[h]));
+                        score.x=s.x;
+                        if (key<p.n) score.y=s.y;
+                    }
+                }
+                if (sub==0) {
+                    uint at=r*flash_keys+tile+2*(l/8);
+                    flash_w[at]=score.x; flash_w[at+1]=score.y;
+                }
+            }
+        }
+        barrier();
+
+        [[unroll]] for (uint r=0;r<flash_heads;r++) {
+            float score[flash_keys/64], m=top[r];
+            [[unroll]] for (uint j=0;j<flash_keys/64;j++) {
+                score[j]=flash_w[r*flash_keys+64*j+l];
+                m=max(m,score[j]);
+            }
+            [[unroll]] for (uint j=32;j>0;j/=2) m=max(m,subgroupShuffleXor(m,j));
+            float rescale=flash_exp(top[r]-m), subtotal=0;
+            [[unroll]] for (uint j=0;j<flash_keys/64;j++) {
+                float v=score[j];
+                float w=v==-1.0/0.0 ? 0 : flash_exp(v-m);
+                flash_w[r*flash_keys+64*j+l]=w;
+                subtotal+=w;
+            }
+            [[unroll]] for (uint j=32;j>0;j/=2) subtotal+=subgroupShuffleXor(subtotal,j);
+            [[unroll]] for (uint u=0;u<pairs;u++) value[r][u]*=rescale;
+            den[r]=ink_fma(den[r],rescale,subtotal);
+            top[r]=m;
+        }
+        barrier();
+
+        uint pair=kh*64+col*pairs, count=min(flash_keys,end-base);
+        for (uint t=l/channels;t<count;t+=pairs) {
+            uint key=base+t;
+            uint data=cache_word(key,true,false,pair/4), scale=cache_word(key,true,true,pair/32);
+            float sc=unpackHalf2x16(floatBitsToUint(d[scale]))[(pair/16)%2];
+            vec2 v[pairs];
+            [[unroll]] for (uint u=0;u<pairs;u++) {
+                uint bits=floatBitsToUint(d[data+u/4])>>(8*((pair+u)%4));
+                v[u]=vec2(ivec2(bits&15,(bits>>4)&15)-8)*sc;
+            }
+            [[unroll]] for (uint r=0;r<flash_heads;r++) {
+                float w=flash_w[r*flash_keys+t];
+                [[unroll]] for (uint u=0;u<pairs;u++) {
+                    value[r][u].x=ink_fma(w,v[u].x,value[r][u].x);
+                    value[r][u].y=ink_fma(w,v[u].y,value[r][u].y);
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r=0;r<flash_heads;r++) {
+        uint at=((h0+r)*p.k+split)*130;
+        [[unroll]] for (uint u=0;u<pairs;u++) {
+            precise vec2 v=value[r][u];
+            [[unroll]] for (uint step=32;step>=channels;step/=2)
+                v+=subgroupShuffleXor(v,step);
+            if (l<channels) {
+                a[at+2*(col*pairs+u)]=v.x;
+                a[at+2*(col*pairs+u)+1]=v.y;
+            }
+        }
+        if (l==0) { a[at+128]=top[r]; a[at+129]=den[r]; }
+    }
+}
+
+shared float flash_rescale[OP==43 ? 513 : 1];
+void flash_merge(uint g,uint l) {
+    uint n=p.k, at=g*n*130;
+    float top=0;
+    for (uint s=l;s<n;s+=128) top=max(top,b[at+s*130+128]);
+    [[unroll]] for (uint j=32;j>0;j/=2) top=max(top,subgroupShuffleXor(top,j));
+    if (l%64==0) lanes[l/64]=top;
+    barrier();
+    top=max(lanes[0],lanes[1]);
+    double den=0;
+    for (uint s=l;s<n;s+=128) {
+        uint off=at+s*130;
+        float w=flash_exp(b[off+128]-top);
+        flash_rescale[s]=w;
+        den+=double(w)*double(b[off+129]);
+    }
+    // Count the zero-valued sink once across all splits.
+    float inv=q36_router_round(1.0LF/(total(den,l)+double(q36_router_exp(-top))));
+    barrier();
+    float acc=0;
+    for (uint s=0;s<n;s++) acc=ink_fma(b[at+s*130+l],flash_rescale[s],acc);
+    uint dst=g*128+l;
+    a[dst]=(acc*inv)*d[dst];
+}
+#endif
+
 void main() {
     uint l=gl_LocalInvocationID.x, g=gl_WorkGroupID.x+65535*gl_WorkGroupID.y, i=g*128+l;
     uint token=gl_WorkGroupID.z*(OP==30 ? 16 : OP==6 ? 8 : OP==8 ? 2 : 1);
@@ -397,6 +546,10 @@ void main() {
     if (OP==12) { oa=token*width; ob=oa; oc=oa; od=oa; }
     if (OP==10) { oa=token*8*p.n; ob=oa*2; oc=token*16; }
     if (OP==14) { oa=token*16; ob=token*128; }
+#ifdef INK_FMA
+    if (OP==42) { flash_tile(g,l); return; }
+    if (OP==43) { flash_merge(g,l); return; }
+#endif
     if (OP==0) { // per-head RMS with optional gamma
         double ss=0;
         if (p.n==width) {

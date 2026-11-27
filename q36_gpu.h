@@ -58,6 +58,7 @@ int q36_gpu_inkling_verify_matmul(q36_gpu_tensor *out, const q36_gpu_tensor *x,
     const q36_gpu_tensor *w, unsigned type, unsigned width, unsigned rows, unsigned tokens);
 int q36_gpu_inkling_packed(void);
 int q36_gpu_inkling_tiled(unsigned kv_format);
+bool q36_gpu_inkling_flash_supported(unsigned kv_format);
 int q36_gpu_inkling_cache(const void *map,uint64_t size,uint64_t offset,uint64_t bytes,
     unsigned type,unsigned width);
 int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t params[8], unsigned kv_format);

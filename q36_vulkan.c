@@ -21,7 +21,8 @@
 
 enum {
     Q36_VK_QK8_0 = 32,
-    Q36_VK_INK_OPS = 42,
+    Q36_VK_INK_OPS = 44,
+    Q36_VK_INK_Q8_Q4 = 7,
     Q36_VK_INK_KEY_INTERLEAVED = 64*9,
     Q36_VK_INK_NV_TILE = 64*8192,
     Q36_VK_TENSOR_F32     = 0,
@@ -1638,12 +1639,14 @@ static int q36_vk_kernel_init(q36_vk_kernel *k) {
         .module = k->shader,
         .pName = "main",
     };
+    bool ink_flash=k==&q36_vk.inkling_ops[Q36_VK_INK_Q8_Q4][42];
+    bool ink_wave64=ink_flash || k==&q36_vk.inkling_ops[Q36_VK_INK_Q8_Q4][43];
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
-        .requiredSubgroupSize = 32u,
+        .requiredSubgroupSize = ink_wave64 ? 64u : 32u,
     };
     if (q36_vk.subgroup_size_control &&
-        ((q36_vk.bc250 && (strstr(k->path,"inkling_matvec") || strstr(k->path,"inkling_ops") ||
+        (ink_wave64 || (q36_vk.bc250 && (strstr(k->path,"inkling_matvec") || strstr(k->path,"inkling_ops") ||
                            (k->tokens%64==40 && strstr(k->path,"inkling_tile_half")) ||
                            (k->tokens%64==8 && strstr(k->path,"inkling_tile_fma")) ||
                            k==&q36_vk.inkling_iq2_tile ||
@@ -1667,9 +1670,9 @@ static int q36_vk_kernel_init(q36_vk_kernel *k) {
         .mapEntryCount = 1, .pMapEntries = &token_entry,
         .dataSize = sizeof(k->tokens), .pData = &k->tokens,
     };
-    uint32_t spec[2]={k->tokens,256};
+    uint32_t spec[2]={k->tokens,ink_flash ? 64u : 256u};
     VkSpecializationMapEntry entries[2]={token_entry,{.constantID=1,.offset=4,.size=4}};
-    if (q36_vk.bc250 && (k==&q36_vk.inkling_ops[0][0] || k==&q36_vk.inkling_ops[0][7] || k==&q36_vk.inkling_ops[7][32] || k==&q36_vk.inkling_ops[0][28])) {
+    if (q36_vk.bc250 && (ink_flash || k==&q36_vk.inkling_ops[0][0] || k==&q36_vk.inkling_ops[0][7] || k==&q36_vk.inkling_ops[7][32] || k==&q36_vk.inkling_ops[0][28])) {
         token_info.mapEntryCount=2;
         token_info.pMapEntries=entries;
         token_info.dataSize=sizeof(spec);
@@ -3833,7 +3836,7 @@ int q36_gpu_init(void) {
     q36_vk.ink_tiled=ink_fma && q36_vk.bc250;
     if (ink_fma) for (unsigned fmt=0;fmt<9;fmt++) for (unsigned i=0;i<Q36_VK_INK_OPS;i++) {
         q36_vk.inkling_ops[fmt][i].path="vulkan/inkling_ops_fma.spv";
-        if (q36_vk.ink_tiled && (i==5 || i==6 || i==21 || i==25 || i==29 || i==30 || i==31 || i==34 || i==37 || i==39))
+        if (q36_vk.ink_tiled && (i==5 || i==6 || i==21 || i==25 || i==29 || i==30 || i==31 || i==34 || i==37 || i==39 || i==42))
             q36_vk.inkling_ops[fmt][i].tokens+=Q36_VK_INK_KEY_INTERLEAVED;
     }
     const char *expert_verify="vulkan/inkling_expert_verify.spv";
@@ -7065,7 +7068,7 @@ int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t p[8], un
     unsigned groups=p[7];
     static const char *names[]={"ink_rms","ink_mix_score","ink_mix","ink_conv","ink_clip","ink_store",
         "ink_score","ink_softmax","ink_value","ink_message_norm","ink_situ","ink_routed_conv","ink_control","ink_logits",
-        "ink_route","ink_copy","ink_q8","ink_group","ink_messages","ink_gates","ink_expert_residual","ink_k_store","ink_v_store","ink_norm_mix_score","ink_value_decode","ink_score_decode","ink_expert_pack","ink_gates_bf16","ink_qkv_norm","ink_kv_store","ink_score_long","ink_score_tile","ink_softmax_tile","ink_value_tile","ink_score_decode_pair","ink_expert_pack_i16","ink_depth_mix","ink_verify_k_store","ink_verify_v_store","ink_verify_kv_store","ink_verify_conv","ink_verify_routed_conv"};
+        "ink_route","ink_copy","ink_q8","ink_group","ink_messages","ink_gates","ink_expert_residual","ink_k_store","ink_v_store","ink_norm_mix_score","ink_value_decode","ink_score_decode","ink_expert_pack","ink_gates_bf16","ink_qkv_norm","ink_kv_store","ink_score_long","ink_score_tile","ink_softmax_tile","ink_value_tile","ink_score_decode_pair","ink_expert_pack_i16","ink_depth_mix","ink_verify_k_store","ink_verify_v_store","ink_verify_kv_store","ink_verify_conv","ink_verify_routed_conv","ink_flash_tile","ink_flash_merge"};
     unsigned z=p[6];
     if (op==3 || op==11 || op==40 || op==41) {
         unsigned channels=z>=8 ? 16 : z>=4 ? 32 : 128;
@@ -7081,6 +7084,11 @@ int q36_gpu_inkling_op(q36_gpu_tensor *const tensors[6], const uint32_t p[8], un
         groups<65535 ? groups : 65535,(groups+65534)/65535,z);
     pthread_mutex_unlock(&q36_vk_mu);
     return ok;
+}
+
+bool q36_gpu_inkling_flash_supported(unsigned kv_format) {
+    return kv_format==Q36_VK_INK_Q8_Q4 && q36_gpu_inkling_tiled(kv_format) &&
+           q36_vk.subgroup_size==64 && q36_vk_use_attn_fused();
 }
 
 int q36_gpu_dspark_supported(void) {

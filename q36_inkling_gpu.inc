@@ -390,7 +390,15 @@ static bool ink_vk_attention(ink_vk *g, const ink_layer *l, unsigned slot, unsig
     if (!ink_vk_op(g,4,2*INK_H,v[IV_Q],ink_vk_weight(g,l->clip_q,INK_Q),v[IV_REL],
             ink_vk_weight(g,l->clip_rel,INK_H*INK_REL),v[IV_GATE],NULL,0,0,0,0,full ? pos+1 : 0)) return false;
     unsigned nt=g->nt;
-    for (unsigned j=0;j<nt;j+=32) {
+    bool fused=full && nt==1 && !g->verify && pos>=49152 && q36_gpu_inkling_flash_supported(g->kv_format);
+    if (fused) {
+        unsigned spans=pos/512+1;
+        if (!ink_vk_op(g,42,INK_KH*spans,g->scores,v[IV_Q],v[IV_REL],kv,
+                       ink_vk_weight(g,l->bias_rel,INK_WINDOW*INK_REL),v[IV_SINK],pos,spans,0,0,0) ||
+            !ink_vk_op(g,43,INK_H,v[IV_CONTEXT],g->scores,NULL,v[IV_GATE],NULL,NULL,pos,spans,0,0,0))
+            return false;
+    }
+    for (unsigned j=0;!fused && j<nt;j+=32) {
         g->nt=nt-j<32 ? nt-j : 32;
         unsigned end=pos+j+g->nt;
         if (window && end>window) end=window;
