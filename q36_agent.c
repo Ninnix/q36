@@ -3339,22 +3339,15 @@ static void agent_tool_viz_puts(agent_stream_renderer *sr, const char *s) {
 
 static void agent_tool_viz_start(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
-    bool line_open = !sr->renderer->last_output_newline;
+    agent_token_renderer *r = sr->renderer;
+    renderer_markdown_finish(r);
+    renderer_flush_utf8(r);
+    if (r->color_open) renderer_reset_color(r);
     memset(v, 0, sizeof(*v));
     v->active = true;
     v->at_line_start = true;
     v->last_output_newline = true;
-    if (sr->replay) {
-        if (line_open) agent_tool_viz_puts(sr, "\n");
-    } else if (sr->renderer->use_color) {
-        /* The raw Qwen tool start marker may arrive after ordinary text on the
-         * current row.  Clear that row only for the live terminal UI; plain
-         * stdout mode must never leak cursor-control escapes into pipes. */
-        agent_tool_viz_puts(sr, "\r\x1b[2K");
-    } else if (line_open) {
-        agent_tool_viz_puts(sr, "\n");
-    }
-    v->last_output_newline = true;
+    if (!r->last_output_newline) agent_tool_viz_puts(sr, "\n");
 }
 
 static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {

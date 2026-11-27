@@ -998,6 +998,35 @@ static void test_compaction_boundaries(void) {
     AGENT_TEST_ASSERT(strstr(text, "COMPACTING summary 12 tokens"));
 }
 
+static void test_tool_preamble(void) {
+    const char text[] = "Checking the directory";
+    const char xml[] = "<tool_call><function=bash><parameter=command>ls"
+        "</parameter></function></tool_call>";
+    for (int native = 0; native < 2; native++) {
+        agent_tail_capture capture = {.cap = 4096};
+        agent_token_renderer renderer = {.capture = &capture, .use_color = true,
+            .format_markdown = true, .last_output_newline = true};
+        agent_qwen_tool_parser parser = {0};
+        agent_stream_renderer stream = {.renderer = &renderer, .parser = &parser};
+        agent_stream_text(&stream, text, strlen(text), false);
+        if (native) {
+            buf body = {0};
+            buf_puts(&body, "{\"args\":{\"command\":\"ls\"},\"name\":\"bash\"}");
+            agent_inkling_preview_start(&stream, "bash");
+            agent_inkling_preview_feed(&stream, &body);
+            agent_inkling_preview_finish(&stream, xml, strlen(xml));
+            buf_free(&body);
+        } else {
+            agent_stream_text(&stream, xml, strlen(xml), false);
+        }
+        char *out = agent_tail_capture_take(&capture, NULL);
+        AGENT_TEST_ASSERT(strstr(out, "Checking the directory\n🛠️ "));
+        AGENT_TEST_ASSERT(parser.calls.len == 1);
+        free(out);
+        agent_qwen_tool_parser_free(&parser);
+    }
+}
+
 static void test_inkling_tool_preview(void) {
     agent_tail_capture capture = {.cap = 4096};
     agent_token_renderer renderer = {.capture = &capture, .last_output_newline = true};
@@ -1107,6 +1136,7 @@ int main(int argc, char **argv) {
     test_worker_ownership();
     test_worker_pause_ui_waits();
     test_compaction_boundaries();
+    test_tool_preamble();
     test_inkling_tool_preview();
     test_mtp_boundaries();
     test_observation_error_is_not_context_exhaustion();
