@@ -389,6 +389,7 @@ int q36_engine_debug_tensor_row_packed(q36_engine *e, const char *tensor_name, u
                                        void *dst, uint64_t dst_cap,
                                        uint64_t *row_bytes, uint32_t *type, uint32_t *n);
 
+bool q36_session_enable_inkling_disk_cache(q36_session *s);
 uint64_t q36_session_payload_bytes(q36_session *s);
 int q36_session_stage_payload(q36_session *s, q36_session_payload_file *out,
                               char *err, size_t errlen);

@@ -205,6 +205,13 @@ buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution
 without running one extra decode step.
 
+For Inkling 2 Mini on Vulkan without DSpark, `q36-server` stores version 6
+checkpoints in a KV-type-specific subdirectory of `--kv-disk-dir`. They store
+the live KV rows and convolution history, so loading a matching prefix skips
+inference. A checkpoint made during prefill can omit logits and still resume
+an extended prompt. At 30,720 tokens with Q8 K and Q4 V, a checkpoint is about
+460 MiB. Use an SSD-backed cache directory if `/tmp` is RAM-backed.
+
 The tensor payload is q36-specific KV/session state, not a generic
 inference graph dump. It is expected to be portable only across compatible
 `q36.c` builds for this model layout.

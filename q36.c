@@ -654,6 +654,7 @@ struct q36_session {
     q36_tokens ink_batches; /* Start and length of each batched prompt segment. */
     bool checkpoint_valid;
     bool vision_state;
+    bool ink_disk_cache;
     q36_vision_span *vision_spans;
     size_t vision_count;
     int32_t rope_delta;
@@ -853,8 +854,10 @@ enum {
     Q36_PAYLOAD_VERSION_TYPED_KV = 3,
     Q36_PAYLOAD_VERSION_MTP = 4,
     Q36_PAYLOAD_VERSION_INK_BATCHES = 5,
+    Q36_PAYLOAD_VERSION_INK_VULKAN = 6,
     Q36_PAYLOAD_U32_FIELDS = 14,
     Q36_PAYLOAD_U32_FIELDS_TYPED_KV = 16,
+    Q36_PAYLOAD_U32_FIELDS_INK_VULKAN = 6,
 };
 
 static void q36_session_reset_runtime(q36_session *s);
@@ -12538,7 +12541,12 @@ int q36_session_sync(q36_session *s, const q36_tokens *prompt, char *err, size_t
     }
     if (!s->vision_state && s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
-        q36_tokens_starts_with(prompt, &s->checkpoint))
+        q36_tokens_starts_with(prompt, &s->checkpoint) &&
+        /* A disk frontier saved mid-prefill can extend the prefix, but it
+         * has no logits with which to generate at that exact position. */
+        (prompt->len > s->checkpoint.len || !s->engine->ink ||
+         s->engine->backend != Q36_BACKEND_VULKAN ||
+         s->logits_host_valid || s->gpu_top2_valid))
     {
         return q36_session_prefill_range(s, prompt, s->checkpoint.len, err, errlen);
     }
@@ -13899,9 +13907,108 @@ static int q36_payload_read_recurrent_state(q36_gpu_tensor *tensor, FILE *fp,
 }
 #endif
 
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+static bool ink_payload_has_logits(const q36_session *s) {
+    return s->logits_host_valid || s->gpu_top2_valid;
+}
+
+static uint64_t ink_payload_kv_bytes(const ink_vk *g, unsigned slot, unsigned rows) {
+    return (uint64_t)ink_vk_ring(g, rows, (slot + 1) % 6 == 0) * g->kv_row_bytes;
+}
+
+static uint64_t ink_payload_data_bytes(const ink_vk *g, unsigned rows, bool logits) {
+    uint64_t bytes = (uint64_t)rows * sizeof(int32_t) + q36_gpu_tensor_bytes(g->history);
+    if (logits) bytes += INK_VOCAB * sizeof(float);
+    for (unsigned i = 0; i < INK_SLOTS; i++) bytes += ink_payload_kv_bytes(g, i, rows);
+    return bytes;
+}
+
+static int ink_save_vk_payload(q36_session *s, FILE *fp, char *err, size_t errlen) {
+    ink_vk *g = s->runtime;
+    uint32_t rows = (uint32_t)s->checkpoint.len;
+    bool logits = ink_payload_has_logits(s);
+    uint32_t h[Q36_PAYLOAD_U32_FIELDS_INK_VULKAN] = {
+        Q36_PAYLOAD_MAGIC, Q36_PAYLOAD_VERSION_INK_VULKAN, rows,
+        g->kv_format, ink_vk_ring(g, UINT32_MAX, false), logits,
+    };
+    if (logits && !q36_session_ensure_logits_host(s)) {
+        q36_payload_set_err(err, errlen, "failed to read Inkling checkpoint logits");
+        return 1;
+    }
+    if (q36_payload_write_bytes(fp, h, sizeof(h), err, errlen) ||
+        q36_payload_write_bytes(fp, s->checkpoint.v, (uint64_t)rows * sizeof(int32_t), err, errlen) ||
+        (logits && q36_payload_write_bytes(fp, s->logits, INK_VOCAB * sizeof(float), err, errlen)) ||
+        q36_payload_write_tensor(fp, g->history, q36_gpu_tensor_bytes(g->history), err, errlen))
+        return 1;
+    for (unsigned i = 0; i < INK_SLOTS; i++) {
+        if (q36_payload_write_tensor(fp, g->kv[i], ink_payload_kv_bytes(g, i, rows), err, errlen))
+            return 1;
+    }
+    return 0;
+}
+
+static int ink_load_vk_payload(q36_session *s, FILE *fp, unsigned rows,
+                               uint64_t remaining, char *err, size_t errlen) {
+    uint32_t h[3];
+    if (!s->engine->ink || s->engine->backend != Q36_BACKEND_VULKAN || s->engine->dspark ||
+        !rows || rows >= (unsigned)s->ctx_size) {
+        q36_payload_set_err(err, errlen, "incompatible Inkling Vulkan checkpoint");
+        return 1;
+    }
+    ink_vk *g = s->runtime;
+    if (q36_payload_read_bytes(fp, h, sizeof(h), &remaining, err, errlen)) return 1;
+    if (h[0] != g->kv_format || h[1] != ink_vk_ring(g, UINT32_MAX, false) || h[2] > 1 ||
+        remaining != ink_payload_data_bytes(g, rows, h[2])) {
+        q36_payload_set_err(err, errlen, "incompatible Inkling Vulkan KV layout");
+        return 1;
+    }
+    q36_session_invalidate(s);
+    if (!ink_vk_reserve(s, rows)) {
+        q36_payload_set_err(err, errlen, "failed to grow Inkling KV cache for checkpoint");
+        return 1;
+    }
+    for (unsigned i = 0; i < rows; i++) {
+        uint32_t tok;
+        if (q36_payload_read_u32(fp, &tok, &remaining, err, errlen)) return 1;
+        if (tok >= INK_VOCAB) {
+            q36_payload_set_err(err, errlen, "invalid token in Inkling checkpoint");
+            return 1;
+        }
+        q36_tokens_push(&s->checkpoint, (int)tok);
+    }
+    if ((h[2] && q36_payload_read_bytes(fp, s->logits, INK_VOCAB * sizeof(float), &remaining, err, errlen)) ||
+        q36_payload_read_tensor(g->history, fp, q36_gpu_tensor_bytes(g->history), &remaining, err, errlen))
+        return 1;
+    for (unsigned i = 0; i < INK_SLOTS; i++) {
+        if (q36_payload_read_tensor(g->kv[i], fp, ink_payload_kv_bytes(g, i, rows), &remaining, err, errlen))
+            return 1;
+    }
+    s->logits_host_valid = h[2];
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
+
+bool q36_session_enable_inkling_disk_cache(q36_session *s) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (s && s->engine->ink && s->engine->backend == Q36_BACKEND_VULKAN && !s->engine->dspark) {
+        s->ink_disk_cache = true;
+        return true;
+    }
+#else
+    (void)s;
+#endif
+    return false;
+}
+
 uint64_t q36_session_payload_bytes(q36_session *s) {
     if (!s || s->vision_state) return 0;
     uint32_t rows = (uint32_t)s->checkpoint.len;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (rows && s->ink_disk_cache)
+        return Q36_PAYLOAD_U32_FIELDS_INK_VULKAN * sizeof(uint32_t) +
+               ink_payload_data_bytes(s->runtime, rows, ink_payload_has_logits(s));
+#endif
     if (s->dist || s->engine->ink || s->engine->variant == Q36_VARIANT_FLASH_NEXT)
         return sizeof(q36_payload_header) + (uint64_t)rows * sizeof(int32_t);
     bool typed = s->engine &&
@@ -14032,6 +14139,10 @@ int q36_session_save_payload(q36_session *s, FILE *fp, char *err, size_t errlen)
         return 1;
     }
     uint32_t rows = (uint32_t)s->checkpoint.len;
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (rows && s->ink_disk_cache)
+        return ink_save_vk_payload(s, fp, err, errlen);
+#endif
     if (s->engine->dspark) {
         q36_session_snapshot snap={0};
         int rc=q36_session_save_snapshot(s,&snap,err,errlen) ||
@@ -14223,6 +14334,10 @@ int q36_session_load_payload(q36_session *s, FILE *fp, uint64_t payload_bytes, c
         if (err && errlen) snprintf(err, errlen, "unsupported session payload format");
         return 1;
     }
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    if (version == Q36_PAYLOAD_VERSION_INK_VULKAN)
+        return ink_load_vk_payload(s, fp, third, remaining, err, errlen);
+#endif
     if (version==Q36_PAYLOAD_VERSION_INK_BATCHES) {
         if (!s->engine->ink || third>(unsigned)s->ctx_size || remaining!=sizeof(int32_t)*(uint64_t)third) {
             q36_payload_set_err(err,errlen,"invalid Inkling checkpoint size");

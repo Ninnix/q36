@@ -7170,6 +7170,79 @@ done:
     q36_engine_close(engine);
 }
 
+typedef struct {
+    q36_session *session;
+    FILE *file;
+    uint64_t bytes;
+    int rows;
+} test_inkling_frontier;
+
+static void test_save_inkling_frontier(void *ud, const char *event, int current, int total) {
+    test_inkling_frontier *p = ud;
+    if (strcmp(event, "prefill_chunk") || p->bytes || current < 1056 || current == total) return;
+    p->bytes = q36_session_payload_bytes(p->session);
+    p->rows = current;
+    TEST_ASSERT(q36_session_save_payload(p->session, p->file, NULL, 0) == 0);
+    TEST_ASSERT(ftello(p->file) == (off_t)p->bytes);
+}
+
+static void test_inkling_vk_cache_roundtrip(q36_session *s, q36_engine *e, q36_tokens *prompt) {
+    FILE *frontier = tmpfile(), *full = tmpfile();
+    TEST_ASSERT(frontier && full);
+    float *expected = NULL;
+    if (!frontier || !full) goto done;
+    while (prompt->len < 1600) q36_tokenize_text(e, " a short cache test", prompt);
+    test_inkling_frontier saved = {.session = s, .file = frontier};
+    q36_session_set_progress(s, test_save_inkling_frontier, &saved);
+    TEST_ASSERT(q36_session_sync(s, prompt, NULL, 0) == 0);
+    q36_session_set_progress(s, NULL, NULL);
+    TEST_ASSERT(saved.rows > 0);
+    uint64_t bytes = q36_session_payload_bytes(s);
+    TEST_ASSERT(q36_session_save_payload(s, full, NULL, 0) == 0);
+    TEST_ASSERT(ftello(full) == (off_t)bytes);
+
+    int vocab = 0;
+    const float *logits = q36_session_logits(s, &vocab);
+    TEST_ASSERT(logits && vocab > 0);
+    if (!logits || vocab <= 0) goto done;
+    size_t logits_bytes = (size_t)vocab * sizeof(*logits);
+    expected = malloc(logits_bytes);
+    TEST_ASSERT(expected != NULL);
+    if (!expected) goto done;
+    memcpy(expected, logits, logits_bytes);
+
+    rewind(frontier);
+    test_progress_probe probe = {0};
+    q36_session_set_progress(s, test_progress_probe_cb, &probe);
+    TEST_ASSERT(q36_session_load_payload(s, frontier, saved.bytes, NULL, 0) == 0);
+    TEST_ASSERT(probe.calls == 0 && q36_session_pos(s) == saved.rows);
+    TEST_ASSERT(q36_session_sync(s, prompt, NULL, 0) == 0);
+    TEST_ASSERT(probe.first_current == prompt->len && probe.calls == 1);
+    logits = q36_session_logits(s, NULL);
+    TEST_ASSERT(logits && !memcmp(logits, expected, logits_bytes));
+
+    int token = q36_session_argmax(s);
+    TEST_ASSERT(q36_session_eval(s, token, NULL, 0) == 0);
+    logits = q36_session_logits(s, NULL);
+    TEST_ASSERT(logits != NULL);
+    if (!logits) goto done;
+    memcpy(expected, logits, logits_bytes);
+    rewind(full);
+    probe = (test_progress_probe){0};
+    TEST_ASSERT(q36_session_load_payload(s, full, bytes, NULL, 0) == 0);
+    TEST_ASSERT(probe.calls == 0 && q36_session_pos(s) == prompt->len);
+    TEST_ASSERT(q36_session_argmax(s) == token);
+    TEST_ASSERT(q36_session_eval(s, token, NULL, 0) == 0);
+    logits = q36_session_logits(s, NULL);
+    TEST_ASSERT(logits && !memcmp(logits, expected, logits_bytes));
+
+done:
+    q36_session_set_progress(s, NULL, NULL);
+    free(expected);
+    if (frontier) fclose(frontier);
+    if (full) fclose(full);
+}
+
 static void test_kv_cache_save_restore(void) {
     if (!test_model_available(test_model_path())) {
         test_skip("kv-cache-save-restore", "model file not found");
@@ -7252,6 +7325,8 @@ static void test_kv_cache_save_restore(void) {
         fclose(oversized);
     }
 
+    if (q36_session_enable_inkling_disk_cache(session))
+        test_inkling_vk_cache_roundtrip(session, engine, &prompt);
     q36_session_snapshot_free(&snap);
     q36_session_free(session);
     q36_tokens_free(&prompt);

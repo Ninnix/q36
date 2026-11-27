@@ -10641,9 +10641,19 @@ int main(int argc, char **argv) {
         char name[40];
         uint64_t key = q36_session_directional_steering_key(s.session);
         snprintf(name, sizeof(name), "steering-%016llx", (unsigned long long)key);
-        /* The legacy server KV header cannot identify different model weights. */
-        char *base = q36_engine_model_id(engine) == 4 ?
-            path_join(cfg.kv_disk_dir, "qwen38-gsq-rco") : xstrdup(cfg.kv_disk_dir);
+        const char *subdir = NULL;
+        char inkling_dir[64];
+        if (q36_session_enable_inkling_disk_cache(s.session)) {
+            for (int i = 1; i < slot_count; i++)
+                q36_session_enable_inkling_disk_cache(s.slots[i].session);
+            /* Keep token-only files out of the fast restore lookup. */
+            snprintf(inkling_dir, sizeof(inkling_dir), "inkling-vulkan-k%u-v%u",
+                     (unsigned)cfg.engine.cache_type_k, (unsigned)cfg.engine.cache_type_v);
+            subdir = inkling_dir;
+        } else if (q36_engine_model_id(engine) == 4) {
+            subdir = "qwen38-gsq-rco";
+        }
+        char *base = subdir ? path_join(cfg.kv_disk_dir, subdir) : xstrdup(cfg.kv_disk_dir);
         char *dir = key ? path_join(base, name) : xstrdup(base);
         kv_cache_open(&s.kv, dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
