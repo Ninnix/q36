@@ -254,10 +254,11 @@ static bool ink_dspark_reserve(ink_dspark *d,unsigned end) {
     q36_gpu_tensor *next[3]={0};
     bool ok=true;
     for (unsigned i=0;i<3 && ok;i++) {
-        unsigned old=ink_dspark_ring(d,i,d->cap), rows=ink_dspark_ring(d,i,cap);
-        if (rows==old) continue;
-        next[i]=ink_dspark_alloc((uint64_t)rows*INK_K);
-        ok=next[i] && (!old || q36_gpu_tensor_copy(next[i],0,d->kv[i],0,4ull*old*INK_K));
+        uint64_t old=q36_gpu_tensor_bytes(d->kv[i]);
+        uint64_t words=(uint64_t)ink_dspark_ring(d,i,cap)*INK_K;
+        if (words*sizeof(float)<=old) continue;
+        next[i]=ink_dspark_alloc(words);
+        ok=next[i] && (!old || q36_gpu_tensor_copy(next[i],0,d->kv[i],0,old));
     }
     for (unsigned i=0;i<3;i++) {
         if (ok && next[i]) { q36_gpu_tensor_free(d->kv[i]); d->kv[i]=next[i]; }
@@ -265,6 +266,16 @@ static bool ink_dspark_reserve(ink_dspark *d,unsigned end) {
     }
     if (ok) d->cap=cap;
     return ok;
+}
+
+static void ink_dspark_trim_kv(ink_dspark *d,unsigned rows) {
+    for (unsigned i=0;i<3;i++) {
+        uint64_t bytes=4ull*ink_dspark_ring(d,i,rows+8)*INK_K;
+        if (q36_gpu_tensor_bytes(d->kv[i])<=bytes) continue;
+        q36_gpu_tensor_free(d->kv[i]);
+        d->kv[i]=NULL;
+    }
+    d->cap=0;
 }
 
 static bool ink_dspark_tap(ink_dspark *d,unsigned slot,q36_gpu_tensor *x,unsigned nt) {

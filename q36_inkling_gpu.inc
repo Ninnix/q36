@@ -196,19 +196,24 @@ static unsigned ink_vk_ring(const ink_vk *g, unsigned cap, bool full) {
     return full || cap<ring ? cap : ring;
 }
 
+enum { INK_VK_KV_SLACK = 4096 };
+
 static bool ink_vk_reserve(q36_session *s, uint32_t need) {
     ink_vk *g=s->runtime;
     if (need<=g->cap) return true;
-    unsigned cap=g->cap+g->cap/4;
+    unsigned growth=g->cap/4;
+    if (growth>INK_VK_KV_SLACK) growth=INK_VK_KV_SLACK;
+    unsigned cap=g->cap+growth;
     if (cap<need) cap=need;
     cap=(unsigned)ink_vk_rows(cap);
     if (cap>(unsigned)s->ctx_size) cap=s->ctx_size;
     for (int i=0;i<INK_SLOTS;i++) {
-        unsigned n=ink_vk_ring(g,cap,(i+1)%6==0), old=ink_vk_ring(g,g->cap,(i+1)%6==0);
-        if (ink_vk_rows(n)==ink_vk_rows(old)) continue;
-        q36_gpu_tensor *kv=q36_gpu_tensor_alloc_uninitialized(ink_vk_rows(n)*g->kv_row_bytes);
+        uint64_t old=q36_gpu_tensor_bytes(g->kv[i]);
+        uint64_t bytes=ink_vk_rows(ink_vk_ring(g,cap,(i+1)%6==0))*g->kv_row_bytes;
+        if (bytes<=old) continue;
+        q36_gpu_tensor *kv=q36_gpu_tensor_alloc_uninitialized(bytes);
         if (!kv) return false;
-        if (g->kv[i] && !q36_gpu_tensor_copy(kv,0,g->kv[i],0,ink_vk_rows(old)*g->kv_row_bytes)) {
+        if (old && !q36_gpu_tensor_copy(kv,0,g->kv[i],0,old)) {
             q36_gpu_tensor_free(kv);
             return false;
         }
@@ -217,6 +222,22 @@ static bool ink_vk_reserve(q36_session *s, uint32_t need) {
     }
     g->cap=cap;
     return true;
+}
+
+/* Only a new prefix may discard old KV. The fixed sliding rings can be reused. */
+static void ink_vk_trim_kv(ink_vk *g,unsigned rows) {
+    if (g->cap<=rows || g->cap-rows<=INK_VK_KV_SLACK) return;
+    for (unsigned i=0;i<INK_SLOTS;i++) {
+        uint64_t bytes=ink_vk_rows(ink_vk_ring(g,rows,(i+1)%6==0))*g->kv_row_bytes;
+        if (q36_gpu_tensor_bytes(g->kv[i])<=bytes) continue;
+        q36_gpu_tensor_free(g->kv[i]);
+        g->kv[i]=NULL;
+    }
+    g->cap=0;
+    if (g->draft) ink_dspark_trim_kv(g->draft,rows);
+    q36_gpu_tensor_free(g->scores);
+    g->scores=NULL;
+    g->score_bytes=0;
 }
 
 static q36_gpu_tensor *ink_vk_weight(ink_vk *g, const float *w, unsigned n) {

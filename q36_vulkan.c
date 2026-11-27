@@ -2449,20 +2449,24 @@ static void q36_vk_ink_pack_rows(void *arg, uint64_t first, uint64_t end) {
     }
 }
 
+/* Some GGUFs store BF16 controller and router matrices in F32 tensors. */
+static bool q36_vk_inkling_f32_is_bf16(const void *data, uint64_t bytes) {
+    const uint32_t *weights = data;
+    uint32_t low = 0;
+    for (uint64_t i = 0; i < bytes/sizeof(*weights); i++) low |= weights[i];
+    return (low & 65535u) == 0;
+}
+
+uint64_t q36_gpu_inkling_f32_weight_bytes(const void *data, uint64_t bytes) {
+    return q36_vk.have_int_dot && q36_vk_inkling_f32_is_bf16(data, bytes) ? bytes/2 : bytes;
+}
+
 static q36_gpu_tensor *q36_vk_weight_load_unlocked(const void *source,uint64_t bytes,
                                                     unsigned type,unsigned blocks) {
     q36_vk_weight *found=q36_vk_weight_find_unlocked(source,bytes);
     if (found) return found->tensor;
 
-    /* Some GGUFs store BF16 controller and router matrices in F32 tensors.
-     * Discard the low half only when it is zero in every weight. */
-    bool compact=type==0 && blocks;
-    if (compact) {
-        const uint32_t *v=source;
-        uint32_t low=0;
-        for (uint64_t i=0;i<bytes/4;i++) low|=v[i];
-        compact=(low&65535)==0;
-    }
+    bool compact=type==0 && blocks && q36_vk_inkling_f32_is_bf16(source,bytes);
     q36_gpu_tensor *tensor=q36_vk_arena_alloc_unlocked(compact ? bytes/2 : bytes);
     if (!tensor) return NULL;
     {
